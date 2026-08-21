@@ -52,8 +52,9 @@ def main() -> int:
         )
         assert first.returncode == 0, (first.stdout, first.stderr)
         assert "interactive mode" in first.stdout
+        assert "\x1b[" not in first.stdout
         assert first.stdout.count("Offline mock response") >= 2
-        match = re.search(r"session:\s+(sess_[A-Za-z0-9_-]+)", first.stdout)
+        match = re.search(r"(?:session:\s+|SESSION\s+)(sess_[A-Za-z0-9_-]+)", first.stdout)
         assert match, first.stdout
         session_id = match.group(1)
 
@@ -89,7 +90,8 @@ def main() -> int:
         )
         assert direct.returncode == 0, (direct.stdout, direct.stderr)
         assert "Offline mock response" in direct.stdout
-        assert "─ end_turn" in direct.stdout
+        assert "TURN COMPLETE" in direct.stdout
+        assert "end_turn" in direct.stdout
 
     print("Borealis interactive CLI smoke test passed")
     return 0

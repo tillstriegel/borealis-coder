@@ -19,7 +19,7 @@ from .diagnostics import run_diagnostics
 from .errors import BorealisError, ConfigurationError, SessionError
 from .models import AgentResult, Event, Role
 from .safety import ApprovalRequest
-from .terminal import ConsoleRenderer, ReadlineHistory
+from .terminal import AuroraUI, ConsoleRenderer, ReadlineHistory
 from .util import truncate_text
 
 ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
@@ -84,6 +84,10 @@ class InteractiveCLI:
         self._active_task: asyncio.Task[AgentResult] | None = None
         self._interrupt_count = 0
 
+    @property
+    def ui(self) -> AuroraUI:
+        return self.renderer.ui
+
     async def run(self) -> int:
         self.runner = await self._new_runner(self.config)
         await self._select_initial_session()
@@ -102,9 +106,11 @@ class InteractiveCLI:
                         line = _terminal_input(self._prompt_label())
                     except EOFError:
                         print()
+                        self.ui.notice("info", "Aurora shell closed", "session saved")
                         break
                     except KeyboardInterrupt:
                         print()
+                        self.ui.notice("warning", "Aurora shell interrupted", "session saved")
                         return 130
                     line = line.strip()
                     if not line:
@@ -116,11 +122,12 @@ class InteractiveCLI:
                         try:
                             should_exit, prompt = await self._command(line)
                         except (BorealisError, ConfigurationError, OSError, ValueError) as error:
-                            print(f"command error: {error}", file=self.renderer.status_stream)
+                            self.ui.notice("error", "Command failed", str(error))
                             continue
                         if prompt:
                             await self._submit(prompt)
                         if should_exit:
+                            self.ui.notice("info", "Aurora shell closed", "session saved")
                             break
                         continue
                     await self._submit(line)
@@ -156,22 +163,24 @@ class InteractiveCLI:
 
     def _print_banner(self) -> None:
         route = self._primary_route()
-        print(f"Borealis Coder {__version__} — interactive mode")
-        print(f"workspace  {self.workspace}")
-        print(f"model      {route.name}/{route.model}")
-        print(
-            f"safety     {self.config.safety.mode} · approval={self.config.safety.approval} "
-            f"· network={'on' if self.config.safety.network else 'off'}"
+        safety = (
+            f"{self.config.safety.mode} · approval {self.config.safety.approval} · "
+            f"network {'on' if self.config.safety.network else 'off'}"
         )
-        if self.session_id:
-            print(f"session    {self.session_id} (resumed)")
-        print("Type /help for commands. Use //text to send a prompt beginning with '/'.")
+        session = f"{self.session_id} (resumed)" if self.session_id else "new conversation"
+        self.ui.banner(
+            version=f"v{__version__}",
+            workspace=self.workspace,
+            route=f"{route.name}/{route.model}",
+            safety=safety,
+            session=session,
+        )
 
     def _prompt_label(self) -> str:
         if not _is_tty(sys.stdin):
             return ""
         short = self.session_id[-8:] if self.session_id else "new"
-        return f"[{short}] › "  # noqa: RUF001 - intentional prompt glyph
+        return self.ui.prompt(short)
 
     async def _submit(self, prompt: str) -> None:
         prompt = prompt.strip()
@@ -189,11 +198,11 @@ class InteractiveCLI:
             result = await task
         except asyncio.CancelledError:
             self.renderer.finish_turn()
-            print("Turn cancelled.", file=self.renderer.status_stream)
+            self.ui.notice("warning", "Turn cancelled", "session state preserved")
             return
         except (BorealisError, ConfigurationError, OSError, ValueError) as error:
             self.renderer.finish_turn()
-            print(f"error: {error}", file=self.renderer.status_stream)
+            self.ui.notice("error", "Turn failed", str(error))
             return
         finally:
             progress_task.cancel()
@@ -206,31 +215,39 @@ class InteractiveCLI:
         self.session_id = result.session_id
         if result.text and not self.renderer.has_rendered(result.text):
             print(result.text)
-        print(_turn_footer(result), file=self.renderer.status_stream)
+        self.ui.turn_footer(_turn_footer(result))
         if result.error and result.stop_reason.value != "cancelled":
-            print(
-                f"[{result.stop_reason.value}] {result.error}",
-                file=self.renderer.status_stream,
-            )
+            self.ui.notice("error", result.stop_reason.value, result.error)
 
     async def _report_progress(self, task: asyncio.Task[AgentResult]) -> None:
         loop = asyncio.get_running_loop()
         started = loop.time()
         generation = self.renderer.activity_generation
+        frame = 0
+        next_heartbeat_at = started + 10.0
         while not task.done():
-            await asyncio.sleep(10)
+            await asyncio.sleep(0.12 if self.renderer.live_activity else 1.0)
             if task.done():
                 return
+            now = loop.time()
+            elapsed = now - started
+            if self.renderer.live_activity:
+                self.renderer.pulse(elapsed, frame)
+                frame += 1
+                continue
             current_generation = self.renderer.activity_generation
-            if current_generation == generation:
-                self.renderer.heartbeat(max(1, int(loop.time() - started)))
-            generation = current_generation
+            if current_generation != generation:
+                generation = current_generation
+                next_heartbeat_at = now + 10.0
+            elif now >= next_heartbeat_at:
+                self.renderer.heartbeat(max(1, int(elapsed)))
+                next_heartbeat_at = now + 10.0
 
     async def _command(self, line: str) -> tuple[bool, str | None]:
         try:
             parts = shlex.split(line)
         except ValueError as error:
-            print(f"command error: {error}", file=self.renderer.status_stream)
+            self.ui.notice("error", "Could not parse command", str(error))
             return False, None
         if not parts:
             return False, None
@@ -243,7 +260,11 @@ class InteractiveCLI:
             self._print_help()
         elif command in {"/new", "/clear"}:
             self.session_id = None
-            print("Started a fresh conversation. The previous session remains saved.")
+            self.ui.notice(
+                "success",
+                "Started a fresh conversation",
+                "the previous session remains saved",
+            )
         elif command in {"/status", "/session"}:
             await self._print_status(full=command == "/status")
         elif command == "/sessions":
@@ -303,10 +324,7 @@ class InteractiveCLI:
         elif command == "/paste":
             return False, await self._read_multiline()
         else:
-            print(
-                f"Unknown command: {command}. Type /help.",
-                file=self.renderer.status_stream,
-            )
+            self.ui.notice("error", f"Unknown command: {command}", "type /help")
         return False, None
 
     async def _resume(self, value: str, *, announce: bool = True) -> None:
@@ -318,7 +336,7 @@ class InteractiveCLI:
                 limit=1,
             )
             if not sessions:
-                print("No saved sessions for this workspace.")
+                self.ui.notice("info", "No saved sessions", str(self.workspace))
                 return
             info = sessions[0]
         else:
@@ -329,9 +347,10 @@ class InteractiveCLI:
                 )
         self.session_id = info.id
         if announce:
-            print(
-                f"Resumed {info.id} · {info.provider}/{info.model} · "
-                f"{info.updated_at} · {info.title}"
+            self.ui.notice(
+                "success",
+                "Session resumed",
+                f"{info.id} · {info.provider}/{info.model} · {info.title}",
             )
 
     async def _list_sessions(self, limit: int) -> None:
@@ -342,46 +361,62 @@ class InteractiveCLI:
             limit=limit,
         )
         if not values:
-            print("No saved sessions for this workspace.")
+            self.ui.notice("info", "No saved sessions", str(self.workspace))
             return
+        rows: list[tuple[str, object]] = []
         for item in values:
-            marker = "*" if item.id == self.session_id else " "
-            print(
-                f"{marker} {item.id}  {item.updated_at}  {item.status:<7} "
-                f"{item.provider}/{item.model}  {item.title}"
+            marker = "◆" if item.id == self.session_id else "◇"
+            rows.append(
+                (
+                    f"{marker} {item.status}",
+                    f"{item.id} · {item.provider}/{item.model} · {item.title}",
+                )
             )
+        self.ui.panel("Session orbit", rows, tone="cyan")
 
     async def _print_status(self, *, full: bool) -> None:
         route = self._primary_route()
-        print(f"workspace: {self.workspace}")
-        print(f"provider:  {route.name}")
-        print(f"model:     {route.model}")
-        print(f"session:   {self.session_id or '(new conversation)'}")
+        rows: list[tuple[str, object]] = [
+            ("workspace", self.workspace),
+            ("provider", route.name),
+            ("model", route.model),
+            ("session", self.session_id or "(new conversation)"),
+        ]
         if full:
-            print(f"mode:      {self.config.safety.mode}")
-            print(f"approval:  {self.config.safety.approval}")
-            print(f"network:   {'on' if self.config.safety.network else 'off'}")
-            print(f"sandbox:   {self.config.sandbox.driver}")
-            print(f"verify:    {'on' if self.config.agent.auto_verify else 'off'}")
+            rows.extend(
+                [
+                    ("mode", self.config.safety.mode),
+                    ("approval", self.config.safety.approval),
+                    ("network", "on" if self.config.safety.network else "off"),
+                    ("sandbox", self.config.sandbox.driver),
+                    ("verify", "on" if self.config.agent.auto_verify else "off"),
+                ]
+            )
         if self.session_id:
             runner = self._require_runner()
             info = await asyncio.to_thread(runner.sessions.get_session, self.session_id)
             usage = await asyncio.to_thread(runner.sessions.usage, self.session_id)
-            print(f"title:     {info.title}")
-            print(
-                f"usage:     {usage.total_tokens} tokens · {usage.requests} requests "
-                f"· ${usage.cost_usd:.4f}"
+            rows.extend(
+                [
+                    ("title", info.title),
+                    (
+                        "usage",
+                        f"{usage.total_tokens} tokens · {usage.requests} requests "
+                        f"· ${usage.cost_usd:.4f}",
+                    ),
+                ]
             )
+        self.ui.panel("Flight status" if full else "Active session", rows, tone="mint")
 
     async def _print_history(self, limit: int) -> None:
         if not self.session_id:
-            print("No active session.")
+            self.ui.notice("info", "No active session", "send a task to begin")
             return
         runner = self._require_runner()
         messages = await asyncio.to_thread(runner.sessions.messages, self.session_id)
         messages = messages[-limit:]
         if not messages:
-            print("Session history is empty.")
+            self.ui.notice("info", "Session history is empty")
             return
         for message in messages:
             if message.role == Role.TOOL:
@@ -393,19 +428,22 @@ class InteractiveCLI:
                 if message.tool_calls
                 else "(empty)"
             )
-            print(f"\n{label}\n{truncate_text(content, 2_000)}")
+            self.ui.role_header(label)
+            print(truncate_text(content, 2_000))
 
     async def _set_provider(self, args: list[str]) -> None:
         if not args:
             current = self._primary_route().name
+            rows: list[tuple[str, object]] = []
             for name, provider in sorted(self.config.providers.items()):
-                marker = "*" if name == current else " "
+                marker = "◆" if name == current else "◇"
                 model = provider.model or "(model required)"
-                print(f"{marker} {name:<20} {provider.type:<18} {model}")
+                rows.append((f"{marker} {name}", f"{provider.type} · {model}"))
+            self.ui.panel("Provider routes", rows, tone="violet")
             return
         name = args[0]
         if name not in self.config.providers:
-            print(f"Unknown provider: {name}", file=self.renderer.status_stream)
+            self.ui.notice("error", "Unknown provider", name)
             return
         model = args[1] if len(args) > 1 else self.config.providers[name].model
 
@@ -418,7 +456,7 @@ class InteractiveCLI:
     async def _set_model(self, args: list[str]) -> None:
         if not args:
             route = self._primary_route()
-            print(f"{route.name}/{route.model}")
+            self.ui.notice("info", "Active model", f"{route.name}/{route.model}")
             return
         model = args[0]
         await self._replace_runtime(
@@ -436,13 +474,14 @@ class InteractiveCLI:
         setter: Callable[[Config, str], None],
     ) -> None:
         if not args:
-            print(getter(self.config))
+            self.ui.notice("info", f"Current {label}", getter(self.config))
             return
         value = args[0].lower()
         if value not in choices:
-            print(
-                f"{label} must be one of: {', '.join(sorted(choices))}",
-                file=self.renderer.status_stream,
+            self.ui.notice(
+                "error",
+                f"Invalid {label}",
+                f"choose {', '.join(sorted(choices))}",
             )
             return
         await self._replace_runtime(lambda config: setter(config, value), f"{label}={value}")
@@ -456,12 +495,12 @@ class InteractiveCLI:
         setter: Callable[[Config, bool], None],
     ) -> None:
         if not args:
-            print("on" if getter(self.config) else "off")
+            self.ui.notice("info", f"Current {label}", "on" if getter(self.config) else "off")
             return
         try:
             value = _parse_boolean(args[0])
         except ValueError as error:
-            print(error, file=self.renderer.status_stream)
+            self.ui.notice("error", f"Invalid {label}", str(error))
             return
         await self._replace_runtime(
             lambda config: setter(config, value),
@@ -478,91 +517,118 @@ class InteractiveCLI:
         try:
             replacement = await self._new_runner(candidate)
         except (BorealisError, ConfigurationError, OSError, ValueError) as error:
-            print(
-                f"Could not apply {description}: {error}",
-                file=self.renderer.status_stream,
-            )
+            self.ui.notice("error", f"Could not apply {description}", str(error))
             return
         previous = self._require_runner()
         self.runner = replacement
         self.config = candidate
         await previous.close()
-        print(f"Updated runtime for this CLI process: {description}")
+        self.ui.notice("success", "Runtime updated", description)
 
     def _print_tools(self, filter_text: str) -> None:
         schemas = self._require_runner().tools.schemas()
         needle = filter_text.lower()
+        rows: list[tuple[str, object]] = []
         for item in schemas:
             value = f"{item['name']} {item.get('description', '')}"
             if needle and needle not in value.lower():
                 continue
-            print(f"{item['name']:<28} {item.get('description', '')}")
+            rows.append((str(item["name"]), str(item.get("description", ""))))
+        if rows:
+            self.ui.panel("Tool constellation", rows, tone="cyan")
+        else:
+            self.ui.notice("info", "No matching tools", filter_text)
 
     def _print_diagnostics(self) -> None:
         for item in run_diagnostics(self.workspace, self.config):
-            print(f"{'PASS' if item.ok else 'FAIL'}  {item.name}: {item.message}")
+            self.ui.notice(
+                "success" if item.ok else "error",
+                f"{'PASS' if item.ok else 'FAIL'} · {item.name}",
+                item.message,
+            )
 
     def _rollback(self, args: list[str]) -> None:
         manager = self._require_runner().tool_context.checkpoints
         if not args:
             values = manager.list()
             if not values:
-                print("No checkpoints.")
+                self.ui.notice("info", "No checkpoints")
                 return
-            for item in values:
-                print(f"{item.id}  {item.created_at}  {item.label}  {len(item.files)} file(s)")
+            rows = [
+                (item.id, f"{item.created_at} · {item.label} · {len(item.files)} file(s)")
+                for item in values
+            ]
+            self.ui.panel("Recovery points", rows, tone="warning")
             return
         checkpoint = manager.restore(args[0])
-        print(f"Restored {checkpoint.id}: {len(checkpoint.files)} file(s)")
+        self.ui.notice(
+            "success", "Checkpoint restored", f"{checkpoint.id} · {len(checkpoint.files)} file(s)"
+        )
 
     async def _read_multiline(self) -> str | None:
-        print("Paste a multiline prompt. Finish with a line containing only /end.")
+        self.ui.notice("info", "Paste a multiline prompt", "finish with /end")
         lines: list[str] = []
-        prompt = "... " if _is_tty(sys.stdin) else ""
+        prompt = self.ui.inline_prompt("paste") if _is_tty(sys.stdin) else ""
         while True:
             try:
                 line = _terminal_input(prompt)
             except EOFError:
                 break
             except KeyboardInterrupt:
-                print("\nMultiline prompt cancelled.")
+                print()
+                self.ui.notice("warning", "Multiline prompt cancelled")
                 return None
             if line.strip() == "/end":
                 break
             lines.append(line)
         value = "\n".join(lines).strip()
         if not value:
-            print("Multiline prompt was empty.")
+            self.ui.notice("warning", "Multiline prompt was empty")
             return None
         return value
 
     def _print_help(self) -> None:
-        print(
-            """
-Interactive commands
-  /status                 Show runtime, safety, session, and usage state
-  /session                Show the current workspace, provider, model, and session
-  /sessions [N]           List recent sessions for this workspace
-  /resume [ID|last]       Resume a durable session (defaults to the latest)
-  /history [N]            Show recent persisted conversation messages
-  /new, /clear            Start a fresh conversation without deleting the old one
-  /provider [NAME MODEL]  Show or switch provider; optional MODEL overrides its default
-  /model [MODEL]          Show or switch the model for this CLI process
-  /mode [VALUE]           plan | workspace-write | full
-  /approval [VALUE]       never | on-risk | always
-  /network [on|off]       Toggle model-initiated network tools
-  /verify [on|off]        Toggle automatic post-change verification
-  /sandbox [VALUE]        native | docker
-  /tools [FILTER]         List the effective built-in, plugin, and MCP tools
-  /doctor                 Run diagnostics with the current runtime settings
-  /rollback [ID]          List checkpoints or restore one
-  /paste                  Enter a multiline prompt; finish with /end
-  /exit, /quit            Leave Borealis
-
-Press Ctrl+C while Borealis is working to cancel the current turn and keep the
-session. Press Ctrl+C at the input prompt to exit. Prefix a literal slash prompt
-with an extra slash, for example: //explain this route.
-""".strip()
+        self.ui.help(
+            [
+                (
+                    "Session",
+                    [
+                        ("/status", "runtime, safety, session, and usage"),
+                        ("/session", "active workspace, route, and session"),
+                        ("/sessions [N]", "recent sessions in this workspace"),
+                        ("/resume [ID|last]", "return to a durable session"),
+                        ("/history [N]", "recent persisted messages"),
+                        ("/new  /clear", "begin fresh; keep the previous session"),
+                    ],
+                ),
+                (
+                    "Runtime",
+                    [
+                        ("/provider [NAME MODEL]", "inspect or switch provider route"),
+                        ("/model [MODEL]", "inspect or switch active model"),
+                        ("/mode [VALUE]", "plan | workspace-write | full"),
+                        ("/approval [VALUE]", "never | on-risk | always"),
+                        ("/network [on|off]", "toggle model-initiated network tools"),
+                        ("/verify [on|off]", "toggle post-change verification"),
+                        ("/sandbox [VALUE]", "native | docker"),
+                    ],
+                ),
+                (
+                    "Utilities",
+                    [
+                        ("/tools [FILTER]", "effective built-in, plugin, and MCP tools"),
+                        ("/doctor", "diagnose the current runtime"),
+                        ("/rollback [ID]", "list or restore recovery points"),
+                        ("/paste", "multiline input; finish with /end"),
+                        ("/exit  /quit", "leave Borealis with the session saved"),
+                    ],
+                ),
+            ]
+        )
+        self.ui.notice(
+            "info",
+            "Controls",
+            "Ctrl+C cancels a turn · // sends a prompt beginning with /",
         )
 
     async def _observe(self, event: Event) -> None:
@@ -611,7 +677,7 @@ with an extra slash, for example: //explain this route.
         )
         if not cancelled or self._interrupt_count > 1:
             task.cancel()
-        print("^C cancelling current turn…", file=self.renderer.status_stream, flush=True)
+        self.ui.notice("warning", "Cancelling current turn", "press Ctrl+C again to force")
 
 
 def _turn_footer(result: AgentResult) -> str:
@@ -626,7 +692,7 @@ def _turn_footer(result: AgentResult) -> str:
         parts.append(f"{len(result.changed_files)} changed file(s)")
     if result.verification is not None:
         parts.append("verified" if result.verification.get("ok") else "verification failed")
-    return "─ " + " · ".join(parts)
+    return " · ".join(parts)
 
 
 def _optional_positive_int(args: list[str], *, default: int) -> int:

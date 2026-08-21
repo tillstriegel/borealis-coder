@@ -16,6 +16,11 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   stored using owner-only permissions on Unix.
 - Turn-level Ctrl+C cancellation that preserves the interactive process and
   durable session.
+- The dependency-free Aurora Shell visual system with a responsive launch panel,
+  session-aware prompt, assistant frames, activity rail, command panels, and
+  compact turn receipts.
+- Live elapsed-time pulses for pending model, tool, and verification work, with
+  accessible uncolored and redirected-output fallbacks.
 
 ### Fixed
 - Assistant output is always terminated cleanly before the next prompt.

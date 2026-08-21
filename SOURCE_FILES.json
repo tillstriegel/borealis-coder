@@ -26,9 +26,9 @@
       "sha256": "1ca3666542c146acd6c23ccd0a7b5577e56f06f617390d0d3f7dbab8ca79b70f"
     },
     {
-      "bytes": 3333,
+      "bytes": 3652,
       "path": "CHANGELOG.md",
-      "sha256": "a0698bddb36336986f50fab4f132246c824a578f9054ed895c12f0ca2afb60f6"
+      "sha256": "970625e51c3cefceb58892d2e4cad3bda6e19a5037648d13be906abdd41cd86a"
     },
     {
       "bytes": 275,
@@ -61,9 +61,9 @@
       "sha256": "92ef717bc64684f76f8c4b3589f386fd42c04488c4f19f514cdeba6608b239a3"
     },
     {
-      "bytes": 17865,
+      "bytes": 18258,
       "path": "README.md",
-      "sha256": "faab849cd5d29d9ab5d4b2eeee666805fe9502c2aaa03ef2eb052b24b4fc259a"
+      "sha256": "7223ad2d6aadfea3860d459a1ff7478f16b93e90a2dfab5e79f9645d6ebaba21"
     },
     {
       "bytes": 747,
@@ -91,14 +91,14 @@
       "sha256": "67f781ea038a87f17bcf2ad216c1113797f0ca28d75c390004774f7046c40c39"
     },
     {
-      "bytes": 7824,
+      "bytes": 7885,
       "path": "docs/FEATURE_MATRIX.md",
-      "sha256": "7d9bc6942b9f5d663473726d51cdfcc26f66039c12aeba0371cd480952115c4d"
+      "sha256": "71edc78ec876027b5e4b8d83d7458ce79503b14a50004de1e28c6451a4b90d61"
     },
     {
-      "bytes": 4970,
+      "bytes": 7069,
       "path": "docs/INTERACTIVE_CLI.md",
-      "sha256": "8dddb2f298952b3dc99db1c222b19b4052c72b99bde58c132961c3eb95c842ee"
+      "sha256": "4d5f2cc8d1e2f35314a8efe92a53bd952272502ccd006c69b75f0e886ce252da"
     },
     {
       "bytes": 5839,
@@ -181,9 +181,9 @@
       "sha256": "99b0d6bb9df21dca0586e98820fb7938a4035ad1c508c13e0444c23babca2cd3"
     },
     {
-      "bytes": 2808,
+      "bytes": 2910,
       "path": "scripts/interactive_smoke_test.py",
-      "sha256": "2ecef36fa3a34861a97134dea689c1e63e6acd1edc413b109f7a723aa1d5df28"
+      "sha256": "bdeb52522d71f68bcb2692dda6846146a5a2d7f168922095177c8348d570c35d"
     },
     {
       "bytes": 3528,
@@ -246,9 +246,9 @@
       "sha256": "97f3bfe90ade59819831099c50e3ae400a2574557707b0fa940b6d6e68468e78"
     },
     {
-      "bytes": 22169,
+      "bytes": 22255,
       "path": "src/borealis_coder/cli.py",
-      "sha256": "4647d67bd9accf06c0ca23c9f2d7cdaf5de8b623b1a89380e15ee962ead60cda"
+      "sha256": "f9ee9fecb06e204078023093493321558c13fd4ec616bab46696de4a281c64c2"
     },
     {
       "bytes": 19223,
@@ -301,9 +301,9 @@
       "sha256": "17b275698395ce5c6ce0871660876655c16dfd8f239dd79a5ce946af930abfcc"
     },
     {
-      "bytes": 25830,
+      "bytes": 28249,
       "path": "src/borealis_coder/interactive.py",
-      "sha256": "0c62c4eca0e729672cc662c33d2f8a466d3f97747df3bdd193a9bdea0cfcc8c8"
+      "sha256": "625c728dbe33559dba60adfacc758b23450547156a83447af5e865a64be260a6"
     },
     {
       "bytes": 391,
@@ -451,9 +451,9 @@
       "sha256": "a7352d417657fafbfbf16340705fafb1aa661c3e2415f5975d9158483f1b150e"
     },
     {
-      "bytes": 12788,
+      "bytes": 29969,
       "path": "src/borealis_coder/terminal.py",
-      "sha256": "9b2a1765e3703d0bdfa3bd665c6160a88c4b0e0431ce09eb1f2b7b6f9c7ce93b"
+      "sha256": "684835c3abccb1830c1a7613187a4174102142af74e66fcd7389d4cde1e39647"
     },
     {
       "bytes": 572,
@@ -551,9 +551,9 @@
       "sha256": "04f4a4f2b1df26aa5abe2f5ce06fbd0d11edc703d56b0814d369fe58b3a593e9"
     },
     {
-      "bytes": 22290,
+      "bytes": 25912,
       "path": "tests/test_cli.py",
-      "sha256": "967e6e08d72da8aa06e98c51dc5ee3af77171e8a8cc0eb9f99b2a8b9af6e0477"
+      "sha256": "c79fd1d3caa15463a68c57bc7d74de809f971e8fa06e3670af687c58baff275d"
     },
     {
       "bytes": 5364,

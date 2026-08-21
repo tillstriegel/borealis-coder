@@ -146,6 +146,12 @@ same `AgentRunner`, EventBus, policy engine, and SQLite session store used by
 one-shot runs and ACP. A conversation therefore survives multiple prompts and can
 be resumed after the process exits.
 
+The interactive surface is the dependency-free **Aurora Shell**: a responsive,
+color-aware inline TUI with a session prompt, framed assistant responses, live
+elapsed-time pulses, a model/tool/verification activity rail, structured slash
+commands, and compact turn receipts. It preserves terminal scrollback and falls
+back to clean uncolored output for pipes, basic terminals, and `NO_COLOR`.
+
 Common commands inside the shell:
 
 | Command | Effect |

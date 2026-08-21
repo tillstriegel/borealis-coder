@@ -53,7 +53,7 @@ The table above is the production baseline implemented directly in the repositor
 
 These are useful product features, but they are not necessary to call the core a competitive coding harness:
 
-- a full-screen TUI
+- an alternate-screen dashboard (Aurora Shell deliberately preserves scrollback)
 - an account/subscription control plane
 - native image/audio prompt ingestion
 - encrypted cloud synchronization

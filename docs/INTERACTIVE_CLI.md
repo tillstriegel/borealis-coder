@@ -46,6 +46,19 @@ borealis \
 
 ## Output behavior
 
+Interactive sessions use the Borealis **Aurora Shell**, a responsive inline TUI
+that keeps normal terminal scrollback intact. Its mint, cyan, and violet palette,
+framed launch summary, two-line session prompt, assistant blocks, activity rail,
+turn receipts, and command panels form one consistent interface. The layout
+adapts to narrower terminals and truncates long paths or labels in the middle so
+the useful endpoints remain visible.
+
+Color is enabled only for capable TTYs. `NO_COLOR` disables ANSI styling,
+`CLICOLOR_FORCE=1` forces it when the receiving terminal understands ANSI, and
+redirected output retains the same readable structure without escape sequences.
+The colored input prompt uses readline-safe control markers, so wrapping and
+cursor movement remain correct.
+
 Assistant text is streamed by default. Every model exchange is rendered
 independently, so a planning message before a tool call cannot suppress the final
 answer after the tool result. Borealis reconciles the completed response with its
@@ -54,12 +67,35 @@ footer, or the next prompt.
 
 Interactive mode also reports live execution phases. It announces workspace
 context preparation immediately, identifies each provider/model exchange, shows
-when a tool call is being assembled, reports provider retries, renders tool
-start/completion, and announces verification before it begins. These messages
-describe observable runtime state; Borealis does not expose private model
-reasoning or stream raw tool arguments to the terminal. After ten seconds with
-no new model or tool event, a heartbeat reports the current phase and elapsed
-turn time.
+when a tool call is being assembled, reports provider retries, renders policy,
+tool, plan, fallback, and verification state, and closes every turn with usage
+and change metadata. While a provider, tool, or verification step is pending, a
+live Aurora pulse updates with the current phase and elapsed time. Redirected or
+non-color output uses a persistent heartbeat every ten seconds instead.
+
+These messages describe observable runtime state. Borealis does not expose
+private model reasoning or stream raw tool arguments to the terminal.
+
+```text
+╭ AURORA SHELL  v0.1.3 ─────────────────────────────────────╮
+│  ◢◤  BOREALIS  CODER                                      │
+│      policy-first autonomous coding · interactive mode    │
+├────────────────────────────────────────────────────────────┤
+│  ROUTE       chatgpt/gpt-5.6-terra                        │
+│  GUARDRAIL   workspace-write · approval on-risk           │
+╰────────────────────────────────────────────────────────────╯
+
+╭─ YOU  session new
+╰─❯ Fix the failing test
+│ ◌ Model  model working · chatgpt/gpt-5.6-terra · turn 1
+│ ◇ Tool   read_file  tests/test_example.py
+│ ◆ Tool complete  read_file · 4 ms
+
+╭─ ✦ BOREALIS
+I found the failing assertion and corrected the boundary condition.
+╰─
+◆ TURN COMPLETE  end_turn · 2 model turns · 1 changed file · verified
+```
 
 Options:
 

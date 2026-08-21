@@ -23,7 +23,7 @@ from .errors import BorealisError, ConfigurationError
 from .interactive import InteractiveCLI
 from .protocol import ACPServer
 from .safety import ApprovalRequest, CheckpointManager, WorkspaceRoots
-from .terminal import ConsoleRenderer
+from .terminal import AuroraUI, ConsoleRenderer
 from .util import atomic_write_text, json_dumps
 
 
@@ -531,12 +531,19 @@ def _runtime_config(args: argparse.Namespace, workspace: Path) -> Config:
 
 
 def _terminal_approval(request: ApprovalRequest) -> str:
-    print("\nApproval required", file=sys.stderr)
-    print(f"Tool: {request.tool_name}", file=sys.stderr)
-    print(f"Reason: {request.decision.reason} ({request.decision.risk})", file=sys.stderr)
-    print(request.arguments_preview, file=sys.stderr)
+    ui = AuroraUI(sys.stderr)
+    ui.panel(
+        "Approval required",
+        [
+            ("tool", request.tool_name),
+            ("risk", request.decision.risk),
+            ("reason", request.decision.reason),
+            ("request", request.arguments_preview),
+        ],
+        tone="warning",
+    )
     while True:
-        answer = input("Allow? [y] once / [a] session / [n] reject: ").strip().lower()
+        answer = input(ui.inline_prompt("allow [y] once · [a] session · [n] reject")).strip().lower()
         if answer in {"y", "yes"}:
             return "allow_once"
         if answer in {"a", "always"}:

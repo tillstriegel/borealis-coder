@@ -19,6 +19,11 @@ from borealis_coder.safety.checkpoints import CheckpointManager
 from borealis_coder.safety.paths import WorkspaceRoots
 
 
+class TTYBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class CLITests(unittest.TestCase):
     def run_cli(
         self,
@@ -244,11 +249,11 @@ class CLITests(unittest.TestCase):
             self.assertIn("(new conversation)", output)
             self.assertIn("fresh conversation", output)
             self.assertGreaterEqual(output.count("Offline mock response"), 2)
-            self.assertIn("provider:  mock", output)
-            self.assertIn("Updated runtime for this CLI process: mode=plan", output)
+            self.assertIn("PROVIDER    mock", output)
+            self.assertIn("Runtime updated  mode=plan", output)
             self.assertIn("Paste a multiline prompt", output)
             self.assertIn("Unknown session", output)
-            self.assertIn("user\nhello", output)
+            self.assertIn("USER\nhello", output)
 
     def test_bare_command_defaults_to_interactive_and_continue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -496,6 +501,96 @@ class CLITests(unittest.TestCase):
         self.assertIn("verified=False", footer)
         self.assertIn("error=boom", footer)
 
+    def test_aurora_ui_and_live_interactive_renderer(self) -> None:
+        async def render() -> str:
+            stream = TTYBuffer()
+            renderer = cli.ConsoleRenderer(
+                interactive=True,
+                text_stream=stream,
+                status_stream=stream,
+            )
+            renderer.ui.color = True
+            await renderer.handle(Event(type="run.started"))
+            renderer.pulse(0.4, 1)
+            await renderer.handle(
+                Event(
+                    type="model.started",
+                    data={"provider": "mock", "model": "aurora", "turn": 1},
+                )
+            )
+            renderer.pulse(0.8, 2)
+            await renderer.handle(Event(type="model.text_delta", data={"text": "hello"}))
+            await renderer.handle(Event(type="model.completed", data={"text": "hello"}))
+            await renderer.handle(
+                Event(type="tool.started", data={"tool": "read_file", "arguments": {}})
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.completed",
+                    data={
+                        "tool": "read_file",
+                        "is_error": False,
+                        "metadata": {"duration_ms": 4},
+                    },
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="plan.updated",
+                    data={
+                        "items": [
+                            {"status": "completed", "content": "Map the interface"},
+                            {"status": "in_progress", "content": "Polish the shell"},
+                        ]
+                    },
+                )
+            )
+            renderer.finish_turn()
+            return stream.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertIn("\033[", output)
+        self.assertIn("\r\033[2K", output)
+        self.assertIn("✦ BOREALIS", output)
+        self.assertIn("Tool complete", output)
+        self.assertIn("PLAN CONSTELLATION", output)
+
+        stream = TTYBuffer()
+        ui = cli.AuroraUI(stream, color=True)
+        prompt = ui.prompt("abc123")
+        self.assertIn("\001\033[", prompt)
+        self.assertIn("session abc123", prompt)
+
+        plain = io.StringIO()
+        cli.AuroraUI(plain, color=False).banner(
+            version="v1",
+            workspace=Path("/tmp/example"),
+            route="mock/aurora",
+            safety="workspace-write · approval on-risk · network off",
+            session="new conversation",
+        )
+        banner = plain.getvalue()
+        self.assertNotIn("\033[", banner)
+        self.assertIn("AURORA SHELL", banner)
+        self.assertIn("interactive mode", banner)
+
+        with patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            self.assertFalse(cli.AuroraUI(TTYBuffer()).color)
+
+        narrow = TTYBuffer()
+        with patch(
+            "borealis_coder.terminal.shutil.get_terminal_size",
+            return_value=os.terminal_size((40, 24)),
+        ):
+            cli.AuroraUI(narrow, color=False).banner(
+                version="v1",
+                workspace=Path("/a/very/long/workspace/path/that/must/remain/readable"),
+                route="provider/a-very-long-model-name",
+                safety="workspace-write · approval on-risk · network off",
+                session="sess_abcdefghijklmnopqrstuvwxyz (resumed)",
+            )
+        self.assertTrue(all(len(line) <= 40 for line in narrow.getvalue().splitlines()))
+
     def test_interactive_turn_cancellation_is_graceful_then_forced(self) -> None:
         class FakeTask:
             def __init__(self) -> None:
@@ -536,7 +631,7 @@ class CLITests(unittest.TestCase):
 
             shell._cancel_active_turn()
             self.assertTrue(task.cancelled)
-            self.assertEqual(output.getvalue().count("cancelling current turn"), 2)
+            self.assertEqual(output.getvalue().count("Cancelling current turn"), 2)
 
     def test_interactive_prompt_keyboard_interrupt_exits_130(self) -> None:
         with tempfile.TemporaryDirectory() as td:
