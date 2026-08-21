@@ -9,7 +9,7 @@ import shutil
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from .models import Event
 from .util import json_dumps, truncate_text
@@ -211,6 +211,45 @@ class AuroraUI:
                     self._framed_line(content, width, self._CYAN),
                     file=self.stream,
                 )
+        print(self.paint("╰" + "─" * (width - 2) + "╯", self._CYAN), file=self.stream)
+
+    def command_selector(
+        self,
+        commands: Sequence[tuple[str, str]],
+        *,
+        query: str,
+        hidden: int = 0,
+    ) -> None:
+        """Render a compact readline completion menu without taking over the screen."""
+
+        width = self.width
+        heading = " COMMAND DECK "
+        print(file=self.stream)
+        print(
+            self.paint(
+                "╭─" + heading + "─" * max(0, width - len(heading) - 3) + "╮",
+                self._CYAN,
+            ),
+            file=self.stream,
+        )
+        for command, description in commands:
+            available = max(8, width - 27)
+            content = (
+                f"  {self.paint(f'{command:<16}', self._WHITE, self._BOLD)}"
+                f"{self.subdued(_middle_truncate(description, available))}"
+            )
+            print(self._framed_line(content, width, self._CYAN), file=self.stream)
+        if hidden:
+            detail = f"{hidden} more · keep typing to narrow"
+            print(
+                self._framed_line(f"  {self.subdued(detail)}", width, self._CYAN),
+                file=self.stream,
+            )
+        hint = f"  {query or '/'}  · type to narrow · Tab completes · Enter runs"
+        print(
+            self._framed_line(self.paint(hint, self._MINT), width, self._CYAN),
+            file=self.stream,
+        )
         print(self.paint("╰" + "─" * (width - 2) + "╯", self._CYAN), file=self.stream)
 
     def _gradient(self, value: str) -> str:
@@ -733,32 +772,44 @@ class ReadlineHistory:
         *,
         enabled: bool = True,
         completions: tuple[str, ...] = (),
+        completion_descriptions: dict[str, str] | None = None,
         max_entries: int = 1_000,
     ) -> None:
         self.path = path
         self.enabled = enabled
         self.completions = completions
+        self.completion_descriptions = dict(completion_descriptions or {})
         self.max_entries = max(1, max_entries)
         self._readline = None
         self._previous_completer = None
+        self._previous_delimiters: str | None = None
+        self._selector_bound = False
 
     def __enter__(self) -> ReadlineHistory:
-        if not self.enabled:
-            return self
         try:
             import readline  # type: ignore[import-not-found]
         except ImportError:
             return self
         self._readline = readline
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.is_file():
-            with contextlib.suppress(OSError):
-                readline.read_history_file(str(self.path))
-        readline.set_history_length(self.max_entries)
+        if self.enabled:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.is_file():
+                with contextlib.suppress(OSError):
+                    readline.read_history_file(str(self.path))
+            readline.set_history_length(self.max_entries)
         self._previous_completer = readline.get_completer()
+        self._previous_delimiters = readline.get_completer_delims()
         readline.set_completer(self._complete)
+        readline.set_completer_delims(" \t\n")
         with contextlib.suppress(Exception):
-            readline.parse_and_bind("tab: complete")
+            if "libedit" in str(readline.__doc__ or "").lower():
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
+        if self.completion_descriptions and _stream_is_tty(sys.stdin):
+            with contextlib.suppress(Exception):
+                _bind_slash_selector(readline)
+                self._selector_bound = True
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:  # type: ignore[no-untyped-def]
@@ -766,17 +817,59 @@ class ReadlineHistory:
         if readline is None:
             return
         try:
-            readline.write_history_file(str(self.path))
-            if os.name != "nt":
-                os.chmod(self.path, 0o600)
+            if self.enabled:
+                readline.write_history_file(str(self.path))
+                if os.name != "nt":
+                    os.chmod(self.path, 0o600)
         except OSError:
             pass
         finally:
             readline.set_completer(self._previous_completer)
+            if self._previous_delimiters is not None:
+                readline.set_completer_delims(self._previous_delimiters)
+            if self._selector_bound:
+                with contextlib.suppress(Exception):
+                    _restore_slash_binding(readline)
 
     def _complete(self, text: str, state: int) -> str | None:
         candidates = [item for item in self.completions if item.startswith(text)]
+        if state == 0 and candidates and self._selector_bound:
+            line = str(self._readline.get_line_buffer() if self._readline else text)
+            if line.startswith("/") and " " not in line:
+                self._show_selector(candidates, query=line)
         return candidates[state] if state < len(candidates) else None
+
+    def _show_selector(self, candidates: list[str], *, query: str) -> None:
+        visible = candidates[:8]
+        rows = [
+            (command, self.completion_descriptions.get(command, "Run command"))
+            for command in visible
+        ]
+        AuroraUI(sys.stdout).command_selector(
+            rows,
+            query=query,
+            hidden=max(0, len(candidates) - len(visible)),
+        )
+        if self._readline is not None:
+            self._readline.redisplay()
+
+
+def _bind_slash_selector(readline: Any) -> None:
+    parse_and_bind = readline.parse_and_bind
+    documentation = str(getattr(readline, "__doc__", "") or "").lower()
+    if "libedit" in documentation:
+        parse_and_bind('bind -s "/" "^V/\\t^E"')
+    else:
+        parse_and_bind('"/": "\\C-v/\\C-i\\C-e"')
+
+
+def _restore_slash_binding(readline: Any) -> None:
+    parse_and_bind = readline.parse_and_bind
+    documentation = str(getattr(readline, "__doc__", "") or "").lower()
+    if "libedit" in documentation:
+        parse_and_bind('bind "/" ed-insert')
+    else:
+        parse_and_bind('"/": self-insert')
 
 
 def _tool_label(tool: object, arguments: object) -> str:

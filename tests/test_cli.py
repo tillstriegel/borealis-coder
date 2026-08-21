@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
-from borealis_coder import cli
+from borealis_coder import cli, terminal
 from borealis_coder.config import load_config
 from borealis_coder.models import AgentResult, Event, StopReason, Usage
 from borealis_coder.safety import ApprovalRequest, PolicyAction, PolicyDecision
@@ -573,6 +573,50 @@ class CLITests(unittest.TestCase):
         self.assertNotIn("\033[", banner)
         self.assertIn("AURORA SHELL", banner)
         self.assertIn("interactive mode", banner)
+
+        selector = io.StringIO()
+        cli.AuroraUI(selector, color=False).command_selector(
+            [("/status", "Inspect runtime health"), ("/sessions", "Browse sessions")],
+            query="/s",
+            hidden=3,
+        )
+        selector_output = selector.getvalue()
+        self.assertIn("COMMAND DECK", selector_output)
+        self.assertIn("/status", selector_output)
+        self.assertIn("3 more", selector_output)
+        self.assertIn("Tab completes", selector_output)
+
+        completion_output = io.StringIO()
+        history = terminal.ReadlineHistory(
+            Path("/tmp/history"),
+            completions=("/status", "/sessions", "/help"),
+            completion_descriptions={
+                "/status": "Inspect runtime health",
+                "/sessions": "Browse sessions",
+                "/help": "Show help",
+            },
+        )
+        history._selector_bound = True
+        redisplay = Mock()
+        cast(Any, history)._readline = SimpleNamespace(
+            get_line_buffer=lambda: "/s",
+            redisplay=redisplay,
+        )
+        with redirect_stdout(completion_output):
+            self.assertEqual(history._complete("/s", 0), "/status")
+        self.assertIn("COMMAND DECK", completion_output.getvalue())
+        redisplay.assert_called_once()
+
+        libedit = SimpleNamespace(
+            parse_and_bind=Mock(),
+            __doc__="libedit readline",
+        )
+        terminal._bind_slash_selector(libedit)
+        binding = " ".join(
+            call.args[0] for call in libedit.parse_and_bind.call_args_list
+        )
+        self.assertIn("^V/", binding)
+        self.assertIn("\\t", binding)
 
         with patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
             self.assertFalse(cli.AuroraUI(TTYBuffer()).color)

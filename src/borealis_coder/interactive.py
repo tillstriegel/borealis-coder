@@ -24,29 +24,31 @@ from .util import truncate_text
 
 ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
 
-_COMMANDS = (
-    "/help",
-    "/status",
-    "/session",
-    "/sessions",
-    "/resume",
-    "/history",
-    "/new",
-    "/clear",
-    "/provider",
-    "/model",
-    "/mode",
-    "/approval",
-    "/network",
-    "/verify",
-    "/sandbox",
-    "/tools",
-    "/doctor",
-    "/rollback",
-    "/paste",
-    "/exit",
-    "/quit",
+_COMMAND_OPTIONS = (
+    ("/help", "Show every command and keyboard control"),
+    ("/status", "Inspect runtime, safety, usage, and cache health"),
+    ("/session", "Show the active workspace, route, and session"),
+    ("/sessions", "Browse recent sessions in this workspace"),
+    ("/resume", "Return to a saved session"),
+    ("/history", "Read recent persisted messages"),
+    ("/new", "Start a fresh conversation"),
+    ("/clear", "Start fresh and keep the previous session"),
+    ("/provider", "Inspect or switch the provider route"),
+    ("/model", "Inspect or switch the active model"),
+    ("/mode", "Change the workspace safety mode"),
+    ("/approval", "Change the approval policy"),
+    ("/network", "Toggle model-initiated network tools"),
+    ("/verify", "Toggle automatic post-change verification"),
+    ("/sandbox", "Switch between native and Docker isolation"),
+    ("/tools", "Browse effective built-in, plugin, and MCP tools"),
+    ("/doctor", "Diagnose the current runtime"),
+    ("/rollback", "List or restore recovery points"),
+    ("/paste", "Enter a multiline prompt"),
+    ("/exit", "Leave Borealis with the session saved"),
+    ("/quit", "Leave Borealis with the session saved"),
 )
+_COMMANDS = tuple(command for command, _ in _COMMAND_OPTIONS)
+_COMMAND_DESCRIPTIONS = dict(_COMMAND_OPTIONS)
 
 
 class InteractiveCLI:
@@ -98,6 +100,7 @@ class InteractiveCLI:
                 history_file,
                 enabled=self.history_enabled,
                 completions=_COMMANDS,
+                completion_descriptions=_COMMAND_DESCRIPTIONS,
             ):
                 if self.initial_prompt:
                     await self._submit(self.initial_prompt)

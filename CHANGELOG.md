@@ -27,6 +27,8 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   responses excluded from replay.
 - Per-turn prompt/response cache metrics, net savings, and cache-write-aware
   provider cost accounting.
+- A readline-native command selector that opens when an interactive message
+  begins with `/`, with descriptions, prefix filtering, and Tab completion.
 
 ### Fixed
 - Assistant output is always terminated cleanly before the next prompt.

@@ -347,6 +347,7 @@ Borealis builds model context incrementally:
 - It deterministically compacts older turns near the configured context threshold while retaining durable full history in SQLite.
 - It keeps a deterministic system-context prefix for provider prompt caching and appends Git status and request-ranked context afterward.
 - It reports provider cache reads, writes, hit rate, and savings, and can reuse short-lived exact text-only responses without replaying tools.
+- Typing `/` at the interactive prompt opens a compact command selector with descriptions; continue typing to narrow it and use Tab to complete.
 
 ## Verification
 
