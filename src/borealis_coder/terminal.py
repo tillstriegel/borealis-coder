@@ -382,6 +382,9 @@ class ConsoleRenderer:
         self._activity_phase = ""
         self._assistant_block_open = False
         self._live_line_open = False
+        self._streamed_tool_output_chars: dict[str, int] = {}
+        self._truncated_tool_outputs: set[str] = set()
+        self._tool_output_line_open = False
 
     @property
     def text_stream(self) -> TextIO:
@@ -410,6 +413,9 @@ class ConsoleRenderer:
         self._tool_call_announced = False
         self._activity_phase = ""
         self._assistant_block_open = False
+        self._streamed_tool_output_chars = {}
+        self._truncated_tool_outputs = set()
+        self._tool_output_line_open = False
         self._clear_live_line()
 
     @property
@@ -446,6 +452,7 @@ class ConsoleRenderer:
 
     def finish_turn(self) -> None:
         self._clear_live_line()
+        self._ensure_tool_output_line_break()
         self._ensure_line_break()
         self._close_assistant_block()
 
@@ -582,8 +589,29 @@ class ConsoleRenderer:
             risk = str(event.data.get("risk") or "unknown")
             self._activity_phase = f"policy {decision} · {risk} risk"
             return
+        if event.type == "tool.output":
+            if not self.show_tool_output:
+                return
+            self._activity_phase = ""
+            text = str(event.data.get("text") or "")
+            if not text:
+                return
+            call_id = str(event.data.get("tool_call_id") or event.data.get("tool") or "tool")
+            used = self._streamed_tool_output_chars.get(call_id, 0)
+            remaining = max(0, self.tool_output_chars - used)
+            chunk = text[:remaining]
+            if chunk:
+                print(chunk, end="", file=self.status_stream, flush=True)
+                self._streamed_tool_output_chars[call_id] = used + len(chunk)
+                self._tool_output_line_open = not chunk.endswith(("\n", "\r"))
+            if len(text) > remaining and call_id not in self._truncated_tool_outputs:
+                self._ensure_tool_output_line_break()
+                print("… output truncated …", file=self.status_stream, flush=True)
+                self._truncated_tool_outputs.add(call_id)
+            return
         if event.type == "tool.completed":
             self._activity_phase = "processing tool result"
+            self._ensure_tool_output_line_break()
             self._ensure_line_break()
             marker = "✗" if event.data.get("is_error") else "✓"
             duration = event.data.get("metadata", {}).get("duration_ms", 0)
@@ -602,7 +630,12 @@ class ConsoleRenderer:
                     flush=True,
                 )
             output = str(event.data.get("output") or "")
-            if output and (self.show_tool_output or bool(event.data.get("is_error"))):
+            call_id = str(event.data.get("tool_call_id") or event.data.get("tool") or "tool")
+            already_streamed = call_id in self._streamed_tool_output_chars
+            if output and (
+                (self.show_tool_output and not already_streamed)
+                or (not self.show_tool_output and bool(event.data.get("is_error")))
+            ):
                 _print_indented(
                     truncate_text(output, self.tool_output_chars),
                     stream=self.status_stream,
@@ -760,6 +793,11 @@ class ConsoleRenderer:
         if self._line_open:
             print(file=self.text_stream, flush=True)
             self._line_open = False
+
+    def _ensure_tool_output_line_break(self) -> None:
+        if self._tool_output_line_open:
+            print(file=self.status_stream, flush=True)
+            self._tool_output_line_open = False
 
     def _close_assistant_block(self) -> None:
         if not self._assistant_block_open:

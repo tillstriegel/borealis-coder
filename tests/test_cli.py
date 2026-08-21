@@ -501,6 +501,45 @@ class CLITests(unittest.TestCase):
         self.assertIn("verified=False", footer)
         self.assertIn("error=boom", footer)
 
+    def test_renderer_streams_bounded_tool_output_without_repeating_it(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(
+                show_tool_output=True,
+                tool_output_chars=200,
+                status_stream=stderr,
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.started",
+                    data={"tool": "shell", "tool_call_id": "call_1", "arguments": {}},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={"tool": "shell", "tool_call_id": "call_1", "text": "x" * 250},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.completed",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "output": "x" * 250,
+                        "is_error": False,
+                        "metadata": {"duration_ms": 2},
+                    },
+                )
+            )
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertEqual(output.count("x"), 200)
+        self.assertEqual(output.count("output truncated"), 1)
+        self.assertLess(output.index("x"), output.index("✓ shell"))
+
     def test_aurora_ui_and_live_interactive_renderer(self) -> None:
         async def render() -> str:
             stream = TTYBuffer()

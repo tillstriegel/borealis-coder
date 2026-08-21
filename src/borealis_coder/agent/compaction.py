@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
+from ..errors import BudgetExceeded
 from ..models import Message, Role
 from ..util import truncate_text
 
@@ -110,6 +111,8 @@ async def compact_messages_with_summary(
             summary = await outcome
         else:
             summary = outcome
+    except BudgetExceeded:
+        raise
     except Exception:
         return compacted
     summary = str(summary or "").strip()

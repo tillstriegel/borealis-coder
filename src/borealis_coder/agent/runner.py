@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -285,7 +286,7 @@ class AgentRunner:
                 if estimated >= threshold:
                     compacted_messages = await compact_messages_with_summary(
                         messages,
-                        self._summarizer(),
+                        self._summarizer(usage_sink),
                         keep_recent=12 if adaptive_cache else 18,
                     )
                     if compacted_messages == messages:
@@ -354,7 +355,7 @@ class AgentRunner:
                     if compacted:
                         raise
                     messages = await compact_messages_with_summary(
-                        messages, self._summarizer(), keep_recent=12
+                        messages, self._summarizer(usage_sink), keep_recent=12
                     )
                     compacted = True
                     await self.events.emit("context.compacted", session_id=session_id, run_id=run_id, provider_overflow=True, messages=len(messages))
@@ -661,14 +662,17 @@ class AgentRunner:
         }
         return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
 
-    def _summarizer(self) -> Summarizer | None:
+    def _summarizer(
+        self,
+        usage_sink: Callable[[Usage], Awaitable[None]],
+    ) -> Summarizer | None:
         """Build an LLM-backed compaction summarizer from the primary route.
 
         Uses the small model when configured (cheap summarization), falling back
         to the primary model. Returns None when compaction should stay purely
-        deterministic (no provider route available).
+        deterministic (as configured, or when no provider route is available).
         """
-        if not self.providers:
+        if self.config.agent.deterministic_compaction or not self.providers:
             return None
         route = self.providers[0]
 
@@ -685,6 +689,7 @@ class AgentRunner:
                 metadata={"purpose": "compaction_summary"},
             )
             response = await route.provider.complete(request)
+            await usage_sink(response.usage)
             return response.text
 
         return summarize

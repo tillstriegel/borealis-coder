@@ -106,8 +106,9 @@ Options:
 ```
 
 `--no-stream` buffers assistant text until that model exchange completes.
-`--show-tool-output` prints bounded successful tool output in addition to the
-usual start/completion status. Errors are always shown in bounded form.
+`--show-tool-output` streams bounded shell output and prints bounded output from
+other successful tools in addition to the usual status. Errors are always shown
+in bounded form.
 
 ## Commands
 

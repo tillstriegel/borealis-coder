@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,8 +10,10 @@ from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import build_runner, compact_messages, compact_messages_with_summary
 from borealis_coder.config import ProviderConfig, SafetyConfig, SandboxConfig
+from borealis_coder.errors import BudgetExceeded
 from borealis_coder.models import Message, ModelResponse, Role, ToolCall, Usage
 from borealis_coder.providers.base import Provider
+from borealis_coder.providers.mock import MockProvider
 from borealis_coder.providers.registry import ProviderRegistry
 from borealis_coder.safety import (
     DockerProcessDriver,
@@ -110,6 +114,54 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         compacted = await compact_messages_with_summary(messages, None, keep_recent=6)
         self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
 
+    async def test_runner_honors_deterministic_compaction_setting(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                self.assertIsNone(runner._summarizer(AsyncMock()))
+            finally:
+                await runner.close()
+
+    async def test_runner_accounts_for_llm_compaction_usage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"deterministic_compaction": False})
+            runner = await build_runner(root, config=config, interactive=False)
+            usage = Usage(input_tokens=100, output_tokens=20, requests=1, cost_usd=0.25)
+            response = ModelResponse(text="accounted summary", usage=usage)
+            provider = runner.providers[0].provider
+            self.assertIsInstance(provider, MockProvider)
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(response)
+            usage_sink = AsyncMock()
+            messages = [
+                Message(role=Role.USER if i % 2 == 0 else Role.ASSISTANT, content=f"m{i}")
+                for i in range(30)
+            ]
+            try:
+                compacted = await compact_messages_with_summary(
+                    messages,
+                    runner._summarizer(usage_sink),
+                    keep_recent=6,
+                )
+                self.assertEqual(compacted[0].content, "accounted summary")
+                usage_sink.assert_awaited_once_with(usage)
+            finally:
+                await runner.close()
+
+    async def test_compaction_does_not_swallow_budget_errors(self):
+        messages = [
+            Message(role=Role.USER if i % 2 == 0 else Role.ASSISTANT, content=f"m{i}")
+            for i in range(30)
+        ]
+
+        async def over_budget(_transcript):
+            raise BudgetExceeded("cost", "summary exceeded budget")
+
+        with self.assertRaises(BudgetExceeded):
+            await compact_messages_with_summary(messages, over_budget, keep_recent=6)
+
     async def test_shell_streams_output_events(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td)
@@ -135,6 +187,72 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("line2", combined)
             for _, kwargs in output_events:
                 self.assertIn(kwargs["stream"], {"stdout", "stderr"})
+
+    async def test_process_stream_decodes_split_utf8(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            code = (
+                "import sys,time;"
+                "sys.stdout.buffer.write(b'\\xe2');sys.stdout.buffer.flush();"
+                "time.sleep(0.05);"
+                "sys.stdout.buffer.write(b'\\x82\\xac');sys.stdout.buffer.flush()"
+            )
+            chunks = []
+            result = await driver.run(
+                [sys.executable, "-c", code],
+                cwd=root,
+                timeout=5,
+                on_output=lambda _stream, text: chunks.append(text),
+            )
+            self.assertEqual(result.stdout, "€")
+            self.assertEqual("".join(chunks), "€")
+
+    async def test_process_bounds_streamed_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root),
+                SafetyConfig(max_process_output_chars=10),
+                SandboxConfig(),
+            )
+            chunks = []
+            result = await driver.run(
+                [sys.executable, "-c", "print('x' * 100, end='')"],
+                cwd=root,
+                timeout=5,
+                on_output=lambda _stream, text: chunks.append(text),
+            )
+            streamed = "".join(chunks)
+            self.assertEqual(streamed.count("x"), 10)
+            self.assertEqual(streamed.count("output truncated"), 1)
+            self.assertEqual(result.stdout, "x" * 10)
+
+    @unittest.skipUnless(os.name == "posix", "SIGTERM output is POSIX-specific")
+    async def test_process_drains_output_after_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            code = (
+                "import signal,sys,time;"
+                "signal.signal(signal.SIGTERM, lambda *_: "
+                "(sys.stdout.write('final\\n'),sys.stdout.flush(),sys.exit(0)));"
+                "sys.stdout.write('start\\n');sys.stdout.flush();time.sleep(10)"
+            )
+            chunks = []
+            result = await driver.run(
+                [sys.executable, "-c", code],
+                cwd=root,
+                timeout=1,
+                on_output=lambda _stream, text: chunks.append(text),
+            )
+            self.assertTrue(result.timed_out)
+            self.assertIn("final", result.stdout)
+            self.assertIn("final", "".join(chunks))
 
     async def test_verification_commands_pass_through_policy(self):
         with tempfile.TemporaryDirectory() as td:

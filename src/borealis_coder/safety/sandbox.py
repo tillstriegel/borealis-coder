@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import codecs
 import inspect
 import os
 import shutil
@@ -14,12 +14,58 @@ from pathlib import Path
 
 from ..config import SafetyConfig, SandboxConfig
 from ..errors import ToolError
-from ..util import monotonic_ms, truncate_text
+from ..util import monotonic_ms
 from .paths import WorkspaceRoots
 
 # Receives ("stdout" | "stderr", decoded_chunk) as output arrives. May return an
 # awaitable; exceptions raised by the consumer never abort the command itself.
 OutputSink = Callable[[str, str], Awaitable[None] | None]
+_OUTPUT_TRUNCATION_MARKER = "\n… output truncated …\n"
+
+
+class _BoundedText:
+    """Keep the same bounded head/tail view without retaining all process output."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._value = ""
+        self._head = ""
+        self._tail = ""
+        self._truncated = False
+        if limit >= len(_OUTPUT_TRUNCATION_MARKER) + 20:
+            available = limit - len(_OUTPUT_TRUNCATION_MARKER)
+            self._head_size = available * 2 // 3
+            self._tail_size = available - self._head_size
+        else:
+            self._head_size = max(0, limit)
+            self._tail_size = 0
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        if self.limit <= 0:
+            self._value += text
+            return
+        if self._truncated:
+            if self._tail_size:
+                self._tail = (self._tail + text)[-self._tail_size :]
+            return
+        combined = self._value + text
+        if len(combined) <= self.limit:
+            self._value = combined
+            return
+        self._truncated = True
+        self._head = combined[: self._head_size]
+        if self._tail_size:
+            self._tail = combined[-self._tail_size :]
+        self._value = ""
+
+    def render(self) -> str:
+        if not self._truncated:
+            return self._value
+        if not self._tail_size:
+            return self._head
+        return self._head + _OUTPUT_TRUNCATION_MARKER + self._tail
 
 
 @dataclass(slots=True)
@@ -100,54 +146,78 @@ class NativeProcessDriver(ProcessDriver):
                 creationflags=creationflags,
             )
         timed_out = False
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
+        limit = self.safety.max_process_output_chars
+        stdout = _BoundedText(limit)
+        stderr = _BoundedText(limit)
+        emitted_chars = 0
+        emitted_truncation = False
+        output_lock = asyncio.Lock()
+
+        async def emit_output(name: str, text: str) -> None:
+            nonlocal emitted_chars, emitted_truncation
+            if on_output is None or not text:
+                return
+            async with output_lock:
+                if limit > 0:
+                    available = max(0, limit - emitted_chars)
+                    chunk = text[:available]
+                    was_truncated = len(text) > available
+                else:
+                    chunk = text
+                    was_truncated = False
+                emitted_chars += len(chunk)
+                try:
+                    if chunk:
+                        outcome = on_output(name, chunk)
+                        if inspect.isawaitable(outcome):
+                            await outcome
+                    if was_truncated and not emitted_truncation:
+                        emitted_truncation = True
+                        outcome = on_output(name, _OUTPUT_TRUNCATION_MARKER)
+                        if inspect.isawaitable(outcome):
+                            await outcome
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
 
         async def pump(
-            stream: asyncio.StreamReader | None, sink: list[str], name: str
+            stream: asyncio.StreamReader | None, sink: _BoundedText, name: str
         ) -> None:
             if stream is None:
                 return
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             while True:
                 data = await stream.read(65_536)
                 if not data:
                     break
-                text = data.decode("utf-8", errors="replace")
+                text = decoder.decode(data)
                 sink.append(text)
-                if on_output is not None:
-                    try:
-                        outcome = on_output(name, text)
-                        if inspect.isawaitable(outcome):
-                            await outcome
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        pass
+                await emit_output(name, text)
+            final = decoder.decode(b"", final=True)
+            sink.append(final)
+            await emit_output(name, final)
 
-        pumps = [
-            pump(process.stdout, stdout_parts, "stdout"),
-            pump(process.stderr, stderr_parts, "stderr"),
-            process.wait(),
+        tasks = [
+            asyncio.create_task(pump(process.stdout, stdout, "stdout")),
+            asyncio.create_task(pump(process.stderr, stderr, "stderr")),
+            asyncio.create_task(process.wait()),
         ]
         try:
-            await asyncio.wait_for(asyncio.gather(*pumps), timeout=max(1, timeout))
-        except TimeoutError:
-            timed_out = True
-            await _terminate_process(process)
-            await asyncio.gather(*pumps, return_exceptions=True)
+            _, pending = await asyncio.wait(tasks, timeout=max(1, timeout))
+            if pending:
+                timed_out = True
+                await _terminate_process(process)
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             await _terminate_process(process)
-            with contextlib.suppress(Exception):
-                await asyncio.gather(*pumps, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        limit = self.safety.max_process_output_chars
-        stdout = truncate_text("".join(stdout_parts), limit)
-        stderr = truncate_text("".join(stderr_parts), limit)
         return ProcessResult(
             command=command if isinstance(command, str) else " ".join(command),
             exit_code=process.returncode if process.returncode is not None else -1,
-            stdout=stdout,
-            stderr=stderr,
+            stdout=stdout.render(),
+            stderr=stderr.render(),
             duration_ms=monotonic_ms() - started,
             timed_out=timed_out,
         )
