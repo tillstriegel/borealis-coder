@@ -1,0 +1,155 @@
+[agent]
+provider = "openai"
+model = "gpt-5.4-mini"
+small_model = ""
+provider_fallbacks = ["anthropic"]
+reasoning_effort = "medium"
+max_turns = 60
+max_input_tokens = 180000
+compact_at_ratio = 0.82
+max_output_tokens = 16000
+max_time_seconds = 3600
+max_cost_usd = 25.0
+parallel_reads = 8
+max_repeated_calls = 3
+auto_verify = true
+auto_verify_max_seconds = 900
+deterministic_compaction = true
+
+[safety]
+mode = "workspace-write"
+approval = "on-risk"
+network = false
+allow_shell = true
+allow_git_commit = false
+allow_git_push = false
+allow_git_hooks = false
+allow_outside_workspace = false
+command_timeout_seconds = 300
+max_process_output_chars = 40000
+env_allowlist = ["PATH", "HOME", "USER", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "TERM", "CI", "NO_COLOR"]
+checkpoints = true
+checkpoint_max_bytes = 25000000
+approval_cache = "session"
+protected_paths = [".git", ".git/**", ".borealis/checkpoints", ".borealis/checkpoints/**"]
+
+[sandbox]
+driver = "docker"
+docker_image = "python:3.13-slim"
+docker_memory = "2g"
+docker_cpus = 2.0
+docker_network = false
+process_cpu_seconds = 600
+process_file_size_bytes = 200000000
+
+[context]
+repo_map_chars = 28000
+max_file_bytes = 2000000
+max_search_results = 200
+tool_output_chars = 24000
+include_git_status = true
+instruction_names = ["AGENTS.md", "BOREALIS.md", "CLAUDE.md"]
+skill_dirs = [".agents/skills", ".borealis/skills"]
+ignored_dirs = [".git", ".borealis", ".venv", "venv", "node_modules", "dist", "build", "target", "coverage", "__pycache__"]
+
+[storage]
+directory = "~/.local/share/borealis"
+database = "sessions.sqlite3"
+trace_jsonl = true
+retain_raw_provider_responses = false
+
+[telemetry]
+enabled = true
+console_level = "info"
+json_events = false
+
+[providers.openai]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-5.4-mini"
+api_style = "responses"
+timeout_seconds = 180
+max_retries = 4
+initial_backoff_seconds = 1.0
+max_backoff_seconds = 30.0
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+cached_input_cost_per_million = 0.0
+
+[providers.chatgpt]
+type = "chatgpt"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_key_env = ""
+model = "gpt-5.6-terra"
+api_style = "responses"
+timeout_seconds = 180
+max_retries = 4
+initial_backoff_seconds = 1.0
+max_backoff_seconds = 30.0
+refresh_before_expiry_seconds = 300
+allow_insecure_auth_file = false
+allow_custom_chatgpt_endpoints = false
+# auth_file = "~/.codex/auth.json"
+# codex_home = "~/.codex"
+# codex_command = "codex"
+
+[providers.openrouter]
+type = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-5.4-mini"
+api_style = "chat"
+app_name = "Borealis Coder"
+site_url = ""
+model_fallbacks = []
+timeout_seconds = 180
+max_retries = 4
+initial_backoff_seconds = 1.0
+max_backoff_seconds = 30.0
+
+# OpenRouter provider routing examples:
+# [providers.openrouter.provider_preferences]
+# allow_fallbacks = true
+# data_collection = "deny"
+# zdr = true
+# sort = "throughput"
+
+[providers.anthropic]
+type = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-opus-5"
+api_style = "messages"
+timeout_seconds = 180
+max_retries = 4
+initial_backoff_seconds = 1.0
+max_backoff_seconds = 30.0
+
+[providers.gemini]
+type = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+model = "gemini-3.6-flash"
+api_style = "interactions"
+timeout_seconds = 180
+max_retries = 4
+initial_backoff_seconds = 1.0
+max_backoff_seconds = 30.0
+
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:11434/v1"
+api_key_env = ""
+model = "local-model"
+api_style = "chat"
+timeout_seconds = 180
+max_retries = 1
+
+# [mcp_servers.repository]
+# type = "stdio"
+# command = "/usr/bin/python3"
+# args = ["/absolute/path/to/server.py"]
+# timeout_seconds = 30
+# enabled = true
+# allowed_tools = ["query_symbols"]

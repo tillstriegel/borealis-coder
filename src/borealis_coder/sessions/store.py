@@ -1,0 +1,419 @@
+"""Durable SQLite session/event/message store with WAL and explicit migrations."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+from ..errors import SessionError
+from ..models import Event, Message, SessionInfo, Usage
+from ..util import ensure_private_directory, ensure_private_file, json_dumps, new_id, utc_now
+
+_SCHEMA_VERSION = 2
+
+
+class SessionStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        ensure_private_directory(self.path.parent)
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
+        self._connection.row_factory = sqlite3.Row
+        with self._lock:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            self._migrate()
+            self._secure_files()
+
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
+            self._secure_files()
+
+    def _secure_files(self) -> None:
+        ensure_private_file(self.path)
+        ensure_private_file(Path(f"{self.path}-wal"))
+        ensure_private_file(Path(f"{self.path}-shm"))
+
+    def _migrate(self) -> None:
+        conn = self._connection
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                workspace TEXT NOT NULL,
+                title TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+            CREATE TABLE IF NOT EXISTS messages (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, sequence);
+            CREATE TABLE IF NOT EXISTS events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                run_id TEXT,
+                type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, sequence);
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                tool_call_id TEXT NOT NULL,
+                run_id TEXT,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                output TEXT,
+                is_error INTEGER,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(session_id, tool_call_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id, started_at);
+            CREATE TABLE IF NOT EXISTS usage (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                requests INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS key_values (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                PRIMARY KEY(session_id, key)
+            );
+            """
+        )
+        current = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
+        if current is None:
+            conn.execute("INSERT INTO schema_meta(key, value) VALUES('version', ?)", (str(_SCHEMA_VERSION),))
+        else:
+            version = int(current[0])
+            if version > _SCHEMA_VERSION:
+                raise SessionError(f"Database schema {current[0]} is newer than supported {_SCHEMA_VERSION}")
+            if version < 2:
+                self._migrate_tool_calls_v2()
+                conn.execute("UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),))
+        conn.commit()
+
+    def _migrate_tool_calls_v2(self) -> None:
+        self._connection.executescript(
+            """
+            ALTER TABLE tool_calls RENAME TO tool_calls_v1;
+            CREATE TABLE tool_calls (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                tool_call_id TEXT NOT NULL,
+                run_id TEXT,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                output TEXT,
+                is_error INTEGER,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(session_id, tool_call_id)
+            );
+            INSERT INTO tool_calls(
+                session_id,tool_call_id,run_id,tool_name,arguments_json,output,
+                is_error,status,started_at,completed_at,metadata_json
+            )
+            SELECT
+                session_id,tool_call_id,run_id,tool_name,arguments_json,output,
+                is_error,status,started_at,completed_at,metadata_json
+            FROM tool_calls_v1;
+            DROP TABLE tool_calls_v1;
+            CREATE INDEX idx_tool_calls_session ON tool_calls(session_id, started_at);
+            """
+        )
+
+    def create_session(
+        self,
+        *,
+        workspace: Path,
+        provider: str,
+        model: str,
+        title: str = "New coding session",
+        metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> SessionInfo:
+        session_id = session_id or new_id("sess")
+        now = utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO sessions(id,workspace,title,provider,model,status,created_at,updated_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                (session_id, str(workspace.resolve()), title, provider, model, "idle", now, now, json_dumps(metadata or {})),
+            )
+            self._connection.execute("INSERT INTO usage(session_id) VALUES(?)", (session_id,))
+        return self.get_session(session_id)
+
+    def get_session(self, session_id: str) -> SessionInfo:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if row is None:
+            raise SessionError(f"Unknown session: {session_id}")
+        return _session_info(row)
+
+    def list_sessions(self, *, workspace: Path | None = None, limit: int = 100) -> list[SessionInfo]:
+        query = "SELECT * FROM sessions"
+        params: list[Any] = []
+        if workspace is not None:
+            query += " WHERE workspace=?"
+            params.append(str(workspace.resolve()))
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        return [_session_info(row) for row in rows]
+
+    def update_session(
+        self,
+        session_id: str,
+        *,
+        status: str | None = None,
+        title: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionInfo:
+        updates = ["updated_at=?"]
+        values: list[Any] = [utc_now()]
+        for column, value in (("status", status), ("title", title), ("provider", provider), ("model", model)):
+            if value is not None:
+                updates.append(f"{column}=?")
+                values.append(value)
+        if metadata is not None:
+            updates.append("metadata_json=?")
+            values.append(json_dumps(metadata))
+        values.append(session_id)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(f"UPDATE sessions SET {', '.join(updates)} WHERE id=?", values)
+            if cursor.rowcount == 0:
+                raise SessionError(f"Unknown session: {session_id}")
+        return self.get_session(session_id)
+
+    def delete_session(self, session_id: str) -> None:
+        with self._lock, self._connection:
+            cursor = self._connection.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            if cursor.rowcount == 0:
+                raise SessionError(f"Unknown session: {session_id}")
+
+    def append_message(self, session_id: str, message: Message) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO messages(session_id,message_id,role,payload_json,created_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(session_id,message_id) DO UPDATE SET
+                    role=excluded.role,
+                    payload_json=excluded.payload_json,
+                    created_at=excluded.created_at""",
+                (session_id, message.id, message.role.value, json_dumps(message.to_dict()), message.created_at),
+            )
+            self._connection.execute("UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id))
+
+    def replace_messages(self, session_id: str, messages: Iterable[Message]) -> None:
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
+            for message in messages:
+                self._connection.execute(
+                    "INSERT INTO messages(session_id,message_id,role,payload_json,created_at) VALUES(?,?,?,?,?)",
+                    (session_id, message.id, message.role.value, json_dumps(message.to_dict()), message.created_at),
+                )
+            self._connection.execute("UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id))
+
+    def messages(self, session_id: str) -> list[Message]:
+        self.get_session(session_id)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload_json FROM messages WHERE session_id=? ORDER BY sequence", (session_id,)
+            ).fetchall()
+        return [Message.from_dict(json.loads(row[0])) for row in rows]
+
+    def append_event(self, event: Event) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO events(event_id,session_id,run_id,type,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+                (event.id, event.session_id, event.run_id, event.type, json_dumps(event.to_dict()), event.created_at),
+            )
+
+    def events(self, session_id: str, *, after_sequence: int = 0, limit: int = 10_000) -> list[tuple[int, Event]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sequence,payload_json FROM events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+                (session_id, after_sequence, limit),
+            ).fetchall()
+        result: list[tuple[int, Event]] = []
+        for row in rows:
+            data = json.loads(row["payload_json"])
+            result.append((int(row["sequence"]), Event(
+                id=data["id"], type=data["type"], session_id=data.get("session_id"),
+                run_id=data.get("run_id"), data=data.get("data") or {}, created_at=data["created_at"],
+            )))
+        return result
+
+    def start_tool_call(self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any]) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO tool_calls(
+                    session_id,tool_call_id,run_id,tool_name,arguments_json,status,started_at
+                ) VALUES(?,?,?,?,?,'running',?)
+                ON CONFLICT(session_id,tool_call_id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    tool_name=excluded.tool_name,
+                    arguments_json=excluded.arguments_json,
+                    output=NULL,
+                    is_error=NULL,
+                    status='running',
+                    started_at=excluded.started_at,
+                    completed_at=NULL,
+                    metadata_json='{}'""",
+                (session_id, call_id, run_id, name, json_dumps(arguments), utc_now()),
+            )
+
+    def complete_tool_call(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        output: str,
+        is_error: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE tool_calls SET
+                    output=?,is_error=?,status=?,completed_at=?,metadata_json=?
+                WHERE session_id=? AND tool_call_id=?""",
+                (
+                    output,
+                    int(is_error),
+                    "error" if is_error else "completed",
+                    utc_now(),
+                    json_dumps(metadata or {}),
+                    session_id,
+                    call_id,
+                ),
+            )
+
+    def cancel_tool_call(self, session_id: str, call_id: str, *, reason: str = "cancelled") -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE tool_calls SET
+                    output=?,is_error=1,status='cancelled',completed_at=?,metadata_json=?
+                WHERE session_id=? AND tool_call_id=?""",
+                (reason, utc_now(), json_dumps({"cancelled": True}), session_id, call_id),
+            )
+
+    def tool_calls(self, session_id: str) -> list[dict[str, Any]]:
+        self.get_session(session_id)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM tool_calls WHERE session_id=? ORDER BY started_at, tool_call_id",
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "session_id": row["session_id"],
+                "tool_call_id": row["tool_call_id"],
+                "run_id": row["run_id"],
+                "tool_name": row["tool_name"],
+                "arguments": json.loads(row["arguments_json"]),
+                "output": row["output"],
+                "is_error": None if row["is_error"] is None else bool(row["is_error"]),
+                "status": row["status"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "metadata": json.loads(row["metadata_json"] or "{}"),
+            }
+            for row in rows
+        ]
+
+    def add_usage(self, session_id: str, usage: Usage) -> Usage:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE usage SET
+                input_tokens=input_tokens+?, output_tokens=output_tokens+?,
+                cached_input_tokens=cached_input_tokens+?, cache_write_tokens=cache_write_tokens+?,
+                reasoning_tokens=reasoning_tokens+?, requests=requests+?, cost_usd=cost_usd+?
+                WHERE session_id=?""",
+                (usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
+                 usage.cache_write_tokens, usage.reasoning_tokens, usage.requests,
+                 usage.cost_usd, session_id),
+            )
+        return self.usage(session_id)
+
+    def usage(self, session_id: str) -> Usage:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM usage WHERE session_id=?", (session_id,)).fetchone()
+        if row is None:
+            raise SessionError(f"Unknown session: {session_id}")
+        return Usage(
+            input_tokens=row["input_tokens"], output_tokens=row["output_tokens"],
+            cached_input_tokens=row["cached_input_tokens"], cache_write_tokens=row["cache_write_tokens"],
+            reasoning_tokens=row["reasoning_tokens"], requests=row["requests"], cost_usd=row["cost_usd"],
+        )
+
+    def set_value(self, session_id: str, key: str, value: Any) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO key_values(session_id,key,value_json) VALUES(?,?,?) ON CONFLICT(session_id,key) DO UPDATE SET value_json=excluded.value_json",
+                (session_id, key, json_dumps(value)),
+            )
+
+    def get_value(self, session_id: str, key: str, default: Any = None) -> Any:
+        with self._lock:
+            row = self._connection.execute("SELECT value_json FROM key_values WHERE session_id=? AND key=?", (session_id, key)).fetchone()
+        return default if row is None else json.loads(row[0])
+
+    def export(self, session_id: str) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        return {
+            "session": {
+                "id": session.id, "workspace": session.workspace, "title": session.title,
+                "provider": session.provider, "model": session.model, "status": session.status,
+                "created_at": session.created_at, "updated_at": session.updated_at,
+                "metadata": session.metadata,
+            },
+            "messages": [item.to_dict() for item in self.messages(session_id)],
+            "tool_calls": self.tool_calls(session_id),
+            "usage": self.usage(session_id).to_dict(),
+            "events": [{"sequence": sequence, **event.to_dict()} for sequence, event in self.events(session_id)],
+        }
+
+
+def _session_info(row: sqlite3.Row) -> SessionInfo:
+    return SessionInfo(
+        id=row["id"], workspace=row["workspace"], title=row["title"],
+        provider=row["provider"], model=row["model"], status=row["status"],
+        created_at=row["created_at"], updated_at=row["updated_at"],
+        metadata=json.loads(row["metadata_json"] or "{}"),
+    )

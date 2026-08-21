@@ -1,0 +1,89 @@
+{
+  "artifact": "Borealis Coder",
+  "distributions": [
+    {
+      "bytes": 135861,
+      "name": "borealis_coder-0.1.3-py3-none-any.whl",
+      "sha256": "6cf209195407b9e6e30a711239bc18b10b288e04fdca1a4751d431cce8e58ecb"
+    },
+    {
+      "bytes": 182577,
+      "name": "borealis_coder-0.1.3.tar.gz",
+      "sha256": "a60a476782d7b91447f015efdc72248177a3b5fbb8acfbba0c4a58b839ef68e4"
+    }
+  ],
+  "environment": {
+    "platform": "macOS-arm64",
+    "python": "3.11.15 and 3.14"
+  },
+  "generated_at": "2026-08-21T08:54:00+00:00",
+  "not_executed_in_this_environment": [
+    "Live billable provider canaries for OpenRouter, OpenAI API, Anthropic, Gemini, and compatible endpoints",
+    "Turn cancellation against a live, slow provider stream; the interactive signal path and runner cancellation paths were validated deterministically",
+    "Docker-driver execution against a running Docker daemon",
+    "Pyright locally because it was unavailable; it remains required by CI",
+    "Python 3.12 and 3.13 locally; CI is configured for Python 3.11-3.13 across Linux, macOS, and Windows",
+    "Build-isolated source-distribution installation with downloaded build requirements; the sdist installed with the locally available setuptools backend",
+    "Independent third-party security audit"
+  ],
+  "release_assessment": "Production-oriented beta/release candidate. The complete deterministic suite passes on Python 3.11 and 3.14. A live ChatGPT/Codex run created an exact file through the tool loop and returned streamed text on a resumed second user turn. Packaging and source and interactive smoke checks passed after the security and correctness remediation. Operators should still run the remaining provider canaries and complete their own sandbox and security review before production use.",
+  "research_snapshot": "2026-08-21",
+  "source": {
+    "license": "MIT",
+    "python_source_files": 64,
+    "python_source_lines": 10253,
+    "runtime_dependency_count": 0,
+    "test_lines": 3330,
+    "test_modules": 16
+  },
+  "validation": {
+    "chatgpt_regression_suite": "passed",
+    "clean_wheel_install": "passed",
+    "compileall": "passed",
+    "coverage": {
+      "branch_measurement_enabled": true,
+      "branch_percent": 63.74,
+      "branches": 1936,
+      "combined_percent": 76.73,
+      "statement_percent": 80.81,
+      "statements": 6170,
+      "status": "previous release measurement; not rerun after remediation",
+      "threshold_percent": 75
+    },
+    "installed_cli_offline_eval": "passed",
+    "installed_cli_version": "passed",
+    "installed_interactive_direct_initial_prompt": "passed",
+    "installed_interactive_multi_turn": "passed",
+    "installed_interactive_resume": "passed",
+    "installed_one_shot_response_newline": "passed",
+    "installed_real_pty_prompt_sigint_exit_130": "passed",
+    "interactive_active_turn_cancellation_logic": "passed",
+    "interactive_default_entrypoint": "passed",
+    "interactive_final_answer_after_tool_turns": "passed",
+    "interactive_multi_turn_session_persistence": "passed",
+    "interactive_piped_stdout_stderr_ordering": "passed",
+    "interactive_provider_model_and_policy_switching": "passed",
+    "interactive_real_pty_prompt_sigint_exit_130": "passed",
+    "interactive_response_newline_and_stream_reconciliation": "passed",
+    "live_chatgpt_exact_file_creation": "passed",
+    "live_chatgpt_resumed_second_turn_text": "passed",
+    "interactive_resume_latest_and_explicit": "passed",
+    "interactive_slash_commands_and_multiline_input": "passed",
+    "local_toolchain_sdist_install": "passed",
+    "offline_agent_tool_checkpoint_smoke": "passed",
+    "openrouter_regression_suite": "passed",
+    "pip_check": "passed",
+    "release_schema_secret_hygiene_validator": "passed",
+    "sdist_structure": "passed",
+    "source_interactive_subprocess_smoke": "passed",
+    "source_zip_structure_and_clean_extract": "passed",
+    "unittest": {
+      "errors": 0,
+      "failures": 0,
+      "status": "passed",
+      "tests": 94
+    },
+    "wheel_structure": "passed"
+  },
+  "version": "0.1.3"
+}

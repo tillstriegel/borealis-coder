@@ -1,0 +1,7 @@
+[mcp_servers.example]
+type = "stdio"
+command = "python"
+args = ["./examples/mcp/server.py"]
+enabled = true
+allowed_tools = ["echo"]
+read_only_tools = ["echo"]

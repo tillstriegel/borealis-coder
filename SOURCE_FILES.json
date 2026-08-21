@@ -1,0 +1,651 @@
+{
+  "files": [
+    {
+      "bytes": 6148,
+      "path": ".DS_Store",
+      "sha256": "5a4e9ea38f9048497558ae5c9457fa770a52dc618945eea9ca4b5351b17f31de"
+    },
+    {
+      "bytes": 97,
+      "path": ".borealisignore",
+      "sha256": "725b7382fdb8f6cf90ff408fae12fca8286fa70d46ef0ae463fb8692407527f3"
+    },
+    {
+      "bytes": 1356,
+      "path": ".github/workflows/ci.yml",
+      "sha256": "2eec13201ba8aed50ed275b7325dd964fb8c1133d7f7f0083c0530fcd7d98bb4"
+    },
+    {
+      "bytes": 748,
+      "path": ".github/workflows/release.yml",
+      "sha256": "c497df69ef01c0d586ae61be54d4db57097cd42ebe58d4ece806dba8988555ff"
+    },
+    {
+      "bytes": 147,
+      "path": ".gitignore",
+      "sha256": "72f2350af6bdd38729b0b07ec78224c4bea29de48d5e7f8275e02911bd9a7c05"
+    },
+    {
+      "bytes": 159,
+      "path": ".pre-commit-config.yaml",
+      "sha256": "1ca3666542c146acd6c23ccd0a7b5577e56f06f617390d0d3f7dbab8ca79b70f"
+    },
+    {
+      "bytes": 3333,
+      "path": "CHANGELOG.md",
+      "sha256": "a0698bddb36336986f50fab4f132246c824a578f9054ed895c12f0ca2afb60f6"
+    },
+    {
+      "bytes": 275,
+      "path": "CODE_OF_CONDUCT.md",
+      "sha256": "e81af79d6b85dcdf2cdb26e1b9a95f4d4c243318c0100e9c97b85cf18293b519"
+    },
+    {
+      "bytes": 553,
+      "path": "CONTRIBUTING.md",
+      "sha256": "34f385d5d371ed743e86afbca47456eacc651415be84c1b09c29b9bd5a5c9916"
+    },
+    {
+      "bytes": 200,
+      "path": "Dockerfile",
+      "sha256": "8d0b84a31f9dd8a6ecc5daab36ec93fe34638619b5c5894255c7649d15af29ff"
+    },
+    {
+      "bytes": 1084,
+      "path": "LICENSE",
+      "sha256": "129565c6ffa8a3375a6316dd98840eb0c12a4051cd3fe2aaafa3ed068aa2adbf"
+    },
+    {
+      "bytes": 434,
+      "path": "MANIFEST.in",
+      "sha256": "491235da6c5a3cd0ae738f2290ed2f8434903030149a62e010a775135d3fff33"
+    },
+    {
+      "bytes": 811,
+      "path": "Makefile",
+      "sha256": "92ef717bc64684f76f8c4b3589f386fd42c04488c4f19f514cdeba6608b239a3"
+    },
+    {
+      "bytes": 17865,
+      "path": "README.md",
+      "sha256": "faab849cd5d29d9ab5d4b2eeee666805fe9502c2aaa03ef2eb052b24b4fc259a"
+    },
+    {
+      "bytes": 747,
+      "path": "SECURITY.md",
+      "sha256": "1fecb21a0932e447e5c3f8f4f524240cd84273d887c87e3b31181e5252394f3b"
+    },
+    {
+      "bytes": 4065,
+      "path": "VALIDATION.json",
+      "sha256": "66103848c62893500bdbfc93b960768ee25419d734bb9ca902d0defeba3a1f7b"
+    },
+    {
+      "bytes": 392,
+      "path": "dist/ARTIFACTS.json",
+      "sha256": "4ca58e2a54f99eaef362e1a6b044a3188c80f315380b0720feb2a5322f2b4ebe"
+    },
+    {
+      "bytes": 135861,
+      "path": "dist/borealis_coder-0.1.3-py3-none-any.whl",
+      "sha256": "6cf209195407b9e6e30a711239bc18b10b288e04fdca1a4751d431cce8e58ecb"
+    },
+    {
+      "bytes": 182577,
+      "path": "dist/borealis_coder-0.1.3.tar.gz",
+      "sha256": "a60a476782d7b91447f015efdc72248177a3b5fbb8acfbba0c4a58b839ef68e4"
+    },
+    {
+      "bytes": 10487,
+      "path": "docs/ARCHITECTURE.md",
+      "sha256": "632e345827e2ca2c3709ca138946f66f45eff55526c94c2fe0391e1cb67fc075"
+    },
+    {
+      "bytes": 10879,
+      "path": "docs/CONFIGURATION.md",
+      "sha256": "4ff022a3cb9cfbaacee579b1cb9f15850de33337b1ad39ec8c99317ed87c839f"
+    },
+    {
+      "bytes": 4349,
+      "path": "docs/EXTENDING.md",
+      "sha256": "67f781ea038a87f17bcf2ad216c1113797f0ca28d75c390004774f7046c40c39"
+    },
+    {
+      "bytes": 7824,
+      "path": "docs/FEATURE_MATRIX.md",
+      "sha256": "7d9bc6942b9f5d663473726d51cdfcc26f66039c12aeba0371cd480952115c4d"
+    },
+    {
+      "bytes": 4417,
+      "path": "docs/INTERACTIVE_CLI.md",
+      "sha256": "4cbf67b0062a0b077ce0a8f88a2591c481fd44c1e08b3203a1c568301aac3e36"
+    },
+    {
+      "bytes": 5839,
+      "path": "docs/OPERATIONS.md",
+      "sha256": "5d451af55ccdb6810f06af174910942501ce441fc2e7bff2e7c728b57e7bb6be"
+    },
+    {
+      "bytes": 3894,
+      "path": "docs/PROTOCOLS.md",
+      "sha256": "68b158b3fb357e74498e75f69ec7becdb079ddf47e33b448af3641248e5f87bf"
+    },
+    {
+      "bytes": 8204,
+      "path": "docs/PROVIDERS.md",
+      "sha256": "c06205775d78bf3989d64b85b7c6a160ecd3a186fe7a86dc72699a4f08f9180d"
+    },
+    {
+      "bytes": 2355,
+      "path": "docs/RELEASE_CHECKLIST.md",
+      "sha256": "674195c7350c85261d4e58986ecff0e288e16c192962378978b80de5246334de"
+    },
+    {
+      "bytes": 16423,
+      "path": "docs/RESEARCH.md",
+      "sha256": "863c0da0a44c7122fdd99b9e901fdfd337c0251f2997d2ad25dc19a3b60fd04f"
+    },
+    {
+      "bytes": 11223,
+      "path": "docs/SECURITY_MODEL.md",
+      "sha256": "f5548c7620ba73027e79a90919f43479b00556c65389de5843c6b944fbf525d3"
+    },
+    {
+      "bytes": 3895,
+      "path": "docs/config.example.toml",
+      "sha256": "b0dbb1dee7151fbea9bcdc6f98c7a1a95e33cb428ef265fb134912cf48ea7ced"
+    },
+    {
+      "bytes": 6148,
+      "path": "examples/.DS_Store",
+      "sha256": "e67841d05bd45d3c89925d7e464ffbc4b24b54a74d53b001a09531cc09fc5aa2"
+    },
+    {
+      "bytes": 358,
+      "path": "examples/basic/SKILL.md",
+      "sha256": "313557016b04fd392447af7304a5285161b38336a2e1cbfc85be8e4aa08ca03a"
+    },
+    {
+      "bytes": 275,
+      "path": "examples/basic/config.toml",
+      "sha256": "8a5ad060b060df20cace4451ba512e88c3f78614c47eda776f79232f27ff29c3"
+    },
+    {
+      "bytes": 540,
+      "path": "examples/basic/embed.py",
+      "sha256": "4b3baefab03be536e30b6fe96600eca973f9577540e3323b02d6dc1838b6fb8d"
+    },
+    {
+      "bytes": 573,
+      "path": "examples/basic/plugin.py",
+      "sha256": "6e8adfb9ea3a9cbbd7f243b77efbb14dadadb8348dd6ab5fd2fb73b03074e17d"
+    },
+    {
+      "bytes": 159,
+      "path": "examples/mcp/config.toml",
+      "sha256": "293cb4fcabcfa0507473726dd7e0151265c4a00ceb086607c98dfdd204c9c406"
+    },
+    {
+      "bytes": 997,
+      "path": "examples/mcp/server.py",
+      "sha256": "cb4272afef4077cc04702318ae7b8dee36a108409d34740b2b12bc6ff23fdf48"
+    },
+    {
+      "bytes": 1773,
+      "path": "pyproject.toml",
+      "sha256": "73ed9e1c4b325b7a97b7689505b152f5145da470ca5f005880c239aae6160106"
+    },
+    {
+      "bytes": 912,
+      "path": "scripts/benchmark_context.py",
+      "sha256": "594d8ff062a0331407c27b2d57b07eba1431696eb5669a99325f1a6f38333a6f"
+    },
+    {
+      "bytes": 2259,
+      "path": "scripts/build_release.py",
+      "sha256": "c3398d20fafd85c4553d2eae473087056464818d619c8fe613a80c7af5daaf71"
+    },
+    {
+      "bytes": 2808,
+      "path": "scripts/interactive_smoke_test.py",
+      "sha256": "2ecef36fa3a34861a97134dea689c1e63e6acd1edc413b109f7a723aa1d5df28"
+    },
+    {
+      "bytes": 3503,
+      "path": "scripts/package_source.py",
+      "sha256": "315e31fc5100af28b400d24620c66be67dc3d756f2fd2a0b5c7c07ff9c642411"
+    },
+    {
+      "bytes": 1171,
+      "path": "scripts/smoke_test.py",
+      "sha256": "682689ca310c740eacc16a60a5ff154d783c9970e7ba1d1844b75f6dd6117378"
+    },
+    {
+      "bytes": 2577,
+      "path": "scripts/validate_release.py",
+      "sha256": "ee29b7531680b9a3cc0dcaaf6f0b63028afc36c345c1b58226f70be90b8595e8"
+    },
+    {
+      "bytes": 6148,
+      "path": "src/.DS_Store",
+      "sha256": "2fff0ce4ebdbb97667fa98c0897e366932fe197c1a9d93bc124af95f2ce3fd1e"
+    },
+    {
+      "bytes": 530,
+      "path": "src/borealis_coder/__init__.py",
+      "sha256": "fd565359c29ba0360e401977446270a1b784625d3e000d19f4dc50839fb3a5c3"
+    },
+    {
+      "bytes": 79,
+      "path": "src/borealis_coder/__main__.py",
+      "sha256": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7"
+    },
+    {
+      "bytes": 363,
+      "path": "src/borealis_coder/agent/__init__.py",
+      "sha256": "01ec074bc4e369dcaf572842bb1b14bf8daef65efd9462b153ca5355590069a5"
+    },
+    {
+      "bytes": 2067,
+      "path": "src/borealis_coder/agent/budget.py",
+      "sha256": "793a9e2a114697927a09334a0b268f58a60f2f42d2e045785c990edaa13cbd16"
+    },
+    {
+      "bytes": 1784,
+      "path": "src/borealis_coder/agent/compaction.py",
+      "sha256": "169017d56f6efa839d1ae23949cb11a80e909784edcd147f4f4adeae3b3a4631"
+    },
+    {
+      "bytes": 3322,
+      "path": "src/borealis_coder/agent/factory.py",
+      "sha256": "ebbe70bfac5d61716b9f53007f914fcd54efd0d8474f801361d9dd158792b274"
+    },
+    {
+      "bytes": 26966,
+      "path": "src/borealis_coder/agent/runner.py",
+      "sha256": "29d3542dfc2c4644ea9071df77aa808d1cee0b4ef0182d19996e5a654a70b5c3"
+    },
+    {
+      "bytes": 692,
+      "path": "src/borealis_coder/auth/__init__.py",
+      "sha256": "8603ee6bf7be969989815eca591850306fb9db123c5f74732fc333cca7e6b3f5"
+    },
+    {
+      "bytes": 26452,
+      "path": "src/borealis_coder/auth/chatgpt.py",
+      "sha256": "d7a1399a558cd9d72e2dbab69da169516f831c2b1f10f64eb3de88d1d1e4622b"
+    },
+    {
+      "bytes": 22169,
+      "path": "src/borealis_coder/cli.py",
+      "sha256": "4647d67bd9accf06c0ca23c9f2d7cdaf5de8b623b1a89380e15ee962ead60cda"
+    },
+    {
+      "bytes": 19208,
+      "path": "src/borealis_coder/config.py",
+      "sha256": "1c8abacf6c6fa1f1fac646c2ec6a52df19e39986c5eef1917df59e992a617076"
+    },
+    {
+      "bytes": 532,
+      "path": "src/borealis_coder/context/__init__.py",
+      "sha256": "f0132e8d25e504a1c80c8944176bf768e2e378c73b9fdd49c571ceb8c9fe6220"
+    },
+    {
+      "bytes": 4019,
+      "path": "src/borealis_coder/context/builder.py",
+      "sha256": "3c3b861a541cabb5b5bf78b11becad22a9615d289953470e35025bcaa24a3304"
+    },
+    {
+      "bytes": 3881,
+      "path": "src/borealis_coder/context/ignore.py",
+      "sha256": "8c4199da664db9dc165c536bc27ca075193e6ac3f9381446cdbbf9a10a4f2dd6"
+    },
+    {
+      "bytes": 2568,
+      "path": "src/borealis_coder/context/instructions.py",
+      "sha256": "b9f68968292a85b3752b6acc322563f99c856bcd31c5cb3c4eeb379e16e815c7"
+    },
+    {
+      "bytes": 6325,
+      "path": "src/borealis_coder/context/repomap.py",
+      "sha256": "4b76c0498ee47c3e52080602012d1d014b72726336136c0e6ae29b77da03bb98"
+    },
+    {
+      "bytes": 2811,
+      "path": "src/borealis_coder/context/skills.py",
+      "sha256": "39689f55111914b4b81370a35937bbe46da9e0af2b8fab0e77b66bdda81e892a"
+    },
+    {
+      "bytes": 3348,
+      "path": "src/borealis_coder/diagnostics.py",
+      "sha256": "fee5d38495bd366159c9e3ccb9e0dfb038ed0c9e2fb108155d4faf8f07976197"
+    },
+    {
+      "bytes": 2309,
+      "path": "src/borealis_coder/errors.py",
+      "sha256": "f32111d2a9d10b781acd11a4a21d67e36a31628dcd2cb0ba690fc9dad12f0e7c"
+    },
+    {
+      "bytes": 2561,
+      "path": "src/borealis_coder/events.py",
+      "sha256": "efa5783e79e0c6678261ce7f0de738ffd1b51326507e09a3888ad152c5df5171"
+    },
+    {
+      "bytes": 25036,
+      "path": "src/borealis_coder/interactive.py",
+      "sha256": "aea7bf16f73f84e0afb9b12d456cdc5c5ce3da91dd991373d5405be5655ee530"
+    },
+    {
+      "bytes": 346,
+      "path": "src/borealis_coder/mcp/__init__.py",
+      "sha256": "7fd0367eb52ea3b28362db0a98245fe7ae79b140559bab5f9c88cdce7002dcde"
+    },
+    {
+      "bytes": 11573,
+      "path": "src/borealis_coder/mcp/client.py",
+      "sha256": "9be985f9cc8022e68bf0dc5f23dc122ca3ed96b3235c5e2c3ce233269a0e5352"
+    },
+    {
+      "bytes": 5095,
+      "path": "src/borealis_coder/mcp/manager.py",
+      "sha256": "c9df71be4988c21ab6c20c576ffc52ba8abf5823f514d91454f748ab32b0b17f"
+    },
+    {
+      "bytes": 7230,
+      "path": "src/borealis_coder/models.py",
+      "sha256": "7328855cd1e36c8e0886338b1782395fcb8ef2a95ba0e7396a06ec041bb01425"
+    },
+    {
+      "bytes": 2138,
+      "path": "src/borealis_coder/plugins.py",
+      "sha256": "9626724ac3932cf3c4bec295ce914db9fd8e9a9dc0bff7dddbbf835bf1cd196c"
+    },
+    {
+      "bytes": 227,
+      "path": "src/borealis_coder/protocol/__init__.py",
+      "sha256": "794ef25dc8b6d5cb846208fb4d6a149c2808f7b7f95117a09c60a6af53273ddf"
+    },
+    {
+      "bytes": 20392,
+      "path": "src/borealis_coder/protocol/acp.py",
+      "sha256": "8dd1e00a986d6967b1206d861e66f84deb0c42e843948480148c11419fb630ad"
+    },
+    {
+      "bytes": 4443,
+      "path": "src/borealis_coder/protocol/jsonrpc.py",
+      "sha256": "e889b2ad7955ed9f51af67852992978925eb15968c480a0f8b4aa0a5d063d80f"
+    },
+    {
+      "bytes": 647,
+      "path": "src/borealis_coder/providers/__init__.py",
+      "sha256": "6f582d29e329fddc4a9dfbf10d5e3cea355c8bde3bf2745f335d8534ea40aba6"
+    },
+    {
+      "bytes": 10054,
+      "path": "src/borealis_coder/providers/anthropic.py",
+      "sha256": "5c67ae6332620ebcd73609c6be44211842f1e61c707cce11db76626d178c4bec"
+    },
+    {
+      "bytes": 3853,
+      "path": "src/borealis_coder/providers/base.py",
+      "sha256": "3f9479425830bb509f28a186c9174fe2543f809579797b25d3470127559360fa"
+    },
+    {
+      "bytes": 5725,
+      "path": "src/borealis_coder/providers/chatgpt.py",
+      "sha256": "725c1081c55b4cac26339e6e03e9b73688cc48b2d4ae94cb1597a176fb36e335"
+    },
+    {
+      "bytes": 9549,
+      "path": "src/borealis_coder/providers/gemini.py",
+      "sha256": "407439aab394413ab44b5dbe5d769ec30f73b2f04aa13c7aafb9a1a37c66efe4"
+    },
+    {
+      "bytes": 7837,
+      "path": "src/borealis_coder/providers/http.py",
+      "sha256": "1f7b7797f45f29c3d491a48425b76afeb92469a03636d2a351d296444fd5123d"
+    },
+    {
+      "bytes": 2888,
+      "path": "src/borealis_coder/providers/mock.py",
+      "sha256": "119a376c5547c913f5a94b9f262d0dbdb1875cbd5e3e44f2a0b0d2da3b8f4b53"
+    },
+    {
+      "bytes": 20824,
+      "path": "src/borealis_coder/providers/openai.py",
+      "sha256": "85c3f1490014348252627d57c71c93fb079504410389743451e3df3615ac3067"
+    },
+    {
+      "bytes": 3370,
+      "path": "src/borealis_coder/providers/openrouter.py",
+      "sha256": "83b46d377ee591665dca4f305ceaade275c837e5aea87f577ca1b031867bbc31"
+    },
+    {
+      "bytes": 2309,
+      "path": "src/borealis_coder/providers/registry.py",
+      "sha256": "44bc853db70be11bce06f9ea45264ee09e5d37570742982a407d85ae275d6e9a"
+    },
+    {
+      "bytes": 0,
+      "path": "src/borealis_coder/py.typed",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 860,
+      "path": "src/borealis_coder/safety/__init__.py",
+      "sha256": "9d9a76b1040d1a6d526738bb5a2053d7b1f4ec6e2b5606cd843d3d0aeb43aec5"
+    },
+    {
+      "bytes": 1860,
+      "path": "src/borealis_coder/safety/approvals.py",
+      "sha256": "05667676327541b3031aeafbd75d8c76ac4a94ec96f8cd101c02897f3788be6d"
+    },
+    {
+      "bytes": 6563,
+      "path": "src/borealis_coder/safety/checkpoints.py",
+      "sha256": "d0080c707b8a2e4fafd7c7bdbc20aaa198d4bd721c3d38a80c093fc4012b0558"
+    },
+    {
+      "bytes": 6132,
+      "path": "src/borealis_coder/safety/commands.py",
+      "sha256": "447a24b534a6ba87f9c1d6374d2a26427a9822299b8a64e680cecd236ce52c15"
+    },
+    {
+      "bytes": 4359,
+      "path": "src/borealis_coder/safety/paths.py",
+      "sha256": "3be2110db502333d0b942b7d09d8a8ca716eb7a1523ef3c2b0e25c3031dbd52d"
+    },
+    {
+      "bytes": 5788,
+      "path": "src/borealis_coder/safety/policy.py",
+      "sha256": "7ce504864f9bf43532ef953dfb9fe4a8900ae61efb2ace454f9779eb2f5adbfb"
+    },
+    {
+      "bytes": 2185,
+      "path": "src/borealis_coder/safety/redaction.py",
+      "sha256": "32fdcf756ad3353e259b89231e643d8d5ae8e64461c97b18e41ee2436189b176"
+    },
+    {
+      "bytes": 7824,
+      "path": "src/borealis_coder/safety/sandbox.py",
+      "sha256": "993cded4e9de0cda244ab966aa8b351680763fab66a346b2bc86594da1f8f245"
+    },
+    {
+      "bytes": 92,
+      "path": "src/borealis_coder/sessions/__init__.py",
+      "sha256": "0ff714191721096f2e03a15262abdcbd3ad88d74eebe3f8e367d1954e6988df6"
+    },
+    {
+      "bytes": 19042,
+      "path": "src/borealis_coder/sessions/store.py",
+      "sha256": "a7352d417657fafbfbf16340705fafb1aa661c3e2415f5975d9158483f1b150e"
+    },
+    {
+      "bytes": 9756,
+      "path": "src/borealis_coder/terminal.py",
+      "sha256": "dc14a1dab3e0d5f1efb8df4039baf785194ae9898a7d14c60f88b75715ea7fe0"
+    },
+    {
+      "bytes": 507,
+      "path": "src/borealis_coder/tools/__init__.py",
+      "sha256": "057469f074a40b261a4c0aa51dbf7150d0ff8789dce7efa10e783f6abdd62e31"
+    },
+    {
+      "bytes": 10902,
+      "path": "src/borealis_coder/tools/base.py",
+      "sha256": "e1441b4c7d8d143a1b3c256dd6bddf9c72696f24839805b964f9454627af6e6a"
+    },
+    {
+      "bytes": 1154,
+      "path": "src/borealis_coder/tools/builtin.py",
+      "sha256": "6458e0f0c4371501d9f627b89d21ccf46cbaeba220eecbb68203f0ea62bbd525"
+    },
+    {
+      "bytes": 2520,
+      "path": "src/borealis_coder/tools/context.py",
+      "sha256": "470adc7a87507d161d37f95a7600d9e8e21ca8ad0418f49deb27469cfa311acd"
+    },
+    {
+      "bytes": 4442,
+      "path": "src/borealis_coder/tools/delegate.py",
+      "sha256": "7516ca14bdf79b13515e6b4e87b2e1b61e03843d9fa02904597cb576179b75f6"
+    },
+    {
+      "bytes": 6261,
+      "path": "src/borealis_coder/tools/fetch.py",
+      "sha256": "7a7674aa830e34aa3533dadc06f48ecb1397f19e1804d1b9b6af8a664476faa2"
+    },
+    {
+      "bytes": 12261,
+      "path": "src/borealis_coder/tools/filesystem.py",
+      "sha256": "de24883f7ddbb36e4431d69f1fd61b20b74cb3c77db20547871e4a1845b8d15b"
+    },
+    {
+      "bytes": 3681,
+      "path": "src/borealis_coder/tools/git.py",
+      "sha256": "5718dfbbf7e464d346871e985d730274afc1297585a55538469bf75f6c763226"
+    },
+    {
+      "bytes": 11999,
+      "path": "src/borealis_coder/tools/patch.py",
+      "sha256": "7a76c5fc107ea7c263076fbe0b49b010461b3940fd31a85f2c75e9e1ba47e57b"
+    },
+    {
+      "bytes": 3765,
+      "path": "src/borealis_coder/tools/search.py",
+      "sha256": "55cf3c2ef4213d03cbb5e94e5506bf23c0a7dc41f3b4736aec37543fe8d6a715"
+    },
+    {
+      "bytes": 1812,
+      "path": "src/borealis_coder/tools/shell.py",
+      "sha256": "316b9b484fff18562bacb8a80fdc0ede2e8d9408a37dec68c20f696302f34b6a"
+    },
+    {
+      "bytes": 1224,
+      "path": "src/borealis_coder/tools/todo.py",
+      "sha256": "e11b4069c6b386407dca7bfa7c7b232710ea214c623a2a628e48b4183ded8db1"
+    },
+    {
+      "bytes": 7246,
+      "path": "src/borealis_coder/tools/verification.py",
+      "sha256": "7f9c5d51cfa86ddfa37de96a6dd40278712363884780f2a42bf35480cde1b969"
+    },
+    {
+      "bytes": 5473,
+      "path": "src/borealis_coder/util.py",
+      "sha256": "6ac7a1b2365406cefe2d47d677cbfcd3af33d96731add16cf2457287cfa5a941"
+    },
+    {
+      "bytes": 0,
+      "path": "tests/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 1447,
+      "path": "tests/helpers.py",
+      "sha256": "da13fb9444ef4315b5c53e0205f01547d0cb8f4108a58d3469285961791ecb33"
+    },
+    {
+      "bytes": 4968,
+      "path": "tests/test_acp.py",
+      "sha256": "c462d2f4af6ef51dc9f51eb8f00fd5bc708c806c75867860f110925781ae62fa"
+    },
+    {
+      "bytes": 10131,
+      "path": "tests/test_agent.py",
+      "sha256": "58c551bea65084edc659878741443900c82bcd2c522f2a0f59800446095ffb03"
+    },
+    {
+      "bytes": 18575,
+      "path": "tests/test_chatgpt.py",
+      "sha256": "593021a044cf28b59ed40101aff2e3a8ab6a319e9a498b660e8dcc0f75ea8706"
+    },
+    {
+      "bytes": 21012,
+      "path": "tests/test_cli.py",
+      "sha256": "962c4eff7358baf92082ce3b1cf5828d5798c88856b1309f482f9af8fc961595"
+    },
+    {
+      "bytes": 5385,
+      "path": "tests/test_config.py",
+      "sha256": "80747e633c402b5e89d05dcab8336249131beb50eae8c932bc9e4bcb63562077"
+    },
+    {
+      "bytes": 3423,
+      "path": "tests/test_context.py",
+      "sha256": "6ad01f7a555b6bced97e5d31b4394a304cd2c2ac1f594a3006fca76f0c730d7e"
+    },
+    {
+      "bytes": 5313,
+      "path": "tests/test_http_transport.py",
+      "sha256": "2ee60c8c2a208b6790b79860d54fb4b228b1700c04d74282568e319fc0160039"
+    },
+    {
+      "bytes": 8251,
+      "path": "tests/test_jsonrpc_and_plugins.py",
+      "sha256": "61f705a22a7ee26b97ab9d6fa2c243bc2c869a18f4443a45979c99393a3e7984"
+    },
+    {
+      "bytes": 4259,
+      "path": "tests/test_mcp.py",
+      "sha256": "ab936adab15d532f7a59152dbba70bb5b4ed002c0c72b25be5dcaa365e613bcf"
+    },
+    {
+      "bytes": 5455,
+      "path": "tests/test_openrouter.py",
+      "sha256": "af0676f6fae38bb5dc297c1fd574a2903012421e796da41c6b6b656987825f11"
+    },
+    {
+      "bytes": 25711,
+      "path": "tests/test_provider_streams.py",
+      "sha256": "54646804ae26b81f029be74be0a230a42a0a0664048d3120a0128c47b8de144a"
+    },
+    {
+      "bytes": 3561,
+      "path": "tests/test_providers.py",
+      "sha256": "47a657859748d14afedcbb30216bed7f34a8ffdf68a9866f500588e98f849337"
+    },
+    {
+      "bytes": 5444,
+      "path": "tests/test_runtime_features.py",
+      "sha256": "84e45694207303363d508dfc4b7290c5ad1c387fe8a84ef1ce11e5313bbb9072"
+    },
+    {
+      "bytes": 6240,
+      "path": "tests/test_safety.py",
+      "sha256": "36d8f03aead3ff147c57f302f22642c85a543e53caafab1b0c90efde683310fd"
+    },
+    {
+      "bytes": 6360,
+      "path": "tests/test_sessions.py",
+      "sha256": "b3c5c31227ff757eae42659cd37da3bb81a4ef8704e43580ef637a96b0013d6a"
+    },
+    {
+      "bytes": 6241,
+      "path": "tests/test_tools.py",
+      "sha256": "b3339c6a225246eed97ef0acc2dfe7d4e031c4c04803cfb1b14acf820eeb81fc"
+    }
+  ],
+  "format": 1,
+  "root": "borealis-coder"
+}

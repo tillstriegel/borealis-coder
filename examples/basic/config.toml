@@ -1,0 +1,16 @@
+[agent]
+provider = "openai"
+model = "gpt-5.4-mini"
+provider_fallbacks = ["anthropic"]
+max_turns = 60
+max_cost_usd = 15.0
+
+[safety]
+mode = "workspace-write"
+approval = "on-risk"
+network = false
+checkpoints = true
+
+[sandbox]
+driver = "docker"
+docker_image = "python:3.13-slim"

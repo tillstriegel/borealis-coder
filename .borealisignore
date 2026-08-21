@@ -1,0 +1,12 @@
+.git/
+.borealis/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+target/
+coverage/
+*.min.js
+*.map
+*.lock

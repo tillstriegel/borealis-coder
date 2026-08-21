@@ -1,0 +1,18 @@
+include LICENSE
+include README.md
+include SECURITY.md
+include CHANGELOG.md
+include CODE_OF_CONDUCT.md
+include CONTRIBUTING.md
+include Dockerfile
+include Makefile
+include pyproject.toml
+recursive-include docs *.md *.toml
+recursive-include scripts *.py
+recursive-include examples *
+recursive-include tests *.py
+recursive-include .github *.yml *.yaml
+prune .borealis
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod] .coverage
