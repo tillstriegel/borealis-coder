@@ -31,6 +31,22 @@ class CostProvider(Provider):
         )
 
 
+class CountingProvider(Provider):
+    name = "counting"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+
+    async def complete(self, request):
+        self.calls += 1
+        return ModelResponse(
+            text="cacheable answer",
+            stop_reason="end_turn",
+            usage=Usage(input_tokens=20, output_tokens=3, requests=1, cost_usd=0.2),
+        )
+
+
 class OneToolProvider(Provider):
     name = "one_tool"
 
@@ -78,6 +94,40 @@ class ConcurrentProvider(Provider):
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_response_cache_avoids_duplicate_provider_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "counting"})
+            config.providers["counting"] = ProviderConfig(
+                type="counting", model="counting", max_retries=0
+            )
+            provider: CountingProvider | None = None
+
+            def factory(cfg, key):
+                nonlocal provider
+                provider = CountingProvider(cfg, key)
+                return provider
+
+            registry = ProviderRegistry()
+            registry.register("counting", factory)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                first = await runner.run("same exact request")
+                second = await runner.run("same exact request")
+                assert provider is not None
+                self.assertEqual(provider.calls, 1)
+                self.assertEqual(first.usage.application_cache_misses, 1)
+                self.assertEqual(second.usage.application_cache_hits, 1)
+                self.assertEqual(second.usage.application_cache_saved_tokens, 23)
+                self.assertEqual(second.usage.cost_usd, 0.0)
+            finally:
+                await runner.close()
+
     async def test_offline_tool_cycle_resume_and_full_history(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

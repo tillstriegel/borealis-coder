@@ -69,13 +69,27 @@ class Provider(abc.ABC):
         assert last_error is not None
         raise last_error
 
-    def price_usage(self, usage: Usage) -> Usage:
-        uncached = max(0, usage.input_tokens - usage.cached_input_tokens)
-        usage.cost_usd = (
-            uncached * self.config.input_cost_per_million
+    def price_usage(
+        self,
+        usage: Usage,
+        *,
+        cache_write_multiplier: float = 1.0,
+    ) -> Usage:
+        cache_write_rate = self.config.cache_write_input_cost_per_million
+        if not cache_write_rate:
+            cache_write_rate = self.config.input_cost_per_million * cache_write_multiplier
+        input_cost = (
+            usage.uncached_input_tokens * self.config.input_cost_per_million
             + usage.cached_input_tokens * self.config.cached_input_cost_per_million
-            + usage.output_tokens * self.config.output_cost_per_million
+            + usage.cache_write_tokens * cache_write_rate
         ) / 1_000_000
+        usage.cost_usd = input_cost + (
+            usage.output_tokens * self.config.output_cost_per_million / 1_000_000
+        )
+        baseline_input_cost = (
+            usage.input_tokens * self.config.input_cost_per_million / 1_000_000
+        )
+        usage.cache_savings_usd = baseline_input_cost - input_cost
         return usage
 
 

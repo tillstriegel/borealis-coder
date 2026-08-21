@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from ..errors import SessionError
 from ..models import Event, Message, SessionInfo, Usage
 from ..util import ensure_private_directory, ensure_private_file, json_dumps, new_id, utc_now
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class SessionStore:
@@ -103,8 +104,26 @@ class SessionStore:
                 cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 reasoning_tokens INTEGER NOT NULL DEFAULT 0,
                 requests INTEGER NOT NULL DEFAULT 0,
-                cost_usd REAL NOT NULL DEFAULT 0
+                cost_usd REAL NOT NULL DEFAULT 0,
+                cache_savings_usd REAL NOT NULL DEFAULT 0,
+                application_cache_hits INTEGER NOT NULL DEFAULT 0,
+                application_cache_misses INTEGER NOT NULL DEFAULT 0,
+                application_cache_saved_tokens INTEGER NOT NULL DEFAULT 0,
+                application_cache_saved_cost_usd REAL NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS response_cache (
+                cache_key TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                usage_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                last_accessed_at REAL NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_response_cache_expiry
+                ON response_cache(expires_at);
             CREATE TABLE IF NOT EXISTS key_values (
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 key TEXT NOT NULL,
@@ -122,7 +141,10 @@ class SessionStore:
                 raise SessionError(f"Database schema {current[0]} is newer than supported {_SCHEMA_VERSION}")
             if version < 2:
                 self._migrate_tool_calls_v2()
-                conn.execute("UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),))
+                version = 2
+            if version < 3:
+                self._migrate_cache_v3()
+            conn.execute("UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),))
         conn.commit()
 
     def _migrate_tool_calls_v2(self) -> None:
@@ -155,6 +177,24 @@ class SessionStore:
             CREATE INDEX idx_tool_calls_session ON tool_calls(session_id, started_at);
             """
         )
+
+    def _migrate_cache_v3(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(usage)").fetchall()
+        }
+        additions = {
+            "cache_savings_usd": "REAL NOT NULL DEFAULT 0",
+            "application_cache_hits": "INTEGER NOT NULL DEFAULT 0",
+            "application_cache_misses": "INTEGER NOT NULL DEFAULT 0",
+            "application_cache_saved_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "application_cache_saved_cost_usd": "REAL NOT NULL DEFAULT 0",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                self._connection.execute(
+                    f"ALTER TABLE usage ADD COLUMN {name} {declaration}"
+                )
 
     def create_session(
         self,
@@ -363,11 +403,19 @@ class SessionStore:
                 """UPDATE usage SET
                 input_tokens=input_tokens+?, output_tokens=output_tokens+?,
                 cached_input_tokens=cached_input_tokens+?, cache_write_tokens=cache_write_tokens+?,
-                reasoning_tokens=reasoning_tokens+?, requests=requests+?, cost_usd=cost_usd+?
+                reasoning_tokens=reasoning_tokens+?, requests=requests+?, cost_usd=cost_usd+?,
+                cache_savings_usd=cache_savings_usd+?,
+                application_cache_hits=application_cache_hits+?,
+                application_cache_misses=application_cache_misses+?,
+                application_cache_saved_tokens=application_cache_saved_tokens+?,
+                application_cache_saved_cost_usd=application_cache_saved_cost_usd+?
                 WHERE session_id=?""",
                 (usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
                  usage.cache_write_tokens, usage.reasoning_tokens, usage.requests,
-                 usage.cost_usd, session_id),
+                 usage.cost_usd, usage.cache_savings_usd,
+                 usage.application_cache_hits, usage.application_cache_misses,
+                 usage.application_cache_saved_tokens,
+                 usage.application_cache_saved_cost_usd, session_id),
             )
         return self.usage(session_id)
 
@@ -380,7 +428,80 @@ class SessionStore:
             input_tokens=row["input_tokens"], output_tokens=row["output_tokens"],
             cached_input_tokens=row["cached_input_tokens"], cache_write_tokens=row["cache_write_tokens"],
             reasoning_tokens=row["reasoning_tokens"], requests=row["requests"], cost_usd=row["cost_usd"],
+            cache_savings_usd=row["cache_savings_usd"],
+            application_cache_hits=row["application_cache_hits"],
+            application_cache_misses=row["application_cache_misses"],
+            application_cache_saved_tokens=row["application_cache_saved_tokens"],
+            application_cache_saved_cost_usd=row["application_cache_saved_cost_usd"],
         )
+
+    def get_cached_response(self, cache_key: str) -> dict[str, Any] | None:
+        now = time.time()
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM response_cache WHERE expires_at<=?", (now,))
+            row = self._connection.execute(
+                "SELECT response_json,usage_json FROM response_cache WHERE cache_key=?",
+                (cache_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._connection.execute(
+                "UPDATE response_cache SET last_accessed_at=?,hit_count=hit_count+1 WHERE cache_key=?",
+                (now, cache_key),
+            )
+        return {
+            "response": json.loads(row["response_json"]),
+            "usage": json.loads(row["usage_json"]),
+        }
+
+    def put_cached_response(
+        self,
+        cache_key: str,
+        *,
+        provider: str,
+        model: str,
+        response: dict[str, Any],
+        usage: Usage,
+        ttl_seconds: int,
+        max_entries: int,
+    ) -> None:
+        if ttl_seconds <= 0:
+            return
+        now = time.time()
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM response_cache WHERE expires_at<=?", (now,))
+            self._connection.execute(
+                """INSERT INTO response_cache(
+                    cache_key,provider,model,response_json,usage_json,created_at,
+                    expires_at,last_accessed_at,hit_count
+                ) VALUES(?,?,?,?,?,?,?,?,0)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    provider=excluded.provider,model=excluded.model,
+                    response_json=excluded.response_json,usage_json=excluded.usage_json,
+                    created_at=excluded.created_at,expires_at=excluded.expires_at,
+                    last_accessed_at=excluded.last_accessed_at,hit_count=0""",
+                (
+                    cache_key,
+                    provider,
+                    model,
+                    json_dumps(response),
+                    json_dumps(usage.to_dict()),
+                    utc_now(),
+                    now + ttl_seconds,
+                    now,
+                ),
+            )
+            excess = self._connection.execute(
+                "SELECT MAX(0, COUNT(*) - ?) FROM response_cache", (max_entries,)
+            ).fetchone()[0]
+            if excess:
+                self._connection.execute(
+                    """DELETE FROM response_cache WHERE cache_key IN (
+                        SELECT cache_key FROM response_cache
+                        ORDER BY last_accessed_at ASC LIMIT ?
+                    )""",
+                    (excess,),
+                )
 
     def set_value(self, session_id: str, key: str, value: Any) -> None:
         with self._lock, self._connection:

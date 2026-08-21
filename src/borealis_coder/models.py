@@ -107,10 +107,28 @@ class Usage:
     reasoning_tokens: int = 0
     requests: int = 0
     cost_usd: float = 0.0
+    cache_savings_usd: float = 0.0
+    application_cache_hits: int = 0
+    application_cache_misses: int = 0
+    application_cache_saved_tokens: int = 0
+    application_cache_saved_cost_usd: float = 0.0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def uncached_input_tokens(self) -> int:
+        return max(0, self.input_tokens - self.cached_input_tokens - self.cache_write_tokens)
+
+    @property
+    def provider_cache_hit_rate(self) -> float:
+        return self.cached_input_tokens / self.input_tokens if self.input_tokens else 0.0
+
+    @property
+    def application_cache_hit_rate(self) -> float:
+        attempts = self.application_cache_hits + self.application_cache_misses
+        return self.application_cache_hits / attempts if attempts else 0.0
 
     def add(self, other: Usage) -> Usage:
         self.input_tokens += other.input_tokens
@@ -120,6 +138,11 @@ class Usage:
         self.reasoning_tokens += other.reasoning_tokens
         self.requests += other.requests
         self.cost_usd += other.cost_usd
+        self.cache_savings_usd += other.cache_savings_usd
+        self.application_cache_hits += other.application_cache_hits
+        self.application_cache_misses += other.application_cache_misses
+        self.application_cache_saved_tokens += other.application_cache_saved_tokens
+        self.application_cache_saved_cost_usd += other.application_cache_saved_cost_usd
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +154,15 @@ class Usage:
             "reasoning_tokens": self.reasoning_tokens,
             "requests": self.requests,
             "cost_usd": round(self.cost_usd, 8),
+            "cache_savings_usd": round(self.cache_savings_usd, 8),
+            "provider_cache_hit_rate": round(self.provider_cache_hit_rate, 6),
+            "application_cache_hits": self.application_cache_hits,
+            "application_cache_misses": self.application_cache_misses,
+            "application_cache_hit_rate": round(self.application_cache_hit_rate, 6),
+            "application_cache_saved_tokens": self.application_cache_saved_tokens,
+            "application_cache_saved_cost_usd": round(
+                self.application_cache_saved_cost_usd, 8
+            ),
             "total_tokens": self.total_tokens,
         }
 
@@ -145,6 +177,15 @@ class Usage:
             reasoning_tokens=int(value.get("reasoning_tokens", 0) or 0),
             requests=int(value.get("requests", 0) or 0),
             cost_usd=float(value.get("cost_usd", 0.0) or 0.0),
+            cache_savings_usd=float(value.get("cache_savings_usd", 0.0) or 0.0),
+            application_cache_hits=int(value.get("application_cache_hits", 0) or 0),
+            application_cache_misses=int(value.get("application_cache_misses", 0) or 0),
+            application_cache_saved_tokens=int(
+                value.get("application_cache_saved_tokens", 0) or 0
+            ),
+            application_cache_saved_cost_usd=float(
+                value.get("application_cache_saved_cost_usd", 0.0) or 0.0
+            ),
         )
 
 

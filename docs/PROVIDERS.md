@@ -153,6 +153,12 @@ The adapter:
 - maps tool-use and tool-result content blocks
 - parses streamed text and structured tool calls
 - normalizes input/output/cache usage where supplied
+- marks the stable system-context block with an explicit Anthropic `cache_control` breakpoint
+- can add a moving conversation breakpoint for multi-turn sessions
+
+The stable block contains repository instructions, skills, and a deterministic repository map.
+Request-ranked context, execution policy, and Git status follow it as an uncached suffix. This
+keeps unrelated prompt changes from invalidating the reusable prefix.
 
 ## Gemini Interactions
 
@@ -184,9 +190,16 @@ Fallback occurs for provider-layer failures, not for a model’s ordinary end-tu
 
 ## Pricing and budgets
 
-Provider configurations can declare local prices per million input, cached-input, and output tokens. Borealis computes cost from normalized usage and enforces `agent.max_cost_usd`.
+Provider configurations can declare local prices per million input, cached-input, cache-write,
+and output tokens. Borealis computes both actual cost and net prompt-cache savings from normalized
+usage and enforces `agent.max_cost_usd`. When no explicit cache-write price is set, Borealis uses
+the input price; the Anthropic adapter applies its 5-minute or 1-hour write multiplier.
 
 Price fields default to zero because pricing changes and can depend on account, region, batch mode, or cache behavior. Production operators should set current prices explicitly and monitor the provider’s own billing controls.
+
+The CLI reports prompt-cache hit rate, read/write tokens, net savings, exact-response-cache hits,
+and avoided tokens. Exact final-text responses are cached locally for a short TTL. Tool-call,
+partial, failed, and cancelled responses are never eligible.
 
 ## Adding a provider
 

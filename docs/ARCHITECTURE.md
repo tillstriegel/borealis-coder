@@ -203,6 +203,9 @@ Borealis uses `asyncio` throughout.
 4. Tool output is bounded before insertion into model context.
 5. Provider-specific response IDs are optional optimization metadata, never required to resume a session.
 6. All effectful calls pass through one policy path, including MCP and verification commands.
+7. Provider prompt caches receive a stable context prefix; request-ranked and mutable context is appended afterward.
+8. Exact-response cache entries are content-addressed and bounded, and never contain tool calls.
+9. Logical input usage includes uncached, cache-read, and cache-write tokens exactly once.
 
 ## Failure handling
 

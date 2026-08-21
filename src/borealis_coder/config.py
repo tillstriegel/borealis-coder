@@ -123,6 +123,20 @@ class StorageConfig:
 
 
 @dataclass(slots=True)
+class CacheConfig:
+    prompt_cache_enabled: bool = True
+    anthropic_ttl: str = "5m"
+    conversation_cache_enabled: bool = True
+    response_cache_enabled: bool = True
+    response_cache_ttl_seconds: int = 300
+    response_cache_max_entries: int = 256
+    adaptive: bool = True
+    low_hit_rate_threshold: float = 0.15
+    adaptive_min_requests: int = 3
+    adaptive_min_input_tokens: int = 4_096
+
+
+@dataclass(slots=True)
 class ProviderConfig:
     type: str = "openai"
     base_url: str = ""
@@ -142,6 +156,7 @@ class ProviderConfig:
     input_cost_per_million: float = 0.0
     output_cost_per_million: float = 0.0
     cached_input_cost_per_million: float = 0.0
+    cache_write_input_cost_per_million: float = 0.0
     # ChatGPT/Codex OAuth settings. Ignored by other provider types.
     auth_file: str = ""
     codex_home: str = ""
@@ -184,6 +199,7 @@ class Config:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     mcp_servers: dict[str, MCPServerConfig] = field(default_factory=dict)
@@ -267,6 +283,7 @@ DEFAULTS: dict[str, Any] = {
     "sandbox": asdict(SandboxConfig()),
     "context": asdict(ContextConfig()),
     "storage": asdict(StorageConfig()),
+    "cache": asdict(CacheConfig()),
     "telemetry": asdict(TelemetryConfig()),
     "providers": {
         "openai": asdict(
@@ -408,6 +425,7 @@ def load_config(
         "sandbox",
         "context",
         "storage",
+        "cache",
         "telemetry",
         "providers",
         "mcp_servers",
@@ -430,6 +448,7 @@ def load_config(
         sandbox=_construct(SandboxConfig, dict(merged.get("sandbox") or {})),
         context=_construct(ContextConfig, dict(merged.get("context") or {})),
         storage=_construct(StorageConfig, dict(merged.get("storage") or {})),
+        cache=_construct(CacheConfig, dict(merged.get("cache") or {})),
         telemetry=_construct(TelemetryConfig, dict(merged.get("telemetry") or {})),
         providers=providers,
         mcp_servers=mcp_servers,
@@ -485,6 +504,16 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("safety.approval must be never, on-risk, or always")
     if config.sandbox.driver not in {"native", "docker"}:
         raise ConfigurationError("sandbox.driver must be native or docker")
+    if config.cache.anthropic_ttl not in {"5m", "1h"}:
+        raise ConfigurationError("cache.anthropic_ttl must be 5m or 1h")
+    if config.cache.response_cache_ttl_seconds < 0:
+        raise ConfigurationError("cache.response_cache_ttl_seconds cannot be negative")
+    if config.cache.response_cache_max_entries < 1:
+        raise ConfigurationError("cache.response_cache_max_entries must be positive")
+    if not 0.0 <= config.cache.low_hit_rate_threshold <= 1.0:
+        raise ConfigurationError("cache.low_hit_rate_threshold must be between 0 and 1")
+    if config.cache.adaptive_min_requests < 1 or config.cache.adaptive_min_input_tokens < 1:
+        raise ConfigurationError("cache adaptive thresholds must be positive")
     for name, provider in config.providers.items():
         if provider.timeout_seconds <= 0:
             raise ConfigurationError(f"providers.{name}.timeout_seconds must be positive")
@@ -492,6 +521,14 @@ def validate_config(config: Config) -> None:
             raise ConfigurationError(
                 f"providers.{name}.refresh_before_expiry_seconds cannot be negative"
             )
+        for field_name in (
+            "input_cost_per_million",
+            "output_cost_per_million",
+            "cached_input_cost_per_million",
+            "cache_write_input_cost_per_million",
+        ):
+            if getattr(provider, field_name) < 0:
+                raise ConfigurationError(f"providers.{name}.{field_name} cannot be negative")
         if provider.type == "chatgpt" and provider.api_style not in {"", "responses"}:
             raise ConfigurationError(
                 f"providers.{name}.api_style must be responses for ChatGPT/Codex auth"
@@ -520,6 +557,12 @@ driver = "native" # use "docker" for a stronger isolation boundary
 [context]
 repo_map_chars = 28000
 tool_output_chars = 24000
+
+[cache]
+prompt_cache_enabled = true
+anthropic_ttl = "5m"
+response_cache_enabled = true
+response_cache_ttl_seconds = 300
 
 # ChatGPT plan via the official Codex login store:
 # [agent]

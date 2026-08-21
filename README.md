@@ -345,6 +345,8 @@ Borealis builds model context incrementally:
 - It extracts symbols for common programming languages and ranks files against the task query.
 - It gives the model search/read tools instead of front-loading the entire repository.
 - It deterministically compacts older turns near the configured context threshold while retaining durable full history in SQLite.
+- It keeps a deterministic system-context prefix for provider prompt caching and appends Git status and request-ranked context afterward.
+- It reports provider cache reads, writes, hit rate, and savings, and can reuse short-lived exact text-only responses without replaying tools.
 
 ## Verification
 

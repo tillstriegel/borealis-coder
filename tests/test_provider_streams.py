@@ -91,6 +91,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             max_backoff_seconds=0,
             input_cost_per_million=2,
             cached_input_cost_per_million=1,
+            cache_write_input_cost_per_million=2.5,
             output_cost_per_million=4,
         )
         provider = DummyProvider(config)
@@ -113,9 +114,15 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 3)
 
         usage = provider.price_usage(
-            Usage(input_tokens=1_000_000, cached_input_tokens=250_000, output_tokens=500_000)
+            Usage(
+                input_tokens=1_000_000,
+                cached_input_tokens=250_000,
+                cache_write_tokens=100_000,
+                output_tokens=500_000,
+            )
         )
-        self.assertAlmostEqual(usage.cost_usd, 3.75)
+        self.assertAlmostEqual(usage.cost_usd, 3.8)
+        self.assertAlmostEqual(usage.cache_savings_usd, 0.2)
         self.assertIsInstance(classify_provider_error(401, "bad"), ProviderAuthenticationError)
         self.assertIsInstance(classify_provider_error(429, "slow"), ProviderRateLimitError)
         self.assertIsInstance(classify_provider_error(503, "down"), ProviderUnavailableError)
@@ -516,7 +523,33 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.tool_calls[0].arguments, {"path": "a"})
         self.assertEqual(final.response_id, "a1")
         self.assertEqual(final.usage.cache_write_tokens, 1)
+        self.assertEqual(final.usage.input_tokens, 13)
         self.assertEqual(provider._headers()["x-api-key"], "key")
+
+        cached_request = ProviderRequest(
+            model="claude",
+            system="stable\n\ndynamic",
+            messages=self.messages,
+            metadata={
+                "prompt_cache_enabled": True,
+                "prompt_cache_ttl": "1h",
+                "anthropic_conversation_cache": True,
+                "system_blocks": [
+                    {"text": "stable", "cacheable": True},
+                    {"text": "dynamic", "cacheable": False},
+                ],
+            },
+        )
+        payload = provider._payload(cached_request)
+        self.assertEqual(
+            payload["system"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        self.assertNotIn("cache_control", payload["system"][1])
+        self.assertEqual(
+            payload["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
 
         converted = provider._messages(self.messages)
         self.assertNotIn("system", [item["role"] for item in converted])

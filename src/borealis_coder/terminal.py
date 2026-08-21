@@ -470,9 +470,44 @@ class ConsoleRenderer:
             else:
                 print(f"↻ {detail}", file=self.status_stream, flush=True)
             return
+        if event.type == "model.cache_hit":
+            self._ensure_line_break()
+            saved_tokens = int(event.data.get("saved_tokens") or 0)
+            detail = f"exact response reused · {saved_tokens} tokens avoided"
+            if self.interactive:
+                self.ui.activity("◆", "Response cache", detail, tone="mint")
+            else:
+                print(f"◆ response cache hit · {saved_tokens} tokens avoided", file=self.status_stream, flush=True)
+            return
+        if event.type == "model.cache_miss":
+            self._activity_phase = "response cache miss · contacting model"
+            return
+        if event.type == "cache.adaptive":
+            self._ensure_line_break()
+            detail = (
+                f"low hit rate ({float(event.data.get('hit_rate') or 0):.0%}) · "
+                f"{event.data.get('action') or 'stable-prefix mode'}"
+            )
+            if self.interactive:
+                self.ui.activity("◇", "Cache tuning", detail, tone="warning")
+            else:
+                print(f"◇ cache tuning · {detail}", file=self.status_stream, flush=True)
+            return
         if event.type == "model.completed":
             self._activity_phase = "processing model response"
             self._render_completed_text(str(event.data.get("text") or ""))
+            usage = event.data.get("usage") or {}
+            cached = int(usage.get("cached_input_tokens") or 0)
+            written = int(usage.get("cache_write_tokens") or 0)
+            total_input = int(usage.get("input_tokens") or 0)
+            if cached or written:
+                self._ensure_line_break()
+                rate = cached / total_input if total_input else 0.0
+                detail = f"{rate:.0%} hit · {cached} read · {written} written"
+                if self.interactive:
+                    self.ui.activity("◆", "Prompt cache", detail, tone="mint")
+                else:
+                    print(f"◆ prompt cache · {detail}", file=self.status_stream, flush=True)
             return
         if event.type == "tool.started":
             self._activity_phase = f"running {event.data.get('tool') or 'tool'}"

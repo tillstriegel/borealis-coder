@@ -404,6 +404,18 @@ class InteractiveCLI:
                         f"{usage.total_tokens} tokens · {usage.requests} requests "
                         f"· ${usage.cost_usd:.4f}",
                     ),
+                    (
+                        "prompt cache",
+                        f"{usage.provider_cache_hit_rate:.0%} hit · "
+                        f"{usage.cached_input_tokens} read · {usage.cache_write_tokens} written "
+                        f"· ${usage.cache_savings_usd:.4f} net saved",
+                    ),
+                    (
+                        "response cache",
+                        f"{usage.application_cache_hits} hit · "
+                        f"{usage.application_cache_misses} miss · "
+                        f"{usage.application_cache_saved_tokens} tokens avoided",
+                    ),
                 ]
             )
         self.ui.panel("Flight status" if full else "Active session", rows, tone="mint")
@@ -688,6 +700,15 @@ def _turn_footer(result: AgentResult) -> str:
     ]
     if result.usage.cost_usd:
         parts.append(f"${result.usage.cost_usd:.4f}")
+    if result.usage.cached_input_tokens or result.usage.cache_write_tokens:
+        parts.append(
+            f"prompt cache {result.usage.provider_cache_hit_rate:.0%} hit "
+            f"({result.usage.cached_input_tokens} read/{result.usage.cache_write_tokens} written)"
+        )
+    if result.usage.application_cache_hits:
+        parts.append(
+            f"response cache hit · {result.usage.application_cache_saved_tokens} tokens avoided"
+        )
     if result.changed_files:
         parts.append(f"{len(result.changed_files)} changed file(s)")
     if result.verification is not None:

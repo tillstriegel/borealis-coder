@@ -59,6 +59,13 @@ class ContextTests(unittest.TestCase):
         self.assertIn("Always run tests", prompt)
         self.assertIn("Review code carefully", prompt)
 
+        builder = ContextBuilder(self.root, self.config)
+        first = builder.build(query="Engine")
+        second = builder.build(query="unrelated request")
+        self.assertEqual(first.stable, second.stable)
+        self.assertEqual(first.stable_fingerprint, second.stable_fingerprint)
+        self.assertNotEqual(first.dynamic, second.dynamic)
+
     def test_repo_map_does_not_leak_workspace_syntax_warnings(self):
         source = self.root / "src/warning.py"
         source.write_text('pattern = "\\s+"\nclass WarningSource:\n    pass\n')

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -259,7 +259,23 @@ class AgentRunner:
         verification: dict[str, Any] | None = None
         compacted = False
         try:
-            system = await asyncio.to_thread(self.context_builder.system_prompt, query=prompt)
+            prompt_context = await asyncio.to_thread(self.context_builder.build, query=prompt)
+            system = prompt_context.text
+            session_usage = await asyncio.to_thread(self.sessions.usage, session_id)
+            adaptive_cache = self._low_cache_effectiveness(session_usage)
+            conversation_cache = (
+                self.config.cache.prompt_cache_enabled
+                and self.config.cache.conversation_cache_enabled
+                and not adaptive_cache
+            )
+            if adaptive_cache:
+                await self.events.emit(
+                    "cache.adaptive",
+                    session_id=session_id,
+                    run_id=run_id,
+                    hit_rate=session_usage.provider_cache_hit_rate,
+                    action="stable-prefix-only; shorter compaction window",
+                )
             while True:
                 self._check_cancel(cancel)
                 budget.before_turn()
@@ -267,7 +283,10 @@ class AgentRunner:
                 estimated = estimate_request_tokens(system, messages, schemas)
                 threshold = int(self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio)
                 if estimated >= threshold:
-                    compacted_messages = compact_messages(messages)
+                    compacted_messages = compact_messages(
+                        messages,
+                        keep_recent=12 if adaptive_cache else 18,
+                    )
                     if compacted_messages == messages:
                         if estimated > self.config.agent.max_input_tokens:
                             raise BudgetExceeded(
@@ -299,7 +318,18 @@ class AgentRunner:
                     max_output_tokens=self.config.agent.max_output_tokens,
                     reasoning_effort=self.config.agent.reasoning_effort or None,
                     parallel_tool_calls=True,
-                    metadata={"session_id": session_id, "run_id": run_id},
+                    metadata={
+                        "session_id": session_id,
+                        "run_id": run_id,
+                        "prompt_cache_key": prompt_context.stable_fingerprint,
+                        "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
+                        "prompt_cache_ttl": self.config.cache.anthropic_ttl,
+                        "anthropic_conversation_cache": conversation_cache,
+                        "system_blocks": [
+                            {"text": prompt_context.stable, "cacheable": True},
+                            {"text": prompt_context.dynamic, "cacheable": False},
+                        ],
+                    },
                 )
                 await self.events.emit(
                     "model.started",
@@ -332,6 +362,17 @@ class AgentRunner:
                     budget.add_usage(response.usage)
                 except BudgetExceeded as error:
                     usage_budget_error = error
+                cumulative_usage = await asyncio.to_thread(self.sessions.usage, session_id)
+                if not adaptive_cache and self._low_cache_effectiveness(cumulative_usage):
+                    adaptive_cache = True
+                    conversation_cache = False
+                    await self.events.emit(
+                        "cache.adaptive",
+                        session_id=session_id,
+                        run_id=run_id,
+                        hit_rate=cumulative_usage.provider_cache_hit_rate,
+                        action="stable-prefix-only; shorter compaction window",
+                    )
                 await asyncio.to_thread(self.sessions.update_session, session_id, provider=used_route.name, model=used_route.model)
                 assistant_metadata = {
                     "model": response.model or used_route.model,
@@ -477,6 +518,7 @@ class AgentRunner:
         assistant_message_id: str,
     ) -> tuple[ModelResponse, ProviderRoute]:
         errors: list[str] = []
+        cache_misses = 0
         for index, route in enumerate(self.providers):
             self._check_cancel(cancel)
             routed = ProviderRequest(
@@ -487,6 +529,58 @@ class AgentRunner:
                 response_schema=request.response_schema, metadata=request.metadata,
             )
             try:
+                cache_key = self._response_cache_key(route, routed)
+                cached = None
+                if self.config.cache.response_cache_enabled:
+                    cached = await asyncio.to_thread(
+                        self.sessions.get_cached_response,
+                        cache_key,
+                    )
+                if cached is not None:
+                    original_usage = Usage.from_dict(cached.get("usage"))
+                    payload = cached.get("response") or {}
+                    usage = Usage(
+                        application_cache_hits=1,
+                        application_cache_misses=cache_misses,
+                        application_cache_saved_tokens=original_usage.total_tokens,
+                        application_cache_saved_cost_usd=original_usage.cost_usd,
+                    )
+                    response = ModelResponse(
+                        text=str(payload.get("text") or ""),
+                        usage=usage,
+                        stop_reason=payload.get("stop_reason"),
+                        model=str(payload.get("model") or route.model),
+                        raw={"application_cache": True},
+                    )
+                    await self.events.emit(
+                        "model.cache_hit",
+                        session_id=session_id,
+                        run_id=run_id,
+                        provider=route.name,
+                        model=route.model,
+                        saved_tokens=usage.application_cache_saved_tokens,
+                        saved_cost_usd=usage.application_cache_saved_cost_usd,
+                    )
+                    if response.text:
+                        await self.events.emit(
+                            "model.text_delta",
+                            session_id=session_id,
+                            run_id=run_id,
+                            message_id=assistant_message_id,
+                            text=response.text,
+                            provider=route.name,
+                            model=route.model,
+                        )
+                    return response, route
+                if self.config.cache.response_cache_enabled:
+                    cache_misses += 1
+                    await self.events.emit(
+                        "model.cache_miss",
+                        session_id=session_id,
+                        run_id=run_id,
+                        provider=route.name,
+                        model=route.model,
+                    )
                 response = await self._stream_route(
                     route,
                     routed,
@@ -495,6 +589,26 @@ class AgentRunner:
                     cancel,
                     assistant_message_id,
                 )
+                if self.config.cache.response_cache_enabled:
+                    response.usage.application_cache_misses += cache_misses
+                    if not response.tool_calls and response.text and response.stop_reason not in {
+                        "error",
+                        "cancelled",
+                    }:
+                        await asyncio.to_thread(
+                            self.sessions.put_cached_response,
+                            cache_key,
+                            provider=route.name,
+                            model=route.model,
+                            response={
+                                "text": response.text,
+                                "stop_reason": response.stop_reason,
+                                "model": response.model or route.model,
+                            },
+                            usage=response.usage,
+                            ttl_seconds=self.config.cache.response_cache_ttl_seconds,
+                            max_entries=self.config.cache.response_cache_max_entries,
+                        )
                 if index:
                     await self.events.emit("model.fallback_succeeded", session_id=session_id, run_id=run_id, provider=route.name, model=route.model)
                 return response, route
@@ -505,6 +619,53 @@ class AgentRunner:
             except ProviderError:
                 raise
         raise ProviderUnavailableError("All provider routes failed: " + "; ".join(errors), retryable=False)
+
+    def _response_cache_key(
+        self,
+        route: ProviderRoute,
+        request: ProviderRequest,
+    ) -> str:
+        messages = [
+            {
+                "role": item.role.value,
+                "content": item.content,
+                "tool_calls": [call.to_dict() for call in item.tool_calls],
+                "tool_call_id": item.tool_call_id,
+                "tool_name": item.tool_name,
+                "is_error": item.is_error,
+                "metadata": item.metadata,
+            }
+            for item in request.messages
+        ]
+        provider_config = asdict(route.provider.config)
+        provider_config.pop("auth_file", None)
+        provider_config.pop("codex_home", None)
+        value = {
+            "version": 1,
+            "provider": route.name,
+            "model": route.model,
+            "provider_config": provider_config,
+            "request": {
+                "system": request.system,
+                "messages": messages,
+                "tools": request.tools,
+                "max_output_tokens": request.max_output_tokens,
+                "temperature": request.temperature,
+                "reasoning_effort": request.reasoning_effort,
+                "parallel_tool_calls": request.parallel_tool_calls,
+                "response_schema": request.response_schema,
+            },
+        }
+        return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
+
+    def _low_cache_effectiveness(self, usage: Usage) -> bool:
+        return bool(
+            self.config.cache.adaptive
+            and usage.requests >= self.config.cache.adaptive_min_requests
+            and usage.input_tokens >= self.config.cache.adaptive_min_input_tokens
+            and usage.provider_cache_hit_rate < self.config.cache.low_hit_rate_threshold
+            and usage.cache_write_tokens > usage.cached_input_tokens
+        )
 
     async def _stream_route(
         self, route: ProviderRoute, request: ProviderRequest,

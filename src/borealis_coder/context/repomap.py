@@ -52,9 +52,15 @@ class RepoMap:
         self.max_file_bytes = max_file_bytes
         self._cache: dict[tuple[str, int, int], FileSummary] = {}
 
-    def build(self, *, query: str = "", max_chars: int = 28_000) -> str:
+    def build(
+        self,
+        *,
+        query: str = "",
+        max_chars: int = 28_000,
+        rank_changed: bool = True,
+    ) -> str:
         terms = {item.lower() for item in re.findall(r"[A-Za-z_][\w.-]{2,}", query)}
-        changed = set(self._git_changed())
+        changed = set(self._git_changed()) if rank_changed else set()
         summaries: list[FileSummary] = []
         for path in repository_files(self.root, self.matcher):
             if path.suffix.lower() not in _EXT_LANG and path.name not in {"Dockerfile", "Makefile"}:
@@ -85,7 +91,8 @@ class RepoMap:
             summary = FileSummary(summary.path, summary.language, summary.symbols, summary.imports, summary.size, score)
             summaries.append(summary)
         summaries.sort(key=lambda item: (-item.score, item.path))
-        header = f"Repository map ({len(summaries)} source files; ranked for query: {query or '(none)'})"
+        ranking = f"query: {query}" if query else "stable path order"
+        header = f"Repository map ({len(summaries)} source files; {ranking})"
         chunks = [header]
         used = len(header)
         for summary in summaries:

@@ -58,6 +58,15 @@ database = "sessions.sqlite3"
 trace_jsonl = true
 retain_raw_provider_responses = false
 
+[cache]
+prompt_cache_enabled = true
+anthropic_ttl = "5m"
+conversation_cache_enabled = true
+response_cache_enabled = true
+response_cache_ttl_seconds = 300
+response_cache_max_entries = 256
+adaptive = true
+
 [telemetry]
 enabled = true
 console_level = "info"
@@ -76,6 +85,7 @@ max_backoff_seconds = 30.0
 input_cost_per_million = 0.0
 output_cost_per_million = 0.0
 cached_input_cost_per_million = 0.0
+cache_write_input_cost_per_million = 0.0
 
 [providers.chatgpt]
 type = "chatgpt"

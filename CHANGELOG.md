@@ -21,6 +21,12 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   compact turn receipts.
 - Live elapsed-time pulses for pending model, tool, and verification work, with
   accessible uncolored and redirected-output fallbacks.
+- Stable provider-cache context prefixes, explicit Anthropic prompt-cache
+  breakpoints, cache-aware ChatGPT routing keys, and adaptive cache tuning.
+- Bounded exact-response caching for successful text-only requests, with tool
+  responses excluded from replay.
+- Per-turn prompt/response cache metrics, net savings, and cache-write-aware
+  provider cost accounting.
 
 ### Fixed
 - Assistant output is always terminated cleanly before the next prompt.

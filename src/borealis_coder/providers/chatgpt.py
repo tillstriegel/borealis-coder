@@ -92,8 +92,10 @@ class ChatGPTProvider(OpenAIProvider):
         payload["tool_choice"] = "auto"
         payload["include"] = ["reasoning.encrypted_content"]
         session_id = str(request.metadata.get("session_id") or "").strip()
+        prompt_cache_key = str(request.metadata.get("prompt_cache_key") or "").strip()
+        if prompt_cache_key or session_id:
+            payload["prompt_cache_key"] = prompt_cache_key or session_id
         if session_id:
-            payload["prompt_cache_key"] = session_id
             payload["client_metadata"] = {
                 "borealis_session_id": session_id,
                 "originator": "borealis_coder",

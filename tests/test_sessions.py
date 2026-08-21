@@ -104,7 +104,7 @@ class SessionStoreTests(unittest.TestCase):
             version = legacy._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='version'"
             ).fetchone()[0]
-            self.assertEqual(version, "2")
+            self.assertEqual(version, "3")
         finally:
             legacy.close()
         self.store = SessionStore(self.root / "sessions.sqlite3")
@@ -120,6 +120,32 @@ class SessionStoreTests(unittest.TestCase):
         self.store.set_value(self.session.id, "plan", {"x": 1})
         self.assertEqual(self.store.get_value(self.session.id, "plan"), {"x": 1})
         self.assertEqual(self.store.get_value(self.session.id, "missing", 9), 9)
+
+    def test_response_cache_is_bounded_and_tracks_usage(self):
+        original = Usage(input_tokens=10, output_tokens=2, requests=1, cost_usd=0.25)
+        self.store.put_cached_response(
+            "first",
+            provider="mock",
+            model="deterministic",
+            response={"text": "one"},
+            usage=original,
+            ttl_seconds=60,
+            max_entries=1,
+        )
+        self.store.put_cached_response(
+            "second",
+            provider="mock",
+            model="deterministic",
+            response={"text": "two"},
+            usage=original,
+            ttl_seconds=60,
+            max_entries=1,
+        )
+        self.assertIsNone(self.store.get_cached_response("first"))
+        cached = self.store.get_cached_response("second")
+        assert cached is not None
+        self.assertEqual(cached["response"]["text"], "two")
+        self.assertEqual(cached["usage"]["total_tokens"], 12)
 
     @unittest.skipUnless(os.name == "posix", "POSIX permissions only")
     def test_state_files_are_private(self):

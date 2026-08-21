@@ -1,6 +1,6 @@
 """Repository discovery, instructions, skills, maps, and prompt assembly."""
 
-from .builder import BASE_SYSTEM_PROMPT, ContextBuilder
+from .builder import BASE_SYSTEM_PROMPT, ContextBuilder, PromptContext
 from .ignore import IgnoreMatcher, repository_files
 from .instructions import InstructionDocument, InstructionLoader
 from .repomap import FileSummary, RepoMap
@@ -13,6 +13,7 @@ __all__ = [
     "IgnoreMatcher",
     "InstructionDocument",
     "InstructionLoader",
+    "PromptContext",
     "RepoMap",
     "Skill",
     "SkillCatalog",

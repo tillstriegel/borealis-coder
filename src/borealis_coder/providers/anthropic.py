@@ -32,7 +32,7 @@ class AnthropicProvider(Provider):
     def _payload(self, request: ProviderRequest, *, stream: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.model,
-            "system": request.system,
+            "system": _system_blocks(request),
             "messages": self._messages(request.messages),
             "tools": [
                 {
@@ -45,6 +45,11 @@ class AnthropicProvider(Provider):
             "max_tokens": request.max_output_tokens,
             "stream": stream,
         }
+        if request.metadata.get("anthropic_conversation_cache"):
+            cache_control: dict[str, str] = {"type": "ephemeral"}
+            if request.metadata.get("prompt_cache_ttl") == "1h":
+                cache_control["ttl"] = "1h"
+            payload["cache_control"] = cache_control
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if not request.parallel_tool_calls:
@@ -59,7 +64,11 @@ class AnthropicProvider(Provider):
             )
             if not isinstance(response.data, dict):
                 raise ProviderError("Anthropic returned a non-object response")
-            return self._parse(response.data, retain_raw=True)
+            return self._parse(
+                response.data,
+                retain_raw=True,
+                cache_ttl=str(request.metadata.get("prompt_cache_ttl") or "5m"),
+            )
 
         return await self.with_retries(operation)
 
@@ -83,9 +92,12 @@ class AnthropicProvider(Provider):
                 message_id = message.get("id")
                 model = message.get("model")
                 initial = message.get("usage") or {}
-                usage.input_tokens = int(initial.get("input_tokens", 0) or 0)
+                uncached = int(initial.get("input_tokens", 0) or 0)
                 usage.cached_input_tokens = int(initial.get("cache_read_input_tokens", 0) or 0)
                 usage.cache_write_tokens = int(initial.get("cache_creation_input_tokens", 0) or 0)
+                usage.input_tokens = (
+                    uncached + usage.cached_input_tokens + usage.cache_write_tokens
+                )
             elif event_type == "content_block_start":
                 index = int(data.get("index", 0))
                 block = data.get("content_block") or {}
@@ -136,7 +148,10 @@ class AnthropicProvider(Provider):
                     raw_arguments=raw or json_dumps(arguments),
                 )
             )
-        self.price_usage(usage)
+        self.price_usage(
+            usage,
+            cache_write_multiplier=_cache_write_multiplier(request),
+        )
         result = ModelResponse(
             text="".join(text_parts),
             tool_calls=tool_calls,
@@ -184,7 +199,13 @@ class AnthropicProvider(Provider):
                 )
         return output
 
-    def _parse(self, data: dict[str, Any], *, retain_raw: bool) -> ModelResponse:
+    def _parse(
+        self,
+        data: dict[str, Any],
+        *,
+        retain_raw: bool,
+        cache_ttl: str = "5m",
+    ) -> ModelResponse:
         text: list[str] = []
         calls: list[ToolCall] = []
         for block in data.get("content", []) or []:
@@ -203,14 +224,17 @@ class AnthropicProvider(Provider):
                     )
                 )
         usage_data = data.get("usage") or {}
+        cached = int(usage_data.get("cache_read_input_tokens", 0) or 0)
+        cache_write = int(usage_data.get("cache_creation_input_tokens", 0) or 0)
         usage = self.price_usage(
             Usage(
-                input_tokens=int(usage_data.get("input_tokens", 0) or 0),
+                input_tokens=int(usage_data.get("input_tokens", 0) or 0) + cached + cache_write,
                 output_tokens=int(usage_data.get("output_tokens", 0) or 0),
-                cached_input_tokens=int(usage_data.get("cache_read_input_tokens", 0) or 0),
-                cache_write_tokens=int(usage_data.get("cache_creation_input_tokens", 0) or 0),
+                cached_input_tokens=cached,
+                cache_write_tokens=cache_write,
                 requests=1,
-            )
+            ),
+            cache_write_multiplier=2.0 if cache_ttl == "1h" else 1.25,
         )
         return ModelResponse(
             text="".join(text),
@@ -240,3 +264,25 @@ def _parse_arguments(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"_raw": raw}
     return value if isinstance(value, dict) else {"value": value}
+
+
+def _system_blocks(request: ProviderRequest) -> list[dict[str, Any]]:
+    configured = request.metadata.get("system_blocks")
+    if not isinstance(configured, list):
+        return [{"type": "text", "text": request.system}]
+    output: list[dict[str, Any]] = []
+    for item in configured:
+        if not isinstance(item, dict) or not item.get("text"):
+            continue
+        block: dict[str, Any] = {"type": "text", "text": str(item["text"])}
+        if item.get("cacheable") and request.metadata.get("prompt_cache_enabled"):
+            cache_control: dict[str, str] = {"type": "ephemeral"}
+            if request.metadata.get("prompt_cache_ttl") == "1h":
+                cache_control["ttl"] = "1h"
+            block["cache_control"] = cache_control
+        output.append(block)
+    return output or [{"type": "text", "text": request.system}]
+
+
+def _cache_write_multiplier(request: ProviderRequest) -> float:
+    return 2.0 if request.metadata.get("prompt_cache_ttl") == "1h" else 1.25
