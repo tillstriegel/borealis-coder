@@ -586,6 +586,16 @@ class CLITests(unittest.TestCase):
         self.assertIn("3 more", selector_output)
         self.assertIn("Tab completes", selector_output)
 
+        themed_selector = io.StringIO()
+        cli.AuroraUI(themed_selector, color=True).command_selector(
+            [("/status", "Inspect runtime health")],
+            query="/s",
+        )
+        themed_selector_output = themed_selector.getvalue()
+        self.assertIn("\033[39;1m/status", themed_selector_output)
+        self.assertIn("\033[90mInspect runtime health", themed_selector_output)
+        self.assertNotIn("38;2;232;244;255", themed_selector_output)
+
         completion_output = io.StringIO()
         history = terminal.ReadlineHistory(
             Path("/tmp/history"),

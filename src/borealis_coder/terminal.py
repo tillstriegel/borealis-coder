@@ -28,14 +28,15 @@ class AuroraUI:
 
     _RESET = "0"
     _BOLD = "1"
-    _DIM = "2"
     _MINT = "38;2;112;255;185"
     _CYAN = "38;2;79;214;255"
     _VIOLET = "38;2;183;139;255"
     _AMBER = "38;2;255;198;92"
     _RED = "38;2;255;112;128"
-    _WHITE = "38;2;232;244;255"
-    _MUTED = "38;2;126;151;168"
+    # Inherit the terminal theme for readable text on both light and dark
+    # backgrounds. Standard bright black provides a theme-aware secondary tone.
+    _FOREGROUND = "39"
+    _MUTED = "90"
 
     def __init__(self, stream: TextIO, *, color: bool | None = None) -> None:
         self.stream = stream
@@ -67,7 +68,7 @@ class AuroraUI:
         return self.paint(value, self._MINT, self._BOLD)
 
     def subdued(self, value: object) -> str:
-        return self.paint(value, self._MUTED, self._DIM)
+        return self.paint(value, self._MUTED)
 
     def prompt(self, session: str) -> str:
         """Return a two-line readline-safe prompt."""
@@ -98,7 +99,9 @@ class AuroraUI:
         top_label = f" AURORA SHELL  {version} "
         top = "╭" + top_label + "─" * max(0, width - len(top_label) - 2) + "╮"
         bottom = "╰" + "─" * (width - 2) + "╯"
-        title = self._gradient("BOREALIS") + "  " + self.paint("CODER", self._WHITE, self._BOLD)
+        title = self._gradient("BOREALIS") + "  " + self.paint(
+            "CODER", self._FOREGROUND, self._BOLD
+        )
         print(self.paint(top, self._MUTED), file=self.stream)
         print(self._box_line(f"  ◢◤  {title}", width), file=self.stream)
         subtitle = _middle_truncate(
@@ -156,7 +159,7 @@ class AuroraUI:
         suffix = f"  {self.subdued(detail)}" if detail else ""
         print(
             f"{self.paint('│', self._MUTED)} {self.paint(marker, color, self._BOLD)} "
-            f"{self.paint(label, self._WHITE)}{suffix}",
+            f"{self.paint(label, self._FOREGROUND)}{suffix}",
             file=self.stream,
             flush=True,
         )
@@ -166,7 +169,7 @@ class AuroraUI:
         return (
             f"{self.paint('│', self._MUTED)} "
             f"{self.paint(glyph, self._CYAN, self._BOLD)} "
-            f"{self.paint(phase, self._WHITE)}  "
+            f"{self.paint(phase, self._FOREGROUND)}  "
             f"{self.subdued(f'{elapsed_seconds:.1f}s')}"
         )
 
@@ -204,7 +207,7 @@ class AuroraUI:
             for command, description in commands:
                 description = _middle_truncate(description, max(8, width - 32))
                 content = (
-                    f"    {self.paint(f'{command:<24}', self._WHITE)}"
+                    f"    {self.paint(f'{command:<24}', self._FOREGROUND)}"
                     f"{self.subdued(description)}"
                 )
                 print(
@@ -228,29 +231,42 @@ class AuroraUI:
         print(
             self.paint(
                 "╭─" + heading + "─" * max(0, width - len(heading) - 3) + "╮",
-                self._CYAN,
+                self._FOREGROUND,
+                self._BOLD,
             ),
             file=self.stream,
         )
         for command, description in commands:
             available = max(8, width - 27)
             content = (
-                f"  {self.paint(f'{command:<16}', self._WHITE, self._BOLD)}"
+                f"  {self.paint(f'{command:<16}', self._FOREGROUND, self._BOLD)}"
                 f"{self.subdued(_middle_truncate(description, available))}"
             )
-            print(self._framed_line(content, width, self._CYAN), file=self.stream)
+            print(
+                self._framed_line(content, width, self._FOREGROUND),
+                file=self.stream,
+            )
         if hidden:
             detail = f"{hidden} more · keep typing to narrow"
             print(
-                self._framed_line(f"  {self.subdued(detail)}", width, self._CYAN),
+                self._framed_line(
+                    f"  {self.subdued(detail)}", width, self._FOREGROUND
+                ),
                 file=self.stream,
             )
         hint = f"  {query or '/'}  · type to narrow · Tab completes · Enter runs"
         print(
-            self._framed_line(self.paint(hint, self._MINT), width, self._CYAN),
+            self._framed_line(
+                self.paint(hint, self._FOREGROUND),
+                width,
+                self._FOREGROUND,
+            ),
             file=self.stream,
         )
-        print(self.paint("╰" + "─" * (width - 2) + "╯", self._CYAN), file=self.stream)
+        print(
+            self.paint("╰" + "─" * (width - 2) + "╯", self._FOREGROUND),
+            file=self.stream,
+        )
 
     def _gradient(self, value: str) -> str:
         colors = (self._MINT, self._CYAN, self._VIOLET)
@@ -289,7 +305,10 @@ class AuroraUI:
 
     def _box_field(self, label: str, value: str, width: int) -> None:
         available = max(10, width - 19)
-        content = f"  {self.paint(f'{label:<11}', self._MUTED, self._BOLD)} {self.paint(_middle_truncate(value, available), self._WHITE)}"
+        content = (
+            f"  {self.paint(f'{label:<11}', self._MUTED, self._BOLD)} "
+            f"{self.paint(_middle_truncate(value, available), self._FOREGROUND)}"
+        )
         print(self._box_line(content, width), file=self.stream)
 
     def _readline_paint(self, value: str, *codes: str) -> str:

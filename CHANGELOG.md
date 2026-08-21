@@ -31,6 +31,8 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   begins with `/`, with descriptions, prefix filtering, and Tab completion.
 
 ### Fixed
+- Command menu text now follows the terminal foreground color, keeping slash
+  commands readable in both light and dark color schemes.
 - Assistant output is always terminated cleanly before the next prompt.
 - Final answers after one or more tool calls are no longer suppressed by text
   emitted during an earlier model exchange in the same user turn.
