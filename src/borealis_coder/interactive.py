@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import shlex
 import signal
@@ -170,7 +171,7 @@ class InteractiveCLI:
         if not _is_tty(sys.stdin):
             return ""
         short = self.session_id[-8:] if self.session_id else "new"
-        return f"[{short}] › "
+        return f"[{short}] › "  # noqa: RUF001 - intentional prompt glyph
 
     async def _submit(self, prompt: str) -> None:
         prompt = prompt.strip()
@@ -181,6 +182,7 @@ class InteractiveCLI:
         self._active_session_id = self.session_id
         self._interrupt_count = 0
         task = asyncio.create_task(runner.run(prompt, session_id=self.session_id))
+        progress_task = asyncio.create_task(self._report_progress(task))
         self._active_task = task
         previous_handler = self._install_turn_interrupt_handler()
         try:
@@ -194,6 +196,9 @@ class InteractiveCLI:
             print(f"error: {error}", file=self.renderer.status_stream)
             return
         finally:
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
             self._restore_interrupt_handler(previous_handler)
             self._active_task = None
             self._active_session_id = None
@@ -207,6 +212,19 @@ class InteractiveCLI:
                 f"[{result.stop_reason.value}] {result.error}",
                 file=self.renderer.status_stream,
             )
+
+    async def _report_progress(self, task: asyncio.Task[AgentResult]) -> None:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        generation = self.renderer.activity_generation
+        while not task.done():
+            await asyncio.sleep(10)
+            if task.done():
+                return
+            current_generation = self.renderer.activity_generation
+            if current_generation == generation:
+                self.renderer.heartbeat(max(1, int(loop.time() - started)))
+            generation = current_generation
 
     async def _command(self, line: str) -> tuple[bool, str | None]:
         try:
@@ -578,10 +596,8 @@ with an extra slash, for example: //explain this route.
     def _restore_interrupt_handler(previous) -> None:  # type: ignore[no-untyped-def]
         if previous is None:
             return
-        try:
+        with contextlib.suppress(ValueError, OSError, AttributeError):
             signal.signal(signal.SIGINT, previous)
-        except (ValueError, OSError, AttributeError):
-            pass
 
     def _cancel_active_turn(self) -> None:
         task = self._active_task
@@ -663,7 +679,5 @@ def _terminal_input(prompt: str) -> str:
         return input(prompt)
     finally:
         if previous is not None:
-            try:
+            with contextlib.suppress(ValueError, OSError, AttributeError):
                 signal.signal(signal.SIGINT, previous)
-            except (ValueError, OSError, AttributeError):
-                pass

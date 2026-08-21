@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -14,7 +15,7 @@ from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 T = TypeVar("T")
 
@@ -40,14 +41,14 @@ def sha256_text(text: str) -> str:
 
 
 def json_default(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, set | frozenset):
         return sorted(value)
     if hasattr(value, "value"):
-        return value.value
+        return cast(Any, value).value
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
@@ -189,7 +190,5 @@ async def cancel_and_wait(task: asyncio.Task[Any] | None) -> None:
     if task is None or task.done():
         return
     task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await task
-    except asyncio.CancelledError:
-        pass

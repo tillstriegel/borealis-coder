@@ -8,7 +8,16 @@ from pathlib import Path
 from borealis_coder.config import SafetyConfig
 from borealis_coder.errors import PathViolation, ToolError
 from borealis_coder.models import Effect
-from borealis_coder.safety import ApprovalManager, ApprovalRequest, CheckpointManager, PolicyAction, PolicyEngine, WorkspaceRoots, assess_command
+from borealis_coder.safety import (
+    ApprovalManager,
+    ApprovalRequest,
+    CheckpointManager,
+    PolicyAction,
+    PolicyDecision,
+    PolicyEngine,
+    WorkspaceRoots,
+    assess_command,
+)
 from borealis_coder.safety.commands import CommandRisk
 
 
@@ -49,7 +58,7 @@ class PathTests(unittest.TestCase):
             file_path.write_text("before", encoding="utf-8")
             manager = CheckpointManager(WorkspaceRoots(root, [extra_root]))
             checkpoint = manager.create([file_path], label="additional root")
-            self.assertIsNotNone(checkpoint)
+            assert checkpoint is not None
             file_path.write_text("after", encoding="utf-8")
             manager.restore(checkpoint.id)
             self.assertEqual(file_path.read_text(encoding="utf-8"), "before")
@@ -60,7 +69,7 @@ class PathTests(unittest.TestCase):
             future = root / "future.txt"
             manager = CheckpointManager(WorkspaceRoots(root))
             checkpoint = manager.create([future], label="absent file")
-            self.assertIsNotNone(checkpoint)
+            assert checkpoint is not None
             future.mkdir()
             with self.assertRaises(ToolError):
                 manager.restore(checkpoint.id)
@@ -121,7 +130,7 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
             calls += 1
             return "allow_always"
         manager = ApprovalManager(callback)
-        decision = type("D", (), {"action": PolicyAction.ASK, "reason":"r", "cache_key":"k", "risk":"high"})()
+        decision = PolicyDecision(PolicyAction.ASK, "r", "high", cache_key="k")
         request = ApprovalRequest("x", "x", decision, "{}")
         await manager.enforce(request)
         await manager.enforce(request)

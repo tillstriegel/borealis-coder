@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 from borealis_coder.errors import ProtocolError
@@ -29,7 +30,7 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             data = root / "data"
             server = ACPServer()
             fake = FakeConnection()
-            server.connection = fake
+            server.connection = cast(Any, fake)
             with patch.dict(os.environ, {"BOREALIS_DATA_DIR": str(data), "BOREALIS_PROVIDER":"mock"}, clear=False):
                 init = await server.handle("initialize", {"protocolVersion":2,"capabilities":{},"info":{"name":"test","version":"1"}})
                 self.assertEqual(init["protocolVersion"], 2)
@@ -78,28 +79,27 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_relative_roots_and_invalid_mcp(self):
         server = ACPServer()
-        server.connection = FakeConnection()
+        server.connection = cast(Any, FakeConnection())
         await server.handle("initialize", {"protocolVersion": 2, "capabilities": {}})
         with self.assertRaises(ProtocolError):
             await server.handle("session/new", {"cwd": ".", "mcpServers": []})
-        with tempfile.TemporaryDirectory() as td:
-            with (
-                patch.dict(
-                    os.environ,
-                    {"BOREALIS_DATA_DIR": str(Path(td) / "data")},
-                    clear=False,
-                ),
-                self.assertRaises(ProtocolError),
-            ):
-                await server.handle(
-                    "session/new",
-                    {
-                        "cwd": td,
-                        "mcpServers": [
-                            {"type": "stdio", "name": "bad", "command": "python"}
-                        ],
-                    },
-                )
+        with (
+            tempfile.TemporaryDirectory() as td, patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(Path(td) / "data")},
+                clear=False,
+            ),
+            self.assertRaises(ProtocolError),
+        ):
+            await server.handle(
+                "session/new",
+                {
+                    "cwd": td,
+                    "mcpServers": [
+                        {"type": "stdio", "name": "bad", "command": "python"}
+                    ],
+                },
+            )
 
 
 if __name__ == "__main__":

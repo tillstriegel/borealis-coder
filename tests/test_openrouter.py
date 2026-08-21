@@ -116,9 +116,8 @@ class OpenRouterProviderTests(unittest.TestCase):
             providers={"openrouter": self.config},
         )
         registry = ProviderRegistry()
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(ConfigurationError):
-                registry.create(config)
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(ConfigurationError):
+            registry.create(config)
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-live"}, clear=True):
             name, model, provider = registry.create(config)
         self.assertEqual(name, "openrouter")

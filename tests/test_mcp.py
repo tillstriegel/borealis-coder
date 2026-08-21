@@ -13,7 +13,6 @@ from borealis_coder.models import ToolCall
 from borealis_coder.tools import build_builtin_registry
 from tests.helpers import make_config, make_context
 
-
 SERVER = r'''
 import json, sys
 for line in sys.stdin:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from collections.abc import Iterable
 from importlib import metadata
 from pathlib import Path
 
@@ -20,8 +21,12 @@ def load_entrypoint_tools(registry: ToolRegistry) -> list[str]:
         value = entry.load()
         tools = value() if callable(value) and not isinstance(value, type) else value
         if isinstance(tools, Tool):
-            tools = [tools]
-        for tool in tools:
+            candidates: Iterable[object] = (tools,)
+        elif isinstance(tools, Iterable):
+            candidates = tools
+        else:
+            raise TypeError(f"Entry point {entry.name} returned a non-iterable value")
+        for tool in candidates:
             if not isinstance(tool, Tool):
                 raise TypeError(f"Entry point {entry.name} returned non-Tool value")
             registry.register(tool)

@@ -46,6 +46,8 @@ def main() -> int:
         ):
             if not any(name.endswith("/" + required) for name in names):
                 errors.append(f"sdist missing {required}")
+        if any(name.endswith("/.DS_Store") for name in names):
+            errors.append("sdist contains .DS_Store")
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         suffixes = (
@@ -57,6 +59,8 @@ def main() -> int:
         for required in suffixes:
             if not any(name.endswith(required) for name in names):
                 errors.append(f"wheel missing *{required}")
+        if any(name.endswith("/.DS_Store") for name in names):
+            errors.append("wheel contains .DS_Store")
 
     artifacts = [
         {"name": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}

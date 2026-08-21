@@ -9,6 +9,7 @@ from borealis_coder.agent import build_runner
 from borealis_coder.config import ProviderConfig
 from borealis_coder.models import ModelResponse, Role, ToolCall, Usage
 from borealis_coder.providers.base import Provider
+from borealis_coder.providers.mock import MockProvider
 from borealis_coder.providers.registry import ProviderRegistry
 from tests.helpers import make_config
 
@@ -98,14 +99,27 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(root, agent={"provider":"bad", "provider_fallbacks":["mock"]})
-            config.providers["bad"] = ProviderConfig(type="slow", model="slow", max_retries=0)
+            config.providers["bad"] = ProviderConfig(
+                type="slow",
+                model="slow",
+                max_retries=1,
+                initial_backoff_seconds=0,
+                max_backoff_seconds=0,
+            )
             registry = ProviderRegistry()
             registry.register("slow", lambda cfg, key: FailingProvider(cfg, key))
             runner = await build_runner(root, config=config, interactive=False, provider_registry=registry)
             try:
                 result = await runner.run("hello")
+                events = [event for _, event in runner.sessions.events(result.session_id)]
+                started = next(event for event in events if event.type == "model.started")
+                retry = next(event for event in events if event.type == "model.retrying")
                 self.assertEqual(result.stop_reason.value, "end_turn")
                 self.assertIn("Offline mock", result.text)
+                self.assertEqual(started.data["provider"], "bad")
+                self.assertEqual(started.data["model"], "slow")
+                self.assertEqual(retry.data["attempt"], 2)
+                self.assertEqual(retry.data["max_attempts"], 2)
             finally:
                 await runner.close()
 
@@ -217,7 +231,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             try:
                 result = await runner.run("hello")
                 self.assertEqual(result.stop_reason.value, "budget")
-                self.assertEqual(runner.providers[0].provider.calls, 0)
+                provider = runner.providers[0].provider
+                assert isinstance(provider, MockProvider)
+                self.assertEqual(provider.calls, 0)
             finally:
                 await runner.close()
 

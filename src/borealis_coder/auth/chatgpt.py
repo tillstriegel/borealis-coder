@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import shlex
@@ -416,10 +417,8 @@ def launch_codex_login(
 
     home = (codex_home or managed_codex_home()).expanduser().resolve()
     home.mkdir(parents=True, exist_ok=True)
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(home, 0o700)
-    except OSError:
-        pass
     config_path = home / "config.toml"
     if not config_path.exists():
         atomic_write_text(config_path, 'cli_auth_credentials_store = "file"\n', mode=0o600)
@@ -499,7 +498,7 @@ class _CredentialFileLock:
                 if time.monotonic() >= deadline:
                     raise ProviderAuthenticationError(
                         f"Timed out waiting for ChatGPT credential lock: {self.path}"
-                    )
+                    ) from None
                 time.sleep(0.05)
 
     def release(self) -> None:

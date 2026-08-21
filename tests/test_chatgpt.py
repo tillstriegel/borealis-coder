@@ -304,7 +304,9 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in provider.stream(request)]
         self.assertEqual(attempts, 2)
         self.assertEqual(refresh_calls, [False, True])
-        self.assertEqual(events[-1].response.text, "done")
+        response = events[-1].response
+        assert response is not None
+        self.assertEqual(response.text, "done")
 
         attempts = 0
         refresh_calls.clear()
@@ -315,9 +317,11 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
             yield ProviderStreamEvent(type="text_delta", text="partial")
             raise ProviderAuthenticationError("expired")
 
-        with patch.object(OpenAIProvider, "stream", partial_parent_stream):
-            with self.assertRaises(ProviderAuthenticationError):
-                _ = [event async for event in provider.stream(request)]
+        with (
+            patch.object(OpenAIProvider, "stream", partial_parent_stream),
+            self.assertRaises(ProviderAuthenticationError),
+        ):
+            _ = [event async for event in provider.stream(request)]
         self.assertEqual(attempts, 1)
         self.assertEqual(refresh_calls, [False])
 

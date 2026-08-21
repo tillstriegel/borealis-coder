@@ -138,9 +138,11 @@ class PluginTests(unittest.TestCase):
             self.assertEqual(load_entrypoint_tools(legacy_registry), ["entry_direct"])
 
         bad = SimpleNamespace(name="bad", load=lambda: [object()])
-        with patch("borealis_coder.plugins.metadata.entry_points", return_value=[bad]):
-            with self.assertRaisesRegex(TypeError, "non-Tool"):
-                load_entrypoint_tools(ToolRegistry())
+        with (
+            patch("borealis_coder.plugins.metadata.entry_points", return_value=[bad]),
+            self.assertRaisesRegex(TypeError, "non-Tool"),
+        ):
+            load_entrypoint_tools(ToolRegistry())
 
     def test_workspace_plugins_opt_in_and_validation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -172,9 +174,15 @@ class PluginTests(unittest.TestCase):
                 self.assertEqual(load_workspace_plugins(missing, ToolRegistry()), [])
 
             (plugins / "bad.py").write_text("value = 1\n", encoding="utf-8")
-            with patch.dict(os.environ, {"BOREALIS_ENABLE_WORKSPACE_PLUGINS": "true"}, clear=False):
-                with self.assertRaisesRegex(TypeError, "must expose register"):
-                    load_workspace_plugins(root, ToolRegistry())
+            with (
+                patch.dict(
+                    os.environ,
+                    {"BOREALIS_ENABLE_WORKSPACE_PLUGINS": "true"},
+                    clear=False,
+                ),
+                self.assertRaisesRegex(TypeError, "must expose register"),
+            ):
+                load_workspace_plugins(root, ToolRegistry())
 
 
 if __name__ == "__main__":

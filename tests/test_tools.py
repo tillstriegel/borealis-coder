@@ -5,12 +5,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from borealis_coder.errors import ToolError, ToolValidationError
 from borealis_coder.models import ToolCall
 from borealis_coder.tools import build_builtin_registry, validate_schema
-from borealis_coder.errors import ToolValidationError
 from borealis_coder.tools.fetch import _fetch_public_url, _validate_public_url
 from borealis_coder.util import sha256_text
-
 from tests.helpers import make_context
 
 
@@ -104,9 +103,9 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.root / "large.txt").exists())
 
     def test_fetch_rejects_non_public_destinations(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(ToolError):
             _validate_public_url("http://127.0.0.1/admin")
-        with self.assertRaises(Exception):
+        with self.assertRaises(ToolError):
             _validate_public_url("http://169.254.169.254/latest/meta-data")
 
     def test_fetch_uses_the_vetted_address_without_resolving_again(self):

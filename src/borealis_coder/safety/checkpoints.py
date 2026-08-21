@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ToolError
-from ..util import atomic_write_bytes, atomic_write_text, ensure_private_directory, new_id, sha256_bytes, utc_now
+from ..util import (
+    atomic_write_bytes,
+    atomic_write_text,
+    ensure_private_directory,
+    new_id,
+    sha256_bytes,
+    utc_now,
+)
 from .paths import WorkspaceRoots
 
 

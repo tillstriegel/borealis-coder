@@ -94,15 +94,18 @@ def assess_command(command: str) -> CommandAssessment:
     if executable in _LOCAL_PACKAGE_COMMANDS:
         subcommand = next((item for item in lowered[1:] if not item.startswith("-")), "")
         if subcommand in _LOCAL_PACKAGE_COMMANDS[executable]:
-            if executable == "cargo" and subcommand in {"check", "test", "clippy", "metadata"}:
-                if "--offline" not in lowered:
-                    return CommandAssessment(
-                        CommandRisk.NETWORK,
-                        f"cargo {subcommand} may fetch dependencies without --offline",
-                        executable,
-                        uses_shell,
-                        True,
-                    )
+            if (
+                executable == "cargo"
+                and subcommand in {"check", "test", "clippy", "metadata"}
+                and "--offline" not in lowered
+            ):
+                return CommandAssessment(
+                    CommandRisk.NETWORK,
+                    f"cargo {subcommand} may fetch dependencies without --offline",
+                    executable,
+                    uses_shell,
+                    True,
+                )
             return CommandAssessment(
                 CommandRisk.SAFE,
                 f"recognized local verification command: {executable} {subcommand}",

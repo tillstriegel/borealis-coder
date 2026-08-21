@@ -52,6 +52,15 @@ answer after the tool result. Borealis reconciles the completed response with it
 stream deltas and terminates the line before rendering tool state, the turn
 footer, or the next prompt.
 
+Interactive mode also reports live execution phases. It announces workspace
+context preparation immediately, identifies each provider/model exchange, shows
+when a tool call is being assembled, reports provider retries, renders tool
+start/completion, and announces verification before it begins. These messages
+describe observable runtime state; Borealis does not expose private model
+reasoning or stream raw tool arguments to the terminal. After ten seconds with
+no new model or tool event, a heartbeat reports the current phase and elapsed
+turn time.
+
 Options:
 
 ```text

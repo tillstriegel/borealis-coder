@@ -109,7 +109,12 @@ class AnthropicProvider(Provider):
                     call["arguments"] = str(call.get("arguments") or "") + partial
                     yield ProviderStreamEvent(
                         type="tool_call_delta",
-                        data={"index": index, "id": call.get("id", ""), "delta": partial},
+                        data={
+                            "index": index,
+                            "id": call.get("id", ""),
+                            "name": call.get("name", ""),
+                            "delta": partial,
+                        },
                     )
             elif event_type == "message_delta":
                 delta = data.get("delta") or {}

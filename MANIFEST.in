@@ -15,4 +15,4 @@ recursive-include .github *.yml *.yaml
 prune .borealis
 prune build
 prune dist
-global-exclude __pycache__ *.py[cod] .coverage
+global-exclude __pycache__ *.py[cod] .coverage .DS_Store

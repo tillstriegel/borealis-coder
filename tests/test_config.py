@@ -46,9 +46,8 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.source_files)
 
     def test_unknown_key_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(ConfigurationError):
-                load_config(Path(td), overrides={"agent": {"not_real": 1}})
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(ConfigurationError):
+            load_config(Path(td), overrides={"agent": {"not_real": 1}})
 
     def test_provider_extra_body_secrets_are_redacted(self):
         with tempfile.TemporaryDirectory() as td:

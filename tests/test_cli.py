@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 from borealis_coder import cli
@@ -348,9 +349,8 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(cli.main(["eval"]), 130)
             self.assertIn("Cancelled", stderr.getvalue())
 
-        with self.assertRaises(SystemExit) as version:
-            with redirect_stdout(io.StringIO()):
-                cli.build_parser().parse_args(["--version"])
+        with self.assertRaises(SystemExit) as version, redirect_stdout(io.StringIO()):
+            cli.build_parser().parse_args(["--version"])
         self.assertEqual(version.exception.code, 0)
 
     def test_renderer_approval_runtime_config_and_footer(self) -> None:
@@ -359,7 +359,17 @@ class CLITests(unittest.TestCase):
             stderr = io.StringIO()
             renderer = cli.ConsoleRenderer()
             with redirect_stdout(stdout), redirect_stderr(stderr):
-                await renderer.handle(Event(type="model.started"))
+                await renderer.handle(Event(type="run.started"))
+                await renderer.handle(
+                    Event(
+                        type="model.started",
+                        data={"provider": "chatgpt", "model": "test-model", "turn": 1},
+                    )
+                )
+                await renderer.handle(
+                    Event(type="model.tool_call_delta", data={"name": "read_file"})
+                )
+                await renderer.handle(Event(type="model.tool_call_delta"))
                 await renderer.handle(Event(type="model.text_delta", data={"text": "a"}))
                 await renderer.handle(Event(type="model.completed", data={"text": "a"}))
                 await renderer.handle(Event(type="tool.started", data={"tool": "read"}))
@@ -379,8 +389,16 @@ class CLITests(unittest.TestCase):
                 await renderer.handle(
                     Event(type="model.route_failed", data={"provider": "x"})
                 )
+                await renderer.handle(
+                    Event(
+                        type="model.retrying",
+                        data={"attempt": 2, "max_attempts": 5, "delay_seconds": 1.0},
+                    )
+                )
+                await renderer.handle(Event(type="verification.started"))
                 await renderer.handle(Event(type="model.started"))
                 await renderer.handle(Event(type="model.completed", data={"text": "final"}))
+                renderer.heartbeat(10)
                 renderer.finish_turn()
                 buffered = cli.ConsoleRenderer(stream_text=False)
                 await buffered.handle(Event(type="model.started"))
@@ -402,6 +420,13 @@ class CLITests(unittest.TestCase):
         self.assertIn("✗ write", err)
         self.assertIn("compacted", err)
         self.assertIn("route failed", err)
+        self.assertIn("preparing workspace context", err)
+        self.assertIn("model working · chatgpt/test-model · turn 1", err)
+        self.assertEqual(err.count("preparing tool call"), 1)
+        self.assertIn("preparing tool call · read_file", err)
+        self.assertIn("provider retry 2/5 in 1s", err)
+        self.assertIn("running verification", err)
+        self.assertIn("still working · processing model response · 10s elapsed", err)
 
         request = ApprovalRequest(
             tool_name="shell",
@@ -498,7 +523,7 @@ class CLITests(unittest.TestCase):
                 history_enabled=False,
             )
             cancel = Mock(return_value=True)
-            shell.runner = SimpleNamespace(cancel=cancel)
+            shell.runner = cast(Any, SimpleNamespace(cancel=cancel))
             shell._active_session_id = "sess_test"
             task = FakeTask()
             shell._active_task = task  # type: ignore[assignment]

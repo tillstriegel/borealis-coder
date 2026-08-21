@@ -32,4 +32,11 @@ def compact_messages(messages: list[Message], *, keep_recent: int = 18, summary_
             summary_lines.append(f"TOOL {message.tool_name or message.tool_call_id} [{status}]: " + truncate_text(message.content.strip(), 700))
     summary_lines.append("</deterministic_conversation_summary>")
     summary = truncate_text("\n".join(summary_lines), summary_chars)
-    return [Message(role=Role.USER, content=summary, metadata={"compacted": True, "source_messages": len(older)})] + recent
+    return [
+        Message(
+            role=Role.USER,
+            content=summary,
+            metadata={"compacted": True, "source_messages": len(older)},
+        ),
+        *recent,
+    ]

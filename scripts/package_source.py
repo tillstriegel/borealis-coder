@@ -21,8 +21,9 @@ EXCLUDED_PARTS = {
     ".venv",
     "__pycache__",
     "build",
+    "dist",
 }
-EXCLUDED_NAMES = {".coverage", "SOURCE_FILES.json"}
+EXCLUDED_NAMES = {".coverage", ".DS_Store", "SOURCE_FILES.json"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 
 
@@ -79,7 +80,7 @@ def build_zip(output: Path) -> dict[str, object]:
     output.parent.mkdir(parents=True, exist_ok=True)
     files = included_files()
     manifest = write_source_manifest(files)
-    files = included_files() + [manifest]
+    files = [*included_files(), manifest]
     files = sorted(set(files), key=lambda item: item.relative_to(ROOT).as_posix())
 
     temporary = output.with_suffix(output.suffix + ".tmp")

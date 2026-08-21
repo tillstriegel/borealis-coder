@@ -7,23 +7,40 @@ import contextlib
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..config import Config
 from ..context import ContextBuilder
 from ..errors import (
-    BudgetExceeded, Cancelled, ProviderContextOverflowError, ProviderError,
-    ProviderRateLimitError, ProviderUnavailableError, SessionError,
+    BudgetExceeded,
+    Cancelled,
+    ProviderContextOverflowError,
+    ProviderError,
+    ProviderRateLimitError,
+    ProviderUnavailableError,
+    SessionError,
 )
 from ..events import EventBus
-from ..models import AgentResult, Message, ModelResponse, ProviderRequest, Role, StopReason, ToolCall, Usage
+from ..models import (
+    AgentResult,
+    Message,
+    ModelResponse,
+    ProviderRequest,
+    Role,
+    StopReason,
+    ToolCall,
+    Usage,
+)
 from ..providers.base import Provider
-from ..sessions import SessionStore
 from ..safety import ApprovalManager
+from ..sessions import SessionStore
 from ..tools import ToolContext, ToolRegistry, VerificationPlanner
 from ..util import json_dumps, new_id, truncate_text
 from .budget import Budget, estimate_request_tokens
 from .compaction import compact_messages
+
+if TYPE_CHECKING:
+    from ..mcp import MCPManager
 
 
 @dataclass(slots=True)
@@ -63,7 +80,7 @@ class AgentRunner:
             asyncio.Queue[tuple[str, str | None, dict[str, Any]]],
         ] = {}
         self._approval_managers: dict[str, ApprovalManager] = {}
-        self.mcp_manager = None
+        self.mcp_manager: MCPManager | None = None
 
 
     async def close(self) -> None:
@@ -242,7 +259,7 @@ class AgentRunner:
         verification: dict[str, Any] | None = None
         compacted = False
         try:
-            system = self.context_builder.system_prompt(query=prompt)
+            system = await asyncio.to_thread(self.context_builder.system_prompt, query=prompt)
             while True:
                 self._check_cancel(cancel)
                 budget.before_turn()
@@ -284,7 +301,15 @@ class AgentRunner:
                     parallel_tool_calls=True,
                     metadata={"session_id": session_id, "run_id": run_id},
                 )
-                await self.events.emit("model.started", session_id=session_id, run_id=run_id, turn=budget.turns, estimated_input_tokens=estimated)
+                await self.events.emit(
+                    "model.started",
+                    session_id=session_id,
+                    run_id=run_id,
+                    turn=budget.turns,
+                    estimated_input_tokens=estimated,
+                    provider=self.providers[0].name,
+                    model=self.providers[0].model,
+                )
                 assistant_message_id = new_id("msg")
                 try:
                     response, used_route = await self._complete_with_fallback(
@@ -371,6 +396,11 @@ class AgentRunner:
                 await self._drain_steering(session_id, run_id, messages)
             if context.changed_files and self.config.agent.auto_verify:
                 planner = VerificationPlanner(self.workspace)
+                await self.events.emit(
+                    "verification.started",
+                    session_id=session_id,
+                    run_id=run_id,
+                )
                 report = await planner.run(context)
                 verification = report.to_dict()
                 await self.events.emit("verification.completed", session_id=session_id, run_id=run_id, **verification)
@@ -489,7 +519,7 @@ class AgentRunner:
             try:
                 stream = route.provider.stream(request).__aiter__()
                 while True:
-                    next_item = asyncio.create_task(anext(stream))
+                    next_item = asyncio.ensure_future(anext(stream))
                     cancelled = asyncio.create_task(cancel.wait())
                     done, _ = await asyncio.wait(
                         {next_item, cancelled},
@@ -532,10 +562,25 @@ class AgentRunner:
                         f"Provider {route.name} stream ended without a completed response", retryable=True
                     )
                 return completed
-            except (ProviderUnavailableError, ProviderRateLimitError):
+            except (ProviderUnavailableError, ProviderRateLimitError) as error:
                 if emitted or attempt + 1 >= attempts:
                     raise
-                await asyncio.sleep(min(route.provider.config.max_backoff_seconds, max(0.25, delay)))
+                retry_delay = min(
+                    route.provider.config.max_backoff_seconds,
+                    max(0.25, delay),
+                )
+                await self.events.emit(
+                    "model.retrying",
+                    session_id=session_id,
+                    run_id=run_id,
+                    provider=route.name,
+                    model=route.model,
+                    attempt=attempt + 2,
+                    max_attempts=attempts,
+                    delay_seconds=retry_delay,
+                    error=str(error),
+                )
+                await asyncio.sleep(retry_delay)
                 delay = max(0.25, delay * 2)
         raise ProviderUnavailableError(f"Provider {route.name} exhausted retries", retryable=False)
 

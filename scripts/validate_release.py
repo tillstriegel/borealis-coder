@@ -9,11 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from borealis_coder import __version__
-from borealis_coder.tools import build_builtin_registry
-
-
 def main() -> int:
+    from borealis_coder import __version__
+    from borealis_coder.tools import build_builtin_registry
+
     errors: list[str] = []
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     if f'version = "{__version__}"' not in pyproject:

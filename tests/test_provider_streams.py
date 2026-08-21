@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import unittest
 from collections.abc import AsyncIterator
-from unittest.mock import patch
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
 
 from borealis_coder.config import ProviderConfig
 from borealis_coder.errors import (
@@ -14,15 +15,19 @@ from borealis_coder.errors import (
     ProviderUnavailableError,
 )
 from borealis_coder.models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
-from borealis_coder.providers.anthropic import AnthropicProvider, _parse_arguments as anthropic_args
+from borealis_coder.providers.anthropic import AnthropicProvider
+from borealis_coder.providers.anthropic import _parse_arguments as anthropic_args
 from borealis_coder.providers.base import Provider, classify_provider_error
-from borealis_coder.providers.gemini import GeminiProvider, _parse_arguments as gemini_args
+from borealis_coder.providers.gemini import GeminiProvider
+from borealis_coder.providers.gemini import _parse_arguments as gemini_args
 from borealis_coder.providers.http import HttpResponse, SSEEvent
 from borealis_coder.providers.openai import (
     OpenAICompatibleProvider,
     OpenAIProvider,
-    _parse_arguments as openai_args,
     _strict_schema_compatible,
+)
+from borealis_coder.providers.openai import (
+    _parse_arguments as openai_args,
 )
 from borealis_coder.tools.base import object_schema
 
@@ -102,7 +107,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             return "done"
 
         with patch("borealis_coder.providers.base.random.uniform", return_value=1.0), patch(
-            "borealis_coder.providers.base.asyncio.sleep", new=unittest.mock.AsyncMock()
+            "borealis_coder.providers.base.asyncio.sleep", new=AsyncMock()
         ):
             self.assertEqual(await provider.with_retries(eventually), "done")
         self.assertEqual(attempts, 3)
@@ -129,9 +134,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         async def os_failure() -> str:
             raise OSError("socket")
 
-        with patch("borealis_coder.providers.base.asyncio.sleep", new=unittest.mock.AsyncMock()):
-            with self.assertRaises(ProviderUnavailableError):
-                await provider.with_retries(os_failure)
+        with (
+            patch(
+                "borealis_coder.providers.base.asyncio.sleep",
+                new=AsyncMock(),
+            ),
+            self.assertRaises(ProviderUnavailableError),
+        ):
+            await provider.with_retries(os_failure)
 
     async def test_openai_responses_stream_complete_and_partial(self) -> None:
         provider = OpenAIProvider(
@@ -207,6 +217,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         provider.http = FakeHttp(events=events)  # type: ignore[assignment]
         streamed = [item async for item in provider.stream(self.request)]
         self.assertEqual([item.type for item in streamed], ["text_delta", "tool_call_delta", "completed"])
+        self.assertEqual(streamed[1].data["name"], "read_file")
         final = streamed[-1].response
         self.assertIsNotNone(final)
         assert final is not None
@@ -346,7 +357,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             ),
             SSEEvent("message", "[DONE]"),
         ]
-        provider.http = FakeHttp(events=chunks)  # type: ignore[assignment]
+        cast(Any, provider).http = FakeHttp(events=chunks)
         streamed = [item async for item in provider.stream(self.request)]
         final = streamed[-1].response
         assert final is not None
@@ -356,7 +367,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.response_id, "chat1")
         self.assertEqual(final.usage.cached_input_tokens, 3)
 
-        provider.http = FakeHttp(
+        cast(Any, provider).http = FakeHttp(
             data={
                 "id": "c2",
                 "model": "m",
@@ -495,8 +506,10 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
         ]
-        provider.http = FakeHttp(events=events)  # type: ignore[assignment]
+        cast(Any, provider).http = FakeHttp(events=events)
         streamed = [item async for item in provider.stream(self.request)]
+        tool_delta = next(item for item in streamed if item.type == "tool_call_delta")
+        self.assertEqual(tool_delta.data["name"], "read_file")
         final = streamed[-1].response
         assert final is not None
         self.assertEqual(final.text, "checking")
@@ -511,7 +524,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(anthropic_args("[1]"), {"value": [1]})
         self.assertEqual(anthropic_args("bad"), {"_raw": "bad"})
 
-        provider.http = FakeHttp(
+        cast(Any, provider).http = FakeHttp(
             data={
                 "id": "a2",
                 "model": "claude",
@@ -574,6 +587,8 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         ]
         provider.http = FakeHttp(events=events)  # type: ignore[assignment]
         partial_events = [item async for item in provider.stream(self.request)]
+        tool_delta = next(item for item in partial_events if item.type == "tool_call_delta")
+        self.assertEqual(tool_delta.data["name"], "read_file")
         partial = partial_events[-1].response
         assert partial is not None
         self.assertEqual(partial.text, "yes")

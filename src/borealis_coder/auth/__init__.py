@@ -15,8 +15,8 @@ from .chatgpt import (
 __all__ = [
     "CHATGPT_CODEX_BASE_URL",
     "ChatGPTCredentialManager",
-    "ChatGPTCredentials",
     "ChatGPTCredentialStatus",
+    "ChatGPTCredentials",
     "candidate_auth_files",
     "custom_chatgpt_endpoints_allowed",
     "has_chatgpt_credentials",

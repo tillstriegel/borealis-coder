@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import urllib.error
@@ -181,10 +182,8 @@ class StdioMCPClient(MCPClient):
         for task in (self._reader_task, self._stderr_task):
             if task:
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
         self.process = None
 
 

@@ -8,8 +8,8 @@ from collections.abc import Callable
 from ..config import Config, ProviderConfig
 from ..errors import ConfigurationError
 from .anthropic import AnthropicProvider
-from .chatgpt import ChatGPTProvider
 from .base import Provider
+from .chatgpt import ChatGPTProvider
 from .gemini import GeminiProvider
 from .mock import MockProvider
 from .openai import OpenAICompatibleProvider, OpenAIProvider
@@ -20,7 +20,7 @@ ProviderFactory = Callable[[ProviderConfig, str], Provider]
 
 class ProviderRegistry:
     @classmethod
-    def with_defaults(cls) -> "ProviderRegistry":
+    def with_defaults(cls) -> ProviderRegistry:
         """Return an independent registry containing all built-in providers."""
         return cls()
 

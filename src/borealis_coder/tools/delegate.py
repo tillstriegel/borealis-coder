@@ -50,7 +50,9 @@ class DelegateTaskTool(Tool):
                 parallel_tool_calls=True,
                 metadata={"parent_session_id": context.session_id, "delegated": True},
             )
-            response = await route.provider.with_retries(lambda: route.provider.complete(request))
+            response = await route.provider.with_retries(
+                lambda request=request: route.provider.complete(request)
+            )
             usage.add(response.usage)
             assistant = Message(role=Role.ASSISTANT, content=response.text, tool_calls=response.tool_calls)
             messages.append(assistant)

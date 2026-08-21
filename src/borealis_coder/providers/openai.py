@@ -125,7 +125,12 @@ class OpenAIProvider(Provider):
                 call = calls.setdefault(key, {"id": key, "name": "", "arguments": ""})
                 call["arguments"] += str(data.get("delta") or "")
                 yield ProviderStreamEvent(
-                    type="tool_call_delta", data={"id": key, "delta": data.get("delta", "")}
+                    type="tool_call_delta",
+                    data={
+                        "id": key,
+                        "name": call.get("name", ""),
+                        "delta": data.get("delta", ""),
+                    },
                 )
             elif event_type in {"response.completed", "response.done"}:
                 final_data = data.get("response") if isinstance(data.get("response"), dict) else data
@@ -356,7 +361,12 @@ class OpenAIProvider(Provider):
                     call["arguments"] += str(function.get("arguments") or "")
                     yield ProviderStreamEvent(
                         type="tool_call_delta",
-                        data={"index": index, "id": call["id"], "delta": function.get("arguments", "")},
+                        data={
+                            "index": index,
+                            "id": call["id"],
+                            "name": call["name"],
+                            "delta": function.get("arguments", ""),
+                        },
                     )
         result = ModelResponse(
             text="".join(text_parts),

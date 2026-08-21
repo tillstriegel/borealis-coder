@@ -11,7 +11,12 @@ from borealis_coder.config import ProviderConfig, SafetyConfig, SandboxConfig
 from borealis_coder.models import Message, ModelResponse, Role, ToolCall, Usage
 from borealis_coder.providers.base import Provider
 from borealis_coder.providers.registry import ProviderRegistry
-from borealis_coder.safety import DockerProcessDriver, NativeProcessDriver, ProcessResult, WorkspaceRoots
+from borealis_coder.safety import (
+    DockerProcessDriver,
+    NativeProcessDriver,
+    ProcessResult,
+    WorkspaceRoots,
+)
 from borealis_coder.tools import build_builtin_registry
 from borealis_coder.tools.verification import VerificationPlanner, VerificationStep
 from tests.helpers import make_config, make_context
@@ -98,6 +103,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 driver = DockerProcessDriver(roots, safety, sandbox)
                 result = await driver.run("python -V", cwd=subdir, timeout=10, shell=True)
             self.assertTrue(result.ok)
+            assert native_run.await_args is not None
             argv = native_run.await_args.args[0]
             self.assertIn("--read-only", argv)
             self.assertIn("--cap-drop", argv)

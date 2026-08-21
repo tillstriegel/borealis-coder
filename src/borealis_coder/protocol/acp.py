@@ -159,7 +159,7 @@ class ACPServer:
         page = sessions[cursor : cursor + 100]
         for item in page:
             self.session_locations[item.id] = runner.sessions.path
-        result = {
+        result: dict[str, Any] = {
             "sessions": [
                 {
                     "sessionId": item.id, "cwd": item.workspace, "title": item.title,
@@ -465,4 +465,4 @@ def _decode_cursor(value: Any) -> int:
     try:
         return max(0, int(base64.urlsafe_b64decode(str(value)).decode()))
     except (ValueError, TypeError, binascii.Error, UnicodeDecodeError):
-        raise ProtocolError("Invalid session/list cursor")
+        raise ProtocolError("Invalid session/list cursor") from None

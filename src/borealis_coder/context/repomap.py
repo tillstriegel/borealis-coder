@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -104,7 +105,7 @@ class RepoMap:
         except OSError:
             return FileSummary(relative, language, size=size)
         if path.suffix.lower() in {".py", ".pyi"}:
-            symbols, imports = _python_symbols(text)
+            symbols, imports = _python_symbols(text, filename=relative)
         else:
             symbols = []
             for pattern in _SYMBOL_PATTERNS:
@@ -128,9 +129,14 @@ class RepoMap:
         return [line[3:].strip().split(" -> ")[-1] for line in result.stdout.splitlines() if len(line) > 3]
 
 
-def _python_symbols(text: str) -> tuple[list[str], list[str]]:
+def _python_symbols(text: str, *, filename: str = "<unknown>") -> tuple[list[str], list[str]]:
     try:
-        tree = ast.parse(text)
+        # Repository-map discovery is not a Python validation pass. Invalid
+        # escape warnings in workspace files must not leak into the interactive
+        # terminal while Borealis is assembling model context.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(text, filename=filename)
     except SyntaxError:
         symbols = []
         for pattern in _SYMBOL_PATTERNS:

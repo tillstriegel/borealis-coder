@@ -116,7 +116,12 @@ class GeminiProvider(Provider):
                     call["arguments"] += partial
                     yield ProviderStreamEvent(
                         type="tool_call_delta",
-                        data={"index": index, "id": call.get("id", ""), "delta": partial},
+                        data={
+                            "index": index,
+                            "id": call.get("id", ""),
+                            "name": call.get("name", ""),
+                            "delta": partial,
+                        },
                     )
             elif event_type in {"interaction.completed", "interaction.complete"}:
                 final_data = data.get("interaction") if isinstance(data.get("interaction"), dict) else data

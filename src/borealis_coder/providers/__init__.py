@@ -8,9 +8,9 @@ from .openrouter import OpenRouterProvider
 from .registry import DEFAULT_PROVIDER_REGISTRY, ProviderRegistry
 
 __all__ = [
+    "DEFAULT_PROVIDER_REGISTRY",
     "AnthropicProvider",
     "ChatGPTProvider",
-    "DEFAULT_PROVIDER_REGISTRY",
     "GeminiProvider",
     "MockProvider",
     "OpenAICompatibleProvider",

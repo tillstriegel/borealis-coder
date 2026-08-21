@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
-from borealis_coder.context import ContextBuilder, IgnoreMatcher, InstructionLoader, RepoMap, SkillCatalog, repository_files
+from borealis_coder.context import (
+    ContextBuilder,
+    IgnoreMatcher,
+    InstructionLoader,
+    RepoMap,
+    SkillCatalog,
+    repository_files,
+)
 from tests.helpers import make_config
 
 
@@ -38,7 +46,9 @@ class ContextTests(unittest.TestCase):
         applicable = loader.for_path(self.root / "src/main.py")
         self.assertEqual([item.relative_path for item in applicable], ["AGENTS.md", "src/AGENTS.md"])
         catalog = SkillCatalog(self.root, [".agents/skills"])
-        self.assertEqual(catalog.get("review").description, "Review code carefully")
+        review = catalog.get("review")
+        assert review is not None
+        self.assertEqual(review.description, "Review code carefully")
 
     def test_repo_map_ranking_and_system_prompt(self):
         matcher = IgnoreMatcher(self.root, ignored_dirs=self.config.context.ignored_dirs)
@@ -48,6 +58,18 @@ class ContextTests(unittest.TestCase):
         prompt = ContextBuilder(self.root, self.config).system_prompt(query="Engine")
         self.assertIn("Always run tests", prompt)
         self.assertIn("Review code carefully", prompt)
+
+    def test_repo_map_does_not_leak_workspace_syntax_warnings(self):
+        source = self.root / "src/warning.py"
+        source.write_text('pattern = "\\s+"\nclass WarningSource:\n    pass\n')
+        matcher = IgnoreMatcher(self.root, ignored_dirs=self.config.context.ignored_dirs)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            output = RepoMap(self.root, matcher).build(query="WarningSource", max_chars=5000)
+
+        self.assertIn("src/warning.py", output)
+        self.assertFalse(any(item.category is SyntaxWarning for item in caught))
 
     def test_external_instruction_and_skill_symlinks_are_ignored(self):
         with tempfile.TemporaryDirectory() as outside:

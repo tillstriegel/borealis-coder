@@ -97,7 +97,7 @@ def _resolve_public_url(
         records = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror as error:
         raise ToolError(f"Could not resolve URL host: {error}") from error
-    addresses = tuple(dict.fromkeys(record[4][0] for record in records))
+    addresses = tuple(dict.fromkeys(str(record[4][0]) for record in records))
     if not addresses:
         raise ToolError("URL hostname resolved to no addresses")
     for value in addresses:
@@ -155,15 +155,13 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         port: int,
         timeout: int,
     ) -> None:
-        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._ssl_context = ssl.create_default_context()
+        super().__init__(host, port=port, timeout=timeout, context=self._ssl_context)
         self._pinned_address = address
 
     def connect(self) -> None:
         self.sock = socket.create_connection(
             (self._pinned_address, self.port),
             self.timeout,
-            self.source_address,
         )
-        if self._tunnel_host:
-            self._tunnel()
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+        self.sock = self._ssl_context.wrap_socket(self.sock, server_hostname=self.host)

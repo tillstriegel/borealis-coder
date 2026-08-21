@@ -5,7 +5,13 @@ from pathlib import Path
 from borealis_coder.config import Config, load_config
 from borealis_coder.context import ContextBuilder
 from borealis_coder.events import EventBus
-from borealis_coder.safety import ApprovalManager, CheckpointManager, PolicyEngine, WorkspaceRoots, build_process_driver
+from borealis_coder.safety import (
+    ApprovalManager,
+    CheckpointManager,
+    PolicyEngine,
+    WorkspaceRoots,
+    build_process_driver,
+)
 from borealis_coder.tools import ToolContext
 
 

@@ -10,7 +10,7 @@ import signal
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..config import SandboxConfig, SafetyConfig
+from ..config import SafetyConfig, SandboxConfig
 from ..errors import ToolError
 from ..util import monotonic_ms, truncate_text
 from .paths import WorkspaceRoots

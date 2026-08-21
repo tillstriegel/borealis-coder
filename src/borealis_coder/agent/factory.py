@@ -7,10 +7,16 @@ from pathlib import Path
 from ..config import Config, load_config
 from ..context import ContextBuilder
 from ..events import EventBus, JsonlTrace
-from ..plugins import load_entrypoint_tools, load_workspace_plugins
 from ..mcp import MCPManager
+from ..plugins import load_entrypoint_tools, load_workspace_plugins
 from ..providers.registry import DEFAULT_PROVIDER_REGISTRY, ProviderRegistry
-from ..safety import ApprovalManager, CheckpointManager, PolicyEngine, WorkspaceRoots, build_process_driver
+from ..safety import (
+    ApprovalManager,
+    CheckpointManager,
+    PolicyEngine,
+    WorkspaceRoots,
+    build_process_driver,
+)
 from ..sessions import SessionStore
 from ..tools import ToolContext, build_builtin_registry
 from .runner import AgentRunner, ProviderRoute

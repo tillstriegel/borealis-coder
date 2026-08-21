@@ -24,7 +24,7 @@ class FakeResponse:
         self.headers = headers or {"Content-Type": "application/json"}
         self.lines = iter(lines or [])
 
-    def __enter__(self) -> "FakeResponse":
+    def __enter__(self) -> FakeResponse:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -60,23 +60,32 @@ class HttpTransportTests(unittest.IsolatedAsyncioTestCase):
         http_error = urllib.error.HTTPError(
             "https://example.test", 429, "rate", headers, io.BytesIO(b'{"error":{"message":"slow down"}}')
         )
-        with patch("borealis_coder.providers.http.urllib.request.urlopen", side_effect=http_error):
-            with self.assertRaisesRegex(ProviderRateLimitError, "slow down"):
-                await client.post_json("https://example.test", payload={})
+        with (
+            patch(
+                "borealis_coder.providers.http.urllib.request.urlopen",
+                side_effect=http_error,
+            ),
+            self.assertRaisesRegex(ProviderRateLimitError, "slow down"),
+        ):
+            await client.post_json("https://example.test", payload={})
 
         text_error = urllib.error.HTTPError(
             "https://example.test", 400, "bad", headers, io.BytesIO(b"not json")
         )
-        with patch("borealis_coder.providers.http.urllib.request.urlopen", side_effect=text_error):
-            with self.assertRaises(ProviderError):
-                await client.post_json("https://example.test", payload={})
+        with (
+            patch(
+                "borealis_coder.providers.http.urllib.request.urlopen",
+                side_effect=text_error,
+            ),
+            self.assertRaises(ProviderError),
+        ):
+            await client.post_json("https://example.test", payload={})
 
         with patch(
             "borealis_coder.providers.http.urllib.request.urlopen",
             side_effect=urllib.error.URLError("offline"),
-        ):
-            with self.assertRaisesRegex(ProviderError, "offline"):
-                await client.post_json("https://example.test", payload={})
+        ), self.assertRaisesRegex(ProviderError, "offline"):
+            await client.post_json("https://example.test", payload={})
 
     async def test_stream_sse_parsing_and_errors(self) -> None:
         lines = [
@@ -102,16 +111,20 @@ class HttpTransportTests(unittest.IsolatedAsyncioTestCase):
         http_error = urllib.error.HTTPError(
             "https://x", 503, "down", headers, io.BytesIO(b'{"error":"unavailable"}')
         )
-        with patch("borealis_coder.providers.http.urllib.request.urlopen", side_effect=http_error):
-            with self.assertRaises(ProviderUnavailableError):
-                _ = [item async for item in HttpClient().stream_sse("https://x", payload={})]
+        with (
+            patch(
+                "borealis_coder.providers.http.urllib.request.urlopen",
+                side_effect=http_error,
+            ),
+            self.assertRaises(ProviderUnavailableError),
+        ):
+            _ = [item async for item in HttpClient().stream_sse("https://x", payload={})]
 
         with patch(
             "borealis_coder.providers.http.urllib.request.urlopen",
             side_effect=RuntimeError("thread failed"),
-        ):
-            with self.assertRaisesRegex(ProviderError, "thread failed"):
-                _ = [item async for item in HttpClient().stream_sse("https://x", payload={})]
+        ), self.assertRaisesRegex(ProviderError, "thread failed"):
+            _ = [item async for item in HttpClient().stream_sse("https://x", payload={})]
 
     def test_decode_and_error_message_helpers(self) -> None:
         self.assertEqual(HttpClient._decode(b"[1,2]", {}), [1, 2])

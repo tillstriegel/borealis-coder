@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,9 @@ class ConsoleRenderer:
         self._streamed_text = ""
         self._line_open = False
         self._assistant_started = False
+        self._tool_call_announced = False
+        self._activity_generation = 0
+        self._activity_phase = ""
 
     @property
     def text_stream(self) -> TextIO:
@@ -54,12 +58,28 @@ class ConsoleRenderer:
     def status_stream(self) -> TextIO:
         return self._status_stream or sys.stderr
 
+    @property
+    def activity_generation(self) -> int:
+        return self._activity_generation
+
     def reset_turn(self) -> None:
         self.printed_text = False
         self._rendered_texts = []
         self._streamed_text = ""
         self._line_open = False
         self._assistant_started = False
+        self._tool_call_announced = False
+        self._activity_phase = ""
+
+    def heartbeat(self, elapsed_seconds: int) -> None:
+        if not self._activity_phase:
+            return
+        self._ensure_line_break()
+        print(
+            f"… still working · {self._activity_phase} · {elapsed_seconds}s elapsed",
+            file=self.status_stream,
+            flush=True,
+        )
 
     def finish_turn(self) -> None:
         self._ensure_line_break()
@@ -74,16 +94,56 @@ class ConsoleRenderer:
         if self.quiet:
             return
 
+        self._activity_generation += 1
+
+        if event.type == "run.started":
+            self._activity_phase = "preparing workspace context"
+            self._ensure_line_break()
+            print("… preparing workspace context", file=self.status_stream, flush=True)
+            return
         if event.type == "model.started":
             self._begin_model_exchange()
+            provider = str(event.data.get("provider") or "provider")
+            model = str(event.data.get("model") or "model")
+            turn = event.data.get("turn")
+            turn_label = f" · turn {turn}" if turn is not None else ""
+            self._activity_phase = f"waiting for {provider}/{model}"
+            print(
+                f"… model working · {provider}/{model}{turn_label}",
+                file=self.status_stream,
+                flush=True,
+            )
             return
         if event.type == "model.text_delta":
             self._render_text_delta(str(event.data.get("text") or ""))
             return
+        if event.type == "model.tool_call_delta":
+            self._activity_phase = "preparing tool call"
+            if not self._tool_call_announced:
+                self._ensure_line_break()
+                name = str(event.data.get("name") or "").strip()
+                suffix = f" · {name}" if name else ""
+                print(f"… preparing tool call{suffix}", file=self.status_stream, flush=True)
+                self._tool_call_announced = True
+            return
+        if event.type == "model.retrying":
+            self._ensure_line_break()
+            attempt = event.data.get("attempt")
+            max_attempts = event.data.get("max_attempts")
+            delay = float(event.data.get("delay_seconds") or 0)
+            self._activity_phase = f"waiting to retry {event.data.get('provider') or 'provider'}"
+            print(
+                f"↻ provider retry {attempt}/{max_attempts} in {delay:g}s",
+                file=self.status_stream,
+                flush=True,
+            )
+            return
         if event.type == "model.completed":
+            self._activity_phase = "processing model response"
             self._render_completed_text(str(event.data.get("text") or ""))
             return
         if event.type == "tool.started":
+            self._activity_phase = f"running {event.data.get('tool') or 'tool'}"
             self._ensure_line_break()
             print(
                 f"→ {_tool_label(event.data.get('tool'), event.data.get('arguments'))}",
@@ -92,6 +152,7 @@ class ConsoleRenderer:
             )
             return
         if event.type == "tool.completed":
+            self._activity_phase = "processing tool result"
             self._ensure_line_break()
             marker = "✗" if event.data.get("is_error") else "✓"
             duration = event.data.get("metadata", {}).get("duration_ms", 0)
@@ -110,6 +171,11 @@ class ConsoleRenderer:
         if event.type == "tool.cancelled":
             self._ensure_line_break()
             print(f"■ {event.data.get('tool')} cancelled", file=self.status_stream)
+            return
+        if event.type == "verification.started":
+            self._activity_phase = "running verification"
+            self._ensure_line_break()
+            print("… running verification", file=self.status_stream, flush=True)
             return
         if event.type == "verification.completed":
             self._ensure_line_break()
@@ -132,14 +198,19 @@ class ConsoleRenderer:
             )
             return
         if event.type == "run.error":
+            self._activity_phase = ""
             self._ensure_line_break()
             print(f"✗ {event.data.get('error')}", file=self.status_stream)
+            return
+        if event.type == "run.completed":
+            self._activity_phase = ""
 
     def _begin_model_exchange(self) -> None:
         self._ensure_line_break()
         self.printed_text = False
         self._streamed_text = ""
         self._assistant_started = False
+        self._tool_call_announced = False
 
     def _start_assistant_block(self) -> None:
         if self._assistant_started:
@@ -220,17 +291,13 @@ class ReadlineHistory:
         self._readline = readline
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.is_file():
-            try:
+            with contextlib.suppress(OSError):
                 readline.read_history_file(str(self.path))
-            except OSError:
-                pass
         readline.set_history_length(self.max_entries)
         self._previous_completer = readline.get_completer()
         readline.set_completer(self._complete)
-        try:
+        with contextlib.suppress(Exception):
             readline.parse_and_bind("tab: complete")
-        except Exception:
-            pass
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:  # type: ignore[no-untyped-def]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 from collections.abc import Awaitable, Callable
@@ -18,6 +19,7 @@ class JsonRpcConnection:
         self.handler = handler
         self._write_lock = asyncio.Lock()
         self._pending: dict[str | int, asyncio.Future[Any]] = {}
+        self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._counter = 10_000
         self.closed = False
 
@@ -35,8 +37,14 @@ class JsonRpcConnection:
             except json.JSONDecodeError as error:
                 await self.send_error(None, -32700, f"Parse error: {error}")
                 continue
-            asyncio.create_task(self._dispatch(message))
+            task = asyncio.create_task(self._dispatch(message))
+            self._dispatch_tasks.add(task)
+            task.add_done_callback(self._finish_dispatch)
         self.closed = True
+        for task in self._dispatch_tasks:
+            task.cancel()
+        if self._dispatch_tasks:
+            await asyncio.gather(*self._dispatch_tasks, return_exceptions=True)
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(ProtocolError("JSON-RPC connection closed"))
@@ -47,7 +55,11 @@ class JsonRpcConnection:
             return
         if "method" not in message:
             request_id = message.get("id")
-            future = self._pending.get(request_id)
+            future = (
+                self._pending.get(request_id)
+                if isinstance(request_id, str | int)
+                else None
+            )
             if future and not future.done():
                 if "error" in message:
                     error = message["error"]
@@ -71,6 +83,11 @@ class JsonRpcConnection:
         except Exception as error:
             if "id" in message:
                 await self.send_error(message["id"], -32603, f"{type(error).__name__}: {error}")
+
+    def _finish_dispatch(self, task: asyncio.Task[None]) -> None:
+        self._dispatch_tasks.discard(task)
+        with contextlib.suppress(asyncio.CancelledError):
+            task.exception()
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:
         await self._write({"jsonrpc": "2.0", "method": method, "params": params})

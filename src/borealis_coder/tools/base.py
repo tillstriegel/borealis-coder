@@ -43,7 +43,7 @@ class ToolContext:
 class Tool:
     name: str = "tool"
     description: str = ""
-    parameters: dict[str, Any] = {
+    parameters: dict[str, Any] = {  # noqa: RUF012 - subclasses override this schema
         "type": "object",
         "properties": {},
         "required": [],

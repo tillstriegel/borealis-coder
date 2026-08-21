@@ -2,26 +2,25 @@
   "artifact": "Borealis Coder",
   "distributions": [
     {
-      "bytes": 135861,
+      "bytes": 137371,
       "name": "borealis_coder-0.1.3-py3-none-any.whl",
-      "sha256": "6cf209195407b9e6e30a711239bc18b10b288e04fdca1a4751d431cce8e58ecb"
+      "sha256": "1f69a087278cae8996727fc57ad353804148c92e48d04e68a6438af77961bee8"
     },
     {
-      "bytes": 182577,
+      "bytes": 185314,
       "name": "borealis_coder-0.1.3.tar.gz",
-      "sha256": "a60a476782d7b91447f015efdc72248177a3b5fbb8acfbba0c4a58b839ef68e4"
+      "sha256": "4206e4330332b06859e05f5631cf18eea7b7bd6b3f0480682da6de2146f894f6"
     }
   ],
   "environment": {
     "platform": "macOS-arm64",
     "python": "3.11.15 and 3.14"
   },
-  "generated_at": "2026-08-21T08:54:00+00:00",
+  "generated_at": "2026-08-21T12:02:21+00:00",
   "not_executed_in_this_environment": [
     "Live billable provider canaries for OpenRouter, OpenAI API, Anthropic, Gemini, and compatible endpoints",
     "Turn cancellation against a live, slow provider stream; the interactive signal path and runner cancellation paths were validated deterministically",
     "Docker-driver execution against a running Docker daemon",
-    "Pyright locally because it was unavailable; it remains required by CI",
     "Python 3.12 and 3.13 locally; CI is configured for Python 3.11-3.13 across Linux, macOS, and Windows",
     "Build-isolated source-distribution installation with downloaded build requirements; the sdist installed with the locally available setuptools backend",
     "Independent third-party security audit"
@@ -31,9 +30,9 @@
   "source": {
     "license": "MIT",
     "python_source_files": 64,
-    "python_source_lines": 10253,
+    "python_source_lines": 10495,
     "runtime_dependency_count": 0,
-    "test_lines": 3330,
+    "test_lines": 3450,
     "test_modules": 16
   },
   "validation": {
@@ -42,12 +41,12 @@
     "compileall": "passed",
     "coverage": {
       "branch_measurement_enabled": true,
-      "branch_percent": 63.74,
-      "branches": 1936,
-      "combined_percent": 76.73,
-      "statement_percent": 80.81,
-      "statements": 6170,
-      "status": "previous release measurement; not rerun after remediation",
+      "branch_percent": 63.53,
+      "branches": 2040,
+      "combined_percent": 76.71,
+      "statement_percent": 80.89,
+      "statements": 6446,
+      "status": "passed",
       "threshold_percent": 75
     },
     "installed_cli_offline_eval": "passed",
@@ -73,7 +72,9 @@
     "offline_agent_tool_checkpoint_smoke": "passed",
     "openrouter_regression_suite": "passed",
     "pip_check": "passed",
+    "pyright": "passed with 0 errors",
     "release_schema_secret_hygiene_validator": "passed",
+    "ruff": "passed with 0 findings",
     "sdist_structure": "passed",
     "source_interactive_subprocess_smoke": "passed",
     "source_zip_structure_and_clean_extract": "passed",
@@ -81,8 +82,9 @@
       "errors": 0,
       "failures": 0,
       "status": "passed",
-      "tests": 94
+      "tests": 95
     },
+    "twine_check": "passed",
     "wheel_structure": "passed"
   },
   "version": "0.1.3"

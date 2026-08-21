@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
 import threading
@@ -14,7 +15,7 @@ from .models import Event
 from .safety.redaction import Redactor
 from .util import atomic_write_text, ensure_private_directory, ensure_private_file, json_dumps
 
-EventHandler = Callable[[Event], None | Awaitable[None]]
+EventHandler = Callable[[Event], Awaitable[None] | None]
 
 
 class JsonlTrace:
@@ -49,10 +50,8 @@ class EventBus:
         self._handlers.append(handler)
 
         def unsubscribe() -> None:
-            try:
+            with contextlib.suppress(ValueError):
                 self._handlers.remove(handler)
-            except ValueError:
-                pass
 
         return unsubscribe
 

@@ -6,7 +6,7 @@ import os
 import tomllib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from .errors import ConfigurationError
 from .util import coerce_scalar, deep_merge, ensure_private_directory, set_nested
@@ -242,7 +242,7 @@ class Config:
                     key: "[REDACTED]" if "auth" in key.lower() or "key" in key.lower() else value
                     for key, value in server.get("headers", {}).items()
                 }
-                server["env"] = {key: "[REDACTED]" for key in server.get("env", {})}
+                server["env"] = dict.fromkeys(server.get("env", {}), "[REDACTED]")
         return data
 
 
@@ -333,7 +333,7 @@ DEFAULTS: dict[str, Any] = {
 
 
 def _construct(dataclass_type: type[T], values: dict[str, Any]) -> T:
-    valid = {item.name for item in fields(dataclass_type)}
+    valid = {item.name for item in fields(cast(Any, dataclass_type))}
     unknown = sorted(set(values) - valid)
     if unknown:
         raise ConfigurationError(
