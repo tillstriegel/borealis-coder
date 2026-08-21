@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import shutil
 import signal
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +16,10 @@ from ..config import SafetyConfig, SandboxConfig
 from ..errors import ToolError
 from ..util import monotonic_ms, truncate_text
 from .paths import WorkspaceRoots
+
+# Receives ("stdout" | "stderr", decoded_chunk) as output arrives. May return an
+# awaitable; exceptions raised by the consumer never abort the command itself.
+OutputSink = Callable[[str, str], Awaitable[None] | None]
 
 
 @dataclass(slots=True)
@@ -49,6 +55,7 @@ class ProcessDriver:
         timeout: int,
         env: dict[str, str] | None = None,
         shell: bool = False,
+        on_output: OutputSink | None = None,
     ) -> ProcessResult:
         raise NotImplementedError
 
@@ -67,6 +74,7 @@ class NativeProcessDriver(ProcessDriver):
         timeout: int,
         env: dict[str, str] | None = None,
         shell: bool = False,
+        on_output: OutputSink | None = None,
     ) -> ProcessResult:
         cwd = self.roots.resolve(cwd, must_exist=True, kind="dir").path
         process_env = {key: value for key, value in os.environ.items() if key in self.safety.env_allowlist}
@@ -92,20 +100,49 @@ class NativeProcessDriver(ProcessDriver):
                 creationflags=creationflags,
             )
         timed_out = False
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+
+        async def pump(
+            stream: asyncio.StreamReader | None, sink: list[str], name: str
+        ) -> None:
+            if stream is None:
+                return
+            while True:
+                data = await stream.read(65_536)
+                if not data:
+                    break
+                text = data.decode("utf-8", errors="replace")
+                sink.append(text)
+                if on_output is not None:
+                    try:
+                        outcome = on_output(name, text)
+                        if inspect.isawaitable(outcome):
+                            await outcome
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+
+        pumps = [
+            pump(process.stdout, stdout_parts, "stdout"),
+            pump(process.stderr, stderr_parts, "stderr"),
+            process.wait(),
+        ]
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(process.communicate(), timeout=max(1, timeout))
+            await asyncio.wait_for(asyncio.gather(*pumps), timeout=max(1, timeout))
         except TimeoutError:
             timed_out = True
             await _terminate_process(process)
-            stdout_b, stderr_b = await process.communicate()
+            await asyncio.gather(*pumps, return_exceptions=True)
         except asyncio.CancelledError:
             await _terminate_process(process)
             with contextlib.suppress(Exception):
-                await process.communicate()
+                await asyncio.gather(*pumps, return_exceptions=True)
             raise
         limit = self.safety.max_process_output_chars
-        stdout = truncate_text(stdout_b.decode("utf-8", errors="replace"), limit)
-        stderr = truncate_text(stderr_b.decode("utf-8", errors="replace"), limit)
+        stdout = truncate_text("".join(stdout_parts), limit)
+        stderr = truncate_text("".join(stderr_parts), limit)
         return ProcessResult(
             command=command if isinstance(command, str) else " ".join(command),
             exit_code=process.returncode if process.returncode is not None else -1,
@@ -134,6 +171,7 @@ class DockerProcessDriver(ProcessDriver):
         timeout: int,
         env: dict[str, str] | None = None,
         shell: bool = False,
+        on_output: OutputSink | None = None,
     ) -> ProcessResult:
         resolved = self.roots.resolve(cwd, must_exist=True, kind="dir")
         mount_points: dict[Path, Path] = {self.roots.primary: Path("/workspace")}
@@ -165,7 +203,9 @@ class DockerProcessDriver(ProcessDriver):
         else:
             argv += command
         native = NativeProcessDriver(self.roots, self.safety, self.sandbox)
-        return await native.run(argv, cwd=self.roots.primary, timeout=timeout, shell=False)
+        return await native.run(
+            argv, cwd=self.roots.primary, timeout=timeout, shell=False, on_output=on_output
+        )
 
 
 def build_process_driver(

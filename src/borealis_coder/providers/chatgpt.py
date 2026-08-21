@@ -10,6 +10,7 @@ from ..auth import (
     ChatGPTCredentials,
     validate_chatgpt_api_base_url,
 )
+from ..config import ProviderConfig
 from ..errors import ProviderAuthenticationError, ProviderError
 from ..models import Message, ModelResponse, ProviderRequest, Role
 from .base import ProviderStreamEvent
@@ -26,7 +27,7 @@ class ChatGPTProvider(OpenAIProvider):
 
     name = "chatgpt"
 
-    def __init__(self, config, api_key: str = "") -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, config: ProviderConfig, api_key: str = "") -> None:
         config.base_url = validate_chatgpt_api_base_url(config.base_url, config)
         super().__init__(config, api_key)
         self.credentials = ChatGPTCredentialManager(config)

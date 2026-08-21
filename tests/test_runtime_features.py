@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from borealis_coder.agent import build_runner, compact_messages
+from borealis_coder.agent import build_runner, compact_messages, compact_messages_with_summary
 from borealis_coder.config import ProviderConfig, SafetyConfig, SandboxConfig
 from borealis_coder.models import Message, ModelResponse, Role, ToolCall, Usage
 from borealis_coder.providers.base import Provider
@@ -72,7 +72,69 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         messages=[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(30)]
         compacted=compact_messages(messages, keep_recent=6)
         self.assertTrue(compacted[0].metadata["compacted"])
+        self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
         self.assertEqual([item.content for item in compacted[-6:]], [f"m{i}" for i in range(24,30)])
+
+    async def test_compaction_llm_summary_preserves_tool_output(self):
+        tool_output = "FAILED tests/test_x.py::test_y - AssertionError: expected 4 got 5"
+        messages = [
+            Message(role=Role.USER, content="run the tests"),
+            Message(role=Role.ASSISTANT, content="", tool_calls=[ToolCall(name="shell", arguments={"command":"pytest"})]),
+            Message(role=Role.TOOL, content=tool_output, tool_name="shell"),
+            *[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(20)],
+        ]
+        seen = {}
+
+        async def summarizer(transcript):
+            seen["transcript"] = transcript
+            return "LLM summary: tests failed with AssertionError."
+
+        compacted = await compact_messages_with_summary(messages, summarizer, keep_recent=6)
+        self.assertEqual(compacted[0].metadata["strategy"], "llm")
+        self.assertIn("AssertionError", seen["transcript"])
+        self.assertIn("LLM summary", compacted[0].content)
+        self.assertEqual([item.content for item in compacted[-6:]], [f"m{i}" for i in range(14,20)])
+
+    async def test_compaction_llm_failure_falls_back_to_deterministic(self):
+        messages=[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(30)]
+
+        async def boom(transcript):
+            raise RuntimeError("provider offline")
+
+        compacted = await compact_messages_with_summary(messages, boom, keep_recent=6)
+        self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
+        self.assertTrue(compacted[0].metadata["compacted"])
+
+    async def test_compaction_without_summarizer_is_deterministic(self):
+        messages=[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(30)]
+        compacted = await compact_messages_with_summary(messages, None, keep_recent=6)
+        self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
+
+    async def test_shell_streams_output_events(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            context=make_context(root)
+            registry=build_builtin_registry()
+            events=[]
+            original_emit = context.events.emit
+
+            async def capture(event_type, **kwargs):
+                events.append((event_type, kwargs))
+                return await original_emit(event_type, **kwargs)
+
+            with patch.object(context.events, "emit", side_effect=capture):
+                result = await registry.execute(
+                    ToolCall(name="shell", arguments={"command":"printf line1\\nline2\\n","cwd":".","timeout_seconds":10,"description":"stream"}),
+                    context,
+                )
+            self.assertFalse(result.is_error, result.output)
+            output_events = [item for item in events if item[0] == "tool.output"]
+            self.assertTrue(output_events, "expected incremental tool.output events")
+            combined = "".join(item[1]["text"] for item in output_events)
+            self.assertIn("line1", combined)
+            self.assertIn("line2", combined)
+            for _, kwargs in output_events:
+                self.assertIn(kwargs["stream"], {"stdout", "stderr"})
 
     async def test_verification_commands_pass_through_policy(self):
         with tempfile.TemporaryDirectory() as td:

@@ -37,7 +37,7 @@ from ..sessions import SessionStore
 from ..tools import ToolContext, ToolRegistry, VerificationPlanner
 from ..util import json_dumps, new_id, truncate_text
 from .budget import Budget, estimate_request_tokens
-from .compaction import compact_messages
+from .compaction import Summarizer, compact_messages_with_summary
 
 if TYPE_CHECKING:
     from ..mcp import MCPManager
@@ -283,8 +283,9 @@ class AgentRunner:
                 estimated = estimate_request_tokens(system, messages, schemas)
                 threshold = int(self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio)
                 if estimated >= threshold:
-                    compacted_messages = compact_messages(
+                    compacted_messages = await compact_messages_with_summary(
                         messages,
+                        self._summarizer(),
                         keep_recent=12 if adaptive_cache else 18,
                     )
                     if compacted_messages == messages:
@@ -352,7 +353,9 @@ class AgentRunner:
                 except ProviderContextOverflowError:
                     if compacted:
                         raise
-                    messages = compact_messages(messages, keep_recent=12)
+                    messages = await compact_messages_with_summary(
+                        messages, self._summarizer(), keep_recent=12
+                    )
                     compacted = True
                     await self.events.emit("context.compacted", session_id=session_id, run_id=run_id, provider_overflow=True, messages=len(messages))
                     continue
@@ -657,6 +660,34 @@ class AgentRunner:
             },
         }
         return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
+
+    def _summarizer(self) -> Summarizer | None:
+        """Build an LLM-backed compaction summarizer from the primary route.
+
+        Uses the small model when configured (cheap summarization), falling back
+        to the primary model. Returns None when compaction should stay purely
+        deterministic (no provider route available).
+        """
+        if not self.providers:
+            return None
+        route = self.providers[0]
+
+        async def summarize(transcript: str) -> str:
+            request = ProviderRequest(
+                model=self.config.agent.small_model or route.model,
+                system=(
+                    "You summarize coding-agent conversations. Output only the "
+                    "summary: factual, dense, and complete with respect to tool "
+                    "outputs such as test failures and stack traces."
+                ),
+                messages=[Message(role=Role.USER, content=transcript)],
+                max_output_tokens=min(4_000, self.config.agent.max_output_tokens),
+                metadata={"purpose": "compaction_summary"},
+            )
+            response = await route.provider.complete(request)
+            return response.text
+
+        return summarize
 
     def _low_cache_effectiveness(self, usage: Usage) -> bool:
         return bool(
