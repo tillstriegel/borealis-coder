@@ -384,6 +384,7 @@ class ConsoleRenderer:
         self._live_line_open = False
         self._streamed_tool_output_chars: dict[str, int] = {}
         self._streamed_tool_output_text: dict[str, str] = {}
+        self._streamed_tool_output_by_stream: dict[str, dict[str, str]] = {}
         self._truncated_tool_outputs: set[str] = set()
         self._tool_output_line_open = False
 
@@ -416,6 +417,7 @@ class ConsoleRenderer:
         self._assistant_block_open = False
         self._streamed_tool_output_chars = {}
         self._streamed_tool_output_text = {}
+        self._streamed_tool_output_by_stream = {}
         self._truncated_tool_outputs = set()
         self._tool_output_line_open = False
         self._clear_live_line()
@@ -608,6 +610,11 @@ class ConsoleRenderer:
                 self._streamed_tool_output_text[call_id] = (
                     self._streamed_tool_output_text.get(call_id, "") + chunk
                 )
+                stream = str(event.data.get("stream") or "output")
+                streamed_by_name = self._streamed_tool_output_by_stream.setdefault(
+                    call_id, {}
+                )
+                streamed_by_name[stream] = streamed_by_name.get(stream, "") + chunk
                 self._tool_output_line_open = not chunk.endswith("\n")
             if len(text) > remaining and call_id not in self._truncated_tool_outputs:
                 self._ensure_tool_output_line_break()
@@ -638,7 +645,16 @@ class ConsoleRenderer:
             call_id = str(event.data.get("tool_call_id") or event.data.get("tool") or "tool")
             already_streamed = call_id in self._streamed_tool_output_chars
             metadata = event.data.get("metadata", {})
-            if output and (
+            streamed_shell_error = bool(
+                output
+                and event.data.get("is_error")
+                and event.data.get("tool") == "shell"
+                and self.show_tool_output
+                and already_streamed
+            )
+            if streamed_shell_error:
+                self._print_streamed_shell_failure(call_id, output, metadata)
+            elif output and (
                 bool(event.data.get("is_error"))
                 or (self.show_tool_output and not already_streamed)
             ):
@@ -822,6 +838,46 @@ class ConsoleRenderer:
         if not tail or tail in self._streamed_tool_output_text.get(call_id, ""):
             return
         print("… final output tail …", file=self.status_stream, flush=True)
+        _print_indented(tail, stream=self.status_stream)
+
+    def _print_streamed_shell_failure(
+        self, call_id: str, output: str, metadata: dict[str, object]
+    ) -> None:
+        details: list[str] = []
+        if "exit_code" in metadata:
+            details.append(f"exit_code={metadata['exit_code']}")
+        if metadata.get("timed_out"):
+            details.append("timed_out=true")
+        if details:
+            _print_indented(" ".join(details), stream=self.status_stream)
+
+        streamed = self._streamed_tool_output_by_stream.get(call_id, {})
+        completed: dict[str, list[str]] = {"stdout": [], "stderr": []}
+        current_stream = ""
+        for line in output.splitlines(keepends=True):
+            label = line.rstrip("\r\n")
+            if label in {"stdout:", "stderr:"}:
+                current_stream = label[:-1]
+                continue
+            if current_stream:
+                completed[current_stream].append(line)
+
+        unseen: dict[str, str] = {}
+        for stream, chunks in completed.items():
+            text = "".join(chunks)
+            shown = streamed.get(stream, "")
+            remainder = text[len(shown) :] if text.startswith(shown) else text
+            unseen[stream] = remainder.rstrip("\r\n")
+        sections = [
+            f"{stream}:\n{text}"
+            for stream, text in unseen.items()
+            if text
+        ]
+        if not sections:
+            return
+        tail_chars = max(80, self.tool_output_chars // 3)
+        tail = "\n".join(sections)[-tail_chars:].lstrip("\n")
+        print("… unseen failure output …", file=self.status_stream, flush=True)
         _print_indented(tail, stream=self.status_stream)
 
     def _close_assistant_block(self) -> None:

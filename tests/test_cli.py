@@ -547,7 +547,12 @@ class CLITests(unittest.TestCase):
             await renderer.handle(
                 Event(
                     type="tool.output",
-                    data={"tool": "shell", "tool_call_id": "call_1", "text": "building\n"},
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "stream": "stdout",
+                        "text": "build",
+                    },
                 )
             )
             await renderer.handle(
@@ -556,7 +561,10 @@ class CLITests(unittest.TestCase):
                     data={
                         "tool": "shell",
                         "tool_call_id": "call_1",
-                        "output": "exit_code=2\nstderr:\nFATAL: build failed",
+                        "output": (
+                            "exit_code=2\nstdout:\nbuilding\n"
+                            "stderr:\nFATAL: failed"
+                        ),
                         "is_error": True,
                         "metadata": {"duration_ms": 2, "exit_code": 2},
                     },
@@ -565,9 +573,11 @@ class CLITests(unittest.TestCase):
             return stderr.getvalue()
 
         output = __import__("asyncio").run(render())
-        self.assertIn("building", output)
+        self.assertEqual(output.count("build"), 1)
+        self.assertNotIn("stdout:\n  building", output)
+        self.assertIn("stdout:\n    ing", output)
         self.assertIn("exit_code=2", output)
-        self.assertIn("FATAL: build failed", output)
+        self.assertIn("FATAL: failed", output)
 
     def test_renderer_preserves_unseen_tail_after_stream_truncation(self) -> None:
         async def render() -> str:

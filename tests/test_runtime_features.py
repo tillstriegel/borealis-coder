@@ -389,6 +389,44 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(output, expected)
 
+    def test_streaming_redactor_preserves_redacted_boundary_across_chunks(self):
+        secret = "custom.secret-value"
+        token = "sk-proj-" + "1234567890abcdef"
+        value = secret + token + ":done"
+        expected = Redactor([secret]).text(value)
+
+        for first in range(len(value) + 1):
+            for second in range(first, len(value) + 1):
+                with self.subTest(first=first, second=second):
+                    redactor = StreamingRedactor(Redactor([secret]))
+                    output = (
+                        redactor.feed(value[:first])
+                        + redactor.feed(value[first:second])
+                        + redactor.feed(value[second:])
+                        + redactor.flush()
+                    )
+                    self.assertEqual(output, expected)
+
+    def test_streaming_redactor_keeps_completed_private_key_intact(self):
+        private_key = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "secret\n"
+            "-----END PRIVATE KEY-----"
+        )
+        value = "__" + private_key + "-" + private_key
+        expected = Redactor().text(value)
+        redactor = StreamingRedactor(Redactor())
+        second_split = len(value) - len(" KEY-----")
+
+        output = (
+            redactor.feed(value[:3])
+            + redactor.feed(value[3:second_split])
+            + redactor.feed(value[second_split:])
+            + redactor.flush()
+        )
+
+        self.assertEqual(output, expected)
+
     def test_streaming_redactor_emits_progress_without_a_line_break(self):
         redactor = StreamingRedactor(Redactor())
 
