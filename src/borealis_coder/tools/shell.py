@@ -6,6 +6,7 @@ from typing import Any
 
 from ..models import Effect, ToolResult
 from ..safety.commands import assess_command
+from ..safety.redaction import StreamingRedactor
 from .base import Tool, ToolContext, nullable, object_schema
 
 
@@ -32,8 +33,15 @@ class ShellTool(Tool):
         cwd = context.roots.resolve(arguments.get("cwd") or ".", must_exist=True, kind="dir").path
         timeout = int(arguments.get("timeout_seconds") or context.config.safety.command_timeout_seconds)
         command = str(arguments["command"])
+        output_redactors = {
+            "stdout": StreamingRedactor(context.events.redactor),
+            "stderr": StreamingRedactor(context.events.redactor),
+        }
 
         async def on_output(stream: str, text: str) -> None:
+            redacted = output_redactors[stream].feed(text)
+            if not redacted:
+                return
             await context.events.emit(
                 "tool.output",
                 session_id=context.session_id,
@@ -41,10 +49,22 @@ class ShellTool(Tool):
                 tool_call_id=context.tool_call_id,
                 tool="shell",
                 stream=stream,
-                text=text,
+                text=redacted,
             )
 
         result = await context.process.run(command, cwd=cwd, timeout=timeout, shell=True, on_output=on_output)
+        for stream, redactor in output_redactors.items():
+            redacted = redactor.flush()
+            if redacted:
+                await context.events.emit(
+                    "tool.output",
+                    session_id=context.session_id,
+                    run_id=context.run_id,
+                    tool_call_id=context.tool_call_id,
+                    tool="shell",
+                    stream=stream,
+                    text=redacted,
+                )
         return ToolResult(result.render(), is_error=not result.ok, metadata={
             "exit_code": result.exit_code, "duration_ms": result.duration_ms,
             "timed_out": result.timed_out, "cwd": context.roots.display(cwd),

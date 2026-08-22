@@ -603,7 +603,7 @@ class ConsoleRenderer:
             if chunk:
                 print(chunk, end="", file=self.status_stream, flush=True)
                 self._streamed_tool_output_chars[call_id] = used + len(chunk)
-                self._tool_output_line_open = not chunk.endswith(("\n", "\r"))
+                self._tool_output_line_open = not chunk.endswith("\n")
             if len(text) > remaining and call_id not in self._truncated_tool_outputs:
                 self._ensure_tool_output_line_break()
                 print("… output truncated …", file=self.status_stream, flush=True)
@@ -633,8 +633,8 @@ class ConsoleRenderer:
             call_id = str(event.data.get("tool_call_id") or event.data.get("tool") or "tool")
             already_streamed = call_id in self._streamed_tool_output_chars
             if output and (
-                (self.show_tool_output and not already_streamed)
-                or (not self.show_tool_output and bool(event.data.get("is_error")))
+                bool(event.data.get("is_error"))
+                or (self.show_tool_output and not already_streamed)
             ):
                 _print_indented(
                     truncate_text(output, self.tool_output_chars),

@@ -21,6 +21,7 @@ from borealis_coder.safety import (
     ProcessResult,
     WorkspaceRoots,
 )
+from borealis_coder.safety.redaction import Redactor, StreamingRedactor
 from borealis_coder.tools import build_builtin_registry
 from borealis_coder.tools.verification import VerificationPlanner, VerificationStep
 from tests.helpers import make_config, make_context
@@ -245,6 +246,52 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("line2", combined)
             for _, kwargs in output_events:
                 self.assertIn(kwargs["stream"], {"stdout", "stderr"})
+
+    async def test_shell_redacts_secrets_split_across_output_chunks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            context = make_context(root)
+            registry = build_builtin_registry()
+            shell = registry.get("shell")
+            assert shell is not None
+            events = []
+            context.events.subscribe(lambda event: events.append(event))
+            secret = "sk-proj-" + "1234567890abcdef"
+
+            async def stream_secret(*_args, **kwargs):
+                on_output = kwargs["on_output"]
+                await on_output("stdout", "sk-proj-12345678")
+                await on_output("stdout", "90abcdef\n")
+                return ProcessResult("ignored", 0, secret + "\n", "", 1)
+
+            with patch.object(context.process, "run", side_effect=stream_secret):
+                result = await shell.execute(
+                    {
+                        "command": "ignored",
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "description": "split secret",
+                    },
+                    context,
+                )
+            self.assertFalse(result.is_error, result.output)
+            streamed = "".join(
+                str(event.data.get("text") or "")
+                for event in events
+                if event.type == "tool.output"
+            )
+            self.assertNotIn(secret, streamed)
+            self.assertIn("[REDACTED]", streamed)
+
+    def test_streaming_redactor_holds_private_key_until_end(self):
+        redactor = StreamingRedactor(Redactor())
+        begin = "-----BEGIN PRIVATE " + "KEY-----"
+        end = "-----END PRIVATE " + "KEY-----"
+
+        self.assertEqual(redactor.feed(f"{begin}\nkey material\n"), "")
+        output = redactor.feed(end) + redactor.flush()
+
+        self.assertEqual(output, "[REDACTED]")
 
     async def test_process_stream_decodes_split_utf8(self):
         with tempfile.TemporaryDirectory() as td:
