@@ -229,6 +229,38 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_runner_accounts_for_compaction_completed_during_cancellation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"deterministic_compaction": False})
+            runner = await build_runner(root, config=config, interactive=False)
+            cancel = asyncio.Event()
+            usage_sink = AsyncMock()
+            usage = Usage(input_tokens=100, output_tokens=20, requests=1)
+            response = ModelResponse(text="unused summary", usage=usage)
+            provider = runner.providers[0].provider
+
+            async def complete_and_cancel(_request):
+                cancel.set()
+                return response
+
+            try:
+                with patch.object(
+                    provider, "complete", side_effect=complete_and_cancel
+                ):
+                    summarizer = runner._summarizer(usage_sink, cancel)
+                    assert summarizer is not None
+
+                    async def run_summary():
+                        outcome = summarizer("old conversation")
+                        return outcome if isinstance(outcome, str) else await outcome
+
+                    with self.assertRaises(Cancelled):
+                        await run_summary()
+                usage_sink.assert_awaited_once_with(usage)
+            finally:
+                await runner.close()
+
     async def test_compaction_does_not_swallow_budget_errors(self):
         messages = [
             Message(role=Role.USER if i % 2 == 0 else Role.ASSISTANT, content=f"m{i}")
@@ -334,6 +366,28 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         ) + redactor.flush()
 
         self.assertEqual(output, "[REDACTED]")
+
+    def test_streaming_redactor_preserves_word_boundaries_across_chunks(self):
+        values = (
+            "mask-abcdefghijklmnop:end",
+            "xghp_abcdefghijklmnop:end",
+            "xgithub_pat_abcdefghijklmnop:end",
+            "xglpat-abcdefghijklmnop:end",
+            "xAIzaabcdefghijklmnopqrstuvwx:end",
+            "xBearer abcdefghijklmnop:end",
+            "xAKIAABCDEFGHIJKLMNOP:end",
+        )
+        for value in values:
+            expected = Redactor().text(value)
+            for split in range(len(value) + 1):
+                with self.subTest(value=value, split=split):
+                    redactor = StreamingRedactor(Redactor())
+                    output = (
+                        redactor.feed(value[:split])
+                        + redactor.feed(value[split:])
+                        + redactor.flush()
+                    )
+                    self.assertEqual(output, expected)
 
     def test_streaming_redactor_emits_progress_without_a_line_break(self):
         redactor = StreamingRedactor(Redactor())

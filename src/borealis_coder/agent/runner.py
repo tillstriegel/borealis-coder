@@ -698,7 +698,7 @@ class AgentRunner:
                     {request_task, cancel_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if cancel_task in done and cancel.is_set():
+                if request_task not in done and cancel_task in done:
                     request_task.cancel()
                     raise Cancelled("Run cancelled")
                 response = await request_task
@@ -712,6 +712,8 @@ class AgentRunner:
                     return_exceptions=True,
                 )
             await usage_sink(response.usage)
+            if cancel.is_set():
+                raise Cancelled("Run cancelled")
             return response.text
 
         return summarize
