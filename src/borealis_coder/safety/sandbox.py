@@ -21,6 +21,7 @@ from .paths import WorkspaceRoots
 # awaitable; exceptions raised by the consumer never abort the command itself.
 OutputSink = Callable[[str, str], Awaitable[None] | None]
 _OUTPUT_TRUNCATION_MARKER = "\n… output truncated …\n"
+_OUTPUT_OBSERVER_DRAIN_SECONDS = 1.0
 
 
 class _BoundedText:
@@ -151,35 +152,73 @@ class NativeProcessDriver(ProcessDriver):
         stderr = _BoundedText(limit)
         emitted_chars = 0
         emitted_truncation = False
-        output_lock = asyncio.Lock()
+        output_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
 
-        async def emit_output(name: str, text: str) -> None:
+        def queue_output(name: str, text: str) -> None:
             nonlocal emitted_chars, emitted_truncation
             if on_output is None or not text:
                 return
-            async with output_lock:
-                if limit > 0:
-                    available = max(0, limit - emitted_chars)
-                    chunk = text[:available]
-                    was_truncated = len(text) > available
-                else:
-                    chunk = text
-                    was_truncated = False
-                emitted_chars += len(chunk)
+            if limit > 0:
+                available = max(0, limit - emitted_chars)
+                chunk = text[:available]
+                was_truncated = len(text) > available
+            else:
+                chunk = text
+                was_truncated = False
+            emitted_chars += len(chunk)
+            if chunk:
+                output_queue.put_nowait((name, chunk))
+            if was_truncated and not emitted_truncation:
+                emitted_truncation = True
+                output_queue.put_nowait((name, _OUTPUT_TRUNCATION_MARKER))
+
+        async def dispatch_output() -> None:
+            while True:
+                item = await output_queue.get()
+                if item is None:
+                    return
+                name, text = item
+                assert on_output is not None
                 try:
-                    if chunk:
-                        outcome = on_output(name, chunk)
-                        if inspect.isawaitable(outcome):
-                            await outcome
-                    if was_truncated and not emitted_truncation:
-                        emitted_truncation = True
-                        outcome = on_output(name, _OUTPUT_TRUNCATION_MARKER)
-                        if inspect.isawaitable(outcome):
-                            await outcome
+                    outcome = on_output(name, text)
+                    if inspect.isawaitable(outcome):
+                        await outcome
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     pass
+
+        output_task = (
+            asyncio.create_task(dispatch_output()) if on_output is not None else None
+        )
+
+        async def finish_output(*, drain: bool) -> None:
+            if output_task is None:
+                return
+            output_queue.put_nowait(None)
+            if drain:
+                done, _ = await asyncio.wait(
+                    {output_task}, timeout=_OUTPUT_OBSERVER_DRAIN_SECONDS
+                )
+                if done:
+                    return
+            output_task.cancel()
+
+            # Give ordinary cancellation-aware observers a chance to exit. Do
+            # not await them without a bound: observers are outside the process
+            # timeout contract and must not keep a command alive.
+            await asyncio.sleep(0)
+
+        if output_task is not None:
+            def consume_output_task(task: asyncio.Task[None]) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            output_task.add_done_callback(consume_output_task)
 
         async def pump(
             stream: asyncio.StreamReader | None, sink: _BoundedText, name: str
@@ -193,10 +232,10 @@ class NativeProcessDriver(ProcessDriver):
                     break
                 text = decoder.decode(data)
                 sink.append(text)
-                await emit_output(name, text)
+                queue_output(name, text)
             final = decoder.decode(b"", final=True)
             sink.append(final)
-            await emit_output(name, final)
+            queue_output(name, final)
 
         tasks = [
             asyncio.create_task(pump(process.stdout, stdout, "stdout")),
@@ -209,9 +248,11 @@ class NativeProcessDriver(ProcessDriver):
                 timed_out = True
                 await _terminate_process(process)
             await asyncio.gather(*tasks)
+            await finish_output(drain=True)
         except asyncio.CancelledError:
             await _terminate_process(process)
             await asyncio.gather(*tasks, return_exceptions=True)
+            await finish_output(drain=False)
             raise
         return ProcessResult(
             command=command if isinstance(command, str) else " ".join(command),

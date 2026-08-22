@@ -286,7 +286,7 @@ class AgentRunner:
                 if estimated >= threshold:
                     compacted_messages = await compact_messages_with_summary(
                         messages,
-                        self._summarizer(usage_sink),
+                        self._summarizer(usage_sink, cancel),
                         keep_recent=12 if adaptive_cache else 18,
                     )
                     if compacted_messages == messages:
@@ -355,7 +355,7 @@ class AgentRunner:
                     if compacted:
                         raise
                     messages = await compact_messages_with_summary(
-                        messages, self._summarizer(usage_sink), keep_recent=12
+                        messages, self._summarizer(usage_sink, cancel), keep_recent=12
                     )
                     compacted = True
                     await self.events.emit("context.compacted", session_id=session_id, run_id=run_id, provider_overflow=True, messages=len(messages))
@@ -665,6 +665,7 @@ class AgentRunner:
     def _summarizer(
         self,
         usage_sink: Callable[[Usage], Awaitable[None]],
+        cancel: asyncio.Event,
     ) -> Summarizer | None:
         """Build an LLM-backed compaction summarizer from the primary route.
 
@@ -688,7 +689,26 @@ class AgentRunner:
                 max_output_tokens=min(4_000, self.config.agent.max_output_tokens),
                 metadata={"purpose": "compaction_summary"},
             )
-            response = await route.provider.complete(request)
+            request_task = asyncio.create_task(route.provider.complete(request))
+            cancel_task = asyncio.create_task(cancel.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {request_task, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancel_task in done and cancel.is_set():
+                    request_task.cancel()
+                    raise Cancelled("Run cancelled")
+                response = await request_task
+            finally:
+                cancel_task.cancel()
+                if not request_task.done():
+                    request_task.cancel()
+                await asyncio.gather(
+                    request_task,
+                    cancel_task,
+                    return_exceptions=True,
+                )
             await usage_sink(response.usage)
             return response.text
 
