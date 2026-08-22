@@ -40,7 +40,7 @@ _STREAMING_TOKEN_SUFFIXES = (
     ),
     re.compile(r"(?<!\w)AKIA[0-9A-Z]{0,16}$"),
 )
-_STREAMING_PREFIXES = (
+_STREAMING_TOKEN_PREFIXES = (
     ("sk-", False),
     ("ghp", False),
     ("github_pat", False),
@@ -48,11 +48,24 @@ _STREAMING_PREFIXES = (
     ("AIza", False),
     ("Bearer", True),
     ("AKIA", False),
-    ("-----BEGIN PRIVATE KEY-----", False),
-    ("-----BEGIN RSA PRIVATE KEY-----", False),
-    ("-----BEGIN EC PRIVATE KEY-----", False),
-    ("-----BEGIN OPENSSH PRIVATE KEY-----", False),
 )
+_STREAMING_PRIVATE_KEY_PREFIXES = (
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+)
+
+
+def _partial_prefix_start(
+    value: str, prefix: str, *, ignore_case: bool = False
+) -> int | None:
+    candidate = value.lower() if ignore_case else value
+    expected = prefix.lower() if ignore_case else prefix
+    for size in range(min(len(candidate), len(expected) - 1), 0, -1):
+        if candidate.endswith(expected[:size]):
+            return len(value) - size
+    return None
 
 
 class Redactor:
@@ -94,6 +107,12 @@ class Redactor:
     def _streaming_suffix_start(self, value: str) -> int | None:
         """Return the earliest suffix that could become a secret."""
         starts: list[int] = []
+        private_key_ends = list(_PRIVATE_KEY_END.finditer(value))
+        completed_private_key_end = (
+            private_key_ends[-1]
+            if private_key_ends and private_key_ends[-1].end() == len(value)
+            else None
+        )
         for secret in self._values:
             maximum = min(len(value), len(secret) - 1)
             for size in range(maximum, 0, -1):
@@ -103,16 +122,19 @@ class Redactor:
         for pattern in _STREAMING_TOKEN_SUFFIXES:
             if match := pattern.search(value):
                 starts.append(match.start())
-        for prefix, ignore_case in _STREAMING_PREFIXES:
-            candidate = value.lower() if ignore_case else value
-            expected = prefix.lower() if ignore_case else prefix
-            for size in range(min(len(candidate), len(expected) - 1), 0, -1):
-                if not candidate.endswith(expected[:size]):
-                    continue
-                start = len(value) - size
-                if start == 0 or not re.match(r"\w", value[start - 1]):
-                    starts.append(start)
-                break
+        for prefix, ignore_case in _STREAMING_TOKEN_PREFIXES:
+            start = _partial_prefix_start(value, prefix, ignore_case=ignore_case)
+            if start is not None and (
+                start == 0 or not re.match(r"\w", value[start - 1])
+            ):
+                starts.append(start)
+        for prefix in _STREAMING_PRIVATE_KEY_PREFIXES:
+            start = _partial_prefix_start(value, prefix)
+            if start is not None and (
+                completed_private_key_end is None
+                or start < completed_private_key_end.start()
+            ):
+                starts.append(start)
         return min(starts) if starts else None
 
 
