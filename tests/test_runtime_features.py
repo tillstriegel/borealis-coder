@@ -293,6 +293,26 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(output, "[REDACTED]")
 
+    def test_streaming_redactor_emits_progress_without_a_line_break(self):
+        redactor = StreamingRedactor(Redactor())
+
+        self.assertEqual(redactor.feed("building..."), "building...")
+        self.assertEqual(redactor.feed("."), ".")
+        self.assertEqual(redactor.flush(), "")
+
+    def test_streaming_redactor_holds_only_an_exact_secret_prefix(self):
+        secret = "custom." + "secret-value"
+        redactor = StreamingRedactor(Redactor([secret]))
+
+        self.assertEqual(redactor.feed("status custom."), "status ")
+        self.assertEqual(redactor.feed("secret-value done"), "[REDACTED] done")
+
+    def test_streaming_redactor_masks_a_secret_prefix_at_truncation(self):
+        redactor = StreamingRedactor(Redactor())
+
+        self.assertEqual(redactor.feed("safe sk-proj-12345678"), "safe ")
+        self.assertEqual(redactor.flush(mask_incomplete=True), "[REDACTED]")
+
     async def test_process_stream_decodes_split_utf8(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -334,6 +354,8 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(streamed.count("x"), 10)
             self.assertEqual(streamed.count("output truncated"), 1)
             self.assertEqual(result.stdout, "x" * 10)
+            self.assertTrue(result.stream_truncated)
+            self.assertTrue(result.stream_complete)
 
     async def test_process_timeout_is_not_blocked_by_output_observer(self):
         with tempfile.TemporaryDirectory() as td:
@@ -361,6 +383,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             elapsed = asyncio.get_running_loop().time() - started
             self.assertTrue(observer_started.is_set())
             self.assertTrue(result.timed_out)
+            self.assertFalse(result.stream_complete)
             self.assertLess(elapsed, 3.5)
 
     @unittest.skipUnless(os.name == "posix", "SIGTERM output is POSIX-specific")

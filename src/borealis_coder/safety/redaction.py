@@ -30,6 +30,30 @@ _PRIVATE_KEY_END = re.compile(
     r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
 )
 
+_STREAMING_TOKEN_SUFFIXES = (
+    re.compile(r"(?<!\w)sk-[A-Za-z0-9_-]*$"),
+    re.compile(r"(?<!\w)(?:ghp|github_pat|glpat)-?[A-Za-z0-9_]*$"),
+    re.compile(r"(?<!\w)AIza[0-9A-Za-z_-]*$"),
+    re.compile(
+        r"(?<!\w)Bearer(?:\s+[A-Za-z0-9._~+/=-]*)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?<!\w)AKIA[0-9A-Z]{0,16}$"),
+)
+_STREAMING_PREFIXES = (
+    ("sk-", False),
+    ("ghp", False),
+    ("github_pat", False),
+    ("glpat", False),
+    ("AIza", False),
+    ("Bearer", True),
+    ("AKIA", False),
+    ("-----BEGIN PRIVATE KEY-----", False),
+    ("-----BEGIN RSA PRIVATE KEY-----", False),
+    ("-----BEGIN EC PRIVATE KEY-----", False),
+    ("-----BEGIN OPENSSH PRIVATE KEY-----", False),
+)
+
 
 class Redactor:
     def __init__(self, extra_values: list[str] | None = None) -> None:
@@ -67,56 +91,76 @@ class Redactor:
     def json(self, value: Any) -> str:
         return json_dumps(self.value(value))
 
+    def _streaming_suffix_start(self, value: str) -> int | None:
+        """Return the earliest suffix that could become a secret."""
+        starts: list[int] = []
+        for secret in self._values:
+            maximum = min(len(value), len(secret) - 1)
+            for size in range(maximum, 0, -1):
+                if value.endswith(secret[:size]):
+                    starts.append(len(value) - size)
+                    break
+        for pattern in _STREAMING_TOKEN_SUFFIXES:
+            if match := pattern.search(value):
+                starts.append(match.start())
+        for prefix, ignore_case in _STREAMING_PREFIXES:
+            candidate = value.lower() if ignore_case else value
+            expected = prefix.lower() if ignore_case else prefix
+            for size in range(min(len(candidate), len(expected) - 1), 0, -1):
+                if not candidate.endswith(expected[:size]):
+                    continue
+                start = len(value) - size
+                if start == 0 or not re.match(r"\w", value[start - 1]):
+                    starts.append(start)
+                break
+        return min(starts) if starts else None
+
 
 class StreamingRedactor:
-    """Redact complete stream records without exposing split secrets."""
+    """Redact a stream while retaining only possible secret suffixes."""
 
     def __init__(self, redactor: Redactor) -> None:
         self.redactor = redactor
         self._buffer = ""
 
     def feed(self, value: str) -> str:
-        """Return redacted complete lines and retain an incomplete tail."""
+        """Return safe text immediately and retain possible split secrets."""
         self._buffer += value
-        boundary = max(self._buffer.rfind("\n"), self._buffer.rfind("\r"))
-        if boundary < 0:
+        safe_end = len(self._buffer)
+        private_key_start = self._unclosed_private_key_start()
+        if private_key_start is not None:
+            safe_end = private_key_start
+        suffix_start = self.redactor._streaming_suffix_start(
+            self._buffer[:safe_end]
+        )
+        if suffix_start is not None:
+            safe_end = min(safe_end, suffix_start)
+        if safe_end <= 0:
             return ""
 
-        boundary = self._safe_boundary(boundary)
-        if boundary < 0:
-            return ""
-
-        complete = self._buffer[: boundary + 1]
-        self._buffer = self._buffer[boundary + 1 :]
+        complete = self._buffer[:safe_end]
+        self._buffer = self._buffer[safe_end:]
         return self.redactor.text(complete)
 
-    def flush(self) -> str:
+    def flush(self, *, mask_incomplete: bool = False) -> str:
         """Redact and return the incomplete stream tail."""
         if not self._buffer:
             return ""
-        private_key_start = self._unclosed_private_key_start()
-        if private_key_start is None:
+        mask_start = self._unclosed_private_key_start()
+        if mask_incomplete:
+            suffix_start = self.redactor._streaming_suffix_start(self._buffer)
+            if suffix_start is not None:
+                mask_start = (
+                    suffix_start
+                    if mask_start is None
+                    else min(mask_start, suffix_start)
+                )
+        if mask_start is None:
             output = self.redactor.text(self._buffer)
         else:
-            output = self.redactor.text(self._buffer[:private_key_start]) + "[REDACTED]"
+            output = self.redactor.text(self._buffer[:mask_start]) + "[REDACTED]"
         self._buffer = ""
         return output
-
-    def _safe_boundary(self, boundary: int) -> int:
-        """Keep private key blocks intact when selecting text to emit."""
-        search_from = 0
-        while True:
-            start = _PRIVATE_KEY_BEGIN.search(self._buffer, search_from)
-            if start is None or start.start() > boundary:
-                return boundary
-            end = _PRIVATE_KEY_END.search(self._buffer, start.end())
-            if end is None:
-                return max(
-                    self._buffer.rfind("\n", 0, start.start()),
-                    self._buffer.rfind("\r", 0, start.start()),
-                )
-            boundary = max(boundary, end.end() - 1)
-            search_from = end.end()
 
     def _unclosed_private_key_start(self) -> int | None:
         starts = list(_PRIVATE_KEY_BEGIN.finditer(self._buffer))

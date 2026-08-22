@@ -7,6 +7,7 @@ from typing import Any
 from ..models import Effect, ToolResult
 from ..safety.commands import assess_command
 from ..safety.redaction import StreamingRedactor
+from ..safety.sandbox import OUTPUT_TRUNCATION_MARKER
 from .base import Tool, ToolContext, nullable, object_schema
 
 
@@ -38,10 +39,7 @@ class ShellTool(Tool):
             "stderr": StreamingRedactor(context.events.redactor),
         }
 
-        async def on_output(stream: str, text: str) -> None:
-            redacted = output_redactors[stream].feed(text)
-            if not redacted:
-                return
+        async def emit_output(stream: str, text: str) -> None:
             await context.events.emit(
                 "tool.output",
                 session_id=context.session_id,
@@ -49,23 +47,30 @@ class ShellTool(Tool):
                 tool_call_id=context.tool_call_id,
                 tool="shell",
                 stream=stream,
-                text=redacted,
+                text=text,
             )
+
+        async def on_output(stream: str, text: str) -> None:
+            if text == OUTPUT_TRUNCATION_MARKER:
+                for buffered_stream, redactor in output_redactors.items():
+                    pending = redactor.flush(mask_incomplete=True)
+                    if pending:
+                        await emit_output(buffered_stream, pending)
+                await emit_output(stream, text)
+                return
+            redacted = output_redactors[stream].feed(text)
+            if not redacted:
+                return
+            await emit_output(stream, redacted)
 
         result = await context.process.run(command, cwd=cwd, timeout=timeout, shell=True, on_output=on_output)
         for stream, redactor in output_redactors.items():
             redacted = redactor.flush()
             if redacted:
-                await context.events.emit(
-                    "tool.output",
-                    session_id=context.session_id,
-                    run_id=context.run_id,
-                    tool_call_id=context.tool_call_id,
-                    tool="shell",
-                    stream=stream,
-                    text=redacted,
-                )
+                await emit_output(stream, redacted)
         return ToolResult(result.render(), is_error=not result.ok, metadata={
             "exit_code": result.exit_code, "duration_ms": result.duration_ms,
             "timed_out": result.timed_out, "cwd": context.roots.display(cwd),
+            "stream_truncated": result.stream_truncated,
+            "stream_complete": result.stream_complete,
         })

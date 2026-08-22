@@ -569,6 +569,44 @@ class CLITests(unittest.TestCase):
         self.assertIn("exit_code=2", output)
         self.assertIn("FATAL: build failed", output)
 
+    def test_renderer_preserves_unseen_tail_after_stream_truncation(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(
+                show_tool_output=True,
+                tool_output_chars=200,
+                status_stream=stderr,
+            )
+            streamed = "H" * 250
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={"tool": "shell", "tool_call_id": "call_1", "text": streamed},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.completed",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "output": f"exit_code=0\nstdout:\n{streamed}IMPORTANT_TAIL",
+                        "is_error": False,
+                        "metadata": {
+                            "duration_ms": 2,
+                            "stream_truncated": True,
+                            "stream_complete": True,
+                        },
+                    },
+                )
+            )
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertIn("output truncated", output)
+        self.assertIn("final output tail", output)
+        self.assertIn("IMPORTANT_TAIL", output)
+
     def test_renderer_ends_bare_carriage_return_before_completion(self) -> None:
         async def render() -> str:
             stderr = io.StringIO()
