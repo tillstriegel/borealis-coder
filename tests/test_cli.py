@@ -540,6 +540,33 @@ class CLITests(unittest.TestCase):
         self.assertEqual(output.count("output truncated"), 1)
         self.assertLess(output.index("x"), output.index("✓ shell"))
 
+    def test_renderer_keeps_tool_heartbeat_after_streamed_output(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(show_tool_output=True, status_stream=stderr)
+            await renderer.handle(
+                Event(
+                    type="tool.started",
+                    data={"tool": "shell", "tool_call_id": "call_1", "arguments": {}},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "stream": "stdout",
+                        "text": "building\n",
+                    },
+                )
+            )
+            renderer.heartbeat(10)
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertIn("still working · running shell · 10s elapsed", output)
+
     def test_renderer_preserves_failure_details_after_streaming_output(self) -> None:
         async def render() -> str:
             stderr = io.StringIO()

@@ -596,7 +596,7 @@ class ConsoleRenderer:
         if event.type == "tool.output":
             if not self.show_tool_output:
                 return
-            self._activity_phase = ""
+            self._activity_phase = f"running {event.data.get('tool') or 'tool'}"
             text = str(event.data.get("text") or "")
             if not text:
                 return
