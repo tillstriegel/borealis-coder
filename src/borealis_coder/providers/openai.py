@@ -6,6 +6,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..config import ProviderConfig
 from ..errors import ProviderError
 from ..models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
@@ -16,7 +17,7 @@ from .http import HttpClient
 class OpenAIProvider(Provider):
     name = "openai"
 
-    def __init__(self, config, api_key: str = "") -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, config: ProviderConfig, api_key: str = "") -> None:
         super().__init__(config, api_key)
         self.http = HttpClient(timeout_seconds=config.timeout_seconds)
 

@@ -36,6 +36,7 @@ class ToolContext:
     checkpoints: CheckpointManager
     session_id: str
     run_id: str
+    tool_call_id: str = ""
     changed_files: set[str] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -123,6 +124,7 @@ class ToolRegistry:
         return [self._tools[name].schema() for name in sorted(self._tools)]
 
     async def execute(self, call: ToolCall, context: ToolContext) -> ToolResult:
+        context.tool_call_id = call.id
         tool = self.get(call.name)
         if tool is None:
             return ToolResult(f"Unknown tool: {call.name}", is_error=True)

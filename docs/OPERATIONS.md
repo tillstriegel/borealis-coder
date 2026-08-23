@@ -131,7 +131,7 @@ CI should build from a clean checkout, install the wheel in a fresh environment,
 - `context.repo_map_chars`: increase for very large cross-cutting tasks; keep compact for routine fixes.
 - `context.tool_output_chars`: avoid feeding full test logs or generated files back to the model.
 - `agent.compact_at_ratio`: lower when providers reject near-limit requests or tool schemas are large.
-- `agent.small_model`: route delegated repository investigations to a cheaper model.
+- `agent.small_model`: route delegated investigations and optional LLM compaction to a cheaper model.
 - provider caching and pricing fields: configure according to the current provider contract.
 
 ## Production qualification limits

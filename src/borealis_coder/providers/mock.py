@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 
+from ..config import ProviderConfig
 from ..models import ModelResponse, ProviderRequest, ToolCall, Usage
 from .base import Provider, ProviderStreamEvent
 
@@ -13,7 +14,7 @@ MockHandler = Callable[[ProviderRequest, int], ModelResponse]
 class MockProvider(Provider):
     name = "mock"
 
-    def __init__(self, config, api_key: str = "", handler: MockHandler | None = None) -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, config: ProviderConfig, api_key: str = "", handler: MockHandler | None = None) -> None:
         super().__init__(config, api_key)
         self.handler = handler
         self.calls = 0

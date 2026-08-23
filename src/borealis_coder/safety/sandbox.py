@@ -3,17 +3,70 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import codecs
+import inspect
 import os
 import shutil
 import signal
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import SafetyConfig, SandboxConfig
 from ..errors import ToolError
-from ..util import monotonic_ms, truncate_text
+from ..util import monotonic_ms
 from .paths import WorkspaceRoots
+
+# Receives ("stdout" | "stderr", decoded_chunk) as output arrives. May return an
+# awaitable; exceptions raised by the consumer never abort the command itself.
+OutputSink = Callable[[str, str], Awaitable[None] | None]
+OUTPUT_TRUNCATION_MARKER = "\n… output truncated …\n"
+_OUTPUT_OBSERVER_DRAIN_SECONDS = 1.0
+
+
+class _BoundedText:
+    """Keep the same bounded head/tail view without retaining all process output."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._value = ""
+        self._head = ""
+        self._tail = ""
+        self._truncated = False
+        if limit >= len(OUTPUT_TRUNCATION_MARKER) + 20:
+            available = limit - len(OUTPUT_TRUNCATION_MARKER)
+            self._head_size = available * 2 // 3
+            self._tail_size = available - self._head_size
+        else:
+            self._head_size = max(0, limit)
+            self._tail_size = 0
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        if self.limit <= 0:
+            self._value += text
+            return
+        if self._truncated:
+            if self._tail_size:
+                self._tail = (self._tail + text)[-self._tail_size :]
+            return
+        combined = self._value + text
+        if len(combined) <= self.limit:
+            self._value = combined
+            return
+        self._truncated = True
+        self._head = combined[: self._head_size]
+        if self._tail_size:
+            self._tail = combined[-self._tail_size :]
+        self._value = ""
+
+    def render(self) -> str:
+        if not self._truncated:
+            return self._value
+        if not self._tail_size:
+            return self._head
+        return self._head + OUTPUT_TRUNCATION_MARKER + self._tail
 
 
 @dataclass(slots=True)
@@ -24,6 +77,8 @@ class ProcessResult:
     stderr: str
     duration_ms: int
     timed_out: bool = False
+    stream_truncated: bool = False
+    stream_complete: bool = True
 
     @property
     def ok(self) -> bool:
@@ -49,6 +104,7 @@ class ProcessDriver:
         timeout: int,
         env: dict[str, str] | None = None,
         shell: bool = False,
+        on_output: OutputSink | None = None,
     ) -> ProcessResult:
         raise NotImplementedError
 
@@ -67,6 +123,7 @@ class NativeProcessDriver(ProcessDriver):
         timeout: int,
         env: dict[str, str] | None = None,
         shell: bool = False,
+        on_output: OutputSink | None = None,
     ) -> ProcessResult:
         cwd = self.roots.resolve(cwd, must_exist=True, kind="dir").path
         process_env = {key: value for key, value in os.environ.items() if key in self.safety.env_allowlist}
@@ -92,27 +149,123 @@ class NativeProcessDriver(ProcessDriver):
                 creationflags=creationflags,
             )
         timed_out = False
+        limit = self.safety.max_process_output_chars
+        stdout = _BoundedText(limit)
+        stderr = _BoundedText(limit)
+        emitted_chars = 0
+        emitted_truncation = False
+        output_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+
+        def queue_output(name: str, text: str) -> None:
+            nonlocal emitted_chars, emitted_truncation
+            if on_output is None or not text:
+                return
+            if limit > 0:
+                available = max(0, limit - emitted_chars)
+                chunk = text[:available]
+                was_truncated = len(text) > available
+            else:
+                chunk = text
+                was_truncated = False
+            emitted_chars += len(chunk)
+            if chunk:
+                output_queue.put_nowait((name, chunk))
+            if was_truncated and not emitted_truncation:
+                emitted_truncation = True
+                output_queue.put_nowait((name, OUTPUT_TRUNCATION_MARKER))
+
+        async def dispatch_output() -> None:
+            while True:
+                item = await output_queue.get()
+                if item is None:
+                    return
+                name, text = item
+                assert on_output is not None
+                try:
+                    outcome = on_output(name, text)
+                    if inspect.isawaitable(outcome):
+                        await outcome
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+        output_task = (
+            asyncio.create_task(dispatch_output()) if on_output is not None else None
+        )
+
+        async def finish_output(*, drain: bool) -> bool:
+            if output_task is None:
+                return True
+            output_queue.put_nowait(None)
+            if drain:
+                done, _ = await asyncio.wait(
+                    {output_task}, timeout=_OUTPUT_OBSERVER_DRAIN_SECONDS
+                )
+                if done:
+                    return True
+            output_task.cancel()
+
+            # Give ordinary cancellation-aware observers a chance to exit. Do
+            # not await them without a bound: observers are outside the process
+            # timeout contract and must not keep a command alive.
+            await asyncio.sleep(0)
+            return False
+
+        if output_task is not None:
+            def consume_output_task(task: asyncio.Task[None]) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            output_task.add_done_callback(consume_output_task)
+
+        async def pump(
+            stream: asyncio.StreamReader | None, sink: _BoundedText, name: str
+        ) -> None:
+            if stream is None:
+                return
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            while True:
+                data = await stream.read(65_536)
+                if not data:
+                    break
+                text = decoder.decode(data)
+                sink.append(text)
+                queue_output(name, text)
+            final = decoder.decode(b"", final=True)
+            sink.append(final)
+            queue_output(name, final)
+
+        tasks = [
+            asyncio.create_task(pump(process.stdout, stdout, "stdout")),
+            asyncio.create_task(pump(process.stderr, stderr, "stderr")),
+            asyncio.create_task(process.wait()),
+        ]
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(process.communicate(), timeout=max(1, timeout))
-        except TimeoutError:
-            timed_out = True
-            await _terminate_process(process)
-            stdout_b, stderr_b = await process.communicate()
+            _, pending = await asyncio.wait(tasks, timeout=max(1, timeout))
+            if pending:
+                timed_out = True
+                await _terminate_process(process)
+            await asyncio.gather(*tasks)
+            stream_complete = await finish_output(drain=True)
         except asyncio.CancelledError:
             await _terminate_process(process)
-            with contextlib.suppress(Exception):
-                await process.communicate()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await finish_output(drain=False)
             raise
-        limit = self.safety.max_process_output_chars
-        stdout = truncate_text(stdout_b.decode("utf-8", errors="replace"), limit)
-        stderr = truncate_text(stderr_b.decode("utf-8", errors="replace"), limit)
         return ProcessResult(
             command=command if isinstance(command, str) else " ".join(command),
             exit_code=process.returncode if process.returncode is not None else -1,
-            stdout=stdout,
-            stderr=stderr,
+            stdout=stdout.render(),
+            stderr=stderr.render(),
             duration_ms=monotonic_ms() - started,
             timed_out=timed_out,
+            stream_truncated=emitted_truncation,
+            stream_complete=stream_complete,
         )
 
 
@@ -134,6 +287,7 @@ class DockerProcessDriver(ProcessDriver):
         timeout: int,
         env: dict[str, str] | None = None,
         shell: bool = False,
+        on_output: OutputSink | None = None,
     ) -> ProcessResult:
         resolved = self.roots.resolve(cwd, must_exist=True, kind="dir")
         mount_points: dict[Path, Path] = {self.roots.primary: Path("/workspace")}
@@ -165,7 +319,9 @@ class DockerProcessDriver(ProcessDriver):
         else:
             argv += command
         native = NativeProcessDriver(self.roots, self.safety, self.sandbox)
-        return await native.run(argv, cwd=self.roots.primary, timeout=timeout, shell=False)
+        return await native.run(
+            argv, cwd=self.roots.primary, timeout=timeout, shell=False, on_output=on_output
+        )
 
 
 def build_process_driver(

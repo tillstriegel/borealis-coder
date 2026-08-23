@@ -1,6 +1,6 @@
 """Safety, policy, approvals, path boundaries, checkpoints, and sandboxing."""
 
-from .approvals import ApprovalManager, ApprovalRequest
+from .approvals import ApprovalCallback, ApprovalManager, ApprovalRequest
 from .checkpoints import Checkpoint, CheckpointManager
 from .commands import CommandAssessment, CommandRisk, assess_command
 from .paths import ResolvedPath, WorkspaceRoots
@@ -14,6 +14,7 @@ from .sandbox import (
 )
 
 __all__ = [
+    "ApprovalCallback",
     "ApprovalManager",
     "ApprovalRequest",
     "Checkpoint",

@@ -501,6 +501,176 @@ class CLITests(unittest.TestCase):
         self.assertIn("verified=False", footer)
         self.assertIn("error=boom", footer)
 
+    def test_renderer_streams_bounded_tool_output_without_repeating_it(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(
+                show_tool_output=True,
+                tool_output_chars=200,
+                status_stream=stderr,
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.started",
+                    data={"tool": "shell", "tool_call_id": "call_1", "arguments": {}},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={"tool": "shell", "tool_call_id": "call_1", "text": "x" * 250},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.completed",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "output": "x" * 250,
+                        "is_error": False,
+                        "metadata": {"duration_ms": 2},
+                    },
+                )
+            )
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertEqual(output.count("x"), 200)
+        self.assertEqual(output.count("output truncated"), 1)
+        self.assertLess(output.index("x"), output.index("✓ shell"))
+
+    def test_renderer_keeps_tool_heartbeat_after_streamed_output(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(show_tool_output=True, status_stream=stderr)
+            await renderer.handle(
+                Event(
+                    type="tool.started",
+                    data={"tool": "shell", "tool_call_id": "call_1", "arguments": {}},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "stream": "stdout",
+                        "text": "building\n",
+                    },
+                )
+            )
+            renderer.heartbeat(10)
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertIn("still working · running shell · 10s elapsed", output)
+
+    def test_renderer_preserves_failure_details_after_streaming_output(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(show_tool_output=True, status_stream=stderr)
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "stream": "stdout",
+                        "text": "build",
+                    },
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.completed",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "output": (
+                            "exit_code=2\nstdout:\nbuilding\n"
+                            "stderr:\nFATAL: failed"
+                        ),
+                        "is_error": True,
+                        "metadata": {"duration_ms": 2, "exit_code": 2},
+                    },
+                )
+            )
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertEqual(output.count("build"), 1)
+        self.assertNotIn("stdout:\n  building", output)
+        self.assertIn("stdout:\n    ing", output)
+        self.assertIn("exit_code=2", output)
+        self.assertIn("FATAL: failed", output)
+
+    def test_renderer_preserves_unseen_tail_after_stream_truncation(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(
+                show_tool_output=True,
+                tool_output_chars=200,
+                status_stream=stderr,
+            )
+            streamed = "H" * 250
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={"tool": "shell", "tool_call_id": "call_1", "text": streamed},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.completed",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "output": f"exit_code=0\nstdout:\n{streamed}IMPORTANT_TAIL",
+                        "is_error": False,
+                        "metadata": {
+                            "duration_ms": 2,
+                            "stream_truncated": True,
+                            "stream_complete": True,
+                        },
+                    },
+                )
+            )
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertIn("output truncated", output)
+        self.assertIn("final output tail", output)
+        self.assertIn("IMPORTANT_TAIL", output)
+
+    def test_renderer_ends_bare_carriage_return_before_completion(self) -> None:
+        async def render() -> str:
+            stderr = io.StringIO()
+            renderer = cli.ConsoleRenderer(show_tool_output=True, status_stream=stderr)
+            await renderer.handle(
+                Event(
+                    type="tool.output",
+                    data={"tool": "shell", "tool_call_id": "call_1", "text": "progress 100%\r"},
+                )
+            )
+            await renderer.handle(
+                Event(
+                    type="tool.completed",
+                    data={
+                        "tool": "shell",
+                        "tool_call_id": "call_1",
+                        "output": "exit_code=0",
+                        "is_error": False,
+                        "metadata": {"duration_ms": 1},
+                    },
+                )
+            )
+            return stderr.getvalue()
+
+        output = __import__("asyncio").run(render())
+        self.assertIn("progress 100%\r\n✓ shell", output)
+
     def test_aurora_ui_and_live_interactive_renderer(self) -> None:
         async def render() -> str:
             stream = TTYBuffer()

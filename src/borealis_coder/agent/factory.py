@@ -11,6 +11,7 @@ from ..mcp import MCPManager
 from ..plugins import load_entrypoint_tools, load_workspace_plugins
 from ..providers.registry import DEFAULT_PROVIDER_REGISTRY, ProviderRegistry
 from ..safety import (
+    ApprovalCallback,
     ApprovalManager,
     CheckpointManager,
     PolicyEngine,
@@ -26,7 +27,7 @@ async def build_runner(
     workspace: Path,
     *,
     config: Config | None = None,
-    approval_callback=None,  # type: ignore[no-untyped-def]
+    approval_callback: ApprovalCallback | None = None,
     interactive: bool = True,
     provider_registry: ProviderRegistry | None = None,
     additional_roots: list[Path] | None = None,

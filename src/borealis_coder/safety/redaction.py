@@ -14,14 +14,62 @@ _SECRET_NAME = re.compile(
     re.IGNORECASE,
 )
 
-_TOKEN_PATTERNS = [
+_TOKEN_PATTERNS = (
     re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\b(?:ghp|github_pat|glpat)-?[A-Za-z0-9_]{16,}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
     re.compile(r"\b(?:Bearer\s+)[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.DOTALL),
-]
+)
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
+    r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+_PRIVATE_KEY_BEGIN = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+)
+_PRIVATE_KEY_END = re.compile(
+    r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+)
+
+_STREAMING_TOKEN_SUFFIXES = (
+    re.compile(r"sk-[A-Za-z0-9_-]*$"),
+    re.compile(r"(?:ghp|github_pat|glpat)-?[A-Za-z0-9_]*$"),
+    re.compile(r"AIza[0-9A-Za-z_-]*$"),
+    re.compile(
+        r"Bearer(?:\s+[A-Za-z0-9._~+/=-]*)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"AKIA[0-9A-Z]{0,16}$"),
+)
+_STREAMING_TOKEN_PREFIXES = (
+    ("sk-", False),
+    ("ghp", False),
+    ("github_pat", False),
+    ("glpat", False),
+    ("AIza", False),
+    ("Bearer", True),
+    ("AKIA", False),
+)
+_STREAMING_PRIVATE_KEY_PREFIXES = (
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+)
+
+
+def _partial_prefix_start(
+    value: str, prefix: str, *, ignore_case: bool = False
+) -> int | None:
+    candidate = value.lower() if ignore_case else value
+    expected = prefix.lower() if ignore_case else prefix
+    for size in range(min(len(candidate), len(expected) - 1), 0, -1):
+        if candidate.endswith(expected[:size]):
+            return len(value) - size
+    return None
 
 
 class Redactor:
@@ -32,13 +80,22 @@ class Redactor:
                 values.add(value)
         self._values = sorted(values, key=len, reverse=True)
 
-    def text(self, value: str) -> str:
+    def text(self, value: str, *, preceding_char: str = "") -> str:
         result = value
         for secret in self._values:
             result = result.replace(secret, "[REDACTED]")
+        boundary_context = ""
+        if preceding_char:
+            boundary_context = (
+                "x" if re.match(r"\w", preceding_char[-1]) else " "
+            )
         for pattern in _TOKEN_PATTERNS:
-            result = pattern.sub("[REDACTED]", result)
-        return result
+            if boundary_context:
+                framed = boundary_context + result
+                result = pattern.sub("[REDACTED]", framed)[1:]
+            else:
+                result = pattern.sub("[REDACTED]", result)
+        return _PRIVATE_KEY_PATTERN.sub("[REDACTED]", result)
 
     def value(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -59,3 +116,119 @@ class Redactor:
 
     def json(self, value: Any) -> str:
         return json_dumps(self.value(value))
+
+    def _streaming_suffix_start(
+        self, value: str, *, preceding_char: str = ""
+    ) -> int | None:
+        """Return the earliest suffix that could become a secret."""
+        starts: list[int] = []
+        private_key_ends = list(_PRIVATE_KEY_END.finditer(value))
+        for secret in self._values:
+            maximum = min(len(value), len(secret) - 1)
+            for size in range(maximum, 0, -1):
+                if value.endswith(secret[:size]):
+                    starts.append(len(value) - size)
+                    break
+        for pattern in _STREAMING_TOKEN_SUFFIXES:
+            if (match := pattern.search(value)) and self._has_streaming_token_boundary(
+                value, match.start(), preceding_char
+            ):
+                starts.append(match.start())
+        for prefix, ignore_case in _STREAMING_TOKEN_PREFIXES:
+            start = _partial_prefix_start(value, prefix, ignore_case=ignore_case)
+            if start is None:
+                continue
+            if self._has_streaming_token_boundary(value, start, preceding_char):
+                starts.append(start)
+        for prefix in _STREAMING_PRIVATE_KEY_PREFIXES:
+            start = _partial_prefix_start(value, prefix)
+            if start is None:
+                continue
+            for private_key_end in reversed(private_key_ends):
+                if private_key_end.start() <= start < private_key_end.end():
+                    start = private_key_end.end()
+                    break
+            if start < len(value):
+                starts.append(start)
+        return min(starts) if starts else None
+
+    def _has_streaming_token_boundary(
+        self, value: str, start: int, preceding_char: str
+    ) -> bool:
+        before = value[start - 1] if start else preceding_char
+        if not before or not re.match(r"\w", before):
+            return True
+        prefix = value[:start]
+        return any(prefix.endswith(secret) for secret in self._values)
+
+
+class StreamingRedactor:
+    """Redact a stream while retaining only possible secret suffixes."""
+
+    def __init__(self, redactor: Redactor) -> None:
+        self.redactor = redactor
+        self._buffer = ""
+        self._redacted_preceding_char = ""
+
+    def feed(self, value: str) -> str:
+        """Return safe text immediately and retain possible split secrets."""
+        self._buffer += value
+        safe_end = len(self._buffer)
+        private_key_start = self._unclosed_private_key_start()
+        if private_key_start is not None:
+            safe_end = private_key_start
+        suffix_start = self.redactor._streaming_suffix_start(
+            self._buffer[:safe_end],
+            preceding_char=self._redacted_preceding_char,
+        )
+        if suffix_start is not None:
+            safe_end = min(safe_end, suffix_start)
+        if safe_end <= 0:
+            return ""
+
+        complete = self._buffer[:safe_end]
+        self._buffer = self._buffer[safe_end:]
+        output = self.redactor.text(
+            complete, preceding_char=self._redacted_preceding_char
+        )
+        self._redacted_preceding_char = output[-1]
+        return output
+
+    def flush(self, *, mask_incomplete: bool = False) -> str:
+        """Redact and return the incomplete stream tail."""
+        if not self._buffer:
+            return ""
+        mask_start = self._unclosed_private_key_start()
+        if mask_incomplete:
+            suffix_start = self.redactor._streaming_suffix_start(
+                self._buffer,
+                preceding_char=self._redacted_preceding_char,
+            )
+            if suffix_start is not None:
+                mask_start = (
+                    suffix_start
+                    if mask_start is None
+                    else min(mask_start, suffix_start)
+                )
+        if mask_start is None:
+            output = self.redactor.text(
+                self._buffer, preceding_char=self._redacted_preceding_char
+            )
+        else:
+            output = self.redactor.text(
+                self._buffer[:mask_start],
+                preceding_char=self._redacted_preceding_char,
+            ) + "[REDACTED]"
+        self._redacted_preceding_char = output[-1]
+        self._buffer = ""
+        return output
+
+    def _unclosed_private_key_start(self) -> int | None:
+        starts = list(_PRIVATE_KEY_BEGIN.finditer(self._buffer))
+        if not starts:
+            return None
+        ends = list(_PRIVATE_KEY_END.finditer(self._buffer))
+        start = starts[-1].start()
+        if not ends or ends[-1].start() < start:
+            return start
+        return None
