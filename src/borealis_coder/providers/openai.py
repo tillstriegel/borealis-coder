@@ -132,7 +132,7 @@ class OpenAIProvider(Provider):
         )
         if not isinstance(response.data, dict):
             raise ProviderError("OpenAI returned a non-object response")
-        _raise_responses_failure(response.data)
+        _raise_in_band_failure(response.data)
         return self._parse_responses(response.data, retain_raw=True)
 
     async def _stream_responses(
@@ -252,13 +252,13 @@ class OpenAIProvider(Provider):
                 completed_data = (
                     data.get("response") if isinstance(data.get("response"), dict) else data
                 )
-                _raise_responses_failure(completed_data)
+                _raise_in_band_failure(completed_data)
                 final_data = completed_data
             elif event_type in {"response.failed", "error"}:
                 failed = (
                     data.get("response") if isinstance(data.get("response"), dict) else data
                 )
-                _raise_responses_failure(failed, default_message="Responses stream failed")
+                _raise_in_band_failure(failed, default_message="Responses stream failed")
         if final_data:
             result = self._parse_responses(final_data, retain_raw=True)
             if not result.text:
@@ -491,6 +491,7 @@ class OpenAIProvider(Provider):
         return payload
 
     async def _complete_chat(self, request: ProviderRequest) -> ModelResponse:
+        prior_usage = Usage()
         try:
             response = await self._complete_chat_once(request)
         except ProviderError as error:
@@ -504,12 +505,14 @@ class OpenAIProvider(Provider):
                     "OpenAI-compatible provider returned an empty response",
                     retryable=True,
                 )
+            prior_usage.add(response.usage)
         response = await self._complete_chat_once(replace(request, reasoning_effort=None))
         if not _has_actionable_output(response):
             raise ProviderUnavailableError(
                 "OpenAI-compatible provider returned an empty response with reasoning disabled",
                 retryable=False,
             )
+        response.usage = prior_usage.add(response.usage)
         return response
 
     async def _complete_chat_once(self, request: ProviderRequest) -> ModelResponse:
@@ -524,12 +527,14 @@ class OpenAIProvider(Provider):
     async def _stream_chat(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         actionable_output_emitted = False
         empty_response = False
+        prior_usage = Usage()
         try:
             async for event in self._stream_chat_once(request):
                 if event.type == "completed" and event.response is not None:
                     if _has_actionable_output(event.response):
                         yield event
                         return
+                    prior_usage.add(event.response.usage)
                     empty_response = True
                     continue
                 if event.type in {"text_delta", "tool_call_delta"}:
@@ -546,16 +551,14 @@ class OpenAIProvider(Provider):
         if request.reasoning_effort and not actionable_output_emitted and empty_response:
             fallback = replace(request, reasoning_effort=None)
             async for event in self._stream_chat_once(fallback):
-                if (
-                    event.type == "completed"
-                    and event.response is not None
-                    and not _has_actionable_output(event.response)
-                ):
-                    raise ProviderUnavailableError(
-                        "OpenAI-compatible provider returned an empty response "
-                        "with reasoning disabled",
-                        retryable=False,
-                    )
+                if event.type == "completed" and event.response is not None:
+                    if not _has_actionable_output(event.response):
+                        raise ProviderUnavailableError(
+                            "OpenAI-compatible provider returned an empty response "
+                            "with reasoning disabled",
+                            retryable=False,
+                        )
+                    event.response.usage = prior_usage.add(event.response.usage)
                 yield event
             return
         raise ProviderUnavailableError(
@@ -583,6 +586,11 @@ class OpenAIProvider(Provider):
                 data = json.loads(item.data)
             except json.JSONDecodeError:
                 continue
+            if data.get("error") or str(data.get("type") or "").lower() == "error":
+                _raise_in_band_failure(
+                    data,
+                    default_message="Chat Completions stream failed",
+                )
             model = data.get("model") or model
             response_id = data.get("id") or response_id
             if data.get("usage"):
@@ -875,7 +883,7 @@ def _has_actionable_output(response: ModelResponse) -> bool:
     return bool(response.text or response.tool_calls)
 
 
-def _raise_responses_failure(
+def _raise_in_band_failure(
     data: dict[str, Any],
     *,
     default_message: str | None = None,
@@ -902,7 +910,13 @@ def _raise_responses_failure(
             or default_message
             or "Responses request failed"
         )
-    code = str(error_data.get("code") or "").lower()
+    raw_code = error_data.get("code")
+    code = str(raw_code or "").lower()
+    status: int | None = None
+    if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+        status = raw_code
+    elif isinstance(raw_code, str) and raw_code.isdecimal():
+        status = int(raw_code)
     if code in {"rate_limit_error", "rate_limit_exceeded", "too_many_requests"}:
         raise ProviderRateLimitError(message, retryable=True, details=data)
     if code in {
@@ -912,7 +926,7 @@ def _raise_responses_failure(
         "service_unavailable",
     }:
         raise ProviderUnavailableError(message, retryable=True, details=data)
-    raise classify_provider_error(None, message, details=data)
+    raise classify_provider_error(status, message, details=data)
 
 
 def _reasoning_summary_unsupported(error: ProviderError) -> bool:

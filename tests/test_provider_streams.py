@@ -612,6 +612,8 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                 type="openrouter",
                 base_url="https://openrouter.test/api/v1",
                 api_style="chat",
+                input_cost_per_million=1,
+                output_cost_per_million=2,
             ),
             "key",
         )
@@ -635,6 +637,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                                 },
                             }
                         ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 3},
                     }
                 ),
             ),
@@ -666,11 +669,81 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         final = streamed[-1].response
         assert final is not None
         self.assertEqual(final.text, "Recovered answer.")
+        self.assertEqual(final.usage.input_tokens, 9)
+        self.assertEqual(final.usage.output_tokens, 5)
+        self.assertEqual(final.usage.requests, 2)
+        self.assertAlmostEqual(final.usage.cost_usd, 0.000019)
         self.assertEqual(len(fake.calls), 2)
         first_payload = cast(dict[str, Any], fake.calls[0][1]["payload"])
         second_payload = cast(dict[str, Any], fake.calls[1][1]["payload"])
         self.assertEqual(first_payload["reasoning"], {"effort": "high"})
         self.assertNotIn("reasoning", second_payload)
+
+    async def test_complete_chat_preserves_usage_across_reasoning_disabled_retry(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        first = ModelResponse(usage=Usage(input_tokens=5, output_tokens=3, requests=1))
+        recovered = ModelResponse(
+            text="Recovered answer.",
+            usage=Usage(input_tokens=4, output_tokens=2, requests=1),
+        )
+        complete_once = AsyncMock(side_effect=[first, recovered])
+
+        with patch.object(provider, "_complete_chat_once", new=complete_once):
+            response = await provider.complete(self.request)
+
+        self.assertEqual(response.text, "Recovered answer.")
+        self.assertEqual(response.usage.input_tokens, 9)
+        self.assertEqual(response.usage.output_tokens, 5)
+        self.assertEqual(response.usage.requests, 2)
+        self.assertEqual(complete_once.await_count, 2)
+        fallback_request = complete_once.await_args_list[1].args[0]
+        self.assertIsNone(fallback_request.reasoning_effort)
+
+    async def test_chat_stream_classifies_in_band_error_without_fallback_request(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        fake = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": 429,
+                                "message": "Provider rate limit exceeded.",
+                            }
+                        }
+                    ),
+                )
+            ]
+        )
+        provider.http = fake  # type: ignore[assignment]
+
+        with self.assertRaises(ProviderRateLimitError) as rate_limited:
+            _ = [event async for event in provider.stream(self.request)]
+
+        self.assertTrue(rate_limited.exception.retryable)
+        self.assertEqual(rate_limited.exception.status_code, 429)
+        self.assertEqual(
+            rate_limited.exception.details["error"]["message"],
+            "Provider rate limit exceeded.",
+        )
+        self.assertEqual(len(fake.calls), 1)
 
     async def test_responses_retries_when_reasoning_summaries_are_unsupported(self) -> None:
         provider = OpenAIProvider(
