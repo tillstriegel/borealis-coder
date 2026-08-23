@@ -168,6 +168,13 @@ MCP server commands execute outside the shell tool and should be treated as trus
 
 Workspace configuration also cannot replace provider endpoints or credential sources unless `BOREALIS_ALLOW_WORKSPACE_PROVIDER_ENDPOINTS=1` is set externally. Prefer user-level or explicit configuration for trusted custom endpoints.
 
+Repository-owned workspace configuration may set only non-authoritative context
+discovery fields by default. Provider selection, budgets, safety, sandbox,
+storage, cache, telemetry, and context resource ceilings require
+`BOREALIS_ALLOW_WORKSPACE_AUTHORITY=1` outside the repository. That general
+opt-in does not enable MCP servers or provider endpoints; their narrower opt-ins
+remain mandatory.
+
 Workspace plugins are disabled unless `BOREALIS_ENABLE_WORKSPACE_PLUGINS=1`. When enabled, they execute Python in the Borealis process and have the process’s full authority. Use entry-point packages or MCP for reviewable production extensions.
 
 ## Persistence and privacy

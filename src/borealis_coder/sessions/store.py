@@ -15,6 +15,7 @@ from ..models import Event, Message, SessionInfo, Usage
 from ..util import ensure_private_directory, ensure_private_file, json_dumps, new_id, utc_now
 
 _SCHEMA_VERSION = 3
+_EVENT_EXPORT_PAGE_SIZE = 1_000
 
 
 class SessionStore:
@@ -134,17 +135,23 @@ class SessionStore:
         )
         current = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
         if current is None:
-            conn.execute("INSERT INTO schema_meta(key, value) VALUES('version', ?)", (str(_SCHEMA_VERSION),))
+            conn.execute(
+                "INSERT INTO schema_meta(key, value) VALUES('version', ?)", (str(_SCHEMA_VERSION),)
+            )
         else:
             version = int(current[0])
             if version > _SCHEMA_VERSION:
-                raise SessionError(f"Database schema {current[0]} is newer than supported {_SCHEMA_VERSION}")
+                raise SessionError(
+                    f"Database schema {current[0]} is newer than supported {_SCHEMA_VERSION}"
+                )
             if version < 2:
                 self._migrate_tool_calls_v2()
                 version = 2
             if version < 3:
                 self._migrate_cache_v3()
-            conn.execute("UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),))
+            conn.execute(
+                "UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),)
+            )
         conn.commit()
 
     def _migrate_tool_calls_v2(self) -> None:
@@ -180,8 +187,7 @@ class SessionStore:
 
     def _migrate_cache_v3(self) -> None:
         columns = {
-            row["name"]
-            for row in self._connection.execute("PRAGMA table_info(usage)").fetchall()
+            row["name"] for row in self._connection.execute("PRAGMA table_info(usage)").fetchall()
         }
         additions = {
             "cache_savings_usd": "REAL NOT NULL DEFAULT 0",
@@ -192,9 +198,7 @@ class SessionStore:
         }
         for name, declaration in additions.items():
             if name not in columns:
-                self._connection.execute(
-                    f"ALTER TABLE usage ADD COLUMN {name} {declaration}"
-                )
+                self._connection.execute(f"ALTER TABLE usage ADD COLUMN {name} {declaration}")
 
     def create_session(
         self,
@@ -211,19 +215,33 @@ class SessionStore:
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT INTO sessions(id,workspace,title,provider,model,status,created_at,updated_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                (session_id, str(workspace.resolve()), title, provider, model, "idle", now, now, json_dumps(metadata or {})),
+                (
+                    session_id,
+                    str(workspace.resolve()),
+                    title,
+                    provider,
+                    model,
+                    "idle",
+                    now,
+                    now,
+                    json_dumps(metadata or {}),
+                ),
             )
             self._connection.execute("INSERT INTO usage(session_id) VALUES(?)", (session_id,))
         return self.get_session(session_id)
 
     def get_session(self, session_id: str) -> SessionInfo:
         with self._lock:
-            row = self._connection.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+            row = self._connection.execute(
+                "SELECT * FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
         if row is None:
             raise SessionError(f"Unknown session: {session_id}")
         return _session_info(row)
 
-    def list_sessions(self, *, workspace: Path | None = None, limit: int = 100) -> list[SessionInfo]:
+    def list_sessions(
+        self, *, workspace: Path | None = None, limit: int = 100
+    ) -> list[SessionInfo]:
         query = "SELECT * FROM sessions"
         params: list[Any] = []
         if workspace is not None:
@@ -247,7 +265,12 @@ class SessionStore:
     ) -> SessionInfo:
         updates = ["updated_at=?"]
         values: list[Any] = [utc_now()]
-        for column, value in (("status", status), ("title", title), ("provider", provider), ("model", model)):
+        for column, value in (
+            ("status", status),
+            ("title", title),
+            ("provider", provider),
+            ("model", model),
+        ):
             if value is not None:
                 updates.append(f"{column}=?")
                 values.append(value)
@@ -256,7 +279,9 @@ class SessionStore:
             values.append(json_dumps(metadata))
         values.append(session_id)
         with self._lock, self._connection:
-            cursor = self._connection.execute(f"UPDATE sessions SET {', '.join(updates)} WHERE id=?", values)
+            cursor = self._connection.execute(
+                f"UPDATE sessions SET {', '.join(updates)} WHERE id=?", values
+            )
             if cursor.rowcount == 0:
                 raise SessionError(f"Unknown session: {session_id}")
         return self.get_session(session_id)
@@ -276,9 +301,17 @@ class SessionStore:
                     role=excluded.role,
                     payload_json=excluded.payload_json,
                     created_at=excluded.created_at""",
-                (session_id, message.id, message.role.value, json_dumps(message.to_dict()), message.created_at),
+                (
+                    session_id,
+                    message.id,
+                    message.role.value,
+                    json_dumps(message.to_dict()),
+                    message.created_at,
+                ),
             )
-            self._connection.execute("UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id))
+            self._connection.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id)
+            )
 
     def replace_messages(self, session_id: str, messages: Iterable[Message]) -> None:
         with self._lock, self._connection:
@@ -286,41 +319,123 @@ class SessionStore:
             for message in messages:
                 self._connection.execute(
                     "INSERT INTO messages(session_id,message_id,role,payload_json,created_at) VALUES(?,?,?,?,?)",
-                    (session_id, message.id, message.role.value, json_dumps(message.to_dict()), message.created_at),
+                    (
+                        session_id,
+                        message.id,
+                        message.role.value,
+                        json_dumps(message.to_dict()),
+                        message.created_at,
+                    ),
                 )
-            self._connection.execute("UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id))
+            self._connection.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id)
+            )
 
     def messages(self, session_id: str) -> list[Message]:
         self.get_session(session_id)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT payload_json FROM messages WHERE session_id=? ORDER BY sequence", (session_id,)
+                "SELECT payload_json FROM messages WHERE session_id=? ORDER BY sequence",
+                (session_id,),
             ).fetchall()
         return [Message.from_dict(json.loads(row[0])) for row in rows]
 
     def append_event(self, event: Event) -> None:
+        self.append_events([event])
+
+    def append_events(self, events: Iterable[Event]) -> None:
+        rows = [
+            (
+                event.id,
+                event.session_id,
+                event.run_id,
+                event.type,
+                json_dumps(event.to_dict()),
+                event.created_at,
+            )
+            for event in events
+        ]
+        if not rows:
+            return
         with self._lock, self._connection:
-            self._connection.execute(
+            self._connection.executemany(
                 "INSERT OR IGNORE INTO events(event_id,session_id,run_id,type,payload_json,created_at) VALUES(?,?,?,?,?,?)",
-                (event.id, event.session_id, event.run_id, event.type, json_dumps(event.to_dict()), event.created_at),
+                rows,
             )
 
-    def events(self, session_id: str, *, after_sequence: int = 0, limit: int = 10_000) -> list[tuple[int, Event]]:
+    def events(
+        self, session_id: str, *, after_sequence: int = 0, limit: int = 10_000
+    ) -> list[tuple[int, Event]]:
+        return self._event_page(
+            session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    def _event_page(
+        self,
+        session_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+        through_sequence: int | None = None,
+    ) -> list[tuple[int, Event]]:
+        upper_bound = "" if through_sequence is None else " AND sequence<=?"
+        parameters: tuple[Any, ...]
+        if through_sequence is None:
+            parameters = (session_id, after_sequence, limit)
+        else:
+            parameters = (session_id, after_sequence, through_sequence, limit)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT sequence,payload_json FROM events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT ?",
-                (session_id, after_sequence, limit),
+                "SELECT sequence,payload_json FROM events "
+                f"WHERE session_id=? AND sequence>?{upper_bound} "
+                "ORDER BY sequence LIMIT ?",
+                parameters,
             ).fetchall()
         result: list[tuple[int, Event]] = []
         for row in rows:
             data = json.loads(row["payload_json"])
-            result.append((int(row["sequence"]), Event(
-                id=data["id"], type=data["type"], session_id=data.get("session_id"),
-                run_id=data.get("run_id"), data=data.get("data") or {}, created_at=data["created_at"],
-            )))
+            result.append(
+                (
+                    int(row["sequence"]),
+                    Event(
+                        id=data["id"],
+                        type=data["type"],
+                        session_id=data.get("session_id"),
+                        run_id=data.get("run_id"),
+                        data=data.get("data") or {},
+                        created_at=data["created_at"],
+                    ),
+                )
+            )
         return result
 
-    def start_tool_call(self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any]) -> None:
+    def _export_events(self, session_id: str) -> list[tuple[int, Event]]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT MAX(sequence) FROM events WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        through_sequence = int(row[0] or 0)
+        after_sequence = 0
+        result: list[tuple[int, Event]] = []
+        while after_sequence < through_sequence:
+            page = self._event_page(
+                session_id,
+                after_sequence=after_sequence,
+                limit=_EVENT_EXPORT_PAGE_SIZE,
+                through_sequence=through_sequence,
+            )
+            if not page:
+                break
+            result.extend(page)
+            after_sequence = page[-1][0]
+        return result
+
+    def start_tool_call(
+        self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any]
+    ) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 """INSERT INTO tool_calls(
@@ -410,24 +525,39 @@ class SessionStore:
                 application_cache_saved_tokens=application_cache_saved_tokens+?,
                 application_cache_saved_cost_usd=application_cache_saved_cost_usd+?
                 WHERE session_id=?""",
-                (usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
-                 usage.cache_write_tokens, usage.reasoning_tokens, usage.requests,
-                 usage.cost_usd, usage.cache_savings_usd,
-                 usage.application_cache_hits, usage.application_cache_misses,
-                 usage.application_cache_saved_tokens,
-                 usage.application_cache_saved_cost_usd, session_id),
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cached_input_tokens,
+                    usage.cache_write_tokens,
+                    usage.reasoning_tokens,
+                    usage.requests,
+                    usage.cost_usd,
+                    usage.cache_savings_usd,
+                    usage.application_cache_hits,
+                    usage.application_cache_misses,
+                    usage.application_cache_saved_tokens,
+                    usage.application_cache_saved_cost_usd,
+                    session_id,
+                ),
             )
         return self.usage(session_id)
 
     def usage(self, session_id: str) -> Usage:
         with self._lock:
-            row = self._connection.execute("SELECT * FROM usage WHERE session_id=?", (session_id,)).fetchone()
+            row = self._connection.execute(
+                "SELECT * FROM usage WHERE session_id=?", (session_id,)
+            ).fetchone()
         if row is None:
             raise SessionError(f"Unknown session: {session_id}")
         return Usage(
-            input_tokens=row["input_tokens"], output_tokens=row["output_tokens"],
-            cached_input_tokens=row["cached_input_tokens"], cache_write_tokens=row["cache_write_tokens"],
-            reasoning_tokens=row["reasoning_tokens"], requests=row["requests"], cost_usd=row["cost_usd"],
+            input_tokens=row["input_tokens"],
+            output_tokens=row["output_tokens"],
+            cached_input_tokens=row["cached_input_tokens"],
+            cache_write_tokens=row["cache_write_tokens"],
+            reasoning_tokens=row["reasoning_tokens"],
+            requests=row["requests"],
+            cost_usd=row["cost_usd"],
             cache_savings_usd=row["cache_savings_usd"],
             application_cache_hits=row["application_cache_hits"],
             application_cache_misses=row["application_cache_misses"],
@@ -512,29 +642,44 @@ class SessionStore:
 
     def get_value(self, session_id: str, key: str, default: Any = None) -> Any:
         with self._lock:
-            row = self._connection.execute("SELECT value_json FROM key_values WHERE session_id=? AND key=?", (session_id, key)).fetchone()
+            row = self._connection.execute(
+                "SELECT value_json FROM key_values WHERE session_id=? AND key=?", (session_id, key)
+            ).fetchone()
         return default if row is None else json.loads(row[0])
 
     def export(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)
         return {
             "session": {
-                "id": session.id, "workspace": session.workspace, "title": session.title,
-                "provider": session.provider, "model": session.model, "status": session.status,
-                "created_at": session.created_at, "updated_at": session.updated_at,
+                "id": session.id,
+                "workspace": session.workspace,
+                "title": session.title,
+                "provider": session.provider,
+                "model": session.model,
+                "status": session.status,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
                 "metadata": session.metadata,
             },
             "messages": [item.to_dict() for item in self.messages(session_id)],
             "tool_calls": self.tool_calls(session_id),
             "usage": self.usage(session_id).to_dict(),
-            "events": [{"sequence": sequence, **event.to_dict()} for sequence, event in self.events(session_id)],
+            "events": [
+                {"sequence": sequence, **event.to_dict()}
+                for sequence, event in self._export_events(session_id)
+            ],
         }
 
 
 def _session_info(row: sqlite3.Row) -> SessionInfo:
     return SessionInfo(
-        id=row["id"], workspace=row["workspace"], title=row["title"],
-        provider=row["provider"], model=row["model"], status=row["status"],
-        created_at=row["created_at"], updated_at=row["updated_at"],
+        id=row["id"],
+        workspace=row["workspace"],
+        title=row["title"],
+        provider=row["provider"],
+        model=row["model"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
         metadata=json.loads(row["metadata_json"] or "{}"),
     )

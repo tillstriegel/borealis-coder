@@ -55,13 +55,20 @@ class InstructionLoader:
             applicable.append(item)
         return sorted(applicable, key=lambda item: len(item.scope.parts))
 
-    def root_text(self) -> str:
+    def root_text(
+        self,
+        documents: list[InstructionDocument] | None = None,
+    ) -> str:
         chunks: list[str] = []
-        for item in self.discover():
+        for item in self.discover() if documents is None else documents:
             if item.scope == self.root:
                 chunks.append(f"## {item.relative_path}\n\n{item.content.strip()}")
         return "\n\n".join(chunks)
 
-    def catalog(self) -> str:
-        nested = [item.relative_path for item in self.discover() if item.scope != self.root]
+    def catalog(
+        self,
+        documents: list[InstructionDocument] | None = None,
+    ) -> str:
+        source = self.discover() if documents is None else documents
+        nested = [item.relative_path for item in source if item.scope != self.root]
         return "\n".join(f"- {item}" for item in nested)

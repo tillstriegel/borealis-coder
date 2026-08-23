@@ -13,6 +13,21 @@ from .util import coerce_scalar, deep_merge, ensure_private_directory, set_neste
 
 T = TypeVar("T")
 
+_SAFE_WORKSPACE_CONTEXT_KEYS = frozenset({
+    "ignored_dirs",
+    "include_git_status",
+    "instruction_names",
+    "skill_dirs",
+})
+_WORKSPACE_AUTHORITY_SECTIONS = frozenset({
+    "agent",
+    "cache",
+    "safety",
+    "sandbox",
+    "storage",
+    "telemetry",
+})
+
 
 @dataclass(slots=True)
 class AgentConfig:
@@ -460,6 +475,7 @@ def load_config(
 
 
 def _validate_workspace_authority(values: dict[str, Any], path: Path) -> None:
+    authority_enabled = _enabled("BOREALIS_ALLOW_WORKSPACE_AUTHORITY")
     if values.get("mcp_servers") and not _enabled("BOREALIS_ENABLE_WORKSPACE_MCP"):
         raise ConfigurationError(
             f"Workspace MCP configuration in {path} is disabled by default. "
@@ -475,9 +491,8 @@ def _validate_workspace_authority(values: dict[str, Any], path: Path) -> None:
         "oauth_client_id",
         "refresh_url",
     }
-    if isinstance(providers, dict) and not _enabled(
-        "BOREALIS_ALLOW_WORKSPACE_PROVIDER_ENDPOINTS"
-    ):
+    provider_endpoints_enabled = _enabled("BOREALIS_ALLOW_WORKSPACE_PROVIDER_ENDPOINTS")
+    if isinstance(providers, dict) and not provider_endpoints_enabled:
         for name, provider in providers.items():
             if isinstance(provider, dict) and endpoint_keys.intersection(provider):
                 raise ConfigurationError(
@@ -485,6 +500,34 @@ def _validate_workspace_authority(values: dict[str, Any], path: Path) -> None:
                     f"in {path} is disabled by default. Move it to the user config, use an "
                     "explicit config file, or set BOREALIS_ALLOW_WORKSPACE_PROVIDER_ENDPOINTS=1."
                 )
+    if providers and not (authority_enabled or provider_endpoints_enabled):
+        raise ConfigurationError(
+            f"Workspace provider configuration in {path} is disabled by default. "
+            "Move it to the user config, use an explicit config file, or set "
+            "BOREALIS_ALLOW_WORKSPACE_AUTHORITY=1."
+        )
+    if authority_enabled:
+        return
+
+    restricted = [
+        section
+        for section in sorted(_WORKSPACE_AUTHORITY_SECTIONS)
+        if values.get(section)
+    ]
+    context = values.get("context") or {}
+    if isinstance(context, dict):
+        restricted.extend(
+            f"context.{key}"
+            for key in sorted(set(context) - _SAFE_WORKSPACE_CONTEXT_KEYS)
+        )
+    elif context:
+        restricted.append("context")
+    if restricted:
+        raise ConfigurationError(
+            f"Workspace authority-bearing configuration in {path} is disabled by default: "
+            f"{', '.join(restricted)}. Move it to the user config, use an explicit config "
+            "file, or set BOREALIS_ALLOW_WORKSPACE_AUTHORITY=1."
+        )
 
 
 def _enabled(name: str) -> bool:
@@ -502,8 +545,18 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("safety.mode must be plan, workspace-write, or full")
     if config.safety.approval not in {"never", "on-risk", "always"}:
         raise ConfigurationError("safety.approval must be never, on-risk, or always")
+    if config.safety.max_process_output_chars < 1:
+        raise ConfigurationError("safety.max_process_output_chars must be positive")
     if config.sandbox.driver not in {"native", "docker"}:
         raise ConfigurationError("sandbox.driver must be native or docker")
+    if config.sandbox.process_cpu_seconds < 1:
+        raise ConfigurationError("sandbox.process_cpu_seconds must be positive")
+    if config.sandbox.process_file_size_bytes < 1:
+        raise ConfigurationError("sandbox.process_file_size_bytes must be positive")
+    if config.context.max_search_results < 1:
+        raise ConfigurationError("context.max_search_results must be positive")
+    if config.context.tool_output_chars < 1:
+        raise ConfigurationError("context.tool_output_chars must be positive")
     if config.cache.anthropic_ttl not in {"5m", "1h"}:
         raise ConfigurationError("cache.anthropic_ttl must be 5m or 1h")
     if config.cache.response_cache_ttl_seconds < 0:
@@ -536,35 +589,20 @@ def validate_config(config: Config) -> None:
 
 
 SAMPLE_CONFIG = """# Borealis Coder workspace configuration
-
-[agent]
-provider = "auto"
-# model = "gpt-5.4-mini"
-max_turns = 60
-max_cost_usd = 25.0
-auto_verify = true
-
-[safety]
-mode = "workspace-write"
-approval = "on-risk"
-network = false
-checkpoints = true
-
-[sandbox]
-driver = "native" # use "docker" for a stronger isolation boundary
-# docker_image = "python:3.13-slim"
+#
+# Workspace files are repository-owned and untrusted by default. Keep provider,
+# budget, safety, sandbox, storage, cache, and telemetry settings in the user
+# config or pass them with --config. To trust those settings here, set
+# BOREALIS_ALLOW_WORKSPACE_AUTHORITY=1 outside the repository.
 
 [context]
-repo_map_chars = 28000
-tool_output_chars = 24000
-
-[cache]
-prompt_cache_enabled = true
-anthropic_ttl = "5m"
-response_cache_enabled = true
-response_cache_ttl_seconds = 300
+include_git_status = true
+instruction_names = ["AGENTS.md", "BOREALIS.md", "CLAUDE.md"]
+skill_dirs = [".agents/skills", ".borealis/skills"]
+ignored_dirs = [".git", ".borealis", ".venv", "venv", "node_modules", "dist", "build", "target", "coverage", "__pycache__"]
 
 # ChatGPT plan via the official Codex login store:
+# Put this in ~/.config/borealis/config.toml or a trusted --config file:
 # [agent]
 # provider = "chatgpt"
 # model = "gpt-5.6-terra"
@@ -572,6 +610,7 @@ response_cache_ttl_seconds = 300
 # Existing ~/.codex/auth.json credentials are discovered automatically.
 
 # OpenRouter example:
+# Put this in ~/.config/borealis/config.toml or a trusted --config file:
 # [providers.openrouter]
 # type = "openrouter"
 # model = "anthropic/claude-sonnet-4.6"

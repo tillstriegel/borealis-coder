@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..errors import ConfigurationError, ProviderAuthenticationError
+from ..network import open_same_origin
 from ..util import atomic_write_text, json_dumps
 
 if TYPE_CHECKING:
@@ -651,11 +652,12 @@ async def _post_refresh_json(url: str, payload: dict[str, Any]) -> dict[str, Any
             method="POST",
         )
         try:
-            with urllib.request.urlopen(
+            with open_same_origin(
                 request, timeout=30, context=ssl.create_default_context()
             ) as response:
                 raw = response.read(MAX_AUTH_FILE_BYTES)
         except urllib.error.HTTPError as error:
+            error.close()
             # Do not include token-service response bodies: they may contain
             # account-specific diagnostics and are unnecessary to remediate auth.
             raise ProviderAuthenticationError(

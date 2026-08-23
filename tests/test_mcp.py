@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import sys
 import tempfile
 import unittest
+import urllib.error
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from borealis_coder.config import MCPServerConfig
+from borealis_coder.errors import ProtocolError
 from borealis_coder.mcp import MCPManager
+from borealis_coder.mcp.client import HttpMCPClient, MCPToolDefinition
 from borealis_coder.models import ToolCall
 from borealis_coder.tools import build_builtin_registry
 from tests.helpers import make_config, make_context
@@ -34,6 +40,28 @@ for line in sys.stdin:
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    def test_http_error_response_is_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            stream = io.BytesIO(b'{"error":"down"}')
+            error = urllib.error.HTTPError(
+                "https://mcp.example/rpc",
+                503,
+                "down",
+                Message(),
+                stream,
+            )
+            client = HttpMCPClient(
+                "remote",
+                MCPServerConfig(type="http", url="https://mcp.example/rpc"),
+                Path(td),
+            )
+            with (
+                patch("borealis_coder.mcp.client.open_same_origin", side_effect=error),
+                self.assertRaisesRegex(ProtocolError, "MCP HTTP remote returned 503"),
+            ):
+                client._post({"jsonrpc": "2.0"})
+            self.assertTrue(stream.closed)
+
     async def test_stdio_discovery_and_call(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -99,6 +127,52 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 await manager.connect_all(build_builtin_registry())
             client.close.assert_awaited_once()
             self.assertIn("broken", manager.errors)
+
+    async def test_cancelled_startup_closes_partial_client(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root)
+            config.mcp_servers["cancelled"] = MCPServerConfig(
+                type="stdio", command=sys.executable
+            )
+            client = SimpleNamespace(
+                start=AsyncMock(side_effect=asyncio.CancelledError()),
+                close=AsyncMock(),
+            )
+            manager = MCPManager(root, config)
+            with (
+                patch("borealis_coder.mcp.manager.StdioMCPClient", return_value=client),
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                await manager.connect_all(build_builtin_registry())
+            client.close.assert_awaited_once()
+            self.assertNotIn("cancelled", manager.errors)
+
+    async def test_failed_registration_removes_tools_from_closed_client(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root)
+            config.mcp_servers["collision"] = MCPServerConfig(
+                type="stdio", command=sys.executable
+            )
+            definitions = [
+                MCPToolDefinition("foo-bar", "first", {}, {}),
+                MCPToolDefinition("foo_bar", "second", {}, {}),
+            ]
+            client = SimpleNamespace(
+                start=AsyncMock(),
+                list_tools=AsyncMock(return_value=definitions),
+                close=AsyncMock(),
+            )
+            registry = build_builtin_registry()
+            manager = MCPManager(root, config)
+            with patch("borealis_coder.mcp.manager.StdioMCPClient", return_value=client):
+                await manager.connect_all(registry)
+
+            client.close.assert_awaited_once()
+            self.assertIn("collision", manager.errors)
+            self.assertIsNone(registry.get("mcp__collision__foo_bar"))
+            self.assertNotIn("collision", manager.clients)
 
 
 if __name__ == "__main__":

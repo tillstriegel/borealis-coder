@@ -49,14 +49,17 @@ class CheckpointManager:
             resolved_path = self.roots.resolve(path)
             resolved = resolved_path.path
             display = self.roots.display(resolved)
-            root_index = self.roots.roots.index(resolved_path.root)
-            relative_path = resolved.relative_to(resolved_path.root).as_posix()
             entry: dict[str, Any] = {
                 "path": display,
-                "root": root_index,
-                "relative_path": relative_path,
                 "existed": resolved.exists(),
             }
+            if resolved_path.root in self.roots.roots:
+                root_index = self.roots.roots.index(resolved_path.root)
+                relative_path = resolved.relative_to(resolved_path.root).as_posix()
+                entry.update({"root": root_index, "relative_path": relative_path})
+                reference = f"{root_index}:{relative_path}"
+            else:
+                reference = f"outside:{resolved}"
             if resolved.exists():
                 if not resolved.is_file():
                     raise ToolError(f"Checkpoint only supports files: {display}")
@@ -64,8 +67,12 @@ class CheckpointManager:
                 total += len(data)
                 if total > self.max_bytes:
                     raise ToolError(f"Checkpoint exceeds configured {self.max_bytes} byte limit")
-                reference = f"{root_index}:{relative_path}"
-                blob_name = base64.urlsafe_b64encode(reference.encode()).decode().rstrip("=") + ".bin"
+                if resolved_path.root in self.roots.roots:
+                    blob_name = (
+                        base64.urlsafe_b64encode(reference.encode()).decode().rstrip("=") + ".bin"
+                    )
+                else:
+                    blob_name = f"outside-{sha256_bytes(reference.encode())}.bin"
                 blob = files_dir / blob_name
                 blob.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_bytes(blob, data)

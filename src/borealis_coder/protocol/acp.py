@@ -41,7 +41,9 @@ class ACPServer:
                 runner = self.runners.get(session_id)
                 if runner:
                     runner.cancel(session_id)
-        await asyncio.gather(*(runner.close() for runner in set(self.runners.values())), return_exceptions=True)
+        await asyncio.gather(
+            *(runner.close() for runner in set(self.runners.values())), return_exceptions=True
+        )
         self.runners.clear()
 
     async def handle(self, method: str, params: dict[str, Any]) -> Any:
@@ -95,17 +97,24 @@ class ACPServer:
         config = load_config(cwd)
         _merge_acp_mcp(config, params.get("mcpServers") or [])
         runner = await build_runner(
-            cwd, config=config, interactive=True,
+            cwd,
+            config=config,
+            interactive=True,
             approval_callback=lambda request: self._request_permission(None, request),
             additional_roots=additional,
         )
         route = runner.providers[0]
         session = await asyncio.to_thread(
-            runner.sessions.create_session, workspace=cwd, provider=route.name,
-            model=route.model, title="New coding session",
+            runner.sessions.create_session,
+            workspace=cwd,
+            provider=route.name,
+            model=route.model,
+            title="New coding session",
             metadata={"additional_directories": [str(item) for item in additional], "acp": True},
         )
-        runner.tool_context.approvals.callback = lambda request: self._request_permission(session.id, request)
+        runner.tool_context.approvals.callback = lambda request: self._request_permission(
+            session.id, request
+        )
         self.runners[session.id] = runner
         self.session_locations[session.id] = runner.sessions.path
         self._subscribe(session.id, runner)
@@ -117,7 +126,9 @@ class ACPServer:
         config = load_config(cwd)
         _merge_acp_mcp(config, params.get("mcpServers") or [])
         runner = await build_runner(
-            cwd, config=config, interactive=True,
+            cwd,
+            config=config,
+            interactive=True,
             approval_callback=lambda request: self._request_permission(session_id, request),
             additional_roots=additional,
         )
@@ -149,32 +160,46 @@ class ACPServer:
         # Session databases are configured globally by default. Use an active runner
         # when possible; otherwise load config for cwd/current directory.
         runner = next(iter(self.runners.values()), None)
-        temporary = False
-        if runner is None:
+        temporary_store: SessionStore | None = None
+        if runner is not None:
+            store = runner.sessions
+        else:
             base = cwd or Path.cwd().resolve()
-            runner = await build_runner(base, config=load_config(base), interactive=False)
-            temporary = True
-        cursor = _decode_cursor(params.get("cursor"))
-        sessions = await asyncio.to_thread(runner.sessions.list_sessions, workspace=cwd, limit=101 + cursor)
-        page = sessions[cursor : cursor + 100]
-        for item in page:
-            self.session_locations[item.id] = runner.sessions.path
-        result: dict[str, Any] = {
-            "sessions": [
-                {
-                    "sessionId": item.id, "cwd": item.workspace, "title": item.title,
-                    "updatedAt": item.updated_at,
-                    "additionalDirectories": item.metadata.get("additional_directories", []),
-                    "_meta": {"provider": item.provider, "model": item.model, "status": item.status},
-                }
-                for item in page
-            ]
-        }
-        if len(sessions) > cursor + 100:
-            result["nextCursor"] = _encode_cursor(cursor + 100)
-        if temporary:
-            await runner.close()
-        return result
+            temporary_store = SessionStore(load_config(base).database_path)
+            store = temporary_store
+        try:
+            cursor = _decode_cursor(params.get("cursor"))
+            sessions = await asyncio.to_thread(
+                store.list_sessions,
+                workspace=cwd,
+                limit=101 + cursor,
+            )
+            page = sessions[cursor : cursor + 100]
+            for item in page:
+                self.session_locations[item.id] = store.path
+            result: dict[str, Any] = {
+                "sessions": [
+                    {
+                        "sessionId": item.id,
+                        "cwd": item.workspace,
+                        "title": item.title,
+                        "updatedAt": item.updated_at,
+                        "additionalDirectories": item.metadata.get("additional_directories", []),
+                        "_meta": {
+                            "provider": item.provider,
+                            "model": item.model,
+                            "status": item.status,
+                        },
+                    }
+                    for item in page
+                ]
+            }
+            if len(sessions) > cursor + 100:
+                result["nextCursor"] = _encode_cursor(cursor + 100)
+            return result
+        finally:
+            if temporary_store is not None:
+                await asyncio.to_thread(temporary_store.close)
 
     async def _session_close(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = _required_str(params, "sessionId")
@@ -223,15 +248,23 @@ class ACPServer:
                 message_id=message_id,
                 metadata={"acp": True},
             )
-            await self._update(session_id, {
-                "sessionUpdate": "user_message", "messageId": message_id,
-                "content": [{"type": "text", "text": prompt}],
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "user_message",
+                    "messageId": message_id,
+                    "content": [{"type": "text", "text": prompt}],
+                },
+            )
             return {}
-        await self._update(session_id, {
-            "sessionUpdate": "user_message", "messageId": message_id,
-            "content": [{"type": "text", "text": prompt}],
-        })
+        await self._update(
+            session_id,
+            {
+                "sessionUpdate": "user_message",
+                "messageId": message_id,
+                "content": [{"type": "text", "text": prompt}],
+            },
+        )
         await self._update(session_id, {"sessionUpdate": "state_update", "state": "running"})
         task = asyncio.create_task(
             self._run_prompt(runner, session_id, prompt, message_id),
@@ -270,88 +303,153 @@ class ACPServer:
             if event.session_id != session_id:
                 return
             await self._event_update(session_id, runner, event)
+
         runner.events.subscribe(handler)
 
     async def _event_update(self, session_id: str, runner: AgentRunner, event: Event) -> None:
         data = event.data
         if event.type == "model.text_delta" and data.get("text"):
-            await self._update(session_id, {
-                "sessionUpdate": "agent_message_chunk",
-                "messageId": data.get("message_id") or new_id("msg"),
-                "content": {"type": "text", "text": data["text"]},
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": data.get("message_id") or new_id("msg"),
+                    "content": {"type": "text", "text": data["text"]},
+                },
+            )
         elif event.type == "model.completed":
             if data.get("text"):
-                await self._update(session_id, {
-                    "sessionUpdate": "agent_message",
-                    "messageId": data.get("message_id") or new_id("msg"),
-                    "content": [{"type": "text", "text": data["text"]}],
-                })
+                await self._update(
+                    session_id,
+                    {
+                        "sessionUpdate": "agent_message",
+                        "messageId": data.get("message_id") or new_id("msg"),
+                        "content": [{"type": "text", "text": data["text"]}],
+                    },
+                )
             for call in data.get("tool_calls", []) or []:
-                await self._update(session_id, {
-                    "sessionUpdate": "tool_call_update", "toolCallId": call["id"],
-                    "title": call["name"], "kind": _tool_kind(call["name"]), "status": "pending",
-                    "rawInput": call.get("arguments") or {},
-                })
+                await self._update(
+                    session_id,
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": call["id"],
+                        "title": call["name"],
+                        "kind": _tool_kind(call["name"]),
+                        "status": "pending",
+                        "rawInput": call.get("arguments") or {},
+                    },
+                )
             usage = await asyncio.to_thread(runner.sessions.usage, session_id)
-            await self._update(session_id, {
-                "sessionUpdate": "usage_update", "used": usage.total_tokens,
-                "size": runner.config.agent.max_input_tokens,
-                "cost": {"amount": usage.cost_usd, "currency": "USD"},
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "usage_update",
+                    "used": usage.total_tokens,
+                    "size": runner.config.agent.max_input_tokens,
+                    "cost": {"amount": usage.cost_usd, "currency": "USD"},
+                },
+            )
         elif event.type == "tool.started":
-            await self._update(session_id, {
-                "sessionUpdate": "tool_call_update", "toolCallId": data["tool_call_id"],
-                "title": data["tool"], "kind": _tool_kind(data["tool"]), "status": "in_progress",
-                "rawInput": data.get("arguments") or {},
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": data["tool_call_id"],
+                    "title": data["tool"],
+                    "kind": _tool_kind(data["tool"]),
+                    "status": "in_progress",
+                    "rawInput": data.get("arguments") or {},
+                },
+            )
         elif event.type == "tool.completed":
-            await self._update(session_id, {
-                "sessionUpdate": "tool_call_update", "toolCallId": data["tool_call_id"],
-                "title": data["tool"], "kind": _tool_kind(data["tool"]),
-                "status": "failed" if data.get("is_error") else "completed",
-                "content": [{"type": "content", "content": {"type": "text", "text": data.get("output") or ""}}],
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": data["tool_call_id"],
+                    "title": data["tool"],
+                    "kind": _tool_kind(data["tool"]),
+                    "status": "failed" if data.get("is_error") else "completed",
+                    "content": [
+                        {
+                            "type": "content",
+                            "content": {"type": "text", "text": data.get("output") or ""},
+                        }
+                    ],
+                },
+            )
         elif event.type == "plan.updated":
-            await self._update(session_id, {
-                "sessionUpdate": "plan_update",
-                "plan": {"type": "items", "planId": event.run_id or new_id("plan"), "entries": [
-                    {"content": item["content"], "status": item["status"], "priority": "medium"}
-                    for item in data.get("items", [])
-                ]},
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "plan_update",
+                    "plan": {
+                        "type": "items",
+                        "planId": event.run_id or new_id("plan"),
+                        "entries": [
+                            {
+                                "content": item["content"],
+                                "status": item["status"],
+                                "priority": "medium",
+                            }
+                            for item in data.get("items", [])
+                        ],
+                    },
+                },
+            )
         elif event.type == "run.completed":
             result = data.get("result") or {}
-            await self._update(session_id, {
-                "sessionUpdate": "state_update", "state": "idle",
-                "stopReason": _acp_stop_reason(result.get("stop_reason")),
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "state_update",
+                    "state": "idle",
+                    "stopReason": _acp_stop_reason(result.get("stop_reason")),
+                },
+            )
 
     async def _request_permission(self, session_id: str | None, request: ApprovalRequest) -> str:
         if not session_id:
             return "no"
-        await self._update(session_id, {
-            "sessionUpdate": "state_update",
-            "state": "requires_action",
-        })
-        try:
-            result = await self.connection.request("session/request_permission", {
-                "sessionId": session_id,
-                "toolCall": {
-                    "toolCallId": new_id("permission"), "title": request.description,
-                    "kind": "other", "status": "pending", "rawInput": request.arguments_preview,
-                },
-                "options": [
-                    {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
-                    {"optionId": "allow_always", "name": "Allow for session", "kind": "allow_always"},
-                    {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
-                ],
-            }, timeout=3600)
-        finally:
-            await self._update(session_id, {
+        await self._update(
+            session_id,
+            {
                 "sessionUpdate": "state_update",
-                "state": "running",
-            })
+                "state": "requires_action",
+            },
+        )
+        try:
+            result = await self.connection.request(
+                "session/request_permission",
+                {
+                    "sessionId": session_id,
+                    "toolCall": {
+                        "toolCallId": new_id("permission"),
+                        "title": request.description,
+                        "kind": "other",
+                        "status": "pending",
+                        "rawInput": request.arguments_preview,
+                    },
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                        {
+                            "optionId": "allow_always",
+                            "name": "Allow for session",
+                            "kind": "allow_always",
+                        },
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+                timeout=3600,
+            )
+        finally:
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "state_update",
+                    "state": "running",
+                },
+            )
         option = result.get("optionId") if isinstance(result, dict) else None
         return str(option or "no")
 
@@ -366,10 +464,14 @@ class ACPServer:
                 kind = "agent_message"
             else:
                 continue
-            await self._update(session_id, {
-                "sessionUpdate": kind, "messageId": message.id,
-                "content": [{"type": "text", "text": message.content}],
-            })
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": kind,
+                    "messageId": message.id,
+                    "content": [{"type": "text", "text": message.content}],
+                },
+            )
 
 
 def _roots(params: dict[str, Any]) -> tuple[Path, list[Path]]:
@@ -399,14 +501,25 @@ def _merge_acp_mcp(config, values: list[dict[str, Any]]) -> None:  # type: ignor
             command = str(value.get("command") or "")
             if not command or not Path(command).is_absolute():
                 raise ProtocolError(f"MCP stdio command must be absolute for server {name!r}")
-            env = {str(item.get("name")): str(item.get("value")) for item in value.get("env", []) if isinstance(item, dict) and item.get("name")}
-            config.mcp_servers[name] = MCPServerConfig(type="stdio", command=command, args=[str(item) for item in value.get("args", [])], env=env)
+            env = {
+                str(item.get("name")): str(item.get("value"))
+                for item in value.get("env", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            config.mcp_servers[name] = MCPServerConfig(
+                type="stdio",
+                command=command,
+                args=[str(item) for item in value.get("args", [])],
+                env=env,
+            )
         elif transport == "http":
             url = str(value.get("url") or "")
             parsed = urlsplit(url)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ProtocolError(f"MCP HTTP URL is invalid for server {name!r}")
-            config.mcp_servers[name] = MCPServerConfig(type="http", url=url, headers=dict(value.get("headers") or {}))
+            config.mcp_servers[name] = MCPServerConfig(
+                type="http", url=url, headers=dict(value.get("headers") or {})
+            )
         else:
             raise ProtocolError(f"Unsupported MCP transport for server {name!r}: {transport!r}")
 
@@ -422,9 +535,13 @@ def _prompt_text(value: Any) -> str:
             chunks.append(str(item.get("text") or ""))
         elif item.get("type") == "resource":
             resource = item.get("resource") or {}
-            chunks.append(f"\n<embedded_resource uri={resource.get('uri')!r}>\n{resource.get('text') or ''}\n</embedded_resource>")
+            chunks.append(
+                f"\n<embedded_resource uri={resource.get('uri')!r}>\n{resource.get('text') or ''}\n</embedded_resource>"
+            )
         elif item.get("type") in {"resource_link", "resourceLink"}:
-            chunks.append(f"\nResource link: {item.get('uri') or item.get('resource', {}).get('uri')}")
+            chunks.append(
+                f"\nResource link: {item.get('uri') or item.get('resource', {}).get('uri')}"
+            )
     prompt = "\n".join(chunks).strip()
     if not prompt:
         raise ProtocolError("prompt contains no supported content")
@@ -450,8 +567,12 @@ def _tool_kind(name: str) -> str:
 
 def _acp_stop_reason(value: str | None) -> str:
     return {
-        "end_turn": "end_turn", "cancelled": "cancelled", "max_turns": "max_turns",
-        "budget": "max_turns", "error": "refusal", "stuck": "refusal",
+        "end_turn": "end_turn",
+        "cancelled": "cancelled",
+        "max_turns": "max_turns",
+        "budget": "max_turns",
+        "error": "refusal",
+        "stuck": "refusal",
     }.get(value or "", "end_turn")
 
 

@@ -107,8 +107,9 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                 raise ProviderUnavailableError("temporary", retryable=True)
             return "done"
 
-        with patch("borealis_coder.providers.base.random.uniform", return_value=1.0), patch(
-            "borealis_coder.providers.base.asyncio.sleep", new=AsyncMock()
+        with (
+            patch("borealis_coder.providers.base.random.uniform", return_value=1.0),
+            patch("borealis_coder.providers.base.asyncio.sleep", new=AsyncMock()),
         ):
             self.assertEqual(await provider.with_retries(eventually), "done")
         self.assertEqual(attempts, 3)
@@ -223,7 +224,9 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         ]
         provider.http = FakeHttp(events=events)  # type: ignore[assignment]
         streamed = [item async for item in provider.stream(self.request)]
-        self.assertEqual([item.type for item in streamed], ["text_delta", "tool_call_delta", "completed"])
+        self.assertEqual(
+            [item.type for item in streamed], ["text_delta", "tool_call_delta", "completed"]
+        )
         self.assertEqual(streamed[1].data["name"], "read_file")
         final = streamed[-1].response
         self.assertIsNotNone(final)
@@ -287,7 +290,9 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sparse.tool_calls[0].arguments, {"path": "sparse.txt"})
 
         partial_events = [
-            SSEEvent("message", json.dumps({"type": "response.output_text.delta", "delta": "partial"})),
+            SSEEvent(
+                "message", json.dumps({"type": "response.output_text.delta", "delta": "partial"})
+            ),
             SSEEvent(
                 "message",
                 json.dumps(
@@ -348,9 +353,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                                 "finish_reason": "tool_calls",
                                 "delta": {
                                     "content": "there",
-                                    "tool_calls": [
-                                        {"index": 0, "function": {"arguments": '"a"}'}}
-                                    ],
+                                    "tool_calls": [{"index": 0, "function": {"arguments": '"a"}'}}],
                                 },
                             }
                         ],
@@ -569,10 +572,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         parsed = await provider.complete(self.request)
         self.assertEqual(parsed.tool_calls[0].arguments, {"value": 3})
 
-        provider.http = FakeHttp(events=[SSEEvent("message", json.dumps({"type": "error", "error": {"message": "boom"}}))])  # type: ignore[assignment]
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent("message", json.dumps({"type": "error", "error": {"message": "boom"}}))
+            ]
+        )
         with self.assertRaisesRegex(ProviderError, "boom"):
             _ = [item async for item in provider.stream(self.request)]
-        provider.http = FakeHttp(data="bad")  # type: ignore[assignment]
+        cast(Any, provider).http = FakeHttp(data="bad")
         with self.assertRaises(ProviderError):
             await provider.complete(self.request)
 
@@ -638,8 +645,21 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                             "model": "gemini",
                             "status": "completed",
                             "steps": [
-                                {"type": "model_output", "content": [{"type": "text", "text": "done"}]},
-                                {"type": "function_call", "id": "f", "name": "read_file", "arguments": "bad"},
+                                {
+                                    "type": "thought",
+                                    "signature": "stream-signature",
+                                    "content": [],
+                                },
+                                {
+                                    "type": "model_output",
+                                    "content": [{"type": "text", "text": "done"}],
+                                },
+                                {
+                                    "type": "function_call",
+                                    "id": "f",
+                                    "name": "read_file",
+                                    "arguments": "bad",
+                                },
                             ],
                             "usage": {
                                 "total_input_tokens": 4,
@@ -658,6 +678,8 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed.text, "done")
         self.assertEqual(completed.tool_calls[0].arguments, {"_raw": "bad"})
         self.assertEqual(completed.usage.reasoning_tokens, 3)
+        assert completed.continuation_state is not None
+        self.assertEqual(completed.continuation_state.items[0]["signature"], "stream-signature")
 
         payload = provider._payload(self.request, stream=True)
         self.assertEqual(payload["generation_config"]["thinking_level"], "high")

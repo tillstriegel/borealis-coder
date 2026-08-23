@@ -47,6 +47,15 @@ class Provider(abc.ABC):
             yield ProviderStreamEvent(type="text_delta", text=response.text)
         yield ProviderStreamEvent(type="completed", response=response)
 
+    async def close(self) -> None:
+        """Release provider-owned runtime resources."""
+
+        return None
+
+    def _continuation_provider(self, request: ProviderRequest) -> str:
+        route = request.metadata.get("provider_route")
+        return route if isinstance(route, str) and route else self.name
+
     async def with_retries(self, operation: Callable[[], Awaitable[T]]) -> T:
         attempts = max(0, self.config.max_retries) + 1
         delay = max(0.0, self.config.initial_backoff_seconds)
@@ -86,9 +95,7 @@ class Provider(abc.ABC):
         usage.cost_usd = input_cost + (
             usage.output_tokens * self.config.output_cost_per_million / 1_000_000
         )
-        baseline_input_cost = (
-            usage.input_tokens * self.config.input_cost_per_million / 1_000_000
-        )
+        baseline_input_cost = usage.input_tokens * self.config.input_cost_per_million / 1_000_000
         usage.cache_savings_usd = baseline_input_cost - input_cost
         return usage
 
@@ -98,9 +105,7 @@ def classify_provider_error(status: int | None, message: str, details: Any = Non
     if status in {401, 403}:
         return ProviderAuthenticationError(message, status_code=status, details=details)
     if status == 429:
-        return ProviderRateLimitError(
-            message, status_code=status, retryable=True, details=details
-        )
+        return ProviderRateLimitError(message, status_code=status, retryable=True, details=details)
     if status in {408, 409, 425} or (status is not None and status >= 500):
         return ProviderUnavailableError(
             message, status_code=status, retryable=True, details=details

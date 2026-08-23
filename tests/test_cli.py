@@ -34,9 +34,12 @@ class CLITests(unittest.TestCase):
     ) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with patch.dict(os.environ, env, clear=False), patch.object(
-            cli.sys, "stdin", io.StringIO(stdin)
-        ), redirect_stdout(stdout), redirect_stderr(stderr):
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(cli.sys, "stdin", io.StringIO(stdin)),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
             code = cli.main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
 
@@ -57,9 +60,7 @@ class CLITests(unittest.TestCase):
             code, out, _ = self.run_cli(["init", "--workspace", str(workspace)], env=env)
             self.assertEqual(code, 0)
             self.assertIn("kept", out)
-            code, out, _ = self.run_cli(
-                ["init", "--workspace", str(workspace), "--force"], env=env
-            )
+            code, out, _ = self.run_cli(["init", "--workspace", str(workspace), "--force"], env=env)
             self.assertIn("created", out)
 
             code, out, _ = self.run_cli(
@@ -68,25 +69,17 @@ class CLITests(unittest.TestCase):
             self.assertEqual(code, 0)
             diagnostics = json.loads(out)
             self.assertTrue(any(item["name"] == "database" for item in diagnostics))
-            code, out, _ = self.run_cli(
-                ["doctor", "--workspace", str(workspace)], env=env
-            )
+            code, out, _ = self.run_cli(["doctor", "--workspace", str(workspace)], env=env)
             self.assertIn("PASS", out)
 
-            code, out, _ = self.run_cli(
-                ["config", "--workspace", str(workspace)], env=env
-            )
+            code, out, _ = self.run_cli(["config", "--workspace", str(workspace)], env=env)
             self.assertEqual(json.loads(out)["agent"]["provider"], "mock")
 
-            code, out, _ = self.run_cli(
-                ["tools", "--workspace", str(workspace), "--json"], env=env
-            )
+            code, out, _ = self.run_cli(["tools", "--workspace", str(workspace), "--json"], env=env)
             self.assertEqual(code, 0)
             schemas = json.loads(out)
             self.assertTrue(any(item["name"] == "read_file" for item in schemas))
-            code, out, _ = self.run_cli(
-                ["tools", "--workspace", str(workspace)], env=env
-            )
+            code, out, _ = self.run_cli(["tools", "--workspace", str(workspace)], env=env)
             self.assertIn("read_file", out)
 
             code, out, err = self.run_cli(
@@ -177,9 +170,7 @@ class CLITests(unittest.TestCase):
             self.assertTrue(checkpoints)
             checkpoint_id = checkpoints[0].id
             (workspace / "borealis-demo.txt").write_text("changed", encoding="utf-8")
-            code, out, _ = self.run_cli(
-                ["rollback", "--workspace", str(workspace)], env=env
-            )
+            code, out, _ = self.run_cli(["rollback", "--workspace", str(workspace)], env=env)
             self.assertIn(checkpoint_id, out)
             code, out, _ = self.run_cli(
                 ["rollback", checkpoint_id, "--workspace", str(workspace)], env=env
@@ -197,6 +188,62 @@ class CLITests(unittest.TestCase):
             self.assertTrue(json.loads(out)["ok"])
             code, out, _ = self.run_cli(["eval"], env=env)
             self.assertIn("PASS", out)
+
+    def test_session_administration_does_not_build_a_provider_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "data"
+            env = {"BOREALIS_DATA_DIR": str(data)}
+            config = load_config(root, overrides={"storage": {"directory": str(data)}})
+            from borealis_coder.sessions import SessionStore
+
+            store = SessionStore(config.database_path)
+            try:
+                session = store.create_session(
+                    workspace=root,
+                    provider="offline",
+                    model="stored-model",
+                    title="Stored session",
+                )
+            finally:
+                store.close()
+
+            with patch(
+                "borealis_coder.cli.build_runner",
+                side_effect=AssertionError("runtime must not start"),
+            ):
+                code, output, error = self.run_cli(
+                    ["sessions", "list", "--workspace", str(root)],
+                    env=env,
+                )
+                show_code, shown, show_error = self.run_cli(
+                    ["sessions", "show", session.id, "--workspace", str(root)],
+                    env=env,
+                )
+                export_path = root / "export.json"
+                export_code, _, export_error = self.run_cli(
+                    [
+                        "sessions",
+                        "export",
+                        session.id,
+                        "--workspace",
+                        str(root),
+                        "--output",
+                        str(export_path),
+                    ],
+                    env=env,
+                )
+                delete_code, _, delete_error = self.run_cli(
+                    ["sessions", "delete", session.id, "--workspace", str(root)],
+                    env=env,
+                )
+            self.assertEqual(code, 0, error)
+            self.assertIn(session.id, output)
+            self.assertEqual(show_code, 0, show_error)
+            self.assertEqual(json.loads(shown)["session"]["id"], session.id)
+            self.assertEqual(export_code, 0, export_error)
+            self.assertTrue(export_path.is_file())
+            self.assertEqual(delete_code, 0, delete_error)
 
     def test_chat_commands_and_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -228,9 +275,12 @@ class CLITests(unittest.TestCase):
                 "/end",
                 "/quit",
             ]
-            with patch.dict(os.environ, env, clear=False), patch(
-                "builtins.input", side_effect=inputs
-            ), redirect_stdout(stdout), redirect_stderr(stderr):
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch("builtins.input", side_effect=inputs),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
                 code = cli.main(
                     [
                         "chat",
@@ -265,9 +315,12 @@ class CLITests(unittest.TestCase):
             }
             stdout = io.StringIO()
             stderr = io.StringIO()
-            with patch.dict(os.environ, env, clear=False), patch(
-                "builtins.input", side_effect=["/quit"]
-            ), redirect_stdout(stdout), redirect_stderr(stderr):
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch("builtins.input", side_effect=["/quit"]),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
                 code = cli.main(
                     [
                         "hello from the bare command",
@@ -300,9 +353,12 @@ class CLITests(unittest.TestCase):
                 store.close()
 
             stdout = io.StringIO()
-            with patch.dict(os.environ, env, clear=False), patch(
-                "builtins.input", side_effect=["/session", "/quit"]
-            ), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch("builtins.input", side_effect=["/session", "/quit"]),
+                redirect_stdout(stdout),
+                redirect_stderr(io.StringIO()),
+            ):
                 code = cli.main(
                     [
                         "--workspace",
@@ -319,9 +375,12 @@ class CLITests(unittest.TestCase):
             self.assertIn("(resumed)", stdout.getvalue())
 
             stdout = io.StringIO()
-            with patch.dict(os.environ, env, clear=False), patch(
-                "builtins.input", side_effect=["/quit"]
-            ), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch("builtins.input", side_effect=["/quit"]),
+                redirect_stdout(stdout),
+                redirect_stderr(io.StringIO()),
+            ):
                 code = cli.main(
                     [
                         "resume",
@@ -391,9 +450,7 @@ class CLITests(unittest.TestCase):
                     )
                 )
                 await renderer.handle(Event(type="context.compacted"))
-                await renderer.handle(
-                    Event(type="model.route_failed", data={"provider": "x"})
-                )
+                await renderer.handle(Event(type="model.route_failed", data={"provider": "x"}))
                 await renderer.handle(
                     Event(
                         type="model.retrying",
@@ -588,10 +645,7 @@ class CLITests(unittest.TestCase):
                     data={
                         "tool": "shell",
                         "tool_call_id": "call_1",
-                        "output": (
-                            "exit_code=2\nstdout:\nbuilding\n"
-                            "stderr:\nFATAL: failed"
-                        ),
+                        "output": ("exit_code=2\nstdout:\nbuilding\nstderr:\nFATAL: failed"),
                         "is_error": True,
                         "metadata": {"duration_ms": 2, "exit_code": 2},
                     },
@@ -792,9 +846,7 @@ class CLITests(unittest.TestCase):
             __doc__="libedit readline",
         )
         terminal._bind_slash_selector(libedit)
-        binding = " ".join(
-            call.args[0] for call in libedit.parse_and_bind.call_args_list
-        )
+        binding = " ".join(call.args[0] for call in libedit.parse_and_bind.call_args_list)
         self.assertIn("^V/", binding)
         self.assertIn("\\t", binding)
 
@@ -865,9 +917,12 @@ class CLITests(unittest.TestCase):
                 "BOREALIS_PROVIDER": "mock",
                 "BOREALIS_APPROVAL": "never",
             }
-            with patch.dict(os.environ, env, clear=False), patch(
-                "builtins.input", side_effect=KeyboardInterrupt
-            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch("builtins.input", side_effect=KeyboardInterrupt),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
                 code = cli.main(
                     [
                         "chat",

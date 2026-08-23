@@ -37,17 +37,27 @@ class OpenRouterProvider(OpenAIProvider):
         payload.pop("reasoning_effort", None)
         if request.reasoning_effort:
             payload["reasoning"] = {"effort": request.reasoning_effort}
-        return self._apply_extensions(payload)
+        return self._apply_extensions(payload, request)
 
     def _responses_payload(
         self, request: ProviderRequest, *, stream: bool = False
     ) -> dict[str, Any]:
-        return self._apply_extensions(super()._responses_payload(request, stream=stream))
+        return self._apply_extensions(
+            super()._responses_payload(request, stream=stream),
+            request,
+        )
 
-    def _apply_extensions(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _apply_extensions(
+        self,
+        payload: dict[str, Any],
+        request: ProviderRequest,
+    ) -> dict[str, Any]:
         # Explicit usage inclusion gives Borealis reliable accounting when a routed
         # upstream does not include usage by default.
         payload.setdefault("usage", {"include": True})
+        session_id = str(request.metadata.get("session_id") or "").strip()
+        if request.metadata.get("prompt_cache_enabled", True) and session_id:
+            payload["session_id"] = session_id
         if self.config.model_fallbacks:
             payload["models"] = list(self.config.model_fallbacks)
         if self.config.provider_preferences:

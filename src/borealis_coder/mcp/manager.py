@@ -79,6 +79,7 @@ class MCPManager:
             if not server.enabled:
                 return
             client: MCPClient | None = None
+            registered: list[str] = []
             try:
                 if server.type == "stdio":
                     client = StdioMCPClient(name, server, self.workspace, env_allowlist=self.config.safety.env_allowlist)
@@ -94,16 +95,25 @@ class MCPManager:
                 for definition in definitions:
                     if allowed and definition.name not in allowed:
                         continue
-                    registry.register(
-                        MCPTool(
-                            name,
-                            definition,
-                            client,
-                            read_only=definition.name in read_only,
-                        )
+                    tool = MCPTool(
+                        name,
+                        definition,
+                        client,
+                        read_only=definition.name in read_only,
                     )
+                    registry.register(tool)
+                    registered.append(tool.name)
                 self.clients[name] = client
+            except asyncio.CancelledError:
+                for tool_name in reversed(registered):
+                    registry.unregister(tool_name)
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.close()
+                raise
             except Exception as error:
+                for tool_name in reversed(registered):
+                    registry.unregister(tool_name)
                 self.errors[name] = f"{type(error).__name__}: {error}"
                 if client is not None:
                     with contextlib.suppress(Exception):

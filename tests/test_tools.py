@@ -82,11 +82,18 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_grep_glob_and_list(self):
         (self.root/"src").mkdir()
-        (self.root/"src/a.py").write_text("def alpha():\n    return 1\n")
+        for name in ("a.py", "b.py", "c.py"):
+            (self.root / "src" / name).write_text("def alpha():\n    return 1\n")
+        self.context.config.context.max_search_results = 1
         grep = await self.call("grep", {"pattern":"alpha","path":".","glob":"*.py","regex":False,"case_sensitive":True,"context_lines":0,"max_results":10})
-        self.assertIn("src/a.py:1", grep.output)
+        self.assertIn(":1:def alpha", grep.output)
+        self.assertEqual(grep.metadata["matches"], 1)
+        self.assertTrue(grep.metadata["truncated"])
         glob = await self.call("glob_files", {"pattern":"**/*.py","path":".","limit":10})
-        self.assertIn("src/a.py", glob.output)
+        self.assertEqual(len(glob.output.splitlines()), 1)
+        self.assertTrue(glob.output.endswith(".py"))
+        self.assertEqual(glob.metadata["matches"], 1)
+        self.assertTrue(glob.metadata["truncated"])
 
     async def test_protected_paths_and_file_size_limits(self):
         protected = await self.call(

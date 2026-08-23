@@ -16,6 +16,7 @@ from typing import Any
 from .. import __version__
 from ..config import MCPServerConfig
 from ..errors import ProtocolError
+from ..network import open_same_origin
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 
@@ -227,13 +228,16 @@ class HttpMCPClient(MCPClient):
             self.config.url, data=json.dumps(payload).encode(), headers=headers, method="POST"
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+            with open_same_origin(request, timeout=self.config.timeout_seconds) as response:
                 body = response.read().decode("utf-8", errors="replace")
                 content_type = response.headers.get("Content-Type", "")
                 parsed = _parse_http_body(body, content_type)
                 return parsed, response.headers
         except urllib.error.HTTPError as error:
-            body = error.read(4096).decode("utf-8", errors="replace")
+            try:
+                body = error.read(4096).decode("utf-8", errors="replace")
+            finally:
+                error.close()
             raise ProtocolError(f"MCP HTTP {self.name} returned {error.code}: {body}") from error
         except urllib.error.URLError as error:
             raise ProtocolError(f"MCP HTTP {self.name} network error: {error.reason}") from error

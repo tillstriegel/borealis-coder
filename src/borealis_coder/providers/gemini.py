@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 
 from ..config import ProviderConfig
 from ..errors import ProviderError
-from ..models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
+from ..models import ContinuationState, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
 from .base import Provider, ProviderStreamEvent
 from .http import HttpClient
@@ -27,6 +27,9 @@ class GeminiProvider(Provider):
         if self.api_key:
             headers.setdefault("x-goog-api-key", self.api_key)
         return headers
+
+    async def close(self) -> None:
+        self.http.close()
 
     def _url(self, *, stream: bool = False) -> str:
         url = self.config.base_url.rstrip("/") + "/interactions"
@@ -49,7 +52,7 @@ class GeminiProvider(Provider):
         payload: dict[str, Any] = {
             "model": request.model,
             "system_instruction": request.system,
-            "input": self._steps(request.messages),
+            "input": self._steps(request),
             "tools": [
                 {
                     "type": "function",
@@ -102,7 +105,9 @@ class GeminiProvider(Provider):
                     calls[index] = {
                         "id": str(step.get("id") or ""),
                         "name": str(step.get("name") or ""),
-                        "arguments": json_dumps(arguments) if isinstance(arguments, dict) else str(arguments or ""),
+                        "arguments": json_dumps(arguments)
+                        if isinstance(arguments, dict)
+                        else str(arguments or ""),
                     }
             elif event_type == "step.delta":
                 index = int(data.get("index", 0))
@@ -125,7 +130,9 @@ class GeminiProvider(Provider):
                         },
                     )
             elif event_type in {"interaction.completed", "interaction.complete"}:
-                final_data = data.get("interaction") if isinstance(data.get("interaction"), dict) else data
+                final_data = (
+                    data.get("interaction") if isinstance(data.get("interaction"), dict) else data
+                )
         if final_data:
             result = self._parse(final_data, retain_raw=True)
         else:
@@ -135,10 +142,9 @@ class GeminiProvider(Provider):
             )
         yield ProviderStreamEvent(type="completed", response=result)
 
-    @staticmethod
-    def _steps(messages: list[Message]) -> list[dict[str, Any]]:
+    def _steps(self, request: ProviderRequest) -> list[dict[str, Any]]:
         steps: list[dict[str, Any]] = []
-        for message in messages:
+        for message in request.messages:
             if message.role == Role.USER:
                 steps.append(
                     {
@@ -147,6 +153,15 @@ class GeminiProvider(Provider):
                     }
                 )
             elif message.role == Role.ASSISTANT:
+                state = ContinuationState.from_metadata(
+                    message.metadata.get("continuation_state"),
+                    provider=self._continuation_provider(request),
+                    model=request.model,
+                    kind="gemini.interactions.steps",
+                )
+                if state is not None:
+                    steps.extend(state.items)
+                    continue
                 if message.content:
                     steps.append(
                         {
@@ -178,6 +193,7 @@ class GeminiProvider(Provider):
     def _parse(self, data: dict[str, Any], *, retain_raw: bool) -> ModelResponse:
         text: list[str] = []
         calls: list[ToolCall] = []
+        continuation_items = _extract_model_steps(data)
         for step in data.get("steps", []) or []:
             if not isinstance(step, dict):
                 continue
@@ -192,7 +208,9 @@ class GeminiProvider(Provider):
                     ToolCall(
                         id=str(step.get("id") or ""),
                         name=str(step.get("name") or ""),
-                        arguments=dict(arguments) if isinstance(arguments, dict) else _parse_arguments(str(arguments)),
+                        arguments=dict(arguments)
+                        if isinstance(arguments, dict)
+                        else _parse_arguments(str(arguments)),
                         raw_arguments=(
                             json_dumps(arguments) if not isinstance(arguments, str) else arguments
                         ),
@@ -216,7 +234,29 @@ class GeminiProvider(Provider):
             response_id=data.get("id"),
             model=data.get("model"),
             raw=data if retain_raw else None,
+            continuation_state=(
+                ContinuationState(
+                    kind="gemini.interactions.steps",
+                    items=continuation_items,
+                )
+                if continuation_items
+                else None
+            ),
         )
+
+
+def _extract_model_steps(data: dict[str, Any]) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    for step in data.get("steps", []) or []:
+        if not isinstance(step, dict):
+            continue
+        step_type = step.get("type")
+        if not isinstance(step_type, str) or not step_type:
+            continue
+        if step_type in {"user_input", "function_result"}:
+            continue
+        steps.append(dict(step))
+    return steps
 
 
 def _parse_arguments(raw: str) -> dict[str, Any]:

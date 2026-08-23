@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
 from ..config import ProviderConfig
 from ..errors import ProviderError
-from ..models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
+from ..models import ContinuationState, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
 from .base import Provider, ProviderStreamEvent
 from .http import HttpClient
@@ -38,23 +39,44 @@ class OpenAIProvider(Provider):
             async for event in self._stream_responses(request):
                 yield event
 
+    async def close(self) -> None:
+        self.http.close()
+
     def _headers(self) -> dict[str, str]:
         headers = dict(self.config.headers)
         if self.api_key:
             headers.setdefault("Authorization", f"Bearer {self.api_key}")
         return headers
 
-    def _responses_payload(self, request: ProviderRequest, *, stream: bool = False) -> dict[str, Any]:
+    def _responses_payload(
+        self, request: ProviderRequest, *, stream: bool = False
+    ) -> dict[str, Any]:
+        input_items = self._responses_input(request)
         payload: dict[str, Any] = {
             "model": request.model,
             "instructions": request.system,
-            "input": self._responses_input(request.messages),
+            "input": input_items,
             "tools": [self._responses_tool(tool) for tool in request.tools],
             "max_output_tokens": request.max_output_tokens,
             "parallel_tool_calls": request.parallel_tool_calls,
             "store": False,
             "stream": stream,
         }
+        prompt_cache_key = str(request.metadata.get("prompt_cache_key") or "").strip()
+        if request.metadata.get("prompt_cache_enabled", True) and prompt_cache_key:
+            payload["prompt_cache_key"] = prompt_cache_key
+        system_blocks = self._explicit_cache_system_blocks(request)
+        if system_blocks is not None:
+            stable, dynamic = system_blocks
+            content = _cache_content_blocks(stable, dynamic, block_type="input_text")
+            payload.pop("instructions")
+            input_items.insert(
+                0,
+                {"type": "message", "role": "developer", "content": content},
+            )
+            payload["prompt_cache_options"] = {"mode": "implicit"}
+        if self.name == "openai":
+            payload["include"] = ["reasoning.encrypted_content"]
         if request.reasoning_effort:
             payload["reasoning"] = {"effort": request.reasoning_effort}
         if request.temperature is not None:
@@ -134,7 +156,9 @@ class OpenAIProvider(Provider):
                     },
                 )
             elif event_type in {"response.completed", "response.done"}:
-                final_data = data.get("response") if isinstance(data.get("response"), dict) else data
+                final_data = (
+                    data.get("response") if isinstance(data.get("response"), dict) else data
+                )
         if final_data:
             result = self._parse_responses(final_data, retain_raw=True)
             if not result.text:
@@ -147,10 +171,11 @@ class OpenAIProvider(Provider):
                 partial_call = self._call_from_partial(partial_data)
                 if not final_call.name:
                     final_call.name = partial_call.name
-                if (
-                    final_call.raw_arguments in {None, "", "{}"}
-                    and partial_call.raw_arguments not in {None, "", "{}"}
-                ):
+                if final_call.raw_arguments in {
+                    None,
+                    "",
+                    "{}",
+                } and partial_call.raw_arguments not in {None, "", "{}"}:
                     final_call.arguments = partial_call.arguments
                     final_call.raw_arguments = partial_call.raw_arguments
             result.tool_calls.extend(
@@ -163,10 +188,18 @@ class OpenAIProvider(Provider):
             result = ModelResponse(text="".join(text_parts), tool_calls=result_calls)
         yield ProviderStreamEvent(type="completed", response=result)
 
-    @staticmethod
-    def _responses_input(messages: list[Message]) -> list[dict[str, Any]]:
+    def _responses_input(self, request: ProviderRequest) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
-        for message in messages:
+        for message in request.messages:
+            if message.role == Role.ASSISTANT:
+                state = ContinuationState.from_metadata(
+                    message.metadata.get("continuation_state"),
+                    provider=self._continuation_provider(request),
+                    model=request.model,
+                    kind="openai.responses.reasoning",
+                )
+                if state is not None:
+                    output.extend(state.items)
             if message.role == Role.USER:
                 output.append(
                     {
@@ -236,12 +269,16 @@ class OpenAIProvider(Provider):
                         name=str(item.get("name") or ""),
                         arguments=_parse_arguments(raw_arguments),
                         raw_arguments=(
-                            raw_arguments if isinstance(raw_arguments, str) else json_dumps(raw_arguments)
+                            raw_arguments
+                            if isinstance(raw_arguments, str)
+                            else json_dumps(raw_arguments)
                         ),
                     )
                 )
         usage_data = data.get("usage") or {}
         usage = self._usage_from_responses(usage_data)
+        raw: dict[str, Any] | None = data if retain_raw else None
+        state = _extract_encrypted_reasoning_state(data)
         return ModelResponse(
             text="".join(text),
             tool_calls=calls,
@@ -249,11 +286,20 @@ class OpenAIProvider(Provider):
             stop_reason=data.get("status") or data.get("incomplete_details"),
             response_id=data.get("id"),
             model=data.get("model"),
-            raw=data if retain_raw else None,
+            raw=raw,
+            continuation_state=(
+                ContinuationState(kind="openai.responses.reasoning", items=state) if state else None
+            ),
         )
 
     def _chat_payload(self, request: ProviderRequest, *, stream: bool = False) -> dict[str, Any]:
-        messages: list[dict[str, Any]] = [{"role": "system", "content": request.system}]
+        system_blocks = self._explicit_cache_system_blocks(request)
+        if system_blocks is None:
+            system_content: str | list[dict[str, Any]] = request.system
+        else:
+            stable, dynamic = system_blocks
+            system_content = _cache_content_blocks(stable, dynamic, block_type="text")
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
         for message in request.messages:
             if message.role in {Role.USER, Role.SYSTEM}:
                 messages.append({"role": message.role.value, "content": message.content})
@@ -299,6 +345,15 @@ class OpenAIProvider(Provider):
             "parallel_tool_calls": request.parallel_tool_calls,
             "stream": stream,
         }
+        prompt_cache_key = str(request.metadata.get("prompt_cache_key") or "").strip()
+        if (
+            self.name == "openai"
+            and request.metadata.get("prompt_cache_enabled", True)
+            and prompt_cache_key
+        ):
+            payload["prompt_cache_key"] = prompt_cache_key
+        if system_blocks is not None:
+            payload["prompt_cache_options"] = {"mode": "implicit"}
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.reasoning_effort:
@@ -422,9 +477,11 @@ class OpenAIProvider(Provider):
                 input_tokens=int(usage_data.get("input_tokens", 0) or 0),
                 output_tokens=int(usage_data.get("output_tokens", 0) or 0),
                 cached_input_tokens=int(details.get("cached_tokens", 0) or 0),
+                cache_write_tokens=int(details.get("cache_write_tokens", 0) or 0),
                 reasoning_tokens=int(output_details.get("reasoning_tokens", 0) or 0),
                 requests=1,
-            )
+            ),
+            cache_write_multiplier=1.25 if self.name == "openai" else 1.0,
         )
 
     def _usage_from_chat(self, usage_data: dict[str, Any]) -> Usage:
@@ -435,10 +492,43 @@ class OpenAIProvider(Provider):
                 input_tokens=int(usage_data.get("prompt_tokens", 0) or 0),
                 output_tokens=int(usage_data.get("completion_tokens", 0) or 0),
                 cached_input_tokens=int(details.get("cached_tokens", 0) or 0),
+                cache_write_tokens=int(details.get("cache_write_tokens", 0) or 0),
                 reasoning_tokens=int(output_details.get("reasoning_tokens", 0) or 0),
                 requests=1,
-            )
+            ),
+            cache_write_multiplier=1.25 if self.name == "openai" else 1.0,
         )
+
+    def _explicit_cache_system_blocks(
+        self,
+        request: ProviderRequest,
+    ) -> tuple[list[str], list[str]] | None:
+        if (
+            self.name != "openai"
+            or not request.metadata.get("prompt_cache_enabled", True)
+            or not _supports_explicit_cache_breakpoints(request.model)
+        ):
+            return None
+        blocks = request.metadata.get("system_blocks")
+        if not isinstance(blocks, list):
+            return None
+        stable: list[str] = []
+        dynamic: list[str] = []
+        found_dynamic = False
+        all_text: list[str] = []
+        for block in blocks:
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                return None
+            text = block["text"]
+            all_text.append(text)
+            if block.get("cacheable") and not found_dynamic:
+                stable.append(text)
+            else:
+                found_dynamic = True
+                dynamic.append(text)
+        if not stable or "\n\n".join(all_text) != request.system:
+            return None
+        return stable, dynamic
 
     @staticmethod
     def _call_from_partial(item: dict[str, Any]) -> ToolCall:
@@ -457,6 +547,51 @@ class OpenAICompatibleProvider(OpenAIProvider):
     @property
     def api_style(self) -> str:
         return self.config.api_style or "chat"
+
+
+def _cache_content_blocks(
+    stable: list[str],
+    dynamic: list[str],
+    *,
+    block_type: str,
+) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    for index, text in enumerate([*stable, *dynamic]):
+        block: dict[str, Any] = {
+            "type": block_type,
+            "text": text if index == 0 else "\n\n" + text,
+        }
+        if index < len(stable) and index < 4:
+            block["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        content.append(block)
+    return content
+
+
+def _supports_explicit_cache_breakpoints(model: str) -> bool:
+    normalized = model.rsplit("/", 1)[-1].lower()
+    match = re.match(r"^gpt-(\d+)(?:\.(\d+))?(?:-|$)", normalized)
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2) or 0)) >= (5, 6)
+
+
+def _extract_encrypted_reasoning_state(data: dict[str, Any]) -> list[dict[str, Any]]:
+    state: list[dict[str, Any]] = []
+    for item in data.get("output", []) or []:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        encrypted = item.get("encrypted_content")
+        if not isinstance(encrypted, str) or not encrypted:
+            continue
+        value: dict[str, Any] = {
+            "type": "reasoning",
+            "encrypted_content": encrypted,
+            "summary": [],
+        }
+        if item.get("id"):
+            value["id"] = str(item["id"])
+        state.append(value)
+    return state
 
 
 def _parse_arguments(value: Any) -> dict[str, Any]:

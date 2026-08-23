@@ -12,7 +12,7 @@ from ..auth import (
 )
 from ..config import ProviderConfig
 from ..errors import ProviderAuthenticationError, ProviderError
-from ..models import Message, ModelResponse, ProviderRequest, Role
+from ..models import ModelResponse, ProviderRequest
 from .base import ProviderStreamEvent
 from .openai import OpenAIProvider
 
@@ -65,8 +65,7 @@ class ChatGPTProvider(OpenAIProvider):
                 # and replay only because the stream emitted no user-visible content.
                 continue
         raise ProviderAuthenticationError(
-            "ChatGPT authentication failed after refreshing credentials. "
-            "Run `borealis auth login`."
+            "ChatGPT authentication failed after refreshing credentials. Run `borealis auth login`."
         )
 
     def _headers(self) -> dict[str, str]:
@@ -93,9 +92,12 @@ class ChatGPTProvider(OpenAIProvider):
         payload["tool_choice"] = "auto"
         payload["include"] = ["reasoning.encrypted_content"]
         session_id = str(request.metadata.get("session_id") or "").strip()
-        prompt_cache_key = str(request.metadata.get("prompt_cache_key") or "").strip()
-        if prompt_cache_key or session_id:
-            payload["prompt_cache_key"] = prompt_cache_key or session_id
+        if (
+            request.metadata.get("prompt_cache_enabled", True)
+            and "prompt_cache_key" not in payload
+            and session_id
+        ):
+            payload["prompt_cache_key"] = session_id
         if session_id:
             payload["client_metadata"] = {
                 "borealis_session_id": session_id,
@@ -103,38 +105,6 @@ class ChatGPTProvider(OpenAIProvider):
             }
         return payload
 
-    @staticmethod
-    def _responses_input(messages: list[Message]) -> list[dict[str, Any]]:
-        output: list[dict[str, Any]] = []
-        for message in messages:
-            if message.role == Role.ASSISTANT:
-                state = message.metadata.get("responses_state")
-                if isinstance(state, list):
-                    output.extend(item for item in state if isinstance(item, dict))
-            output.extend(OpenAIProvider._responses_input([message]))
-        return output
-
     def _parse_responses(self, data: dict[str, Any], *, retain_raw: bool) -> ModelResponse:
         response = super()._parse_responses(data, retain_raw=False)
-        state = _extract_encrypted_reasoning_state(data)
-        response.raw = {"responses_state": state} if state else None
         return response
-
-
-def _extract_encrypted_reasoning_state(data: dict[str, Any]) -> list[dict[str, Any]]:
-    state: list[dict[str, Any]] = []
-    for item in data.get("output", []) or []:
-        if not isinstance(item, dict) or item.get("type") != "reasoning":
-            continue
-        encrypted = item.get("encrypted_content")
-        if not isinstance(encrypted, str) or not encrypted:
-            continue
-        value: dict[str, Any] = {
-            "type": "reasoning",
-            "encrypted_content": encrypted,
-            "summary": [],
-        }
-        if item.get("id"):
-            value["id"] = str(item["id"])
-        state.append(value)
-    return state

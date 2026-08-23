@@ -145,7 +145,7 @@ The in-memory compactor summarizes structural facts, completed work, pending wor
 - cumulative usage and cost
 - session-scoped key/value state
 
-Database writes are serialized through an async lock. Reads can be performed while the process remains active. Export produces a portable JSON object containing all durable session evidence.
+Database writes are serialized through an async lock. Reads can be performed while the process remains active. Event persistence is authoritative: a failed event batch stays queued in order and fails the run instead of reporting false success. Optional trace and subscriber failures remain isolated from already committed SQLite batches. Export produces a portable JSON object containing all durable session evidence. Administrative session commands open this store directly and do not initialize providers, plugins, or MCP servers.
 
 ### `mcp/`
 
@@ -182,7 +182,7 @@ The runner emits typed events for:
 - verification
 - terminal state
 
-Subscribers are isolated: one failing observer cannot crash the run. A redacted JSONL trace can be enabled independently from SQLite persistence.
+Subscribers are isolated: one failing observer cannot crash the run. SQLite event persistence is required and fails closed; a redacted JSONL trace remains an independent optional sink.
 
 ## Concurrency model
 
@@ -206,6 +206,8 @@ Borealis uses `asyncio` throughout.
 7. Provider prompt caches receive a stable context prefix; request-ranked and mutable context is appended afterward.
 8. Exact-response cache entries are content-addressed and bounded, and never contain tool calls.
 9. Logical input usage includes uncached, cache-read, and cache-write tokens exactly once.
+10. Provider continuation state is versioned, contains only provider-selected replay items, and is accepted only for the originating provider and requested model.
+11. A lifecycle event is not considered durable until its SQLite batch commits successfully.
 
 ## Failure handling
 

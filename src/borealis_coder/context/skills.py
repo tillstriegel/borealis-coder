@@ -21,12 +21,11 @@ class SkillCatalog:
     def __init__(self, root: Path, directories: list[str]) -> None:
         self.root = root.resolve()
         self.directories = directories
-        self._skills: dict[str, Skill] | None = None
+        self._cache: dict[Path, tuple[int, int, Skill]] = {}
 
     def discover(self) -> dict[str, Skill]:
-        if self._skills is not None:
-            return self._skills
         skills: dict[str, Skill] = {}
+        active: dict[Path, tuple[int, int, Skill]] = {}
         for directory in self.directories:
             base = (self.root / directory).resolve(strict=False)
             try:
@@ -43,13 +42,23 @@ class SkillCatalog:
                     continue
                 if not resolved.is_file():
                     continue
-                text = resolved.read_text(encoding="utf-8", errors="replace")
-                metadata, body = _frontmatter(text)
-                name = str(metadata.get("name") or path.parent.name).strip()
-                description = str(metadata.get("description") or _first_paragraph(body)).strip()
-                if name and name not in skills:
-                    skills[name] = Skill(name, description, resolved, body, metadata)
-        self._skills = skills
+                try:
+                    stat = resolved.stat()
+                except OSError:
+                    continue
+                cached = self._cache.get(resolved)
+                if cached is None or cached[:2] != (stat.st_mtime_ns, stat.st_size):
+                    text = resolved.read_text(encoding="utf-8", errors="replace")
+                    metadata, body = _frontmatter(text)
+                    name = str(metadata.get("name") or path.parent.name).strip()
+                    description = str(metadata.get("description") or _first_paragraph(body)).strip()
+                    skill = Skill(name, description, resolved, body, metadata)
+                    cached = (stat.st_mtime_ns, stat.st_size, skill)
+                active[resolved] = cached
+                skill = cached[2]
+                if skill.name and skill.name not in skills:
+                    skills[skill.name] = skill
+        self._cache = active
         return skills
 
     def get(self, name: str) -> Skill | None:
@@ -73,7 +82,7 @@ def _frontmatter(text: str) -> tuple[dict[str, Any], str]:
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
-        metadata[key.strip()] = value.strip().strip('"\'')
+        metadata[key.strip()] = value.strip().strip("\"'")
     return metadata, text[end + 5 :]
 
 

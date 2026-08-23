@@ -31,26 +31,53 @@ class FileSummary:
 
 
 _EXT_LANG = {
-    ".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
-    ".ts": "TypeScript", ".tsx": "TypeScript", ".rs": "Rust", ".go": "Go",
-    ".java": "Java", ".kt": "Kotlin", ".swift": "Swift", ".rb": "Ruby",
-    ".php": "PHP", ".cs": "C#", ".c": "C", ".h": "C/C++", ".cpp": "C++",
-    ".hpp": "C++", ".scala": "Scala", ".sh": "Shell", ".sql": "SQL",
+    ".py": "Python",
+    ".pyi": "Python",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".rs": "Rust",
+    ".go": "Go",
+    ".java": "Java",
+    ".kt": "Kotlin",
+    ".swift": "Swift",
+    ".rb": "Ruby",
+    ".php": "PHP",
+    ".cs": "C#",
+    ".c": "C",
+    ".h": "C/C++",
+    ".cpp": "C++",
+    ".hpp": "C++",
+    ".scala": "Scala",
+    ".sh": "Shell",
+    ".sql": "SQL",
 }
 _SYMBOL_PATTERNS = [
-    re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:def|function|fn|func)\s+([A-Za-z_$][\w$]*)", re.MULTILINE),
-    re.compile(r"^\s*(?:export\s+)?(?:class|struct|enum|interface|trait|type)\s+([A-Za-z_$][\w$]*)", re.MULTILINE),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:async\s+)?(?:def|function|fn|func)\s+([A-Za-z_$][\w$]*)",
+        re.MULTILINE,
+    ),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:class|struct|enum|interface|trait|type)\s+([A-Za-z_$][\w$]*)",
+        re.MULTILINE,
+    ),
     re.compile(r"^\s*(?:pub\s+)?(?:const|static)\s+([A-Za-z_$][\w$]*)", re.MULTILINE),
 ]
-_IMPORT_PATTERN = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w./@-]+)|use\s+([\w:]+)|require\(['\"]([^'\"]+))", re.MULTILINE)
+_IMPORT_PATTERN = re.compile(
+    r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w./@-]+)|use\s+([\w:]+)|require\(['\"]([^'\"]+))",
+    re.MULTILINE,
+)
 
 
 class RepoMap:
-    def __init__(self, root: Path, matcher: IgnoreMatcher, *, max_file_bytes: int = 2_000_000) -> None:
+    def __init__(
+        self, root: Path, matcher: IgnoreMatcher, *, max_file_bytes: int = 2_000_000
+    ) -> None:
         self.root = root.resolve()
         self.matcher = matcher
         self.max_file_bytes = max_file_bytes
-        self._cache: dict[tuple[str, int, int], FileSummary] = {}
+        self._cache: dict[str, tuple[int, int, FileSummary]] = {}
 
     def build(
         self,
@@ -59,9 +86,18 @@ class RepoMap:
         max_chars: int = 28_000,
         rank_changed: bool = True,
     ) -> str:
-        terms = {item.lower() for item in re.findall(r"[A-Za-z_][\w.-]{2,}", query)}
-        changed = set(self._git_changed()) if rank_changed else set()
+        return self.render(
+            self.snapshot(),
+            query=query,
+            max_chars=max_chars,
+            rank_changed=rank_changed,
+        )
+
+    def snapshot(self) -> list[FileSummary]:
+        """Collect current source summaries once for one or more map views."""
+
         summaries: list[FileSummary] = []
+        active_paths: set[str] = set()
         for path in repository_files(self.root, self.matcher):
             if path.suffix.lower() not in _EXT_LANG and path.name not in {"Dockerfile", "Makefile"}:
                 continue
@@ -71,11 +107,35 @@ class RepoMap:
                 continue
             if stat.st_size > self.max_file_bytes:
                 continue
-            key = (str(path), stat.st_mtime_ns, stat.st_size)
-            summary = self._cache.get(key)
-            if summary is None:
+            key = str(path)
+            active_paths.add(key)
+            cached = self._cache.get(key)
+            if cached is None or cached[:2] != (stat.st_mtime_ns, stat.st_size):
                 summary = self._summarize(path, stat.st_size)
-                self._cache[key] = summary
+                self._cache[key] = (stat.st_mtime_ns, stat.st_size, summary)
+            else:
+                summary = cached[2]
+            summaries.append(summary)
+        self._cache = {path: cached for path, cached in self._cache.items() if path in active_paths}
+        return summaries
+
+    def render(
+        self,
+        summaries: list[FileSummary],
+        *,
+        query: str = "",
+        max_chars: int = 28_000,
+        rank_changed: bool = True,
+        changed_paths: set[str] | None = None,
+    ) -> str:
+        terms = {item.lower() for item in re.findall(r"[A-Za-z_][\w.-]{2,}", query)}
+        changed = (
+            (set(self._git_changed()) if changed_paths is None else changed_paths)
+            if rank_changed
+            else set()
+        )
+        ranked: list[FileSummary] = []
+        for summary in summaries:
             score = 0.2
             haystack = " ".join([summary.path, *summary.symbols, *summary.imports]).lower()
             for term in terms:
@@ -88,14 +148,21 @@ class RepoMap:
                 score += 3
             if summary.path.startswith(("src/", "lib/", "app/")):
                 score += 0.5
-            summary = FileSummary(summary.path, summary.language, summary.symbols, summary.imports, summary.size, score)
-            summaries.append(summary)
-        summaries.sort(key=lambda item: (-item.score, item.path))
+            summary = FileSummary(
+                summary.path,
+                summary.language,
+                summary.symbols,
+                summary.imports,
+                summary.size,
+                score,
+            )
+            ranked.append(summary)
+        ranked.sort(key=lambda item: (-item.score, item.path))
         ranking = f"query: {query}" if query else "stable path order"
-        header = f"Repository map ({len(summaries)} source files; {ranking})"
+        header = f"Repository map ({len(ranked)} source files; {ranking})"
         chunks = [header]
         used = len(header)
-        for summary in summaries:
+        for summary in ranked:
             rendered = "\n" + summary.render()
             if used + len(rendered) > max_chars:
                 chunks.append("\n… repository map truncated …")
@@ -117,23 +184,39 @@ class RepoMap:
             symbols = []
             for pattern in _SYMBOL_PATTERNS:
                 symbols.extend(pattern.findall(text))
-            imports = [next(item for item in match if item) for match in _IMPORT_PATTERN.findall(text)]
+            imports = [
+                next(item for item in match if item) for match in _IMPORT_PATTERN.findall(text)
+            ]
         return FileSummary(relative, language, _dedupe(symbols)[:80], _dedupe(imports)[:40], size)
 
     def _git_changed(self) -> list[str]:
         try:
             result = subprocess.run(
                 [
-                    "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                    "-C", str(self.root), "status", "--porcelain",
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(self.root),
+                    "status",
+                    "--porcelain",
                 ],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return []
         if result.returncode:
             return []
-        return [line[3:].strip().split(" -> ")[-1] for line in result.stdout.splitlines() if len(line) > 3]
+        return [
+            line[3:].strip().split(" -> ")[-1]
+            for line in result.stdout.splitlines()
+            if len(line) > 3
+        ]
 
 
 def _python_symbols(text: str, *, filename: str = "<unknown>") -> tuple[list[str], list[str]]:

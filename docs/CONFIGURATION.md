@@ -13,6 +13,14 @@ Values are merged from lowest to highest precedence:
 
 Unknown sections and keys are rejected. This prevents misspellings from silently producing an unsafe or ineffective configuration.
 
+The workspace file is repository-owned and untrusted by default. Without an
+external opt-in it may set only `context.include_git_status`,
+`context.instruction_names`, `context.skill_dirs`, and `context.ignored_dirs`.
+Put authority-bearing settings in the user configuration or an explicit
+`--config` file, or set `BOREALIS_ALLOW_WORKSPACE_AUTHORITY=1` outside the
+repository. MCP servers and provider endpoints retain their separate, narrower
+opt-ins.
+
 ## Environment variables
 
 Direct variables:
@@ -30,6 +38,7 @@ Direct variables:
 | `BOREALIS_ENABLE_WORKSPACE_PLUGINS` | Enables workspace Python plugins when set to `1`. |
 | `BOREALIS_ENABLE_WORKSPACE_MCP` | Trust workspace configuration to start MCP servers. |
 | `BOREALIS_ALLOW_WORKSPACE_PROVIDER_ENDPOINTS` | Trust workspace configuration to set provider endpoints or credential sources. |
+| `BOREALIS_ALLOW_WORKSPACE_AUTHORITY` | Trust workspace provider selection, budgets, safety, sandbox, storage, cache, telemetry, and context resource ceilings. Does not enable MCP or provider endpoints. |
 | `BOREALIS_CHATGPT_AUTH_FILE` | Explicit file-backed Codex `auth.json` used by the `chatgpt` provider. |
 | `BOREALIS_CHATGPT_HOME` | Borealis-managed Codex credential directory. |
 | `BOREALIS_CHATGPT_ACCOUNT_ID` | Account/workspace ID for an externally supplied `CODEX_ACCESS_TOKEN`. |
@@ -183,7 +192,8 @@ Model identifiers change over time. Treat built-in IDs as dated defaults, not a 
 
 The exact-response cache key covers the effective provider configuration, model, system context,
 semantic message history, tool schemas, and generation settings. Prompt text is not stored in the
-cache table; only its SHA-256 key, the final text, and accounting metadata are persisted.
+cache table; only its SHA-256 key, the final text, accounting metadata, and any validated
+provider-selected continuation items are persisted. Full raw provider responses are never cached.
 
 ### ChatGPT credential resolution
 

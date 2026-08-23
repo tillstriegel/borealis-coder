@@ -26,6 +26,11 @@ class OpenRouterProviderTests(unittest.TestCase):
                 }
             ],
             reasoning_effort="high",
+            metadata={
+                "session_id": "sess_openrouter",
+                "prompt_cache_enabled": True,
+                "prompt_cache_key": "stable-cache-key",
+            },
         )
         self.config = ProviderConfig(
             type="openrouter",
@@ -62,6 +67,8 @@ class OpenRouterProviderTests(unittest.TestCase):
         self.assertEqual(payload["usage"], {"include": True})
         self.assertTrue(payload["stream"])
         self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual(payload["session_id"], "sess_openrouter")
+        self.assertNotIn("prompt_cache_key", payload)
 
     def test_responses_style_is_available(self) -> None:
         config = ProviderConfig(
@@ -76,6 +83,18 @@ class OpenRouterProviderTests(unittest.TestCase):
         self.assertEqual(payload["reasoning"], {"effort": "high"})
         self.assertEqual(payload["models"], ["openai/gpt-5.4-mini"])
         self.assertEqual(payload["usage"], {"include": True})
+        self.assertEqual(payload["prompt_cache_key"], "stable-cache-key")
+        self.assertEqual(payload["session_id"], "sess_openrouter")
+
+    def test_cache_routing_metadata_respects_disabled_cache(self) -> None:
+        self.request.metadata["prompt_cache_enabled"] = False
+        provider = OpenRouterProvider(self.config, "key")
+        chat_payload = provider._chat_payload(self.request)
+        responses_payload = provider._responses_payload(self.request)
+        self.assertNotIn("session_id", chat_payload)
+        self.assertNotIn("prompt_cache_key", chat_payload)
+        self.assertNotIn("session_id", responses_payload)
+        self.assertNotIn("prompt_cache_key", responses_payload)
 
     def test_extra_body_is_an_escape_hatch(self) -> None:
         config = ProviderConfig(
