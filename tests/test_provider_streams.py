@@ -385,6 +385,103 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(partial.text, "partial")
         self.assertEqual(partial.tool_calls[0].arguments, {"_raw": "not-json"})
 
+    async def test_responses_emits_summary_found_only_in_completed_event(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "summary-response",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "reasoning",
+                                        "summary": [
+                                            {
+                                                "type": "summary_text",
+                                                "text": "Only in the completed response.",
+                                            }
+                                        ],
+                                    },
+                                    {
+                                        "type": "message",
+                                        "content": [
+                                            {"type": "output_text", "text": "answer"}
+                                        ],
+                                    },
+                                ],
+                            },
+                        }
+                    ),
+                )
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        self.assertEqual(
+            [item.type for item in streamed],
+            ["reasoning_summary_delta", "completed"],
+        )
+        self.assertEqual(streamed[0].text, "Only in the completed response.")
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.reasoning_summary, streamed[0].text)
+
+    async def test_responses_stream_preserves_refusal_as_visible_text(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.refusal.delta",
+                            "delta": "I cannot help with that.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "refusal-response",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "content": [
+                                            {
+                                                "type": "refusal",
+                                                "refusal": "I cannot help with that.",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        self.assertEqual([item.type for item in streamed], ["text_delta", "completed"])
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.text, "I cannot help with that.")
+
     async def test_openai_chat_stream_and_complete_paths(self) -> None:
         provider = OpenAICompatibleProvider(
             ProviderConfig(type="openai_compatible", base_url="http://localhost:1234/v1"), ""
@@ -633,6 +730,67 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             {"effort": "high", "generate_summary": "auto"},
         )
         self.assertEqual(second_payload["reasoning"], {"effort": "high"})
+
+        top_level_failed = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "error",
+                        "code": "invalid_parameter",
+                        "message": "Reasoning summaries are unsupported.",
+                        "param": "reasoning.generate_summary",
+                    }
+                ),
+            )
+        ]
+        fake = FakeHttp(event_batches=[top_level_failed, recovered])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.text, "Recovered answer.")
+        self.assertEqual(len(fake.calls), 2)
+
+    async def test_responses_classifies_in_band_transient_errors(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(
+                type="openai",
+                base_url="https://openai.test/v1",
+                max_retries=0,
+            ),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            data={
+                "status": "failed",
+                "error": {"code": "server_error", "message": "Generation failed."},
+            }
+        )
+
+        with self.assertRaises(ProviderUnavailableError) as unavailable:
+            await provider.complete(self.request)
+
+        self.assertTrue(unavailable.exception.retryable)
+        self.assertEqual(
+            unavailable.exception.details["error"]["code"],
+            "server_error",
+        )
+
+        cast(Any, provider).http = FakeHttp(
+            data={
+                "type": "error",
+                "code": "rate_limit_exceeded",
+                "message": "Slow down.",
+            }
+        )
+
+        with self.assertRaises(ProviderRateLimitError) as rate_limited:
+            await provider.complete(self.request)
+
+        self.assertTrue(rate_limited.exception.retryable)
+        self.assertEqual(rate_limited.exception.details["code"], "rate_limit_exceeded")
 
     async def test_openai_payload_helpers_and_response_complete_error(self) -> None:
         provider = OpenAIProvider(

@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from ..config import ProviderConfig
-from ..errors import ProviderError, ProviderUnavailableError
+from ..errors import ProviderError, ProviderRateLimitError, ProviderUnavailableError
 from ..models import ContinuationState, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
 from .base import Provider, ProviderStreamEvent, classify_provider_error
@@ -211,7 +211,7 @@ class OpenAIProvider(Provider):
                     reasoning_summary_key = next_key
                 reasoning_summary_parts.append(delta)
                 yield ProviderStreamEvent(type="reasoning_summary_delta", text=delta)
-            elif event_type == "response.output_text.delta":
+            elif event_type in {"response.output_text.delta", "response.refusal.delta"}:
                 delta = str(data.get("delta") or "")
                 text_parts.append(delta)
                 yield ProviderStreamEvent(type="text_delta", text=delta)
@@ -263,8 +263,19 @@ class OpenAIProvider(Provider):
             result = self._parse_responses(final_data, retain_raw=True)
             if not result.text:
                 result.text = "".join(text_parts)
+            streamed_summary = "".join(reasoning_summary_parts)
             if not result.reasoning_summary:
-                result.reasoning_summary = "".join(reasoning_summary_parts)
+                result.reasoning_summary = streamed_summary
+            else:
+                remaining_summary = _remaining_stream_delta(
+                    streamed_summary,
+                    result.reasoning_summary,
+                )
+                if remaining_summary:
+                    yield ProviderStreamEvent(
+                        type="reasoning_summary_delta",
+                        text=remaining_summary,
+                    )
             final_calls = {call.id: call for call in result.tool_calls}
             for call_id, partial_data in calls.items():
                 final_call = final_calls.get(call_id)
@@ -362,11 +373,12 @@ class OpenAIProvider(Provider):
             item_type = item.get("type")
             if item_type == "message":
                 for block in item.get("content", []) or []:
-                    if isinstance(block, dict) and block.get("type") in {
-                        "output_text",
-                        "text",
-                    }:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in {"output_text", "text"}:
                         text.append(str(block.get("text") or ""))
+                    elif block.get("type") == "refusal":
+                        text.append(str(block.get("refusal") or ""))
             elif item_type in {"function_call", "custom_tool_call"}:
                 raw_arguments = item.get("arguments") or item.get("input") or "{}"
                 calls.append(
@@ -853,6 +865,12 @@ def _reasoning_summary_separator(parts: list[str], next_part: str) -> str:
     return "\n"
 
 
+def _remaining_stream_delta(streamed: str, completed: str) -> str:
+    if completed.startswith(streamed):
+        return completed[len(streamed) :]
+    return ""
+
+
 def _has_actionable_output(response: ModelResponse) -> bool:
     return bool(response.text or response.tool_calls)
 
@@ -864,13 +882,37 @@ def _raise_responses_failure(
 ) -> None:
     error = data.get("error")
     failed = str(data.get("status") or "").lower() == "failed"
-    if not error and not failed and default_message is None:
+    error_event = str(data.get("type") or "").lower() == "error"
+    if not error and not failed and not error_event and default_message is None:
         return
     if isinstance(error, dict):
-        message = str(error.get("message") or error.get("code") or default_message or error)
+        error_data = error
+        message = str(
+            error_data.get("message")
+            or error_data.get("code")
+            or default_message
+            or error_data
+        )
     else:
-        message = str(error or default_message or "Responses request failed")
-    raise classify_provider_error(None, message, details=error)
+        error_data = data
+        message = str(
+            error
+            or error_data.get("message")
+            or error_data.get("code")
+            or default_message
+            or "Responses request failed"
+        )
+    code = str(error_data.get("code") or "").lower()
+    if code in {"rate_limit_error", "rate_limit_exceeded", "too_many_requests"}:
+        raise ProviderRateLimitError(message, retryable=True, details=data)
+    if code in {
+        "internal_server_error",
+        "request_timeout",
+        "server_error",
+        "service_unavailable",
+    }:
+        raise ProviderUnavailableError(message, retryable=True, details=data)
+    raise classify_provider_error(None, message, details=data)
 
 
 def _reasoning_summary_unsupported(error: ProviderError) -> bool:

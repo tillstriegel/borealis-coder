@@ -76,6 +76,20 @@ class ProviderAdapterTests(unittest.TestCase):
         self.assertEqual(parsed.usage.cached_input_tokens, 2)
         self.assertEqual(parsed.usage.cache_write_tokens, 3)
         self.assertAlmostEqual(parsed.usage.cost_usd, 0.0000175)
+        refused = provider._parse_responses(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "refusal", "refusal": "I cannot help with that."}
+                        ],
+                    }
+                ]
+            },
+            retain_raw=False,
+        )
+        self.assertEqual(refused.text, "I cannot help with that.")
         chat_usage = provider._usage_from_chat(
             {
                 "prompt_tokens": 10,
