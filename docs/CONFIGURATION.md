@@ -192,8 +192,9 @@ Model identifiers change over time. Treat built-in IDs as dated defaults, not a 
 
 The exact-response cache key covers the effective provider configuration, model, system context,
 semantic message history, tool schemas, and generation settings. Prompt text is not stored in the
-cache table; only its SHA-256 key, the final text, accounting metadata, and any validated
-provider-selected continuation items are persisted. Full raw provider responses are never cached.
+cache table; only its SHA-256 key, the final text, reasoning summary, accounting metadata, and any
+validated provider-selected continuation items are persisted. Full raw provider responses are
+never cached.
 
 ### ChatGPT credential resolution
 

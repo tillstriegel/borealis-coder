@@ -621,11 +621,6 @@ class OpenAIProvider(Provider):
             for choice in data.get("choices", []) or []:
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta") or {}
-                content = delta.get("content") or delta.get("refusal")
-                if content:
-                    text = str(content)
-                    text_parts.append(text)
-                    yield ProviderStreamEvent(type="text_delta", text=text)
                 for key, summary in _chat_reasoning_summaries(delta):
                     if reasoning_summary_key is not None and key != reasoning_summary_key:
                         separator = _reasoning_summary_separator(
@@ -641,6 +636,11 @@ class OpenAIProvider(Provider):
                         type="reasoning_summary_delta",
                         text=summary,
                     )
+                content = delta.get("content") or delta.get("refusal")
+                if content:
+                    text = str(content)
+                    text_parts.append(text)
+                    yield ProviderStreamEvent(type="text_delta", text=text)
                 for call_delta in delta.get("tool_calls", []) or []:
                     index = int(call_delta.get("index", 0))
                     call = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})

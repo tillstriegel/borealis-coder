@@ -557,6 +557,18 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         ]
         cast(Any, provider).http = FakeHttp(events=chunks)
         streamed = [item async for item in provider.stream(self.request)]
+        self.assertEqual(
+            [item.type for item in streamed],
+            [
+                "reasoning_summary_delta",
+                "text_delta",
+                "tool_call_delta",
+                "reasoning_summary_delta",
+                "text_delta",
+                "tool_call_delta",
+                "completed",
+            ],
+        )
         final = streamed[-1].response
         assert final is not None
         self.assertEqual(final.text, "hi there")

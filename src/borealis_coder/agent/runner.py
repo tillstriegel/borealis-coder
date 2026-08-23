@@ -35,6 +35,7 @@ from ..models import (
 )
 from ..providers.base import Provider
 from ..safety import ApprovalManager
+from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import ToolContext, ToolRegistry, VerificationPlanner
 from ..util import json_dumps, new_id, truncate_text
@@ -847,22 +848,35 @@ class AgentRunner:
                 async def consume() -> ModelResponse | None:
                     nonlocal emitted
                     completed: ModelResponse | None = None
+                    reasoning_redactor = StreamingRedactor(self.events.redactor)
                     stream = route.provider.stream(request).__aiter__()
+
+                    async def emit_reasoning(text: str) -> None:
+                        nonlocal emitted
+                        if not text:
+                            return
+                        emitted = True
+                        await self.events.emit(
+                            "model.reasoning_delta",
+                            session_id=session_id,
+                            run_id=run_id,
+                            message_id=assistant_message_id,
+                            text=text,
+                            provider=route.name,
+                            model=route.model,
+                        )
+
                     try:
                         async for item in stream:
                             self._check_cancel(cancel)
                             if item.type == "reasoning_summary_delta" and item.text:
-                                emitted = True
-                                await self.events.emit(
-                                    "model.reasoning_delta",
-                                    session_id=session_id,
-                                    run_id=run_id,
-                                    message_id=assistant_message_id,
-                                    text=item.text,
-                                    provider=route.name,
-                                    model=route.model,
-                                )
-                            elif item.type == "text_delta" and item.text:
+                                await emit_reasoning(reasoning_redactor.feed(item.text))
+                                continue
+
+                            await emit_reasoning(
+                                reasoning_redactor.flush(mask_incomplete=True)
+                            )
+                            if item.type == "text_delta" and item.text:
                                 emitted = True
                                 await self.events.emit(
                                     "model.text_delta",

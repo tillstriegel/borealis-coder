@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,6 +183,32 @@ class BurstProvider(Provider):
         )
 
 
+class SplitSecretReasoningProvider(Provider):
+    name = "split_secret_reasoning"
+
+    async def complete(self, request):
+        return ModelResponse(text="done", stop_reason="end_turn")
+
+    async def stream(self, request):
+        yield ProviderStreamEvent(
+            type="reasoning_summary_delta",
+            text="Checked sk-abc",
+        )
+        yield ProviderStreamEvent(
+            type="reasoning_summary_delta",
+            text="defghijklmnop safely.",
+        )
+        yield ProviderStreamEvent(type="text_delta", text="done")
+        yield ProviderStreamEvent(
+            type="completed",
+            response=ModelResponse(
+                text="done",
+                reasoning_summary="Checked sk-abcdefghijklmnop safely.",
+                stop_reason="end_turn",
+            ),
+        )
+
+
 class EmptyProvider(Provider):
     name = "empty"
 
@@ -255,6 +282,59 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(reasoning, ["Checked the stream."])
                 self.assertEqual(create_task.call_count, 2)
+            finally:
+                await runner.close()
+
+    async def test_reasoning_stream_redacts_secrets_across_chunks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "split_secret_reasoning"})
+            config.providers["split_secret_reasoning"] = ProviderConfig(
+                type="split_secret_reasoning",
+                model="split-secret-reasoning",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register(
+                "split_secret_reasoning",
+                lambda cfg, key: SplitSecretReasoningProvider(cfg, key),
+            )
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_TEST_SECRET": "sk-abcdefghijklmnop"},
+                clear=False,
+            ):
+                runner = await build_runner(
+                    root,
+                    config=config,
+                    interactive=False,
+                    provider_registry=registry,
+                )
+            try:
+                session = runner.sessions.create_session(
+                    workspace=root,
+                    provider="split_secret_reasoning",
+                    model="split-secret-reasoning",
+                )
+                await runner._stream_route(
+                    runner.providers[0],
+                    ProviderRequest(
+                        model="split-secret-reasoning",
+                        system="",
+                        messages=[],
+                    ),
+                    session.id,
+                    "run_1",
+                    asyncio.Event(),
+                    "msg_1",
+                )
+                await runner.events.flush()
+                reasoning = [
+                    str(event.data.get("text") or "")
+                    for _, event in runner.sessions.events(session.id)
+                    if event.type == "model.reasoning_delta"
+                ]
+                self.assertEqual("".join(reasoning), "Checked [REDACTED] safely.")
             finally:
                 await runner.close()
 
