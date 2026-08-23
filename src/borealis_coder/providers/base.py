@@ -52,6 +52,10 @@ class Provider(abc.ABC):
 
         return None
 
+    def _continuation_provider(self, request: ProviderRequest) -> str:
+        route = request.metadata.get("provider_route")
+        return route if isinstance(route, str) and route else self.name
+
     async def with_retries(self, operation: Callable[[], Awaitable[T]]) -> T:
         attempts = max(0, self.config.max_retries) + 1
         delay = max(0.0, self.config.initial_backoff_seconds)

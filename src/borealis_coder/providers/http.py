@@ -222,6 +222,7 @@ class HttpClient:
                     response.status,
                     response_headers,
                     request_headers,
+                    body,
                 )
                 if redirect_request is None:
                     raise self._http_error(response.status, raw)
@@ -368,6 +369,7 @@ class HttpClient:
                             response.status,
                             response_headers,
                             request_headers,
+                            body,
                         )
                         if redirect_request is None:
                             completed = True
@@ -532,20 +534,28 @@ class HttpClient:
         status: int,
         response_headers: dict[str, str],
         request_headers: dict[str, str],
+        body: bytes,
     ) -> urllib.request.Request | None:
         location = response_headers.get("location")
-        if status not in {301, 302, 303} or not location:
+        if status not in {301, 302, 303, 307, 308} or not location:
             return None
         try:
             redirect_url = same_origin_redirect_url(url, location)
         except ValueError as error:
             raise ProviderError("Provider refused an unsafe HTTP redirect") from error
+        preserve_method = status in {307, 308}
         redirect_headers = {
             name: value
             for name, value in request_headers.items()
-            if name.lower() not in {"content-length", "content-type"}
+            if name.lower() != "content-length"
+            and (preserve_method or name.lower() != "content-type")
         }
-        return urllib.request.Request(redirect_url, headers=redirect_headers, method="GET")
+        return urllib.request.Request(
+            redirect_url,
+            data=body if preserve_method else None,
+            headers=redirect_headers,
+            method="POST" if preserve_method else "GET",
+        )
 
     def _http_error(self, status: int, raw: bytes) -> ProviderError:
         try:

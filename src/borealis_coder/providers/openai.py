@@ -194,7 +194,7 @@ class OpenAIProvider(Provider):
             if message.role == Role.ASSISTANT:
                 state = ContinuationState.from_metadata(
                     message.metadata.get("continuation_state"),
-                    provider=self.name,
+                    provider=self._continuation_provider(request),
                     model=request.model,
                     kind="openai.responses.reasoning",
                 )

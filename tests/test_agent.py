@@ -62,6 +62,41 @@ class CountingProvider(Provider):
         )
 
 
+class AliasContinuationProvider(Provider):
+    name = "alias_implementation"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.replayed: list[bool] = []
+        self.route_names: list[str] = []
+
+    async def complete(self, request):
+        self.calls += 1
+        route_name = self._continuation_provider(request)
+        self.route_names.append(route_name)
+        for message in reversed(request.messages):
+            if "continuation_state" not in message.metadata:
+                continue
+            state = ContinuationState.from_metadata(
+                message.metadata["continuation_state"],
+                provider=route_name,
+                model=request.model,
+                kind="alias.state",
+            )
+            self.replayed.append(state is not None)
+            break
+        return ModelResponse(
+            text=f"answer-{len(request.messages)}",
+            stop_reason="end_turn",
+            usage=Usage(input_tokens=10, output_tokens=2, requests=1),
+            continuation_state=ContinuationState(
+                kind="alias.state",
+                items=[{"type": "opaque", "value": f"state-{self.calls}"}],
+            ),
+        )
+
+
 class IncompleteProvider(Provider):
     name = "incomplete"
 
@@ -250,6 +285,48 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(provider.calls, 2)
                 self.assertEqual(first_follow_up.usage.application_cache_misses, 1)
                 self.assertEqual(cached_follow_up.usage.application_cache_hits, 1)
+            finally:
+                await runner.close()
+
+    async def test_provider_alias_replays_live_and_cached_continuation_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "corp_openai"})
+            config.providers["corp_openai"] = ProviderConfig(
+                type="alias_implementation",
+                model="alias-model",
+                max_retries=0,
+            )
+            provider: AliasContinuationProvider | None = None
+
+            def factory(cfg, key):
+                nonlocal provider
+                provider = AliasContinuationProvider(cfg, key)
+                return provider
+
+            registry = ProviderRegistry()
+            registry.register("alias_implementation", factory)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                first = await runner.run("same request")
+                second = await runner.run("same request")
+                await runner.run("same follow-up", session_id=first.session_id)
+                cached_follow_up = await runner.run(
+                    "same follow-up",
+                    session_id=second.session_id,
+                )
+                self.assertEqual(cached_follow_up.usage.application_cache_hits, 1)
+                await runner.run("unique final prompt", session_id=second.session_id)
+
+                assert provider is not None
+                self.assertEqual(provider.calls, 3)
+                self.assertEqual(provider.route_names, ["corp_openai"] * 3)
+                self.assertEqual(provider.replayed, [True, True])
             finally:
                 await runner.close()
 

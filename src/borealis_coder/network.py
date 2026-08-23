@@ -42,6 +42,15 @@ class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
                 headers,
                 response,
             ) from error
+        if code in {307, 308}:
+            return urllib.request.Request(
+                safe_url,
+                data=request.data,
+                headers={**request.headers, **request.unredirected_hdrs},
+                origin_req_host=request.origin_req_host,
+                unverifiable=True,
+                method=request.get_method(),
+            )
         return super().redirect_request(
             request,
             response,

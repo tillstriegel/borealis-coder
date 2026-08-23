@@ -589,7 +589,7 @@ class AgentRunner:
                 reasoning_effort=request.reasoning_effort,
                 parallel_tool_calls=request.parallel_tool_calls,
                 response_schema=request.response_schema,
-                metadata=request.metadata,
+                metadata={**request.metadata, "provider_route": route.name},
             )
             try:
                 cache_key = self._response_cache_key(route, routed)

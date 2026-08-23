@@ -113,6 +113,16 @@ class ProviderAdapterTests(unittest.TestCase):
         continuation_request.model = "different-model"
         self.assertEqual(provider._responses_input(continuation_request)[0]["type"], "message")
         continuation_request.model = "model"
+        alias_metadata = retained.continuation_state.to_metadata(
+            provider="corp_openai",
+            model="model",
+        )
+        assert alias_metadata is not None
+        assistant.metadata = {"continuation_state": alias_metadata}
+        continuation_request.metadata = {"provider_route": "corp_openai"}
+        self.assertEqual(provider._responses_input(continuation_request)[0]["type"], "reasoning")
+        continuation_request.metadata = {"provider_route": "different_alias"}
+        self.assertEqual(provider._responses_input(continuation_request)[0]["type"], "message")
         assistant.metadata = {
             "responses_state": retained.continuation_state.items,
         }
@@ -286,6 +296,16 @@ class ProviderAdapterTests(unittest.TestCase):
         replay_steps = provider._steps(replay)
         self.assertEqual(replay_steps[:3], parsed.continuation_state.items)
         self.assertEqual(replay_steps[3]["type"], "function_result")
+
+        alias_continuation = parsed.continuation_state.to_metadata(
+            provider="corp_gemini",
+            model="model",
+        )
+        assert alias_continuation is not None
+        replay.messages[0].metadata = {"continuation_state": alias_continuation}
+        replay.metadata = {"provider_route": "corp_gemini"}
+        alias_steps = provider._steps(replay)
+        self.assertEqual(alias_steps[:3], parsed.continuation_state.items)
 
 
 if __name__ == "__main__":

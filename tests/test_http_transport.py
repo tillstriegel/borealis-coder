@@ -278,13 +278,44 @@ class HttpTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(redirected.full_url, "https://provider.example/v1/next")
         self.assertEqual(redirected.get_header("Authorization"), "Bearer synthetic-secret")
 
+        preserved = handler.redirect_request(
+            request,
+            io.BytesIO(),
+            307,
+            "Temporary Redirect",
+            Message(),
+            "https://provider.example/v1/preserved",
+        )
+        assert preserved is not None
+        self.assertEqual(preserved.get_method(), "POST")
+        self.assertEqual(preserved.data, b"{}")
+        self.assertEqual(preserved.get_header("Authorization"), "Bearer synthetic-secret")
+
         with self.assertRaisesRegex(ProviderError, "unsafe HTTP redirect"):
             HttpClient._redirect_request(
                 "https://provider.example/v1/messages",
                 302,
                 {"location": "https://attacker.example/collect"},
                 {"Authorization": "Bearer synthetic-secret"},
+                b"{}",
             )
+
+        redirected_post = HttpClient._redirect_request(
+            "https://provider.example/v1/messages",
+            308,
+            {"location": "/v1/canonical"},
+            {
+                "Authorization": "Bearer synthetic-secret",
+                "Content-Type": "application/json",
+                "Content-Length": "2",
+            },
+            b"{}",
+        )
+        assert redirected_post is not None
+        self.assertEqual(redirected_post.get_method(), "POST")
+        self.assertEqual(redirected_post.data, b"{}")
+        self.assertEqual(redirected_post.get_header("Content-type"), "application/json")
+        self.assertIsNone(redirected_post.get_header("Content-length"))
 
 
 class HttpConnectionReuseTests(unittest.IsolatedAsyncioTestCase):
@@ -303,6 +334,10 @@ class HttpConnectionReuseTests(unittest.IsolatedAsyncioTestCase):
                     body = b""
                     status = 302
                     content_type = "text/plain"
+                elif self.path in {"/redirect-preserve", "/stream-redirect"}:
+                    body = b""
+                    status = 307
+                    content_type = "text/plain"
                 elif self.path == "/rate":
                     body = b'{"error":{"message":"slow down"}}'
                     status = 429
@@ -318,8 +353,10 @@ class HttpConnectionReuseTests(unittest.IsolatedAsyncioTestCase):
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
-                if self.path == "/redirect":
+                if self.path in {"/redirect", "/redirect-preserve"}:
                     self.send_header("Location", "/json")
+                elif self.path == "/stream-redirect":
+                    self.send_header("Location", "/stream")
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -358,6 +395,24 @@ class HttpConnectionReuseTests(unittest.IsolatedAsyncioTestCase):
             redirected = await client.post_json(base_url + "/redirect", payload={})
             self.assertEqual(redirected.data, {"ok": True})
             self.assertEqual(requests[-2:], [("POST", "/redirect"), ("GET", "/json")])
+            preserved = await client.post_json(base_url + "/redirect-preserve", payload={})
+            self.assertEqual(preserved.data, {"ok": True})
+            self.assertEqual(
+                requests[-2:],
+                [("POST", "/redirect-preserve"), ("POST", "/json")],
+            )
+            redirected_events = [
+                event
+                async for event in client.stream_sse(
+                    base_url + "/stream-redirect",
+                    payload={},
+                )
+            ]
+            self.assertEqual([event.data for event in redirected_events], ["streamed"])
+            self.assertEqual(
+                requests[-2:],
+                [("POST", "/stream-redirect"), ("POST", "/stream")],
+            )
         finally:
             client.close()
             server.shutdown()
