@@ -439,6 +439,7 @@ class AgentRunner:
                     turn=budget.turns,
                     message_id=assistant.id,
                     text=response.text,
+                    reasoning_summary=response.reasoning_summary,
                     tool_calls=[call.to_dict() for call in response.tool_calls],
                     usage=response.usage.to_dict(),
                     stop_reason=response.stop_reason,
@@ -610,6 +611,7 @@ class AgentRunner:
                     )
                     response = ModelResponse(
                         text=str(payload.get("text") or ""),
+                        reasoning_summary=str(payload.get("reasoning_summary") or ""),
                         usage=usage,
                         stop_reason=payload.get("stop_reason"),
                         model=str(payload.get("model") or route.model),
@@ -629,6 +631,16 @@ class AgentRunner:
                         saved_tokens=usage.application_cache_saved_tokens,
                         saved_cost_usd=usage.application_cache_saved_cost_usd,
                     )
+                    if response.reasoning_summary:
+                        await self.events.emit(
+                            "model.reasoning_delta",
+                            session_id=session_id,
+                            run_id=run_id,
+                            message_id=assistant_message_id,
+                            text=response.reasoning_summary,
+                            provider=route.name,
+                            model=route.model,
+                        )
                     if response.text:
                         await self.events.emit(
                             "model.text_delta",
@@ -662,6 +674,7 @@ class AgentRunner:
                     if _is_cacheable_response(response):
                         cached_response: dict[str, Any] = {
                             "text": response.text,
+                            "reasoning_summary": response.reasoning_summary,
                             "stop_reason": response.stop_reason,
                             "model": response.model or route.model,
                         }
@@ -838,7 +851,18 @@ class AgentRunner:
                     try:
                         async for item in stream:
                             self._check_cancel(cancel)
-                            if item.type == "text_delta" and item.text:
+                            if item.type == "reasoning_summary_delta" and item.text:
+                                emitted = True
+                                await self.events.emit(
+                                    "model.reasoning_delta",
+                                    session_id=session_id,
+                                    run_id=run_id,
+                                    message_id=assistant_message_id,
+                                    text=item.text,
+                                    provider=route.name,
+                                    model=route.model,
+                                )
+                            elif item.type == "text_delta" and item.text:
                                 emitted = True
                                 await self.events.emit(
                                     "model.text_delta",
@@ -892,9 +916,14 @@ class AgentRunner:
                         f"Provider {route.name} stream ended without a completed response",
                         retryable=True,
                     )
+                if not completed.text and not completed.tool_calls:
+                    raise ProviderUnavailableError(
+                        f"Provider {route.name} returned an empty response",
+                        retryable=True,
+                    )
                 return completed
             except (ProviderUnavailableError, ProviderRateLimitError) as error:
-                if emitted or attempt + 1 >= attempts:
+                if emitted or not error.retryable or attempt + 1 >= attempts:
                     raise
                 retry_delay = min(
                     route.provider.config.max_backoff_seconds,

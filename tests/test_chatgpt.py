@@ -147,6 +147,10 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
             payload = provider._responses_payload(request, stream=True)
             self.assertEqual(payload["tool_choice"], "auto")
             self.assertEqual(payload["include"], ["reasoning.encrypted_content"])
+            self.assertEqual(
+                payload["reasoning"],
+                {"effort": "high", "summary": "auto"},
+            )
             self.assertEqual(payload["prompt_cache_key"], "sess_abc")
             self.assertNotIn("max_output_tokens", payload)
             self.assertNotIn("temperature", payload)
@@ -270,6 +274,7 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
             retain_raw=True,
         )
         self.assertEqual(response.text, "done")
+        self.assertEqual(response.reasoning_summary, "private")
         self.assertIsNone(response.raw)
         assert response.continuation_state is not None
         self.assertEqual(

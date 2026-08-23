@@ -12,6 +12,7 @@ The agent runtime does not consume provider-native response objects. Each adapte
 
 It yields normalized events for:
 
+- provider-supplied reasoning-summary deltas
 - text deltas
 - completed tool calls
 - usage
@@ -30,6 +31,7 @@ The adapter:
 - emits flat strict function tools
 - supports multiple tool calls in one turn
 - parses response text and function-call argument fragments
+- requests and streams provider-generated reasoning summaries by default
 - maps input, output, and cached token usage
 - retries transient HTTP and service failures
 

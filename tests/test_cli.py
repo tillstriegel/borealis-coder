@@ -434,8 +434,19 @@ class CLITests(unittest.TestCase):
                     Event(type="model.tool_call_delta", data={"name": "read_file"})
                 )
                 await renderer.handle(Event(type="model.tool_call_delta"))
+                await renderer.handle(
+                    Event(type="model.reasoning_delta", data={"text": "Checked "})
+                )
+                await renderer.handle(
+                    Event(type="model.reasoning_delta", data={"text": "the plan."})
+                )
                 await renderer.handle(Event(type="model.text_delta", data={"text": "a"}))
-                await renderer.handle(Event(type="model.completed", data={"text": "a"}))
+                await renderer.handle(
+                    Event(
+                        type="model.completed",
+                        data={"text": "a", "reasoning_summary": "Checked the plan."},
+                    )
+                )
                 await renderer.handle(Event(type="tool.started", data={"tool": "read"}))
                 await renderer.handle(
                     Event(
@@ -464,8 +475,19 @@ class CLITests(unittest.TestCase):
                 renderer.finish_turn()
                 buffered = cli.ConsoleRenderer(stream_text=False)
                 await buffered.handle(Event(type="model.started"))
+                await buffered.handle(
+                    Event(type="model.reasoning_delta", data={"text": "Buffered reasoning"})
+                )
                 await buffered.handle(Event(type="model.text_delta", data={"text": "buffered"}))
-                await buffered.handle(Event(type="model.completed", data={"text": "buffered"}))
+                await buffered.handle(
+                    Event(
+                        type="model.completed",
+                        data={
+                            "text": "buffered",
+                            "reasoning_summary": "Buffered reasoning",
+                        },
+                    )
+                )
                 quiet = cli.ConsoleRenderer(quiet=True)
                 await quiet.handle(Event(type="model.text_delta", data={"text": "hidden"}))
                 json_renderer = cli.ConsoleRenderer(json_events=True)
@@ -489,6 +511,9 @@ class CLITests(unittest.TestCase):
         self.assertIn("provider retry 2/5 in 1s", err)
         self.assertIn("running verification", err)
         self.assertIn("still working · processing model response · 10s elapsed", err)
+        self.assertEqual(err.count("◇ reasoning summary"), 2)
+        self.assertEqual(err.count("Checked the plan."), 1)
+        self.assertEqual(err.count("Buffered reasoning"), 1)
 
         request = ApprovalRequest(
             tool_name="shell",
@@ -724,6 +749,33 @@ class CLITests(unittest.TestCase):
 
         output = __import__("asyncio").run(render())
         self.assertIn("progress 100%\r\n✓ shell", output)
+
+    def test_live_renderer_keeps_reasoning_summary_after_progress_pulse(self) -> None:
+        async def render() -> str:
+            stream = TTYBuffer()
+            renderer = cli.ConsoleRenderer(
+                interactive=True,
+                text_stream=stream,
+                status_stream=stream,
+            )
+            renderer.ui.color = True
+            await renderer.handle(Event(type="model.started"))
+            renderer.pulse(0.4, 1)
+            await renderer.handle(
+                Event(type="model.reasoning_delta", data={"text": "First summary"})
+            )
+            renderer.pulse(0.8, 2)
+            await renderer.handle(
+                Event(type="model.reasoning_delta", data={"text": "\nSecond summary"})
+            )
+            renderer.pulse(1.2, 3)
+            await renderer.handle(Event(type="model.text_delta", data={"text": "answer"}))
+            return stream.getvalue()
+
+        output = __import__("asyncio").run(render())
+        summary_start = output.index("First summary")
+        self.assertNotIn("\r\033[2K", output[summary_start:])
+        self.assertIn("First summary\nSecond summary\n", terminal._strip_ansi(output))
 
     def test_aurora_ui_and_live_interactive_renderer(self) -> None:
         async def render() -> str:

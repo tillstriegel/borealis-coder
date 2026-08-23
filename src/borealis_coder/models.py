@@ -247,6 +247,7 @@ class ModelResponse:
     model: str | None = None
     raw: dict[str, Any] | None = None
     continuation_state: ContinuationState | None = None
+    reasoning_summary: str = ""
 
 
 @dataclass(slots=True)

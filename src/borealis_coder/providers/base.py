@@ -24,7 +24,7 @@ T = TypeVar("T")
 
 @dataclass(slots=True)
 class ProviderStreamEvent:
-    type: str  # text_delta | tool_call_delta | completed | usage | error
+    type: str  # reasoning_summary_delta | text_delta | tool_call_delta | completed | usage | error
     text: str = ""
     data: dict[str, Any] = field(default_factory=dict)
     response: ModelResponse | None = None
@@ -43,6 +43,11 @@ class Provider(abc.ABC):
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         response = await self.complete(request)
+        if response.reasoning_summary:
+            yield ProviderStreamEvent(
+                type="reasoning_summary_delta",
+                text=response.reasoning_summary,
+            )
         if response.text:
             yield ProviderStreamEvent(type="text_delta", text=response.text)
         yield ProviderStreamEvent(type="completed", response=response)

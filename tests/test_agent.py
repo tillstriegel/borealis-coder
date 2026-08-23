@@ -52,6 +52,7 @@ class CountingProvider(Provider):
         self.calls += 1
         return ModelResponse(
             text="cacheable answer",
+            reasoning_summary="Checked cacheability.",
             stop_reason="end_turn",
             response_id=f"response-{self.calls}",
             usage=Usage(input_tokens=20, output_tokens=3, requests=1, cost_usd=0.2),
@@ -165,12 +166,27 @@ class BurstProvider(Provider):
         return ModelResponse(text="abc", stop_reason="end_turn")
 
     async def stream(self, request):
+        yield ProviderStreamEvent(
+            type="reasoning_summary_delta",
+            text="Checked the stream.",
+        )
         for text in "abc":
             yield ProviderStreamEvent(type="text_delta", text=text)
         yield ProviderStreamEvent(
             type="completed",
-            response=ModelResponse(text="abc", stop_reason="end_turn"),
+            response=ModelResponse(
+                text="abc",
+                reasoning_summary="Checked the stream.",
+                stop_reason="end_turn",
+            ),
         )
+
+
+class EmptyProvider(Provider):
+    name = "empty"
+
+    async def complete(self, request):
+        return ModelResponse(stop_reason="stop")
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
@@ -230,6 +246,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                         "msg_1",
                     )
                 self.assertEqual(response.text, "abc")
+                self.assertEqual(response.reasoning_summary, "Checked the stream.")
+                await runner.events.flush()
+                reasoning = [
+                    event.data["text"]
+                    for _, event in runner.sessions.events(session.id)
+                    if event.type == "model.reasoning_delta"
+                ]
+                self.assertEqual(reasoning, ["Checked the stream."])
                 self.assertEqual(create_task.call_count, 2)
             finally:
                 await runner.close()
@@ -265,6 +289,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(second.usage.application_cache_hits, 1)
                 self.assertEqual(second.usage.application_cache_saved_tokens, 23)
                 self.assertEqual(second.usage.cost_usd, 0.0)
+                for result in (first, second):
+                    reasoning = "".join(
+                        str(event.data.get("text") or "")
+                        for _, event in runner.sessions.events(result.session_id)
+                        if event.type == "model.reasoning_delta"
+                    )
+                    self.assertEqual(reasoning, "Checked cacheability.")
                 first_messages = runner.sessions.messages(first.session_id)
                 second_messages = runner.sessions.messages(second.session_id)
                 first_state = first_messages[-1].metadata.get("continuation_state")
@@ -414,6 +445,38 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(started.data["model"], "slow")
                 self.assertEqual(retry.data["attempt"], 2)
                 self.assertEqual(retry.data["max_attempts"], 2)
+            finally:
+                await runner.close()
+
+    async def test_empty_provider_response_uses_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "empty", "provider_fallbacks": ["mock"]},
+            )
+            config.providers["empty"] = ProviderConfig(
+                type="empty",
+                model="empty",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register("empty", lambda cfg, key: EmptyProvider(cfg, key))
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("hello")
+                events = [event for _, event in runner.sessions.events(result.session_id)]
+                route_failure = next(
+                    event for event in events if event.type == "model.route_failed"
+                )
+                self.assertIn("empty response", route_failure.data["error"])
+                self.assertIn("Offline mock", result.text)
+                self.assertEqual(result.stop_reason.value, "end_turn")
             finally:
                 await runner.close()
 

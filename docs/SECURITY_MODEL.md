@@ -179,7 +179,7 @@ Workspace plugins are disabled unless `BOREALIS_ENABLE_WORKSPACE_PLUGINS=1`. Whe
 
 ## Persistence and privacy
 
-By default Borealis stores normalized messages, events, tool lifecycle, usage, and redacted JSONL traces under the configured data directory. Repository snippets and model outputs may still be sensitive.
+By default Borealis stores normalized messages, events, tool lifecycle, usage, and redacted JSONL traces under the configured data directory. Provider-supplied reasoning summaries are model-output events and may be sensitive. Encrypted reasoning continuation state remains opaque. Repository snippets and other model outputs may also be sensitive.
 
 For restricted environments:
 

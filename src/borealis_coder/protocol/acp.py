@@ -308,7 +308,16 @@ class ACPServer:
 
     async def _event_update(self, session_id: str, runner: AgentRunner, event: Event) -> None:
         data = event.data
-        if event.type == "model.text_delta" and data.get("text"):
+        if event.type == "model.reasoning_delta" and data.get("text"):
+            await self._update(
+                session_id,
+                {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "messageId": data.get("message_id") or new_id("msg"),
+                    "content": {"type": "text", "text": data["text"]},
+                },
+            )
+        elif event.type == "model.text_delta" and data.get("text"):
             await self._update(
                 session_id,
                 {

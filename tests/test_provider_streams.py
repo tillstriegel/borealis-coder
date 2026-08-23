@@ -29,18 +29,27 @@ from borealis_coder.providers.openai import (
 from borealis_coder.providers.openai import (
     _parse_arguments as openai_args,
 )
+from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.tools.base import object_schema
 
 
 class FakeHttp:
-    def __init__(self, *, events: list[SSEEvent] | None = None, data: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        events: list[SSEEvent] | None = None,
+        event_batches: list[list[SSEEvent]] | None = None,
+        data: object | None = None,
+    ) -> None:
         self.events = events or []
+        self.event_batches = event_batches
         self.data = data if data is not None else {}
         self.calls: list[tuple[str, dict[str, object]]] = []
 
     async def stream_sse(self, url: str, **kwargs: object) -> AsyncIterator[SSEEvent]:
         self.calls.append((url, dict(kwargs)))
-        for event in self.events:
+        events = self.event_batches.pop(0) if self.event_batches is not None else self.events
+        for event in events:
             yield event
 
     async def post_json(self, url: str, **kwargs: object) -> HttpResponse:
@@ -164,6 +173,42 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         )
         events = [
             SSEEvent("message", "not-json"),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "Checked ",
+                    }
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "the request.",
+                    }
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 1,
+                        "delta": "Prepared the answer.",
+                    }
+                ),
+            ),
             SSEEvent("message", json.dumps({"type": "response.output_text.delta", "delta": "hel"})),
             SSEEvent(
                 "message",
@@ -200,6 +245,19 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                             "status": "completed",
                             "output": [
                                 {
+                                    "type": "reasoning",
+                                    "summary": [
+                                        {
+                                            "type": "summary_text",
+                                            "text": "Checked the request.",
+                                        },
+                                        {
+                                            "type": "summary_text",
+                                            "text": "Prepared the answer.",
+                                        }
+                                    ],
+                                },
+                                {
                                     "type": "message",
                                     "content": [{"type": "output_text", "text": "hello"}],
                                 },
@@ -225,13 +283,30 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         provider.http = FakeHttp(events=events)  # type: ignore[assignment]
         streamed = [item async for item in provider.stream(self.request)]
         self.assertEqual(
-            [item.type for item in streamed], ["text_delta", "tool_call_delta", "completed"]
+            [item.type for item in streamed],
+            [
+                "reasoning_summary_delta",
+                "reasoning_summary_delta",
+                "reasoning_summary_delta",
+                "text_delta",
+                "tool_call_delta",
+                "completed",
+            ],
         )
-        self.assertEqual(streamed[1].data["name"], "read_file")
+        self.assertEqual(
+            [item.text for item in streamed if item.type == "reasoning_summary_delta"],
+            ["Checked ", "the request.", "\nPrepared the answer."],
+        )
+        tool_delta = next(item for item in streamed if item.type == "tool_call_delta")
+        self.assertEqual(tool_delta.data["name"], "read_file")
         final = streamed[-1].response
         self.assertIsNotNone(final)
         assert final is not None
         self.assertEqual(final.text, "hello")
+        self.assertEqual(
+            final.reasoning_summary,
+            "Checked the request.\nPrepared the answer.",
+        )
         self.assertEqual(final.tool_calls[0].arguments, {"path": "b"})
         self.assertEqual(final.usage.reasoning_tokens, 1)
         self.assertIn("Authorization", provider._headers())
@@ -327,6 +402,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "finish_reason": None,
                                 "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "Checked ",
+                                            "id": "summary_1",
+                                            "index": 0,
+                                        }
+                                    ],
                                     "content": "hi ",
                                     "tool_calls": [
                                         {
@@ -352,6 +435,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "finish_reason": "tool_calls",
                                 "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "the request.",
+                                            "id": "summary_1",
+                                            "index": 0,
+                                        }
+                                    ],
                                     "content": "there",
                                     "tool_calls": [{"index": 0, "function": {"arguments": '"a"}'}}],
                                 },
@@ -376,6 +467,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.stop_reason, "tool_calls")
         self.assertEqual(final.response_id, "chat1")
         self.assertEqual(final.usage.cached_input_tokens, 3)
+        self.assertEqual(final.reasoning_summary, "Checked the request.")
 
         cast(Any, provider).http = FakeHttp(
             data={
@@ -386,6 +478,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                         "finish_reason": "stop",
                         "message": {
                             "content": [{"text": "ok"}],
+                            "reasoning_details": [
+                                {
+                                    "type": "reasoning.summary",
+                                    "summary": "Prepared the response.",
+                                    "id": "summary_2",
+                                    "index": 0,
+                                }
+                            ],
                             "tool_calls": [
                                 {
                                     "id": "t",
@@ -400,6 +500,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         )  # type: ignore[assignment]
         completed = await provider.complete(self.request)
         self.assertEqual(completed.text, "ok")
+        self.assertEqual(completed.reasoning_summary, "Prepared the response.")
         self.assertEqual(completed.tool_calls[0].arguments, {"value": []})
         with self.assertRaises(ProviderError):
             provider._parse_chat({}, retain_raw=False)
@@ -408,12 +509,140 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProviderError):
             await provider.complete(self.request)
 
+    async def test_chat_retries_empty_reasoning_response_without_reasoning_controls(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+            ),
+            "key",
+        )
+        first = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "id": "empty",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.text",
+                                            "text": "Raw reasoning is not a summary.",
+                                            "index": 0,
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        second = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "id": "recovered",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {"content": "Recovered answer."},
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        fake = FakeHttp(event_batches=[first, second])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.text, "Recovered answer.")
+        self.assertEqual(len(fake.calls), 2)
+        first_payload = cast(dict[str, Any], fake.calls[0][1]["payload"])
+        second_payload = cast(dict[str, Any], fake.calls[1][1]["payload"])
+        self.assertEqual(first_payload["reasoning"], {"effort": "high"})
+        self.assertNotIn("reasoning", second_payload)
+
+    async def test_responses_retries_when_reasoning_summaries_are_unsupported(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        failed = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "message": "This model does not support reasoning summaries."
+                            },
+                        },
+                    }
+                ),
+            )
+        ]
+        recovered = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {"type": "response.output_text.delta", "delta": "Recovered answer."}
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "output": [],
+                            "usage": {"input_tokens": 4, "output_tokens": 2},
+                        },
+                    }
+                ),
+            ),
+        ]
+        fake = FakeHttp(event_batches=[failed, recovered])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.text, "Recovered answer.")
+        self.assertEqual(len(fake.calls), 2)
+        first_payload = cast(dict[str, Any], fake.calls[0][1]["payload"])
+        second_payload = cast(dict[str, Any], fake.calls[1][1]["payload"])
+        self.assertEqual(
+            first_payload["reasoning"],
+            {"effort": "high", "generate_summary": "auto"},
+        )
+        self.assertEqual(second_payload["reasoning"], {"effort": "high"})
+
     async def test_openai_payload_helpers_and_response_complete_error(self) -> None:
         provider = OpenAIProvider(
             ProviderConfig(type="openai", base_url="https://x", api_style="responses"), ""
         )
         payload = provider._responses_payload(self.request, stream=True)
-        self.assertEqual(payload["reasoning"], {"effort": "high"})
+        self.assertEqual(
+            payload["reasoning"],
+            {"effort": "high", "generate_summary": "auto"},
+        )
         self.assertEqual(payload["temperature"], 0.2)
         self.assertEqual(payload["text"]["format"]["type"], "json_schema")
         self.assertFalse(payload["parallel_tool_calls"])

@@ -15,6 +15,7 @@ Modern coding agents need more than an LLM call wrapped around a shell. Borealis
 - **Repository intelligence:** Git-aware discovery, hierarchical `AGENTS.md` instructions, lazy skills, language-aware symbol extraction, ranked repository maps, search, and focused reads.
 - **Least-privilege execution:** workspace-root containment, symlink-escape prevention, centralized policies, interactive approvals, command classification, network gates, and Docker isolation.
 - **Durability and interoperability:** SQLite/WAL sessions, event traces, full-history export, MCP tools, ACP v2 sessions, and Python entry-point plugins.
+- **Visible model progress:** provider-supplied reasoning summaries stream separately from assistant answers and are shown by default.
 - **Evidence-based completion:** repository-aware verification, Git diff/status reporting, usage/cost accounting, and structured terminal or JSON output.
 
 The design was synthesized from a code-level review of the most-starred open-source coding harnesses as of August 20, 2026. See [the research report](docs/RESEARCH.md) and [feature matrix](docs/FEATURE_MATRIX.md).

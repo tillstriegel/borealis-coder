@@ -54,7 +54,11 @@ class ChatGPTProvider(OpenAIProvider):
             emitted = False
             try:
                 async for event in super().stream(request):
-                    if event.type in {"text_delta", "tool_call_delta"}:
+                    if event.type in {
+                        "reasoning_summary_delta",
+                        "text_delta",
+                        "tool_call_delta",
+                    }:
                         emitted = True
                     yield event
                 return
@@ -82,13 +86,26 @@ class ChatGPTProvider(OpenAIProvider):
         return headers
 
     def _responses_payload(
-        self, request: ProviderRequest, *, stream: bool = False
+        self,
+        request: ProviderRequest,
+        *,
+        stream: bool = False,
+        include_reasoning_summary: bool = True,
     ) -> dict[str, Any]:
-        payload = super()._responses_payload(request, stream=stream)
+        payload = super()._responses_payload(
+            request,
+            stream=stream,
+            include_reasoning_summary=include_reasoning_summary,
+        )
         # Match the Codex backend contract rather than the public API's optional
         # generation controls. ChatGPT plans enforce their own usage/output limits.
         payload.pop("max_output_tokens", None)
         payload.pop("temperature", None)
+        reasoning = payload.get("reasoning")
+        if isinstance(reasoning, dict):
+            reasoning.pop("generate_summary", None)
+            if include_reasoning_summary:
+                reasoning["summary"] = "auto"
         payload["tool_choice"] = "auto"
         payload["include"] = ["reasoning.encrypted_content"]
         session_id = str(request.metadata.get("session_id") or "").strip()

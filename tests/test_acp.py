@@ -9,6 +9,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from borealis_coder.errors import ProtocolError
+from borealis_coder.models import Event
 from borealis_coder.protocol import ACPServer
 from borealis_coder.sessions import SessionStore
 
@@ -27,6 +28,26 @@ class FakeConnection:
 
 
 class ACPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reasoning_summary_is_forwarded_as_agent_thought(self):
+        server = ACPServer()
+        fake = FakeConnection()
+        server.connection = cast(Any, fake)
+
+        await server._event_update(
+            "session_1",
+            cast(Any, None),
+            Event(
+                type="model.reasoning_delta",
+                session_id="session_1",
+                data={"message_id": "message_1", "text": "Checked the plan."},
+            ),
+        )
+
+        update = fake.notifications[0][1]["update"]
+        self.assertEqual(update["sessionUpdate"], "agent_thought_chunk")
+        self.assertEqual(update["messageId"], "message_1")
+        self.assertEqual(update["content"], {"type": "text", "text": "Checked the plan."})
+
     async def test_inactive_session_list_does_not_build_a_provider_runtime(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
