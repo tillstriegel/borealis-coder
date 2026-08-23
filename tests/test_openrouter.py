@@ -82,7 +82,7 @@ class OpenRouterProviderTests(unittest.TestCase):
         self.assertEqual(provider.api_style, "responses")
         self.assertEqual(
             payload["reasoning"],
-            {"effort": "high", "generate_summary": "auto"},
+            {"effort": "high", "summary": "auto"},
         )
         self.assertEqual(payload["models"], ["openai/gpt-5.4-mini"])
         self.assertEqual(payload["usage"], {"include": True})

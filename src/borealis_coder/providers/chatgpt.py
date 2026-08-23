@@ -101,11 +101,6 @@ class ChatGPTProvider(OpenAIProvider):
         # generation controls. ChatGPT plans enforce their own usage/output limits.
         payload.pop("max_output_tokens", None)
         payload.pop("temperature", None)
-        reasoning = payload.get("reasoning")
-        if isinstance(reasoning, dict):
-            reasoning.pop("generate_summary", None)
-            if include_reasoning_summary:
-                reasoning["summary"] = "auto"
         payload["tool_choice"] = "auto"
         payload["include"] = ["reasoning.encrypted_content"]
         session_id = str(request.metadata.get("session_id") or "").strip()

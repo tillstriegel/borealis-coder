@@ -146,8 +146,10 @@ For file-backed credentials, Borealis:
 - refreshes near-expiry tokens under an in-process and cross-process lock
 - atomically replaces rotated credentials with mode `0600`
 - prints only masked account metadata and never access/refresh tokens
-- persists only normalized messages and encrypted Responses continuation state,
-  not complete native provider responses or plaintext reasoning summaries
+- persists normalized messages, redacted runtime events, usage, encrypted
+  Responses continuation state, and eligible exact-response cache entries
+- discards complete native provider responses and never replays plaintext
+  reasoning summaries to the provider
 
 The default API and refresh endpoints are fixed to the ChatGPT/Codex and OpenAI
 OAuth hosts. Because a custom endpoint can exfiltrate bearer or refresh tokens,
@@ -179,12 +181,13 @@ Workspace plugins are disabled unless `BOREALIS_ENABLE_WORKSPACE_PLUGINS=1`. Whe
 
 ## Persistence and privacy
 
-By default Borealis stores normalized messages, events, tool lifecycle, usage, and redacted JSONL traces under the configured data directory. Provider-supplied reasoning summaries are model-output events and may be sensitive. Encrypted reasoning continuation state remains opaque. Repository snippets and other model outputs may also be sensitive.
+By default Borealis stores normalized messages, events, tool lifecycle, usage, and redacted JSONL traces under the configured data directory. Provider-supplied reasoning summaries are model-output events and may be sensitive. The default exact-response cache can also retain them for its configured lifetime. Encrypted reasoning continuation state remains opaque. Repository snippets and other model outputs may also be sensitive.
 
 For restricted environments:
 
 - set a protected storage directory
 - disable `storage.trace_jsonl` when unnecessary
+- disable `cache.response_cache_enabled` when exact-response reuse is unnecessary
 - keep `storage.retain_raw_provider_responses = false`
 - delete or export sessions according to retention policy
 - encrypt the storage volume at the operating-system level

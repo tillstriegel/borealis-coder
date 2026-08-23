@@ -17,7 +17,7 @@ from borealis_coder.errors import (
 from borealis_coder.models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from borealis_coder.providers.anthropic import AnthropicProvider
 from borealis_coder.providers.anthropic import _parse_arguments as anthropic_args
-from borealis_coder.providers.base import Provider, classify_provider_error
+from borealis_coder.providers.base import Provider, ProviderStreamEvent, classify_provider_error
 from borealis_coder.providers.gemini import GeminiProvider
 from borealis_coder.providers.gemini import _parse_arguments as gemini_args
 from borealis_coder.providers.http import HttpResponse, SSEEvent
@@ -707,6 +707,65 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         fallback_request = complete_once.await_args_list[1].args[0]
         self.assertIsNone(fallback_request.reasoning_effort)
 
+    async def test_chat_buffers_summary_from_abandoned_attempt(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        summary_only = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "Abandoned summary.",
+                                            "index": 0,
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        transient_failure = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "error": {
+                            "code": 503,
+                            "message": "Provider temporarily unavailable.",
+                        }
+                    }
+                ),
+            )
+        ]
+        fake = FakeHttp(event_batches=[summary_only, transient_failure])
+        provider.http = fake  # type: ignore[assignment]
+        streamed: list[ProviderStreamEvent] = []
+
+        with self.assertRaises(ProviderUnavailableError) as unavailable:
+            async for event in provider.stream(self.request):
+                streamed.append(event)
+
+        self.assertTrue(unavailable.exception.retryable)
+        self.assertEqual(streamed, [])
+        self.assertEqual(len(fake.calls), 2)
+
     async def test_chat_stream_classifies_in_band_error_without_fallback_request(self) -> None:
         provider = OpenRouterProvider(
             ProviderConfig(
@@ -800,7 +859,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         second_payload = cast(dict[str, Any], fake.calls[1][1]["payload"])
         self.assertEqual(
             first_payload["reasoning"],
-            {"effort": "high", "generate_summary": "auto"},
+            {"effort": "high", "summary": "auto"},
         )
         self.assertEqual(second_payload["reasoning"], {"effort": "high"})
 
@@ -812,7 +871,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                         "type": "error",
                         "code": "invalid_parameter",
                         "message": "Reasoning summaries are unsupported.",
-                        "param": "reasoning.generate_summary",
+                        "param": "reasoning.summary",
                     }
                 ),
             )
@@ -872,7 +931,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         payload = provider._responses_payload(self.request, stream=True)
         self.assertEqual(
             payload["reasoning"],
-            {"effort": "high", "generate_summary": "auto"},
+            {"effort": "high", "summary": "auto"},
         )
         self.assertEqual(payload["temperature"], 0.2)
         self.assertEqual(payload["text"]["format"]["type"], "json_schema")

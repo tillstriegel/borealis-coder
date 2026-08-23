@@ -87,7 +87,7 @@ class OpenAIProvider(Provider):
                 "effort": request.reasoning_effort,
             }
             if include_reasoning_summary:
-                payload["reasoning"]["generate_summary"] = "auto"
+                payload["reasoning"]["summary"] = "auto"
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.response_schema:
@@ -527,17 +527,26 @@ class OpenAIProvider(Provider):
     async def _stream_chat(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         actionable_output_emitted = False
         empty_response = False
+        pending_reasoning: list[ProviderStreamEvent] = []
         prior_usage = Usage()
         try:
             async for event in self._stream_chat_once(request):
+                if event.type == "reasoning_summary_delta" and not actionable_output_emitted:
+                    pending_reasoning.append(event)
+                    continue
                 if event.type == "completed" and event.response is not None:
                     if _has_actionable_output(event.response):
+                        for pending in pending_reasoning:
+                            yield pending
                         yield event
                         return
                     prior_usage.add(event.response.usage)
                     empty_response = True
                     continue
                 if event.type in {"text_delta", "tool_call_delta"}:
+                    for pending in pending_reasoning:
+                        yield pending
+                    pending_reasoning.clear()
                     actionable_output_emitted = True
                 yield event
         except ProviderError as error:
@@ -549,8 +558,13 @@ class OpenAIProvider(Provider):
                 raise
             empty_response = True
         if request.reasoning_effort and not actionable_output_emitted and empty_response:
+            pending_reasoning.clear()
             fallback = replace(request, reasoning_effort=None)
+            fallback_output_emitted = False
             async for event in self._stream_chat_once(fallback):
+                if event.type == "reasoning_summary_delta" and not fallback_output_emitted:
+                    pending_reasoning.append(event)
+                    continue
                 if event.type == "completed" and event.response is not None:
                     if not _has_actionable_output(event.response):
                         raise ProviderUnavailableError(
@@ -559,6 +573,14 @@ class OpenAIProvider(Provider):
                             retryable=False,
                         )
                     event.response.usage = prior_usage.add(event.response.usage)
+                    for pending in pending_reasoning:
+                        yield pending
+                    pending_reasoning.clear()
+                elif event.type in {"text_delta", "tool_call_delta"}:
+                    for pending in pending_reasoning:
+                        yield pending
+                    pending_reasoning.clear()
+                    fallback_output_emitted = True
                 yield event
             return
         raise ProviderUnavailableError(

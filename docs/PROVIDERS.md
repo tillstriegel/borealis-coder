@@ -53,8 +53,10 @@ It is distinct from the public OpenAI API-key route:
 - access tokens are proactively refreshed when a refresh token is available.
 - token rotation is persisted atomically under a cross-process credential lock.
 - the account/workspace identifier is sent through `ChatGPT-Account-ID`.
-- encrypted Responses reasoning state is preserved across local tool turns while
-  plaintext reasoning summaries and complete native responses are discarded.
+- encrypted Responses reasoning state is preserved across local tool turns.
+- plaintext reasoning summaries are not replayed to the provider, but they appear
+  in redacted local events and may enter the exact-response cache.
+- complete native provider responses are discarded.
 - one authentication retry is permitted only before any text or tool-call delta
   has been emitted, avoiding duplicate partial output.
 
