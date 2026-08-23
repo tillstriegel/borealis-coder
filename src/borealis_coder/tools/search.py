@@ -39,7 +39,10 @@ class GrepTool(Tool):
         files = [resolved.path] if resolved.path.is_file() else _walk_files(resolved.path, context)
         file_glob = arguments.get("glob")
         context_lines = int(arguments["context_lines"])
-        max_results = int(arguments["max_results"])
+        max_results = min(
+            int(arguments["max_results"]),
+            context.config.context.max_search_results,
+        )
         rows: list[str] = []
         match_count = 0
         scanned = 0

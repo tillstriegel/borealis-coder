@@ -10,20 +10,54 @@ from unittest.mock import patch
 
 from borealis_coder.errors import ProtocolError
 from borealis_coder.protocol import ACPServer
+from borealis_coder.sessions import SessionStore
 
 
 class FakeConnection:
     def __init__(self):
-        self.notifications=[]
-        self.requests=[]
+        self.notifications = []
+        self.requests = []
+
     async def notify(self, method, params):
         self.notifications.append((method, params))
+
     async def request(self, method, params, timeout=None):
         self.requests.append((method, params))
-        return {"optionId":"allow_once"}
+        return {"optionId": "allow_once"}
 
 
 class ACPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inactive_session_list_does_not_build_a_provider_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "data"
+            store = SessionStore(data / "sessions.sqlite3")
+            try:
+                session = store.create_session(
+                    workspace=root,
+                    provider="offline",
+                    model="stored-model",
+                    title="Stored session",
+                )
+            finally:
+                store.close()
+
+            server = ACPServer()
+            await server.handle("initialize", {"protocolVersion": 2, "capabilities": {}})
+            with (
+                patch.dict(
+                    os.environ,
+                    {"BOREALIS_DATA_DIR": str(data)},
+                    clear=False,
+                ),
+                patch(
+                    "borealis_coder.protocol.acp.build_runner",
+                    side_effect=AssertionError("runtime must not start"),
+                ),
+            ):
+                listed = await server.handle("session/list", {"cwd": str(root)})
+            self.assertEqual([item["sessionId"] for item in listed["sessions"]], [session.id])
+
     async def test_session_lifecycle_and_updates(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -31,17 +65,38 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             server = ACPServer()
             fake = FakeConnection()
             server.connection = cast(Any, fake)
-            with patch.dict(os.environ, {"BOREALIS_DATA_DIR": str(data), "BOREALIS_PROVIDER":"mock"}, clear=False):
-                init = await server.handle("initialize", {"protocolVersion":2,"capabilities":{},"info":{"name":"test","version":"1"}})
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(data), "BOREALIS_PROVIDER": "mock"},
+                clear=False,
+            ):
+                init = await server.handle(
+                    "initialize",
+                    {
+                        "protocolVersion": 2,
+                        "capabilities": {},
+                        "info": {"name": "test", "version": "1"},
+                    },
+                )
                 self.assertEqual(init["protocolVersion"], 2)
-                created = await server.handle("session/new", {"cwd":str(root),"mcpServers":[]})
+                created = await server.handle("session/new", {"cwd": str(root), "mcpServers": []})
                 session_id = created["sessionId"]
-                accepted = await server.handle("session/prompt", {"sessionId":session_id,"prompt":[{"type":"text","text":"OFFLINE_WRITE_DEMO"}]})
+                accepted = await server.handle(
+                    "session/prompt",
+                    {
+                        "sessionId": session_id,
+                        "prompt": [{"type": "text", "text": "OFFLINE_WRITE_DEMO"}],
+                    },
+                )
                 self.assertEqual(accepted, {})
                 task = server.tasks[session_id]
                 await asyncio.wait_for(task, timeout=5)
-                self.assertTrue((root/"borealis-demo.txt").exists())
-                update_types = [params["update"]["sessionUpdate"] for method, params in fake.notifications if method=="session/update"]
+                self.assertTrue((root / "borealis-demo.txt").exists())
+                update_types = [
+                    params["update"]["sessionUpdate"]
+                    for method, params in fake.notifications
+                    if method == "session/update"
+                ]
                 self.assertIn("tool_call_update", update_types)
                 self.assertIn("agent_message", update_types)
                 self.assertIn("agent_message_chunk", update_types)
@@ -61,20 +116,27 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
                     if method == "session/update"
                     and params["update"]["sessionUpdate"] == "agent_message"
                 ]
-                self.assertTrue(any(item["messageId"] in assistant_ids for item in full_agent_updates))
-                listed = await server.handle("session/list", {"cwd":str(root)})
-                self.assertTrue(any(item["sessionId"]==session_id for item in listed["sessions"]))
-                await server.handle("session/close", {"sessionId":session_id})
-                await server.handle("session/resume", {
-                    "sessionId": session_id,
-                    "cwd": str(root),
-                    "mcpServers": [],
-                    "replayFrom": {"type": "start"},
-                })
+                self.assertTrue(
+                    any(item["messageId"] in assistant_ids for item in full_agent_updates)
+                )
+                listed = await server.handle("session/list", {"cwd": str(root)})
+                self.assertTrue(any(item["sessionId"] == session_id for item in listed["sessions"]))
+                await server.handle("session/close", {"sessionId": session_id})
+                await server.handle(
+                    "session/resume",
+                    {
+                        "sessionId": session_id,
+                        "cwd": str(root),
+                        "mcpServers": [],
+                        "replayFrom": {"type": "start"},
+                    },
+                )
                 await server.handle("session/close", {"sessionId": session_id})
                 await server.handle("session/delete", {"sessionId": session_id})
                 listed = await server.handle("session/list", {"cwd": str(root)})
-                self.assertFalse(any(item["sessionId"] == session_id for item in listed["sessions"]))
+                self.assertFalse(
+                    any(item["sessionId"] == session_id for item in listed["sessions"])
+                )
             await server.close()
 
     async def test_rejects_relative_roots_and_invalid_mcp(self):
@@ -84,7 +146,8 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProtocolError):
             await server.handle("session/new", {"cwd": ".", "mcpServers": []})
         with (
-            tempfile.TemporaryDirectory() as td, patch.dict(
+            tempfile.TemporaryDirectory() as td,
+            patch.dict(
                 os.environ,
                 {"BOREALIS_DATA_DIR": str(Path(td) / "data")},
                 clear=False,
@@ -95,9 +158,7 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
                 "session/new",
                 {
                     "cwd": td,
-                    "mcpServers": [
-                        {"type": "stdio", "name": "bad", "command": "python"}
-                    ],
+                    "mcpServers": [{"type": "stdio", "name": "bad", "command": "python"}],
                 },
             )
 

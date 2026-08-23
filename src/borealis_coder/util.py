@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 T = TypeVar("T")
+_TOKEN_ESTIMATE_CHUNK_CHARS = 16_384
 
 
 def utc_now() -> str:
@@ -126,8 +127,17 @@ def estimate_tokens(text: str) -> int:
     """A conservative tokenizer-free estimate suitable for budget gates."""
     if not text:
         return 0
-    ascii_chars = sum(ord(char) < 128 for char in text)
-    ratio = 3.6 if ascii_chars / len(text) > 0.85 else 2.6
+    if text.isascii():
+        ratio = 3.6
+    else:
+        ascii_chars = 0
+        for start in range(0, len(text), _TOKEN_ESTIMATE_CHUNK_CHARS):
+            chunk = text[start : start + _TOKEN_ESTIMATE_CHUNK_CHARS]
+            if chunk.isascii():
+                ascii_chars += len(chunk)
+            else:
+                ascii_chars += len(chunk.encode("ascii", errors="ignore"))
+        ratio = 3.6 if ascii_chars / len(text) > 0.85 else 2.6
     return max(1, int(len(text) / ratio) + text.count("\n") // 8)
 
 

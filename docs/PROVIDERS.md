@@ -164,7 +164,7 @@ keeps unrelated prompt changes from invalidating the reusable prefix.
 
 Provider type: `gemini`, API style: `interactions`.
 
-The adapter uses the Interactions surface and maps normalized messages, system instruction, flat function tools, tool calls/results, generation controls, and usage to Borealis events.
+The adapter uses the Interactions surface and maps normalized messages, system instruction, flat function tools, tool calls/results, generation controls, and usage to Borealis events. Requests use stateless storage. Borealis therefore retains the model-generated interaction steps, including signed thought and function-call steps, and replays them exactly on the next turn. This continuation state is versioned and accepted only for the same provider and requested model.
 
 Because provider APIs evolve, the adapter is covered by wire-format fixtures, but live calls should be part of deployment qualification.
 
@@ -198,8 +198,10 @@ the input price; the Anthropic adapter applies its 5-minute or 1-hour write mult
 Price fields default to zero because pricing changes and can depend on account, region, batch mode, or cache behavior. Production operators should set current prices explicitly and monitor the provider’s own billing controls.
 
 The CLI reports prompt-cache hit rate, read/write tokens, net savings, exact-response-cache hits,
-and avoided tokens. Exact final-text responses are cached locally for a short TTL. Tool-call,
-partial, failed, and cancelled responses are never eligible.
+and avoided tokens. Exact final-text responses are cached locally for a short TTL. Safe
+provider-selected continuation items are cached with the text so a cache hit remains resumable;
+full provider responses are not stored. Tool-call, partial, failed, and cancelled responses are
+never eligible.
 
 ## Adding a provider
 

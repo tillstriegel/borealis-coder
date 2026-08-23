@@ -221,23 +221,20 @@ Configuration is merged in this order:
 Minimal workspace configuration:
 
 ```toml
-[agent]
-provider = "auto"
-max_turns = 60
-max_cost_usd = 25.0
-auto_verify = true
-
-[safety]
-mode = "workspace-write"
-approval = "on-risk"
-network = false
-checkpoints = true
-
-[sandbox]
-driver = "native" # choose "docker" for stronger isolation
+[context]
+include_git_status = true
+instruction_names = ["AGENTS.md", "BOREALIS.md", "CLAUDE.md"]
+skill_dirs = [".agents/skills", ".borealis/skills"]
 ```
 
-Provider override:
+Workspace configuration is repository-owned and cannot change provider
+selection, budgets, safety, sandbox, storage, cache, telemetry, or context
+resource ceilings by default. Put those settings in the user configuration or
+an explicit `--config` file. To trust them in a workspace file, set
+`BOREALIS_ALLOW_WORKSPACE_AUTHORITY=1` outside the repository. MCP servers and
+provider endpoints still require their dedicated opt-ins.
+
+Trusted user or explicit-file provider override:
 
 ```toml
 [providers.openai]
@@ -346,7 +343,7 @@ Borealis builds model context incrementally:
 - It gives the model search/read tools instead of front-loading the entire repository.
 - It deterministically compacts older turns near the configured context threshold while retaining durable full history in SQLite.
 - It keeps a deterministic system-context prefix for provider prompt caching and appends Git status and request-ranked context afterward.
-- It reports provider cache reads, writes, hit rate, and savings, and can reuse short-lived exact text-only responses without replaying tools.
+- It reports provider cache reads, writes, hit rate, and savings, and can reuse short-lived exact text-only responses without replaying tools. Validated provider continuation state is retained so cached responses remain resumable.
 - Typing `/` at the interactive prompt opens a compact command selector with descriptions; continue typing to narrow it and use Tab to complete.
 
 ## Verification

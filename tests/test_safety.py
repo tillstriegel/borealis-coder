@@ -75,6 +75,26 @@ class PathTests(unittest.TestCase):
                 manager.restore(checkpoint.id)
             self.assertTrue(future.is_dir())
 
+    def test_checkpoint_restores_an_authorized_outside_path(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside:
+            root = Path(td)
+            file_path = Path(outside) / "state.txt"
+            file_path.write_text("before", encoding="utf-8")
+            roots = WorkspaceRoots(root, allow_outside=True)
+            manager = CheckpointManager(roots)
+            checkpoint = manager.create([file_path], label="outside root")
+            assert checkpoint is not None
+
+            file_path.write_text("after", encoding="utf-8")
+            roots.allow_outside = False
+            with self.assertRaises(PathViolation):
+                manager.restore(checkpoint.id)
+            self.assertEqual(file_path.read_text(encoding="utf-8"), "after")
+
+            roots.allow_outside = True
+            manager.restore(checkpoint.id)
+            self.assertEqual(file_path.read_text(encoding="utf-8"), "before")
+
 
 class PolicyTests(unittest.IsolatedAsyncioTestCase):
     def test_command_classification(self):

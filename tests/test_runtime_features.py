@@ -8,7 +8,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from borealis_coder.agent import build_runner, compact_messages, compact_messages_with_summary
+from borealis_coder.agent import (
+    build_runner,
+    compact_messages,
+    compact_messages_with_summary,
+    estimate_request_tokens,
+)
 from borealis_coder.config import ProviderConfig, SafetyConfig, SandboxConfig
 from borealis_coder.errors import BudgetExceeded, Cancelled
 from borealis_coder.models import Message, ModelResponse, Role, ToolCall, Usage
@@ -24,69 +29,269 @@ from borealis_coder.safety import (
 from borealis_coder.safety.redaction import Redactor, StreamingRedactor
 from borealis_coder.tools import build_builtin_registry
 from borealis_coder.tools.verification import VerificationPlanner, VerificationStep
+from borealis_coder.util import estimate_tokens, json_dumps
 from tests.helpers import make_config, make_context
 
 
 class SteeringProvider(Provider):
-    name="steering"
+    name = "steering"
+
     def __init__(self, config, api_key=""):
         super().__init__(config, api_key)
-        self.calls=0
+        self.calls = 0
+
     async def complete(self, request):
         self.calls += 1
         if self.calls == 1:
-            await asyncio.sleep(.15)
-            return ModelResponse(tool_calls=[ToolCall(name="read_file", arguments={"path":"a.txt","start_line":None,"end_line":None,"max_chars":None})], usage=Usage(requests=1))
+            await asyncio.sleep(0.15)
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="read_file",
+                        arguments={
+                            "path": "a.txt",
+                            "start_line": None,
+                            "end_line": None,
+                            "max_chars": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
         steering = any(message.content == "new direction" for message in request.messages)
-        return ModelResponse(text="steering seen" if steering else "missing", usage=Usage(requests=1))
+        return ModelResponse(
+            text="steering seen" if steering else "missing", usage=Usage(requests=1)
+        )
 
 
 class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runner_factory_closes_owned_resources_after_provider_failure(self):
+        class TrackingStore:
+            def __init__(self, _path):
+                self.closed = False
+
+            def append_events(self, _events):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        class TrackingMCP:
+            def __init__(self, _workspace, _config):
+                self.closed = False
+
+            async def connect_all(self, _tools):
+                return None
+
+            async def close(self):
+                self.closed = True
+
+        class TrackingProvider(Provider):
+            name = "primary"
+
+            def __init__(self, config, api_key=""):
+                super().__init__(config, api_key)
+                self.closed = False
+
+            async def complete(self, request):
+                return ModelResponse(text="unused")
+
+            async def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "primary", "provider_fallbacks": ["broken"]},
+            )
+            config.providers["primary"] = ProviderConfig(type="primary", model="p")
+            config.providers["broken"] = ProviderConfig(type="broken", model="b")
+            provider = TrackingProvider(config.providers["primary"])
+            registry = ProviderRegistry()
+            registry.register("primary", lambda _config, _key: provider)
+
+            def fail_provider(_config, _key):
+                raise RuntimeError("provider construction failed")
+
+            registry.register("broken", fail_provider)
+            store = TrackingStore(config.database_path)
+            mcp = TrackingMCP(root, config)
+            with (
+                patch("borealis_coder.agent.factory.SessionStore", return_value=store),
+                patch("borealis_coder.agent.factory.MCPManager", return_value=mcp),
+                self.assertRaisesRegex(RuntimeError, "provider construction failed"),
+            ):
+                await build_runner(
+                    root,
+                    config=config,
+                    interactive=False,
+                    provider_registry=registry,
+                )
+
+            self.assertTrue(provider.closed)
+            self.assertTrue(mcp.closed)
+            self.assertTrue(store.closed)
+
+    def test_request_estimate_preserves_unicode_and_component_framing(self):
+        call = ToolCall(
+            id="call_1",
+            name="lookup",
+            arguments={"query": "東京\nMünchen"},
+        )
+        messages = [
+            Message(role=Role.USER, content="界" * 100_000 + "\n" * 16),
+            Message(role=Role.ASSISTANT, content="résumé", tool_calls=[call]),
+        ]
+        tools = [
+            {
+                "name": "lookup",
+                "description": "Suche",
+                "parameters": {"type": "object"},
+            }
+        ]
+        expected = (
+            estimate_tokens("système")
+            + estimate_tokens(json_dumps(tools))
+            + sum(estimate_tokens(message.content) for message in messages)
+            + estimate_tokens(json_dumps([call.to_dict()]))
+            + len(messages) * 12
+            + len(tools) * 30
+        )
+        self.assertEqual(
+            estimate_request_tokens("système", messages, tools),
+            expected,
+        )
+
+    def test_request_estimate_never_builds_a_combined_history_string(self):
+        messages = [Message(role=Role.USER, content="x" * 6_400) for _ in range(100)]
+        with patch(
+            "borealis_coder.agent.budget.estimate_tokens",
+            wraps=estimate_tokens,
+        ) as estimator:
+            estimated = estimate_request_tokens("system", messages, [])
+        self.assertGreater(estimated, 0)
+        self.assertEqual(estimator.call_count, 102)
+        self.assertLessEqual(
+            max(len(call.args[0]) for call in estimator.call_args_list),
+            6_400,
+        )
+
+    def test_token_estimate_keeps_the_mixed_text_threshold(self):
+        mostly_ascii = "a" * 90 + "界" * 10
+        mostly_unicode = "a" * 80 + "界" * 20
+        self.assertEqual(estimate_tokens(mostly_ascii), int(100 / 3.6))
+        self.assertEqual(estimate_tokens(mostly_unicode), int(100 / 2.6))
+
     async def test_steering_is_injected_before_next_turn(self):
         with tempfile.TemporaryDirectory() as td:
-            root=Path(td)
-            (root/"a.txt").write_text("a")
-            config=make_config(root, agent={"provider":"steering"})
-            config.providers["steering"]=ProviderConfig(type="steering", model="s", max_retries=0)
-            registry=ProviderRegistry()
-            registry.register("steering", lambda cfg,key: SteeringProvider(cfg,key))
-            runner=await build_runner(root, config=config, interactive=False, provider_registry=registry)
+            root = Path(td)
+            (root / "a.txt").write_text("a")
+            config = make_config(root, agent={"provider": "steering"})
+            config.providers["steering"] = ProviderConfig(type="steering", model="s", max_retries=0)
+            registry = ProviderRegistry()
+            registry.register("steering", lambda cfg, key: SteeringProvider(cfg, key))
+            runner = await build_runner(
+                root, config=config, interactive=False, provider_registry=registry
+            )
             try:
-                task=asyncio.create_task(runner.run("start"))
+                task = asyncio.create_task(runner.run("start"))
                 while not runner._cancel:
-                    await asyncio.sleep(.01)
-                session_id=next(iter(runner._cancel))
+                    await asyncio.sleep(0.01)
+                session_id = next(iter(runner._cancel))
                 runner.steer(session_id, "new direction")
-                result=await task
+                result = await task
                 self.assertEqual(result.text, "steering seen")
             finally:
                 await runner.close()
 
     async def test_shell_bounds_and_policy(self):
         with tempfile.TemporaryDirectory() as td:
-            root=Path(td)
-            context=make_context(root)
-            registry=build_builtin_registry()
-            ok=await registry.execute(ToolCall(name="shell", arguments={"command":"printf 123","cwd":".","timeout_seconds":10,"description":"test"}), context)
+            root = Path(td)
+            context = make_context(root)
+            registry = build_builtin_registry()
+            ok = await registry.execute(
+                ToolCall(
+                    name="shell",
+                    arguments={
+                        "command": "printf 123",
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "description": "test",
+                    },
+                ),
+                context,
+            )
             self.assertFalse(ok.is_error, ok.output)
             self.assertIn("123", ok.output)
-            denied=await registry.execute(ToolCall(name="shell", arguments={"command":"rm -rf x","cwd":".","timeout_seconds":10,"description":"bad"}), context)
+            denied = await registry.execute(
+                ToolCall(
+                    name="shell",
+                    arguments={
+                        "command": "rm -rf x",
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "description": "bad",
+                    },
+                ),
+                context,
+            )
             self.assertTrue(denied.is_error)
 
     def test_compaction_keeps_recent_context(self):
-        messages=[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(30)]
-        compacted=compact_messages(messages, keep_recent=6)
+        messages = [
+            Message(role=Role.USER if i % 2 == 0 else Role.ASSISTANT, content=f"m{i}")
+            for i in range(30)
+        ]
+        compacted = compact_messages(messages, keep_recent=6)
         self.assertTrue(compacted[0].metadata["compacted"])
         self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
-        self.assertEqual([item.content for item in compacted[-6:]], [f"m{i}" for i in range(24,30)])
+        self.assertEqual(
+            [item.content for item in compacted[-6:]], [f"m{i}" for i in range(24, 30)]
+        )
+
+    def test_compaction_preserves_recent_provider_continuation_metadata(self):
+        continuation = {
+            "version": 1,
+            "provider": "gemini",
+            "model": "gemini-model",
+            "kind": "gemini.interactions.steps",
+            "items": [{"type": "thought", "signature": "signed"}],
+        }
+        messages = [
+            *[Message(role=Role.USER, content=f"old-{index}") for index in range(12)],
+            Message(
+                role=Role.ASSISTANT,
+                tool_calls=[ToolCall(id="call_1", name="read_file", arguments={})],
+                metadata={"continuation_state": continuation},
+            ),
+            Message(
+                role=Role.TOOL,
+                content="result",
+                tool_call_id="call_1",
+                tool_name="read_file",
+            ),
+        ]
+        compacted = compact_messages(messages, keep_recent=2)
+        self.assertEqual(
+            compacted[-2].metadata["continuation_state"],
+            continuation,
+        )
 
     async def test_compaction_llm_summary_preserves_tool_output(self):
         tool_output = "FAILED tests/test_x.py::test_y - AssertionError: expected 4 got 5"
         messages = [
             Message(role=Role.USER, content="run the tests"),
-            Message(role=Role.ASSISTANT, content="", tool_calls=[ToolCall(name="shell", arguments={"command":"pytest"})]),
+            Message(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[ToolCall(name="shell", arguments={"command": "pytest"})],
+            ),
             Message(role=Role.TOOL, content=tool_output, tool_name="shell"),
-            *[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(20)],
+            *[
+                Message(role=Role.USER if i % 2 == 0 else Role.ASSISTANT, content=f"m{i}")
+                for i in range(20)
+            ],
         ]
         seen = {}
 
@@ -100,7 +305,9 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LLM summary", compacted[0].content)
         self.assertIn("not a new user request", compacted[0].content)
         self.assertIn("untrusted data", compacted[0].content)
-        self.assertEqual([item.content for item in compacted[-6:]], [f"m{i}" for i in range(14,20)])
+        self.assertEqual(
+            [item.content for item in compacted[-6:]], [f"m{i}" for i in range(14, 20)]
+        )
 
     async def test_compaction_llm_summary_cannot_close_history_boundary(self):
         messages = [
@@ -141,7 +348,10 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt.count("</untrusted_conversation_transcript>"), 1)
 
     async def test_compaction_llm_failure_falls_back_to_deterministic(self):
-        messages=[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(30)]
+        messages = [
+            Message(role=Role.USER if i % 2 == 0 else Role.ASSISTANT, content=f"m{i}")
+            for i in range(30)
+        ]
 
         async def boom(transcript):
             raise RuntimeError("provider offline")
@@ -151,7 +361,10 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(compacted[0].metadata["compacted"])
 
     async def test_compaction_without_summarizer_is_deterministic(self):
-        messages=[Message(role=Role.USER if i%2==0 else Role.ASSISTANT, content=f"m{i}") for i in range(30)]
+        messages = [
+            Message(role=Role.USER if i % 2 == 0 else Role.ASSISTANT, content=f"m{i}")
+            for i in range(30)
+        ]
         compacted = await compact_messages_with_summary(messages, None, keep_recent=6)
         self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
 
@@ -245,9 +458,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 return response
 
             try:
-                with patch.object(
-                    provider, "complete", side_effect=complete_and_cancel
-                ):
+                with patch.object(provider, "complete", side_effect=complete_and_cancel):
                     summarizer = runner._summarizer(usage_sink, cancel)
                     assert summarizer is not None
 
@@ -287,10 +498,10 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shell_streams_output_events(self):
         with tempfile.TemporaryDirectory() as td:
-            root=Path(td)
-            context=make_context(root)
-            registry=build_builtin_registry()
-            events=[]
+            root = Path(td)
+            context = make_context(root)
+            registry = build_builtin_registry()
+            events = []
             original_emit = context.events.emit
 
             async def capture(event_type, **kwargs):
@@ -299,7 +510,15 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
             with patch.object(context.events, "emit", side_effect=capture):
                 result = await registry.execute(
-                    ToolCall(name="shell", arguments={"command":"printf line1\\nline2\\n","cwd":".","timeout_seconds":10,"description":"stream"}),
+                    ToolCall(
+                        name="shell",
+                        arguments={
+                            "command": "printf line1\\nline2\\n",
+                            "cwd": ".",
+                            "timeout_seconds": 10,
+                            "description": "stream",
+                        },
+                    ),
                     context,
                 )
             self.assertFalse(result.is_error, result.output)
@@ -340,9 +559,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertFalse(result.is_error, result.output)
             streamed = "".join(
-                str(event.data.get("text") or "")
-                for event in events
-                if event.type == "tool.output"
+                str(event.data.get("text") or "") for event in events if event.type == "tool.output"
             )
             self.assertNotIn(secret, streamed)
             self.assertIn("[REDACTED]", streamed)
@@ -361,9 +578,9 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         redactor = StreamingRedactor(Redactor())
 
         self.assertEqual(redactor.feed("x-----BEGIN PRIVATE "), "x")
-        output = redactor.feed(
-            "KEY-----\nkey material\n-----END PRIVATE KEY-----"
-        ) + redactor.flush()
+        output = (
+            redactor.feed("KEY-----\nkey material\n-----END PRIVATE KEY-----") + redactor.flush()
+        )
 
         self.assertEqual(output, "[REDACTED]")
 
@@ -408,11 +625,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(output, expected)
 
     def test_streaming_redactor_keeps_completed_private_key_intact(self):
-        private_key = (
-            "-----BEGIN PRIVATE KEY-----\n"
-            "secret\n"
-            "-----END PRIVATE KEY-----"
-        )
+        private_key = "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"
         value = "__" + private_key + "-" + private_key
         expected = Redactor().text(value)
         redactor = StreamingRedactor(Redactor())
@@ -450,9 +663,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_stream_decodes_split_utf8(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            driver = NativeProcessDriver(
-                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
-            )
+            driver = NativeProcessDriver(WorkspaceRoots(root), SafetyConfig(), SandboxConfig())
             code = (
                 "import sys,time;"
                 "sys.stdout.buffer.write(b'\\xe2');sys.stdout.buffer.flush();"
@@ -494,9 +705,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_timeout_is_not_blocked_by_output_observer(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            driver = NativeProcessDriver(
-                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
-            )
+            driver = NativeProcessDriver(WorkspaceRoots(root), SafetyConfig(), SandboxConfig())
             observer_started = asyncio.Event()
 
             async def blocked_observer(_stream, _text):
@@ -524,9 +733,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_drains_output_after_timeout(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            driver = NativeProcessDriver(
-                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
-            )
+            driver = NativeProcessDriver(WorkspaceRoots(root), SafetyConfig(), SandboxConfig())
             code = (
                 "import signal,sys,time;"
                 "signal.signal(signal.SIGTERM, lambda *_: "
@@ -565,11 +772,14 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             safety = SafetyConfig(network=False)
             sandbox = SandboxConfig(driver="docker")
             fake_result = ProcessResult("docker", 0, "", "", 1)
-            with patch("borealis_coder.safety.sandbox.shutil.which", return_value="/usr/bin/docker"), patch.object(
-                NativeProcessDriver,
-                "run",
-                new=AsyncMock(return_value=fake_result),
-            ) as native_run:
+            with (
+                patch("borealis_coder.safety.sandbox.shutil.which", return_value="/usr/bin/docker"),
+                patch.object(
+                    NativeProcessDriver,
+                    "run",
+                    new=AsyncMock(return_value=fake_result),
+                ) as native_run,
+            ):
                 driver = DockerProcessDriver(roots, safety, sandbox)
                 result = await driver.run("python -V", cwd=subdir, timeout=10, shell=True)
             self.assertTrue(result.ok)

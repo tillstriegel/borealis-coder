@@ -7,7 +7,9 @@ import os
 import tempfile
 import time
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
+from email.message import Message as EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,6 +20,7 @@ from borealis_coder.auth import (
     ChatGPTCredentials,
     launch_codex_login,
 )
+from borealis_coder.auth.chatgpt import _post_refresh_json
 from borealis_coder.config import AgentConfig, Config, ProviderConfig, load_config
 from borealis_coder.errors import ConfigurationError, ProviderAuthenticationError
 from borealis_coder.models import Message, ModelResponse, ProviderRequest, Role
@@ -75,6 +78,25 @@ def write_auth(path: Path, *, expires: int, access: str | None = None) -> None:
 
 
 class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_http_error_response_is_closed(self) -> None:
+        stream = io.BytesIO(b'{"error":"invalid_grant"}')
+        error = urllib.error.HTTPError(
+            "https://auth.openai.com/oauth/token",
+            400,
+            "bad request",
+            EmailMessage(),
+            stream,
+        )
+        with (
+            patch("borealis_coder.auth.chatgpt.open_same_origin", side_effect=error),
+            self.assertRaisesRegex(ProviderAuthenticationError, "HTTP 400"),
+        ):
+            await _post_refresh_json(
+                "https://auth.openai.com/oauth/token",
+                {"refresh_token": "synthetic"},
+            )
+        self.assertTrue(stream.closed)
+
     async def test_load_status_headers_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
             auth = Path(td) / "auth.json"
@@ -129,6 +151,8 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("max_output_tokens", payload)
             self.assertNotIn("temperature", payload)
             self.assertTrue(payload["stream"])
+            request.metadata["prompt_cache_enabled"] = False
+            self.assertNotIn("prompt_cache_key", provider._responses_payload(request))
 
     async def test_refresh_is_atomic_and_rotates_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
@@ -194,9 +218,7 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
             data["tokens"]["refresh_token"] = ""
             auth.write_text(json.dumps(data), encoding="utf-8")
             os.chmod(auth, 0o600)
-            manager = ChatGPTCredentialManager(
-                ProviderConfig(type="chatgpt", auth_file=str(auth))
-            )
+            manager = ChatGPTCredentialManager(ProviderConfig(type="chatgpt", auth_file=str(auth)))
             with self.assertRaises(ProviderAuthenticationError):
                 await manager.ensure_valid()
 
@@ -248,25 +270,32 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
             retain_raw=True,
         )
         self.assertEqual(response.text, "done")
+        self.assertIsNone(response.raw)
+        assert response.continuation_state is not None
         self.assertEqual(
-            response.raw,
-            {
-                "responses_state": [
-                    {
-                        "type": "reasoning",
-                        "id": "rs_1",
-                        "encrypted_content": "opaque-ciphertext",
-                        "summary": [],
-                    }
-                ]
-            },
+            response.continuation_state.items,
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-ciphertext",
+                    "summary": [],
+                }
+            ],
         )
+        continuation = response.continuation_state.to_metadata(
+            provider="chatgpt",
+            model="gpt-5.6-terra",
+        )
+        assert continuation is not None
         assistant = Message(
             role=Role.ASSISTANT,
             content="done",
-            metadata=response.raw or {},
+            metadata={"continuation_state": continuation},
         )
-        values = provider._responses_input([assistant])
+        values = provider._responses_input(
+            ProviderRequest(model="gpt-5.6-terra", system="", messages=[assistant])
+        )
         self.assertEqual(values[0]["encrypted_content"], "opaque-ciphertext")
         self.assertNotIn("private", json.dumps(values))
 
@@ -380,8 +409,9 @@ class ChatGPTLoginAndCliTests(unittest.TestCase):
                 write_auth(home / "auth.json", expires=int(time.time()) + 3600)
                 return SimpleNamespace(returncode=0)
 
-            with patch("borealis_coder.auth.chatgpt.shutil.which", return_value="/bin/codex"), patch(
-                "borealis_coder.auth.chatgpt.subprocess.run", side_effect=run
+            with (
+                patch("borealis_coder.auth.chatgpt.shutil.which", return_value="/bin/codex"),
+                patch("borealis_coder.auth.chatgpt.subprocess.run", side_effect=run),
             ):
                 auth_file = launch_codex_login(
                     codex_home=home, codex_command="codex", device_code=True
@@ -400,15 +430,18 @@ class ChatGPTLoginAndCliTests(unittest.TestCase):
             }
             stdout = io.StringIO()
             stderr = io.StringIO()
-            with patch.dict(os.environ, env, clear=True), redirect_stdout(stdout), redirect_stderr(
-                stderr
+            with (
+                patch.dict(os.environ, env, clear=True),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
             ):
                 code = cli.main(["auth", "status", "--workspace", str(root), "--json"])
             self.assertEqual(code, 0)
             self.assertTrue(json.loads(stdout.getvalue())["available"])
 
-            with patch("borealis_coder.cli.launch_codex_login", return_value=auth), redirect_stdout(
-                stdout := io.StringIO()
+            with (
+                patch("borealis_coder.cli.launch_codex_login", return_value=auth),
+                redirect_stdout(stdout := io.StringIO()),
             ):
                 code = cli.main(
                     [
@@ -422,8 +455,9 @@ class ChatGPTLoginAndCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("ChatGPT login ready", stdout.getvalue())
 
-            with patch("borealis_coder.cli.logout_managed_chatgpt", return_value=auth), redirect_stdout(
-                stdout := io.StringIO()
+            with (
+                patch("borealis_coder.cli.logout_managed_chatgpt", return_value=auth),
+                redirect_stdout(stdout := io.StringIO()),
             ):
                 code = cli.main(["auth", "logout", "--codex-home", str(root / "managed")])
             self.assertEqual(code, 0)

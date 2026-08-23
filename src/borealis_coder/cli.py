@@ -23,6 +23,7 @@ from .errors import BorealisError, ConfigurationError
 from .interactive import InteractiveCLI
 from .protocol import ACPServer
 from .safety import ApprovalRequest, CheckpointManager, WorkspaceRoots
+from .sessions import SessionStore
 from .terminal import AuroraUI, ConsoleRenderer
 from .util import atomic_write_text, json_dumps
 
@@ -96,12 +97,24 @@ def build_parser() -> argparse.ArgumentParser:
     auth_status.add_argument("--workspace", type=Path, default=Path.cwd())
     auth_status.add_argument("--config", type=Path)
     auth_status.add_argument("--json", action="store_true")
-    auth_login = auth_sub.add_parser("login", help="Sign in with ChatGPT through the official Codex CLI")
-    auth_login.add_argument("--device-code", action="store_true", help="Use Codex device-code login")
-    auth_login.add_argument("--codex-home", type=Path, help="Credential directory; defaults to a Borealis-managed directory")
+    auth_login = auth_sub.add_parser(
+        "login", help="Sign in with ChatGPT through the official Codex CLI"
+    )
+    auth_login.add_argument(
+        "--device-code", action="store_true", help="Use Codex device-code login"
+    )
+    auth_login.add_argument(
+        "--codex-home",
+        type=Path,
+        help="Credential directory; defaults to a Borealis-managed directory",
+    )
     auth_login.add_argument("--codex-command", default="codex")
-    auth_logout = auth_sub.add_parser("logout", help="Revoke/delete a selected Codex credential store")
-    auth_logout.add_argument("--codex-home", type=Path, help="Defaults to the Borealis-managed credential directory")
+    auth_logout = auth_sub.add_parser(
+        "logout", help="Revoke/delete a selected Codex credential store"
+    )
+    auth_logout.add_argument(
+        "--codex-home", type=Path, help="Defaults to the Borealis-managed credential directory"
+    )
     auth_logout.add_argument("--codex-command", default="codex")
 
     doctor = sub.add_parser("doctor", help="Validate configuration and runtime dependencies")
@@ -269,7 +282,9 @@ async def _run(args: argparse.Namespace) -> int:
     config = _runtime_config(args, workspace)
     renderer = ConsoleRenderer(json_events=args.json, quiet=args.json)
     approval = None if args.non_interactive else _terminal_approval
-    runner = await build_runner(workspace, config=config, approval_callback=approval, interactive=not args.non_interactive)
+    runner = await build_runner(
+        workspace, config=config, approval_callback=approval, interactive=not args.non_interactive
+    )
     runner.events.subscribe(renderer.handle)
     try:
         result = await runner.run(prompt, session_id=args.resume)
@@ -282,7 +297,12 @@ async def _run(args: argparse.Namespace) -> int:
         if result.text and not renderer.has_rendered(result.text):
             print(result.text)
         print(_result_footer(result), file=sys.stderr)
-    return 0 if result.stop_reason.value == "end_turn" and not (result.verification and not result.verification.get("ok", True)) else 1
+    return (
+        0
+        if result.stop_reason.value == "end_turn"
+        and not (result.verification and not result.verification.get("ok", True))
+        else 1
+    )
 
 
 async def _chat(args: argparse.Namespace) -> int:
@@ -406,7 +426,20 @@ def _doctor(args: argparse.Namespace) -> int:
     config = load_config(workspace, explicit_path=args.config)
     diagnostics = run_diagnostics(workspace, config)
     if args.json:
-        print(json_dumps([{"name": item.name, "ok": item.ok, "message": item.message, "details": item.details} for item in diagnostics], pretty=True))
+        print(
+            json_dumps(
+                [
+                    {
+                        "name": item.name,
+                        "ok": item.ok,
+                        "message": item.message,
+                        "details": item.details,
+                    }
+                    for item in diagnostics
+                ],
+                pretty=True,
+            )
+        )
     else:
         for item in diagnostics:
             print(f"{'PASS' if item.ok else 'FAIL'}  {item.name}: {item.message}")
@@ -415,7 +448,9 @@ def _doctor(args: argparse.Namespace) -> int:
 
 async def _tools(args: argparse.Namespace) -> int:
     workspace = args.workspace.expanduser().resolve()
-    config = load_config(workspace, explicit_path=args.config, overrides={"agent": {"provider": "mock"}})
+    config = load_config(
+        workspace, explicit_path=args.config, overrides={"agent": {"provider": "mock"}}
+    )
     runner = await build_runner(workspace, config=config, interactive=False)
     try:
         schemas = runner.tools.schemas()
@@ -438,28 +473,44 @@ def _config(args: argparse.Namespace) -> int:
 
 async def _sessions(args: argparse.Namespace) -> int:
     workspace = args.workspace.expanduser().resolve()
-    config = load_config(workspace, explicit_path=args.config, overrides={"agent": {"provider": "mock"}})
-    runner = await build_runner(workspace, config=config, interactive=False)
+    config = load_config(workspace, explicit_path=args.config)
+    store = SessionStore(config.database_path)
     try:
         if args.action == "list":
-            values = await asyncio.to_thread(runner.sessions.list_sessions, workspace=None if args.all_workspaces else workspace)
+            values = await asyncio.to_thread(
+                store.list_sessions,
+                workspace=None if args.all_workspaces else workspace,
+            )
             for item in values:
-                print(f"{item.id}\t{item.updated_at}\t{item.status}\t{item.provider}/{item.model}\t{item.title}")
+                print(
+                    f"{item.id}\t{item.updated_at}\t{item.status}\t{item.provider}/{item.model}\t{item.title}"
+                )
             return 0
         if not args.session_id:
             raise ValueError(f"sessions {args.action} requires SESSION_ID")
         if args.action == "show":
-            print(json_dumps(await asyncio.to_thread(runner.sessions.export, args.session_id), pretty=True))
+            print(
+                json_dumps(
+                    await asyncio.to_thread(store.export, args.session_id),
+                    pretty=True,
+                )
+            )
         elif args.action == "export":
-            data = json_dumps(await asyncio.to_thread(runner.sessions.export, args.session_id), pretty=True) + "\n"
+            data = (
+                json_dumps(
+                    await asyncio.to_thread(store.export, args.session_id),
+                    pretty=True,
+                )
+                + "\n"
+            )
             output = args.output or Path(f"{args.session_id}.json")
             atomic_write_text(output, data)
             print(output.resolve())
         elif args.action == "delete":
-            await asyncio.to_thread(runner.sessions.delete_session, args.session_id)
+            await asyncio.to_thread(store.delete_session, args.session_id)
             print(f"deleted {args.session_id}")
     finally:
-        await runner.close()
+        await asyncio.to_thread(store.close)
     return 0
 
 
@@ -480,16 +531,25 @@ def _rollback(args: argparse.Namespace) -> int:
 async def _eval(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="borealis-eval-") as temp:
         workspace = Path(temp)
-        (workspace / "pyproject.toml").write_text('[project]\nname="fixture"\nversion="0.1.0"\n', encoding="utf-8")
-        config = load_config(workspace, overrides={
-            "agent": {"provider": "mock", "auto_verify": False},
-            "storage": {"directory": str(workspace / ".data")},
-            "safety": {"approval": "never"},
-        })
+        (workspace / "pyproject.toml").write_text(
+            '[project]\nname="fixture"\nversion="0.1.0"\n', encoding="utf-8"
+        )
+        config = load_config(
+            workspace,
+            overrides={
+                "agent": {"provider": "mock", "auto_verify": False},
+                "storage": {"directory": str(workspace / ".data")},
+                "safety": {"approval": "never"},
+            },
+        )
         runner = await build_runner(workspace, config=config, interactive=False)
         try:
             result = await runner.run("OFFLINE_WRITE_DEMO")
-            file_ok = (workspace / "borealis-demo.txt").read_text(encoding="utf-8").startswith("Created by")
+            file_ok = (
+                (workspace / "borealis-demo.txt")
+                .read_text(encoding="utf-8")
+                .startswith("Created by")
+            )
             resumed = await runner.run("Confirm state", session_id=result.session_id)
             checks = {
                 "agent_end_turn": result.stop_reason.value == "end_turn",
@@ -529,7 +589,6 @@ def _runtime_config(args: argparse.Namespace, workspace: Path) -> Config:
     return load_config(workspace, explicit_path=args.config, overrides=overrides)
 
 
-
 def _terminal_approval(request: ApprovalRequest) -> str:
     ui = AuroraUI(sys.stderr)
     ui.panel(
@@ -543,7 +602,9 @@ def _terminal_approval(request: ApprovalRequest) -> str:
         tone="warning",
     )
     while True:
-        answer = input(ui.inline_prompt("allow [y] once · [a] session · [n] reject")).strip().lower()
+        answer = (
+            input(ui.inline_prompt("allow [y] once · [a] session · [n] reject")).strip().lower()
+        )
         if answer in {"y", "yes"}:
             return "allow_once"
         if answer in {"a", "always"}:
@@ -554,8 +615,10 @@ def _terminal_approval(request: ApprovalRequest) -> str:
 
 def _result_footer(result) -> str:  # type: ignore[no-untyped-def]
     parts = [
-        f"session={result.session_id}", f"stop={result.stop_reason.value}",
-        f"turns={result.turns}", f"tokens={result.usage.total_tokens}",
+        f"session={result.session_id}",
+        f"stop={result.stop_reason.value}",
+        f"turns={result.turns}",
+        f"tokens={result.usage.total_tokens}",
         f"cost=${result.usage.cost_usd:.4f}",
     ]
     if result.changed_files:

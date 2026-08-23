@@ -30,6 +30,9 @@ class AnthropicProvider(Provider):
             headers.setdefault("x-api-key", self.api_key)
         return headers
 
+    async def close(self) -> None:
+        self.http.close()
+
     def _payload(self, request: ProviderRequest, *, stream: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.model,
@@ -96,9 +99,7 @@ class AnthropicProvider(Provider):
                 uncached = int(initial.get("input_tokens", 0) or 0)
                 usage.cached_input_tokens = int(initial.get("cache_read_input_tokens", 0) or 0)
                 usage.cache_write_tokens = int(initial.get("cache_creation_input_tokens", 0) or 0)
-                usage.input_tokens = (
-                    uncached + usage.cached_input_tokens + usage.cache_write_tokens
-                )
+                usage.input_tokens = uncached + usage.cached_input_tokens + usage.cache_write_tokens
             elif event_type == "content_block_start":
                 index = int(data.get("index", 0))
                 block = data.get("content_block") or {}
@@ -133,7 +134,9 @@ class AnthropicProvider(Provider):
                 delta = data.get("delta") or {}
                 stop_reason = delta.get("stop_reason") or stop_reason
                 delta_usage = data.get("usage") or {}
-                usage.output_tokens = int(delta_usage.get("output_tokens", 0) or usage.output_tokens)
+                usage.output_tokens = int(
+                    delta_usage.get("output_tokens", 0) or usage.output_tokens
+                )
             elif event_type == "error":
                 error = data.get("error") or {}
                 raise ProviderError(str(error.get("message") or error))
@@ -220,7 +223,9 @@ class AnthropicProvider(Provider):
                     ToolCall(
                         id=str(block.get("id") or ""),
                         name=str(block.get("name") or ""),
-                        arguments=dict(arguments) if isinstance(arguments, dict) else {"value": arguments},
+                        arguments=dict(arguments)
+                        if isinstance(arguments, dict)
+                        else {"value": arguments},
                         raw_arguments=json_dumps(arguments),
                     )
                 )
@@ -271,16 +276,26 @@ def _system_blocks(request: ProviderRequest) -> list[dict[str, Any]]:
     configured = request.metadata.get("system_blocks")
     if not isinstance(configured, list):
         return [{"type": "text", "text": request.system}]
+    configured = [item for item in configured if isinstance(item, dict) and item.get("text")]
+    separated = "\n\n".join(str(item["text"]) for item in configured) == request.system
+    max_breakpoints = 3 if request.metadata.get("anthropic_conversation_cache") else 4
+    breakpoints = 0
     output: list[dict[str, Any]] = []
-    for item in configured:
-        if not isinstance(item, dict) or not item.get("text"):
-            continue
-        block: dict[str, Any] = {"type": "text", "text": str(item["text"])}
-        if item.get("cacheable") and request.metadata.get("prompt_cache_enabled"):
+    for index, item in enumerate(configured):
+        text = str(item["text"])
+        if separated and index:
+            text = "\n\n" + text
+        block: dict[str, Any] = {"type": "text", "text": text}
+        if (
+            item.get("cacheable")
+            and request.metadata.get("prompt_cache_enabled")
+            and breakpoints < max_breakpoints
+        ):
             cache_control: dict[str, str] = {"type": "ephemeral"}
             if request.metadata.get("prompt_cache_ttl") == "1h":
                 cache_control["ttl"] = "1h"
             block["cache_control"] = cache_control
+            breakpoints += 1
         output.append(block)
     return output or [{"type": "text", "text": request.system}]
 

@@ -160,9 +160,7 @@ class Usage:
             "application_cache_misses": self.application_cache_misses,
             "application_cache_hit_rate": round(self.application_cache_hit_rate, 6),
             "application_cache_saved_tokens": self.application_cache_saved_tokens,
-            "application_cache_saved_cost_usd": round(
-                self.application_cache_saved_cost_usd, 8
-            ),
+            "application_cache_saved_cost_usd": round(self.application_cache_saved_cost_usd, 8),
             "total_tokens": self.total_tokens,
         }
 
@@ -180,13 +178,63 @@ class Usage:
             cache_savings_usd=float(value.get("cache_savings_usd", 0.0) or 0.0),
             application_cache_hits=int(value.get("application_cache_hits", 0) or 0),
             application_cache_misses=int(value.get("application_cache_misses", 0) or 0),
-            application_cache_saved_tokens=int(
-                value.get("application_cache_saved_tokens", 0) or 0
-            ),
+            application_cache_saved_tokens=int(value.get("application_cache_saved_tokens", 0) or 0),
             application_cache_saved_cost_usd=float(
                 value.get("application_cache_saved_cost_usd", 0.0) or 0.0
             ),
         )
+
+
+@dataclass(slots=True)
+class ContinuationState:
+    """Opaque provider output required to continue a stateless interaction."""
+
+    kind: str
+    items: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_metadata(self, *, provider: str, model: str) -> dict[str, Any] | None:
+        if (
+            not self.kind
+            or not self.items
+            or any(not isinstance(item, dict) for item in self.items)
+        ):
+            return None
+        return {
+            "version": 1,
+            "provider": provider,
+            "model": model,
+            "kind": self.kind,
+            "items": [dict(item) for item in self.items],
+        }
+
+    @classmethod
+    def from_metadata(
+        cls,
+        value: Any,
+        *,
+        provider: str,
+        model: str,
+        kind: str | None = None,
+    ) -> ContinuationState | None:
+        if not isinstance(value, dict) or value.get("version") != 1:
+            return None
+        if value.get("provider") != provider or value.get("model") != model:
+            return None
+        value_kind = value.get("kind")
+        items = value.get("items")
+        if (
+            not isinstance(value_kind, str)
+            or not value_kind
+            or (kind is not None and value_kind != kind)
+        ):
+            return None
+        if (
+            not isinstance(items, list)
+            or not items
+            or any(not isinstance(item, dict) for item in items)
+        ):
+            return None
+        return cls(kind=value_kind, items=[dict(item) for item in items])
 
 
 @dataclass(slots=True)
@@ -198,6 +246,7 @@ class ModelResponse:
     response_id: str | None = None
     model: str | None = None
     raw: dict[str, Any] | None = None
+    continuation_state: ContinuationState | None = None
 
 
 @dataclass(slots=True)

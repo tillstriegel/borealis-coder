@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from borealis_coder.events import JsonlTrace
+from borealis_coder.errors import SessionError
+from borealis_coder.events import EventBus, JsonlTrace
 from borealis_coder.models import Event, Message, Role, Usage
 from borealis_coder.sessions import SessionStore
 
@@ -16,7 +17,9 @@ class SessionStoreTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.store = SessionStore(self.root / "sessions.sqlite3")
-        self.session = self.store.create_session(workspace=self.root, provider="mock", model="deterministic", title="Test")
+        self.session = self.store.create_session(
+            workspace=self.root, provider="mock", model="deterministic", title="Test"
+        )
 
     def tearDown(self):
         self.store.close()
@@ -27,7 +30,9 @@ class SessionStoreTests(unittest.TestCase):
         self.store.append_message(self.session.id, message)
         event = Event(type="test", session_id=self.session.id, data={"x": 1})
         self.store.append_event(event)
-        self.store.add_usage(self.session.id, Usage(input_tokens=5, output_tokens=2, requests=1, cost_usd=.1))
+        self.store.add_usage(
+            self.session.id, Usage(input_tokens=5, output_tokens=2, requests=1, cost_usd=0.1)
+        )
         self.store.start_tool_call(self.session.id, "run_1", "call_1", "read_file", {"path": "x"})
         self.store.complete_tool_call(
             self.session.id,
@@ -42,6 +47,17 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(exported["usage"]["total_tokens"], 7)
         self.assertEqual(exported["tool_calls"][0]["status"], "completed")
 
+    def test_export_contains_more_than_one_event_query_page(self):
+        self.store.append_events(
+            Event(type="model.text_delta", session_id=self.session.id, data={"text": "x"})
+            for _ in range(10_005)
+        )
+
+        self.assertEqual(len(self.store.events(self.session.id)), 10_000)
+        exported = self.store.export(self.session.id)
+        self.assertEqual(len(exported["events"]), 10_005)
+        self.assertEqual(exported["events"][-1]["sequence"], 10_005)
+
     def test_message_upsert_preserves_order_and_tool_ids_are_session_scoped(self):
         first = Message(role=Role.USER, content="first")
         second = Message(role=Role.ASSISTANT, content="second")
@@ -49,7 +65,9 @@ class SessionStoreTests(unittest.TestCase):
         self.store.append_message(self.session.id, second)
         first.content = "updated"
         self.store.append_message(self.session.id, first)
-        self.assertEqual([item.content for item in self.store.messages(self.session.id)], ["updated", "second"])
+        self.assertEqual(
+            [item.content for item in self.store.messages(self.session.id)], ["updated", "second"]
+        )
 
         other = self.store.create_session(
             workspace=self.root,
@@ -159,6 +177,104 @@ class SessionStoreTests(unittest.TestCase):
         trace.append(Event(type="private"))
         self.assertEqual(trace_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(trace_path.parent.stat().st_mode & 0o777, 0o700)
+
+
+class EventBusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_events_are_live_immediately_and_persisted_in_one_batch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = SessionStore(root / "sessions.sqlite3")
+            session = store.create_session(
+                workspace=root,
+                provider="mock",
+                model="deterministic",
+            )
+            batches: list[int] = []
+
+            def persist(events: list[Event]) -> None:
+                batches.append(len(events))
+                store.append_events(events)
+
+            trace_path = root / "events.jsonl"
+            bus = EventBus(trace=JsonlTrace(trace_path), persist=persist)
+            live: list[str] = []
+            bus.subscribe(lambda event: live.append(event.type))
+            for index in range(10):
+                await bus.emit(
+                    "model.text_delta",
+                    session_id=session.id,
+                    run_id="run_1",
+                    text=str(index),
+                )
+            self.assertEqual(len(live), 10)
+            self.assertEqual(batches, [])
+
+            await bus.emit(
+                "model.completed",
+                session_id=session.id,
+                run_id="run_1",
+            )
+            self.assertEqual(batches, [11])
+            persisted = [event.type for _, event in store.events(session.id)]
+            self.assertEqual(
+                persisted,
+                ["model.text_delta"] * 10 + ["model.completed"],
+            )
+            self.assertEqual(len(trace_path.read_text().splitlines()), 11)
+            await bus.flush()
+            store.close()
+
+    async def test_persistence_failure_keeps_order_for_lossless_retry(self):
+        durable: list[str] = []
+        attempted: list[list[str]] = []
+        attempts = 0
+
+        def persist(events: list[Event]) -> None:
+            nonlocal attempts
+            attempts += 1
+            attempted.append([event.id for event in events])
+            if attempts == 1:
+                raise OSError("disk full")
+            durable.extend(event.id for event in events)
+
+        bus = EventBus(persist=persist)
+        await bus.emit("model.text_delta")
+        await bus.emit("model.text_delta")
+        with self.assertRaisesRegex(SessionError, "disk full"):
+            await bus.emit("model.completed")
+        self.assertEqual(durable, [])
+
+        await bus.flush()
+        fourth = await bus.emit("run.completed")
+        self.assertEqual(durable, [*attempted[0], fourth.id])
+        self.assertEqual(len(durable), len(set(durable)))
+
+    async def test_trace_retry_does_not_repeat_authoritative_persistence(self):
+        persisted: list[str] = []
+
+        class FlakyTrace:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.traced: list[str] = []
+
+            def append_many(self, events: list[Event]) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("trace unavailable")
+                self.traced.extend(event.id for event in events)
+
+        trace = FlakyTrace()
+        bus = EventBus(
+            trace=trace,  # type: ignore[arg-type]
+            persist=lambda events: persisted.extend(event.id for event in events),
+        )
+        with self.assertRaisesRegex(OSError, "trace unavailable"):
+            await bus.emit("run.started")
+        self.assertEqual(len(persisted), 1)
+
+        await bus.flush()
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(trace.traced, persisted)
 
 
 if __name__ == "__main__":

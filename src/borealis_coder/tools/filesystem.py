@@ -226,6 +226,10 @@ class GlobFilesTool(Tool):
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         resolved = context.roots.resolve(arguments["path"] or ".", must_exist=True, kind="dir")
         pattern = str(arguments["pattern"])
+        limit = min(
+            int(arguments["limit"]),
+            context.config.context.max_search_results,
+        )
         ignored = set(context.config.context.ignored_dirs)
         matches: list[str] = []
         for current, dirs, files in os.walk(resolved.path):
@@ -235,7 +239,7 @@ class GlobFilesTool(Tool):
                 rel = path.relative_to(resolved.path).as_posix()
                 if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
                     matches.append(context.roots.display(path))
-                    if len(matches) >= int(arguments["limit"]):
+                    if len(matches) >= limit:
                         return ToolResult("\n".join(sorted(matches)), metadata={"truncated": True, "matches": len(matches)})
         matches.sort()
         return ToolResult("\n".join(matches) or "No matches", metadata={"matches": len(matches)})

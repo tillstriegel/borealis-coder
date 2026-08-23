@@ -24,6 +24,7 @@ from ..errors import (
 from ..events import EventBus
 from ..models import (
     AgentResult,
+    ContinuationState,
     Message,
     ModelResponse,
     ProviderRequest,
@@ -49,6 +50,9 @@ class ProviderRoute:
     name: str
     model: str
     provider: Provider
+
+
+_CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
 
 
 class AgentRunner:
@@ -83,11 +87,17 @@ class AgentRunner:
         self._approval_managers: dict[str, ApprovalManager] = {}
         self.mcp_manager: MCPManager | None = None
 
-
     async def close(self) -> None:
-        if self.mcp_manager is not None:
-            await self.mcp_manager.close()
-        await asyncio.to_thread(self.sessions.close)
+        try:
+            if self.mcp_manager is not None:
+                await self.mcp_manager.close()
+            for route in self.providers:
+                await route.provider.close()
+        finally:
+            try:
+                await self.events.flush()
+            finally:
+                await asyncio.to_thread(self.sessions.close)
 
     def cancel(self, session_id: str) -> bool:
         event = self._cancel.get(session_id)
@@ -146,7 +156,9 @@ class AgentRunner:
         else:
             session = await asyncio.to_thread(self.sessions.get_session, session_id)
             if Path(session.workspace).resolve() != self.workspace:
-                raise SessionError(f"Session workspace is {session.workspace}, not {self.workspace}")
+                raise SessionError(
+                    f"Session workspace is {session.workspace}, not {self.workspace}"
+                )
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         if lock.locked():
             raise SessionError(f"Session {session_id} is already running")
@@ -251,7 +263,17 @@ class AgentRunner:
         messages.append(user)
         await asyncio.to_thread(self.sessions.append_message, session_id, user)
         await asyncio.to_thread(self.sessions.update_session, session_id, status="running")
-        await self.events.emit("run.started", session_id=session_id, run_id=run_id, prompt=prompt)
+        try:
+            await self.events.emit(
+                "run.started",
+                session_id=session_id,
+                run_id=run_id,
+                prompt=prompt,
+            )
+        except Exception:
+            self._cancel.pop(session_id, None)
+            await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
+            raise
         last_batch_signature: str | None = None
         repeated_batch_count = 0
         final_text = ""
@@ -282,7 +304,9 @@ class AgentRunner:
                 budget.before_turn()
                 schemas = self.tools.schemas()
                 estimated = estimate_request_tokens(system, messages, schemas)
-                threshold = int(self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio)
+                threshold = int(
+                    self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio
+                )
                 if estimated >= threshold:
                     compacted_messages = await compact_messages_with_summary(
                         messages,
@@ -323,14 +347,11 @@ class AgentRunner:
                     metadata={
                         "session_id": session_id,
                         "run_id": run_id,
-                        "prompt_cache_key": prompt_context.stable_fingerprint,
+                        "prompt_cache_key": prompt_context.cache_routing_key,
                         "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
                         "prompt_cache_ttl": self.config.cache.anthropic_ttl,
                         "anthropic_conversation_cache": conversation_cache,
-                        "system_blocks": [
-                            {"text": prompt_context.stable, "cacheable": True},
-                            {"text": prompt_context.dynamic, "cacheable": False},
-                        ],
+                        "system_blocks": prompt_context.system_blocks,
                     },
                 )
                 await self.events.emit(
@@ -358,7 +379,13 @@ class AgentRunner:
                         messages, self._summarizer(usage_sink, cancel), keep_recent=12
                     )
                     compacted = True
-                    await self.events.emit("context.compacted", session_id=session_id, run_id=run_id, provider_overflow=True, messages=len(messages))
+                    await self.events.emit(
+                        "context.compacted",
+                        session_id=session_id,
+                        run_id=run_id,
+                        provider_overflow=True,
+                        messages=len(messages),
+                    )
                     continue
                 await asyncio.to_thread(self.sessions.add_usage, session_id, response.usage)
                 usage_budget_error: BudgetExceeded | None = None
@@ -377,17 +404,25 @@ class AgentRunner:
                         hit_rate=cumulative_usage.provider_cache_hit_rate,
                         action="stable-prefix-only; shorter compaction window",
                     )
-                await asyncio.to_thread(self.sessions.update_session, session_id, provider=used_route.name, model=used_route.model)
+                await asyncio.to_thread(
+                    self.sessions.update_session,
+                    session_id,
+                    provider=used_route.name,
+                    model=used_route.model,
+                )
                 assistant_metadata = {
                     "model": response.model or used_route.model,
                     "response_id": response.response_id,
                 }
-                if isinstance(response.raw, dict):
-                    responses_state = response.raw.get("responses_state")
-                    if isinstance(responses_state, list) and responses_state:
-                        # Keep only the encrypted continuation state selected by the
-                        # provider. Full raw responses are never persisted here.
-                        assistant_metadata["responses_state"] = responses_state
+                if response.continuation_state is not None:
+                    continuation = response.continuation_state.to_metadata(
+                        provider=used_route.name,
+                        model=used_route.model,
+                    )
+                    if continuation is not None:
+                        # Persist only provider-selected continuation items, never
+                        # the full raw response.
+                        assistant_metadata["continuation_state"] = continuation
                 assistant = Message(
                     id=assistant_message_id,
                     role=Role.ASSISTANT,
@@ -398,10 +433,15 @@ class AgentRunner:
                 messages.append(assistant)
                 await asyncio.to_thread(self.sessions.append_message, session_id, assistant)
                 await self.events.emit(
-                    "model.completed", session_id=session_id, run_id=run_id, turn=budget.turns,
+                    "model.completed",
+                    session_id=session_id,
+                    run_id=run_id,
+                    turn=budget.turns,
                     message_id=assistant.id,
-                    text=response.text, tool_calls=[call.to_dict() for call in response.tool_calls],
-                    usage=response.usage.to_dict(), stop_reason=response.stop_reason,
+                    text=response.text,
+                    tool_calls=[call.to_dict() for call in response.tool_calls],
+                    usage=response.usage.to_dict(),
+                    stop_reason=response.stop_reason,
                 )
                 if response.text:
                     final_text = response.text
@@ -433,8 +473,12 @@ class AgentRunner:
                 results = await self._execute_calls(response.tool_calls, cancel, context)
                 for call, result in zip(response.tool_calls, results, strict=True):
                     tool_message = Message(
-                        role=Role.TOOL, content=result.output, tool_call_id=call.id,
-                        tool_name=call.name, is_error=result.is_error, metadata=result.metadata,
+                        role=Role.TOOL,
+                        content=result.output,
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        is_error=result.is_error,
+                        metadata=result.metadata,
                     )
                     messages.append(tool_message)
                     await asyncio.to_thread(self.sessions.append_message, session_id, tool_message)
@@ -448,7 +492,9 @@ class AgentRunner:
                 )
                 report = await planner.run(context)
                 verification = report.to_dict()
-                await self.events.emit("verification.completed", session_id=session_id, run_id=run_id, **verification)
+                await self.events.emit(
+                    "verification.completed", session_id=session_id, run_id=run_id, **verification
+                )
         except Cancelled as error:
             stop_reason = StopReason.CANCELLED
             error_message = str(error)
@@ -463,16 +509,16 @@ class AgentRunner:
         except asyncio.CancelledError:
             if deadline_expired.is_set():
                 stop_reason = StopReason.BUDGET
-                error_message = (
-                    f"Maximum {self.config.agent.max_time_seconds}s run time reached"
-                )
+                error_message = f"Maximum {self.config.agent.max_time_seconds}s run time reached"
             else:
                 stop_reason = StopReason.CANCELLED
                 error_message = "Run cancelled"
         except Exception as error:
             stop_reason = StopReason.ERROR
             error_message = f"{type(error).__name__}: {error}"
-            await self.events.emit("run.error", session_id=session_id, run_id=run_id, error=error_message)
+            await self.events.emit(
+                "run.error", session_id=session_id, run_id=run_id, error=error_message
+            )
         finally:
             self._cancel.pop(session_id, None)
             queue = self._steering.get(session_id)
@@ -481,17 +527,22 @@ class AgentRunner:
             await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
         usage = budget.usage or Usage()
         result = AgentResult(
-            session_id=session_id, run_id=run_id, text=final_text,
-            stop_reason=stop_reason, usage=usage, turns=budget.turns,
-            changed_files=sorted(context.changed_files), verification=verification,
+            session_id=session_id,
+            run_id=run_id,
+            text=final_text,
+            stop_reason=stop_reason,
+            usage=usage,
+            turns=budget.turns,
+            changed_files=sorted(context.changed_files),
+            verification=verification,
             error=error_message,
         )
-        await self.events.emit("run.completed", session_id=session_id, run_id=run_id, result=result.to_dict())
+        await self.events.emit(
+            "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
+        )
         return result
 
-    async def _drain_steering(
-        self, session_id: str, run_id: str, messages: list[Message]
-    ) -> bool:
+    async def _drain_steering(self, session_id: str, run_id: str, messages: list[Message]) -> bool:
         queue = self._steering.get(session_id)
         if queue is None:
             return False
@@ -507,8 +558,11 @@ class AgentRunner:
             messages.append(message)
             await asyncio.to_thread(self.sessions.append_message, session_id, message)
             await self.events.emit(
-                "user.steered", session_id=session_id, run_id=run_id,
-                message_id=message.id, prompt=prompt,
+                "user.steered",
+                session_id=session_id,
+                run_id=run_id,
+                message_id=message.id,
+                prompt=prompt,
             )
             added = True
         return added
@@ -526,11 +580,16 @@ class AgentRunner:
         for index, route in enumerate(self.providers):
             self._check_cancel(cancel)
             routed = ProviderRequest(
-                model=route.model, system=request.system, messages=request.messages,
-                tools=request.tools, max_output_tokens=request.max_output_tokens,
-                temperature=request.temperature, reasoning_effort=request.reasoning_effort,
+                model=route.model,
+                system=request.system,
+                messages=request.messages,
+                tools=request.tools,
+                max_output_tokens=request.max_output_tokens,
+                temperature=request.temperature,
+                reasoning_effort=request.reasoning_effort,
                 parallel_tool_calls=request.parallel_tool_calls,
-                response_schema=request.response_schema, metadata=request.metadata,
+                response_schema=request.response_schema,
+                metadata=request.metadata,
             )
             try:
                 cache_key = self._response_cache_key(route, routed)
@@ -555,6 +614,11 @@ class AgentRunner:
                         stop_reason=payload.get("stop_reason"),
                         model=str(payload.get("model") or route.model),
                         raw={"application_cache": True},
+                        continuation_state=ContinuationState.from_metadata(
+                            payload.get("continuation_state"),
+                            provider=route.name,
+                            model=route.model,
+                        ),
                     )
                     await self.events.emit(
                         "model.cache_hit",
@@ -595,34 +659,55 @@ class AgentRunner:
                 )
                 if self.config.cache.response_cache_enabled:
                     response.usage.application_cache_misses += cache_misses
-                    if not response.tool_calls and response.text and response.stop_reason not in {
-                        "error",
-                        "cancelled",
-                    }:
+                    if _is_cacheable_response(response):
+                        cached_response: dict[str, Any] = {
+                            "text": response.text,
+                            "stop_reason": response.stop_reason,
+                            "model": response.model or route.model,
+                        }
+                        if response.continuation_state is not None:
+                            continuation = response.continuation_state.to_metadata(
+                                provider=route.name,
+                                model=route.model,
+                            )
+                            if continuation is not None:
+                                cached_response["continuation_state"] = continuation
                         await asyncio.to_thread(
                             self.sessions.put_cached_response,
                             cache_key,
                             provider=route.name,
                             model=route.model,
-                            response={
-                                "text": response.text,
-                                "stop_reason": response.stop_reason,
-                                "model": response.model or route.model,
-                            },
+                            response=cached_response,
                             usage=response.usage,
                             ttl_seconds=self.config.cache.response_cache_ttl_seconds,
                             max_entries=self.config.cache.response_cache_max_entries,
                         )
                 if index:
-                    await self.events.emit("model.fallback_succeeded", session_id=session_id, run_id=run_id, provider=route.name, model=route.model)
+                    await self.events.emit(
+                        "model.fallback_succeeded",
+                        session_id=session_id,
+                        run_id=run_id,
+                        provider=route.name,
+                        model=route.model,
+                    )
                 return response, route
             except (ProviderUnavailableError, ProviderRateLimitError) as error:
                 errors.append(f"{route.name}/{route.model}: {error}")
-                await self.events.emit("model.route_failed", session_id=session_id, run_id=run_id, provider=route.name, model=route.model, error=str(error), retryable=True)
+                await self.events.emit(
+                    "model.route_failed",
+                    session_id=session_id,
+                    run_id=run_id,
+                    provider=route.name,
+                    model=route.model,
+                    error=str(error),
+                    retryable=True,
+                )
                 continue
             except ProviderError:
                 raise
-        raise ProviderUnavailableError("All provider routes failed: " + "; ".join(errors), retryable=False)
+        raise ProviderUnavailableError(
+            "All provider routes failed: " + "; ".join(errors), retryable=False
+        )
 
     def _response_cache_key(
         self,
@@ -637,7 +722,11 @@ class AgentRunner:
                 "tool_call_id": item.tool_call_id,
                 "tool_name": item.tool_name,
                 "is_error": item.is_error,
-                "metadata": item.metadata,
+                "metadata": (
+                    {"continuation_state": item.metadata["continuation_state"]}
+                    if "continuation_state" in item.metadata
+                    else {}
+                ),
             }
             for item in request.messages
         ]
@@ -645,7 +734,7 @@ class AgentRunner:
         provider_config.pop("auth_file", None)
         provider_config.pop("codex_home", None)
         value = {
-            "version": 1,
+            "version": 3,
             "provider": route.name,
             "model": route.model,
             "provider_config": provider_config,
@@ -728,59 +817,80 @@ class AgentRunner:
         )
 
     async def _stream_route(
-        self, route: ProviderRoute, request: ProviderRequest,
-        session_id: str, run_id: str, cancel: asyncio.Event,
+        self,
+        route: ProviderRoute,
+        request: ProviderRequest,
+        session_id: str,
+        run_id: str,
+        cancel: asyncio.Event,
         assistant_message_id: str,
     ) -> ModelResponse:
         attempts = max(0, route.provider.config.max_retries) + 1
         delay = max(0.0, route.provider.config.initial_backoff_seconds)
         for attempt in range(attempts):
             emitted = False
-            completed: ModelResponse | None = None
             try:
-                stream = route.provider.stream(request).__aiter__()
-                while True:
-                    next_item = asyncio.ensure_future(anext(stream))
-                    cancelled = asyncio.create_task(cancel.wait())
-                    done, _ = await asyncio.wait(
-                        {next_item, cancelled},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if cancelled in done and cancel.is_set():
-                        next_item.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                            await next_item
+
+                async def consume() -> ModelResponse | None:
+                    nonlocal emitted
+                    completed: ModelResponse | None = None
+                    stream = route.provider.stream(request).__aiter__()
+                    try:
+                        async for item in stream:
+                            self._check_cancel(cancel)
+                            if item.type == "text_delta" and item.text:
+                                emitted = True
+                                await self.events.emit(
+                                    "model.text_delta",
+                                    session_id=session_id,
+                                    run_id=run_id,
+                                    message_id=assistant_message_id,
+                                    text=item.text,
+                                    provider=route.name,
+                                    model=route.model,
+                                )
+                            elif item.type == "tool_call_delta":
+                                emitted = True
+                                await self.events.emit(
+                                    "model.tool_call_delta",
+                                    session_id=session_id,
+                                    run_id=run_id,
+                                    provider=route.name,
+                                    model=route.model,
+                                    **item.data,
+                                )
+                            elif item.type == "completed" and item.response is not None:
+                                completed = item.response
+                    finally:
                         close = getattr(stream, "aclose", None)
                         if close is not None:
                             with contextlib.suppress(Exception):
                                 await close()
+                    return completed
+
+                stream_task = asyncio.create_task(consume())
+                cancel_task = asyncio.create_task(cancel.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {stream_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if cancel_task in done and cancel.is_set():
                         raise Cancelled("Run cancelled")
-                    cancelled.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await cancelled
-                    try:
-                        item = await next_item
-                    except StopAsyncIteration:
-                        break
-                    self._check_cancel(cancel)
-                    if item.type == "text_delta" and item.text:
-                        emitted = True
-                        await self.events.emit(
-                            "model.text_delta", session_id=session_id, run_id=run_id,
-                            message_id=assistant_message_id,
-                            text=item.text, provider=route.name, model=route.model,
-                        )
-                    elif item.type == "tool_call_delta":
-                        emitted = True
-                        await self.events.emit(
-                            "model.tool_call_delta", session_id=session_id, run_id=run_id,
-                            provider=route.name, model=route.model, **item.data,
-                        )
-                    elif item.type == "completed" and item.response is not None:
-                        completed = item.response
+                    completed = await stream_task
+                finally:
+                    cancel_task.cancel()
+                    if not stream_task.done():
+                        stream_task.cancel()
+                    await asyncio.gather(
+                        stream_task,
+                        cancel_task,
+                        return_exceptions=True,
+                    )
                 if completed is None:
                     raise ProviderUnavailableError(
-                        f"Provider {route.name} stream ended without a completed response", retryable=True
+                        f"Provider {route.name} stream ended without a completed response",
+                        retryable=True,
                     )
                 return completed
             except (ProviderUnavailableError, ProviderRateLimitError) as error:
@@ -826,7 +936,9 @@ class AgentRunner:
 
         if reads:
             read_results = await asyncio.gather(*(run_read(call) for call in reads))
-            results.update({call.id: result for call, result in zip(reads, read_results, strict=True)})
+            results.update(
+                {call.id: result for call, result in zip(reads, read_results, strict=True)}
+            )
         for call in writes:
             self._check_cancel(cancel)
             results[call.id] = await self._execute_one(call, context, cancel)
@@ -891,3 +1003,10 @@ def _title(prompt: str) -> str:
     words = prompt.replace("\n", " ").split()
     value = " ".join(words[:10])
     return truncate_text(value, 80, marker="…") or "New coding session"
+
+
+def _is_cacheable_response(response: ModelResponse) -> bool:
+    stop_reason = str(response.stop_reason or "").strip().lower()
+    return bool(
+        response.text and not response.tool_calls and stop_reason in _CACHEABLE_STOP_REASONS
+    )

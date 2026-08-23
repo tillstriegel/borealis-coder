@@ -4,13 +4,22 @@ __version__ = "0.1.3"
 
 from .agent import AgentRunner, build_runner
 from .config import Config, load_config
-from .models import AgentResult, Message, ModelResponse, ToolCall, ToolResult, Usage
+from .models import (
+    AgentResult,
+    ContinuationState,
+    Message,
+    ModelResponse,
+    ToolCall,
+    ToolResult,
+    Usage,
+)
 from .providers import Provider, ProviderRegistry
 
 __all__ = [
     "AgentResult",
     "AgentRunner",
     "Config",
+    "ContinuationState",
     "Message",
     "ModelResponse",
     "Provider",

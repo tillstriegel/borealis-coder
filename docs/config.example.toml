@@ -1,3 +1,7 @@
+# Full trusted configuration example. Install this as the user configuration or
+# pass it with --config. A repository-owned workspace file needs the documented
+# external authority opt-ins for these settings.
+
 [agent]
 provider = "openai"
 model = "gpt-5.4-mini"
