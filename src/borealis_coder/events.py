@@ -18,7 +18,9 @@ from .util import atomic_write_text, ensure_private_directory, ensure_private_fi
 
 EventHandler = Callable[[Event], Awaitable[None] | None]
 EventBatchHandler = Callable[[list[Event]], None]
-_BUFFERED_EVENT_TYPES = frozenset({"model.text_delta", "model.tool_call_delta"})
+_BUFFERED_EVENT_TYPES = frozenset(
+    {"model.reasoning_delta", "model.text_delta", "model.tool_call_delta"}
+)
 _EVENT_BATCH_SIZE = 64
 
 

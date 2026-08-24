@@ -118,6 +118,25 @@ class Usage:
         return self.input_tokens + self.output_tokens
 
     @property
+    def is_empty(self) -> bool:
+        return not any(
+            (
+                self.input_tokens,
+                self.output_tokens,
+                self.cached_input_tokens,
+                self.cache_write_tokens,
+                self.reasoning_tokens,
+                self.requests,
+                self.cost_usd,
+                self.cache_savings_usd,
+                self.application_cache_hits,
+                self.application_cache_misses,
+                self.application_cache_saved_tokens,
+                self.application_cache_saved_cost_usd,
+            )
+        )
+
+    @property
     def uncached_input_tokens(self) -> int:
         return max(0, self.input_tokens - self.cached_input_tokens - self.cache_write_tokens)
 
@@ -247,6 +266,7 @@ class ModelResponse:
     model: str | None = None
     raw: dict[str, Any] | None = None
     continuation_state: ContinuationState | None = None
+    reasoning_summary: str = ""
 
 
 @dataclass(slots=True)

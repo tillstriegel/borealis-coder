@@ -40,10 +40,18 @@ class OpenRouterProvider(OpenAIProvider):
         return self._apply_extensions(payload, request)
 
     def _responses_payload(
-        self, request: ProviderRequest, *, stream: bool = False
+        self,
+        request: ProviderRequest,
+        *,
+        stream: bool = False,
+        include_reasoning_summary: bool = True,
     ) -> dict[str, Any]:
         return self._apply_extensions(
-            super()._responses_payload(request, stream=stream),
+            super()._responses_payload(
+                request,
+                stream=stream,
+                include_reasoning_summary=include_reasoning_summary,
+            ),
             request,
         )
 

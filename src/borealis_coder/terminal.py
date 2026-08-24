@@ -375,7 +375,10 @@ class ConsoleRenderer:
         self.printed_text = False
         self._rendered_texts: list[str] = []
         self._streamed_text = ""
+        self._streamed_reasoning_summary = ""
         self._line_open = False
+        self._reasoning_line_open = False
+        self._reasoning_started = False
         self._assistant_started = False
         self._tool_call_announced = False
         self._activity_generation = 0
@@ -410,7 +413,10 @@ class ConsoleRenderer:
         self.printed_text = False
         self._rendered_texts = []
         self._streamed_text = ""
+        self._streamed_reasoning_summary = ""
         self._line_open = False
+        self._reasoning_line_open = False
+        self._reasoning_started = False
         self._assistant_started = False
         self._tool_call_announced = False
         self._activity_phase = ""
@@ -457,6 +463,7 @@ class ConsoleRenderer:
     def finish_turn(self) -> None:
         self._clear_live_line()
         self._ensure_tool_output_line_break()
+        self._finish_reasoning_summary()
         self._ensure_line_break()
         self._close_assistant_block()
 
@@ -502,6 +509,15 @@ class ConsoleRenderer:
                     flush=True,
                 )
             return
+        if event.type == "model.reasoning_delta":
+            # The visible summary is the progress indicator. A live pulse would
+            # share its unfinished terminal line and erase the summary.
+            self._activity_phase = ""
+            self._render_reasoning_delta(str(event.data.get("text") or ""))
+            return
+
+        self._finish_reasoning_summary()
+
         if event.type == "model.text_delta":
             self._activity_phase = ""
             self._render_text_delta(str(event.data.get("text") or ""))
@@ -564,6 +580,9 @@ class ConsoleRenderer:
             return
         if event.type == "model.completed":
             self._activity_phase = "processing model response"
+            self._render_completed_reasoning(
+                str(event.data.get("reasoning_summary") or "")
+            )
             self._render_completed_text(str(event.data.get("text") or ""))
             usage = event.data.get("usage") or {}
             cached = int(usage.get("cached_input_tokens") or 0)
@@ -769,12 +788,61 @@ class ConsoleRenderer:
             self._close_assistant_block()
 
     def _begin_model_exchange(self) -> None:
+        self._finish_reasoning_summary()
         self._close_assistant_block()
         self._ensure_line_break()
         self.printed_text = False
         self._streamed_text = ""
+        self._streamed_reasoning_summary = ""
         self._assistant_started = False
         self._tool_call_announced = False
+
+    def _start_reasoning_summary(self) -> None:
+        if self._reasoning_started:
+            return
+        self._ensure_line_break()
+        self._close_assistant_block()
+        self._ensure_tool_output_line_break()
+        if self.interactive:
+            self.ui.activity("◇", "Reasoning summary", tone="violet")
+        else:
+            print("◇ reasoning summary", file=self.status_stream, flush=True)
+        self._reasoning_started = True
+
+    def _render_reasoning_delta(self, text: str) -> None:
+        if not text:
+            return
+        self._streamed_reasoning_summary += text
+        if not self.stream_text:
+            return
+        self._start_reasoning_summary()
+        rendered = self.ui.subdued(text) if self.interactive else text
+        print(rendered, end="", file=self.status_stream, flush=True)
+        self._reasoning_line_open = not text.endswith(("\n", "\r"))
+
+    def _render_completed_reasoning(self, text: str) -> None:
+        if not text:
+            return
+        if not self.stream_text or not self._streamed_reasoning_summary:
+            remainder = text
+        elif text.startswith(self._streamed_reasoning_summary):
+            remainder = text[len(self._streamed_reasoning_summary) :]
+        elif text != self._streamed_reasoning_summary:
+            remainder = text
+        else:
+            remainder = ""
+        if remainder:
+            self._start_reasoning_summary()
+            rendered = self.ui.subdued(remainder) if self.interactive else remainder
+            print(rendered, end="", file=self.status_stream, flush=True)
+            self._reasoning_line_open = not remainder.endswith(("\n", "\r"))
+        self._finish_reasoning_summary()
+
+    def _finish_reasoning_summary(self) -> None:
+        if self._reasoning_line_open:
+            print(file=self.status_stream, flush=True)
+        self._reasoning_line_open = False
+        self._reasoning_started = False
 
     def _start_assistant_block(self) -> None:
         if self._assistant_started:

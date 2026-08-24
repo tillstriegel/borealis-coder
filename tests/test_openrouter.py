@@ -80,7 +80,10 @@ class OpenRouterProviderTests(unittest.TestCase):
         provider = OpenRouterProvider(config, "key")
         payload = provider._responses_payload(self.request)
         self.assertEqual(provider.api_style, "responses")
-        self.assertEqual(payload["reasoning"], {"effort": "high"})
+        self.assertEqual(
+            payload["reasoning"],
+            {"effort": "high", "summary": "auto"},
+        )
         self.assertEqual(payload["models"], ["openai/gpt-5.4-mini"])
         self.assertEqual(payload["usage"], {"include": True})
         self.assertEqual(payload["prompt_cache_key"], "stable-cache-key")

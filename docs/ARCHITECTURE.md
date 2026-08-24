@@ -173,6 +173,7 @@ The runner emits typed events for:
 
 - session and run lifecycle
 - provider request/retry/fallback
+- provider-supplied reasoning summaries, kept separate from assistant text
 - assistant text
 - plan changes
 - tool pending/in-progress/completed/failed

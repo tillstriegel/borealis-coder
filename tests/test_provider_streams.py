@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from collections.abc import AsyncIterator
@@ -17,7 +18,7 @@ from borealis_coder.errors import (
 from borealis_coder.models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from borealis_coder.providers.anthropic import AnthropicProvider
 from borealis_coder.providers.anthropic import _parse_arguments as anthropic_args
-from borealis_coder.providers.base import Provider, classify_provider_error
+from borealis_coder.providers.base import Provider, ProviderStreamEvent, classify_provider_error
 from borealis_coder.providers.gemini import GeminiProvider
 from borealis_coder.providers.gemini import _parse_arguments as gemini_args
 from borealis_coder.providers.http import HttpResponse, SSEEvent
@@ -29,18 +30,27 @@ from borealis_coder.providers.openai import (
 from borealis_coder.providers.openai import (
     _parse_arguments as openai_args,
 )
+from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.tools.base import object_schema
 
 
 class FakeHttp:
-    def __init__(self, *, events: list[SSEEvent] | None = None, data: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        events: list[SSEEvent] | None = None,
+        event_batches: list[list[SSEEvent]] | None = None,
+        data: object | None = None,
+    ) -> None:
         self.events = events or []
+        self.event_batches = event_batches
         self.data = data if data is not None else {}
         self.calls: list[tuple[str, dict[str, object]]] = []
 
     async def stream_sse(self, url: str, **kwargs: object) -> AsyncIterator[SSEEvent]:
         self.calls.append((url, dict(kwargs)))
-        for event in self.events:
+        events = self.event_batches.pop(0) if self.event_batches is not None else self.events
+        for event in events:
             yield event
 
     async def post_json(self, url: str, **kwargs: object) -> HttpResponse:
@@ -164,6 +174,42 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         )
         events = [
             SSEEvent("message", "not-json"),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "Checked ",
+                    }
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "the request.",
+                    }
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 1,
+                        "delta": "Prepared the answer.",
+                    }
+                ),
+            ),
             SSEEvent("message", json.dumps({"type": "response.output_text.delta", "delta": "hel"})),
             SSEEvent(
                 "message",
@@ -200,6 +246,19 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                             "status": "completed",
                             "output": [
                                 {
+                                    "type": "reasoning",
+                                    "summary": [
+                                        {
+                                            "type": "summary_text",
+                                            "text": "Checked the request.",
+                                        },
+                                        {
+                                            "type": "summary_text",
+                                            "text": "Prepared the answer.",
+                                        }
+                                    ],
+                                },
+                                {
                                     "type": "message",
                                     "content": [{"type": "output_text", "text": "hello"}],
                                 },
@@ -225,13 +284,30 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         provider.http = FakeHttp(events=events)  # type: ignore[assignment]
         streamed = [item async for item in provider.stream(self.request)]
         self.assertEqual(
-            [item.type for item in streamed], ["text_delta", "tool_call_delta", "completed"]
+            [item.type for item in streamed],
+            [
+                "reasoning_summary_delta",
+                "reasoning_summary_delta",
+                "reasoning_summary_delta",
+                "text_delta",
+                "tool_call_delta",
+                "completed",
+            ],
         )
-        self.assertEqual(streamed[1].data["name"], "read_file")
+        self.assertEqual(
+            [item.text for item in streamed if item.type == "reasoning_summary_delta"],
+            ["Checked ", "the request.", "\nPrepared the answer."],
+        )
+        tool_delta = next(item for item in streamed if item.type == "tool_call_delta")
+        self.assertEqual(tool_delta.data["name"], "read_file")
         final = streamed[-1].response
         self.assertIsNotNone(final)
         assert final is not None
         self.assertEqual(final.text, "hello")
+        self.assertEqual(
+            final.reasoning_summary,
+            "Checked the request.\nPrepared the answer.",
+        )
         self.assertEqual(final.tool_calls[0].arguments, {"path": "b"})
         self.assertEqual(final.usage.reasoning_tokens, 1)
         self.assertIn("Authorization", provider._headers())
@@ -310,6 +386,268 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(partial.text, "partial")
         self.assertEqual(partial.tool_calls[0].arguments, {"_raw": "not-json"})
 
+    async def test_responses_emits_summary_found_only_in_completed_event(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "summary-response",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "reasoning",
+                                        "summary": [
+                                            {
+                                                "type": "summary_text",
+                                                "text": "Only in the completed response.",
+                                            }
+                                        ],
+                                    },
+                                    {
+                                        "type": "message",
+                                        "content": [
+                                            {"type": "output_text", "text": "answer"}
+                                        ],
+                                    },
+                                ],
+                            },
+                        }
+                    ),
+                )
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        self.assertEqual(
+            [item.type for item in streamed],
+            ["reasoning_summary_delta", "completed"],
+        )
+        self.assertEqual(streamed[0].text, "Only in the completed response.")
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.reasoning_summary, streamed[0].text)
+
+    async def test_responses_discards_summary_only_completed_attempt(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": "reasoning_1",
+                            "output_index": 0,
+                            "summary_index": 0,
+                            "delta": "Abandoned summary.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "summary-only",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "reasoning",
+                                        "summary": [
+                                            {
+                                                "type": "summary_text",
+                                                "text": "Abandoned summary.",
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 2, "output_tokens": 1},
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        self.assertEqual([event.type for event in streamed], ["completed"])
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.reasoning_summary, "")
+        self.assertEqual(streamed[-1].response.usage.input_tokens, 2)
+
+    async def test_reasoning_summary_separators_are_not_duplicated(self) -> None:
+        responses_provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, responses_provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": "reasoning_1",
+                            "output_index": 0,
+                            "summary_index": 0,
+                            "delta": "First.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": "reasoning_1",
+                            "output_index": 0,
+                            "summary_index": 1,
+                            "delta": "Second.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps({"type": "response.output_text.delta", "delta": "ok"}),
+                ),
+            ]
+        )
+
+        responses = [item async for item in responses_provider.stream(self.request)]
+
+        responses_final = responses[-1].response
+        assert responses_final is not None
+        self.assertEqual(responses_final.reasoning_summary, "First.\nSecond.")
+        self.assertEqual(
+            [item.text for item in responses if item.type == "reasoning_summary_delta"],
+            ["First.", "\nSecond."],
+        )
+
+        chat_provider = OpenAICompatibleProvider(
+            ProviderConfig(type="openai_compatible", base_url="https://chat.test/v1"),
+            "key",
+        )
+        cast(Any, chat_provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {
+                                                "type": "reasoning.summary",
+                                                "summary": "First.",
+                                                "id": "summary_1",
+                                                "index": 0,
+                                            }
+                                        ],
+                                        "content": "ok",
+                                    }
+                                }
+                            ]
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {
+                                                "type": "reasoning.summary",
+                                                "summary": "Second.",
+                                                "id": "summary_2",
+                                                "index": 0,
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        chat = [item async for item in chat_provider.stream(self.request)]
+
+        chat_final = chat[-1].response
+        assert chat_final is not None
+        self.assertEqual(chat_final.reasoning_summary, "First.\nSecond.")
+        self.assertEqual(
+            [item.text for item in chat if item.type == "reasoning_summary_delta"],
+            ["First.", "\nSecond."],
+        )
+
+    async def test_responses_stream_preserves_refusal_as_visible_text(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.refusal.delta",
+                            "delta": "I cannot help with that.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "refusal-response",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "content": [
+                                            {
+                                                "type": "refusal",
+                                                "refusal": "I cannot help with that.",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        self.assertEqual([item.type for item in streamed], ["text_delta", "completed"])
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.text, "I cannot help with that.")
+
     async def test_openai_chat_stream_and_complete_paths(self) -> None:
         provider = OpenAICompatibleProvider(
             ProviderConfig(type="openai_compatible", base_url="http://localhost:1234/v1"), ""
@@ -327,6 +665,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "finish_reason": None,
                                 "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "Checked ",
+                                            "id": "summary_1",
+                                            "index": 0,
+                                        }
+                                    ],
                                     "content": "hi ",
                                     "tool_calls": [
                                         {
@@ -352,6 +698,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "finish_reason": "tool_calls",
                                 "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "the request.",
+                                            "id": "summary_1",
+                                            "index": 0,
+                                        }
+                                    ],
                                     "content": "there",
                                     "tool_calls": [{"index": 0, "function": {"arguments": '"a"}'}}],
                                 },
@@ -369,6 +723,22 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         ]
         cast(Any, provider).http = FakeHttp(events=chunks)
         streamed = [item async for item in provider.stream(self.request)]
+        self.assertEqual(
+            [item.type for item in streamed],
+            [
+                "reasoning_summary_delta",
+                "text_delta",
+                "tool_call_delta",
+                "reasoning_summary_delta",
+                "text_delta",
+                "tool_call_delta",
+                "completed",
+            ],
+        )
+        self.assertEqual(
+            [item.text for item in streamed if item.type == "reasoning_summary_delta"],
+            ["Checked ", "the request."],
+        )
         final = streamed[-1].response
         assert final is not None
         self.assertEqual(final.text, "hi there")
@@ -376,6 +746,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.stop_reason, "tool_calls")
         self.assertEqual(final.response_id, "chat1")
         self.assertEqual(final.usage.cached_input_tokens, 3)
+        self.assertEqual(final.reasoning_summary, "Checked the request.")
 
         cast(Any, provider).http = FakeHttp(
             data={
@@ -386,6 +757,14 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
                         "finish_reason": "stop",
                         "message": {
                             "content": [{"text": "ok"}],
+                            "reasoning_details": [
+                                {
+                                    "type": "reasoning.summary",
+                                    "summary": "Prepared the response.",
+                                    "id": "summary_2",
+                                    "index": 0,
+                                }
+                            ],
                             "tool_calls": [
                                 {
                                     "id": "t",
@@ -400,6 +779,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         )  # type: ignore[assignment]
         completed = await provider.complete(self.request)
         self.assertEqual(completed.text, "ok")
+        self.assertEqual(completed.reasoning_summary, "Prepared the response.")
         self.assertEqual(completed.tool_calls[0].arguments, {"value": []})
         with self.assertRaises(ProviderError):
             provider._parse_chat({}, retain_raw=False)
@@ -408,12 +788,548 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProviderError):
             await provider.complete(self.request)
 
+    async def test_chat_reasoning_streams_text_before_response_finishes(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+            ),
+            "key",
+        )
+
+        class GatedHttp:
+            def __init__(self) -> None:
+                self.release = asyncio.Event()
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def stream_sse(
+                self,
+                url: str,
+                **kwargs: object,
+            ) -> AsyncIterator[SSEEvent]:
+                self.calls.append((url, dict(kwargs)))
+                yield SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "id": "chat1",
+                            "choices": [
+                                {
+                                    "finish_reason": None,
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {
+                                                "type": "reasoning.summary",
+                                                "summary": "Checked.",
+                                                "id": "summary_1",
+                                                "index": 0,
+                                            }
+                                        ],
+                                        "content": "Live text.",
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                )
+                await self.release.wait()
+                yield SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "choices": [{"finish_reason": "stop", "delta": {}}],
+                            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                        }
+                    ),
+                )
+                yield SSEEvent("message", "[DONE]")
+
+        fake = GatedHttp()
+        provider.http = fake  # type: ignore[assignment]
+        stream = provider.stream(self.request).__aiter__()
+        try:
+            summary = await asyncio.wait_for(stream.__anext__(), timeout=0.5)
+            text = await asyncio.wait_for(stream.__anext__(), timeout=0.5)
+            self.assertEqual(summary.type, "reasoning_summary_delta")
+            self.assertEqual(summary.text, "Checked.")
+            self.assertEqual(text.type, "text_delta")
+            self.assertEqual(text.text, "Live text.")
+            fake.release.set()
+            rest = [event async for event in stream]
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+
+        self.assertEqual([event.type for event in rest], ["completed"])
+        assert rest[-1].response is not None
+        self.assertEqual(rest[-1].response.text, "Live text.")
+
+    async def test_chat_retries_empty_reasoning_response_without_reasoning_controls(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                input_cost_per_million=1,
+                output_cost_per_million=2,
+            ),
+            "key",
+        )
+        first = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "id": "empty",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.text",
+                                            "text": "Raw reasoning is not a summary.",
+                                            "index": 0,
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        second = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "id": "recovered",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {"content": "Recovered answer."},
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        fake = FakeHttp(event_batches=[first, second])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.text, "Recovered answer.")
+        self.assertEqual(final.usage.input_tokens, 9)
+        self.assertEqual(final.usage.output_tokens, 5)
+        self.assertEqual(final.usage.requests, 2)
+        self.assertAlmostEqual(final.usage.cost_usd, 0.000019)
+        self.assertEqual(len(fake.calls), 2)
+        first_payload = cast(dict[str, Any], fake.calls[0][1]["payload"])
+        second_payload = cast(dict[str, Any], fake.calls[1][1]["payload"])
+        self.assertEqual(first_payload["reasoning"], {"effort": "high"})
+        self.assertNotIn("reasoning", second_payload)
+
+    async def test_complete_chat_preserves_usage_across_reasoning_disabled_retry(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        first = ModelResponse(usage=Usage(input_tokens=5, output_tokens=3, requests=1))
+        recovered = ModelResponse(
+            text="Recovered answer.",
+            usage=Usage(input_tokens=4, output_tokens=2, requests=1),
+        )
+        complete_once = AsyncMock(side_effect=[first, recovered])
+
+        with patch.object(provider, "_complete_chat_once", new=complete_once):
+            response = await provider.complete(self.request)
+
+        self.assertEqual(response.text, "Recovered answer.")
+        self.assertEqual(response.usage.input_tokens, 9)
+        self.assertEqual(response.usage.output_tokens, 5)
+        self.assertEqual(response.usage.requests, 2)
+        self.assertEqual(complete_once.await_count, 2)
+        fallback_request = complete_once.await_args_list[1].args[0]
+        self.assertIsNone(fallback_request.reasoning_effort)
+
+    async def test_complete_chat_preserves_usage_when_internal_fallback_fails(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=1,
+            ),
+            "key",
+        )
+        first = ModelResponse(usage=Usage(input_tokens=5, output_tokens=3, requests=1))
+        recovered = ModelResponse(
+            text="Recovered answer.",
+            usage=Usage(input_tokens=4, output_tokens=2, requests=1),
+        )
+        complete_once = AsyncMock(
+            side_effect=[
+                first,
+                ProviderUnavailableError("fallback down", retryable=True),
+                recovered,
+            ]
+        )
+
+        with patch.object(provider, "_complete_chat_once", new=complete_once):
+            response = await provider.complete(self.request)
+
+        self.assertEqual(response.text, "Recovered answer.")
+        self.assertEqual(response.usage.input_tokens, 9)
+        self.assertEqual(response.usage.output_tokens, 5)
+        self.assertEqual(response.usage.requests, 2)
+        self.assertEqual(complete_once.await_count, 3)
+        self.assertIsNone(complete_once.await_args_list[1].args[0].reasoning_effort)
+        self.assertEqual(complete_once.await_args_list[2].args[0].reasoning_effort, "high")
+
+    async def test_chat_stream_error_carries_usage_from_failed_internal_fallback(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        first = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "id": "empty",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "Billed summary.",
+                                            "index": 0,
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        failed_fallback = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "error": {
+                            "code": 503,
+                            "message": "Fallback provider unavailable.",
+                        }
+                    }
+                ),
+            )
+        ]
+        fake = FakeHttp(event_batches=[first, failed_fallback])
+        provider.http = fake  # type: ignore[assignment]
+
+        with self.assertRaises(ProviderUnavailableError) as unavailable:
+            _ = [event async for event in provider.stream(self.request)]
+
+        self.assertIsNotNone(unavailable.exception.usage)
+        assert unavailable.exception.usage is not None
+        self.assertEqual(unavailable.exception.usage.input_tokens, 5)
+        self.assertEqual(unavailable.exception.usage.output_tokens, 3)
+        self.assertEqual(unavailable.exception.usage.requests, 1)
+        self.assertEqual(len(fake.calls), 2)
+
+    async def test_chat_buffers_summary_from_abandoned_attempt(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        summary_only = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "Abandoned summary.",
+                                            "index": 0,
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        transient_failure = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "error": {
+                            "code": 503,
+                            "message": "Provider temporarily unavailable.",
+                        }
+                    }
+                ),
+            )
+        ]
+        fake = FakeHttp(event_batches=[summary_only, transient_failure])
+        provider.http = fake  # type: ignore[assignment]
+        streamed: list[ProviderStreamEvent] = []
+
+        with self.assertRaises(ProviderUnavailableError) as unavailable:
+            async for event in provider.stream(self.request):
+                streamed.append(event)
+
+        self.assertTrue(unavailable.exception.retryable)
+        self.assertEqual(streamed, [])
+        self.assertEqual(len(fake.calls), 2)
+
+    async def test_chat_stream_classifies_in_band_error_without_fallback_request(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        fake = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": 429,
+                                "message": "Provider rate limit exceeded.",
+                            }
+                        }
+                    ),
+                )
+            ]
+        )
+        provider.http = fake  # type: ignore[assignment]
+
+        with self.assertRaises(ProviderRateLimitError) as rate_limited:
+            _ = [event async for event in provider.stream(self.request)]
+
+        self.assertTrue(rate_limited.exception.retryable)
+        self.assertEqual(rate_limited.exception.status_code, 429)
+        self.assertEqual(
+            rate_limited.exception.details["error"]["message"],
+            "Provider rate limit exceeded.",
+        )
+        self.assertEqual(len(fake.calls), 1)
+
+    async def test_responses_retries_when_reasoning_summaries_are_unsupported(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        failed = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "message": "This model does not support reasoning summaries."
+                            },
+                        },
+                    }
+                ),
+            )
+        ]
+        recovered = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {"type": "response.output_text.delta", "delta": "Recovered answer."}
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "output": [],
+                            "usage": {"input_tokens": 4, "output_tokens": 2},
+                        },
+                    }
+                ),
+            ),
+        ]
+        fake = FakeHttp(event_batches=[failed, recovered])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.text, "Recovered answer.")
+        self.assertEqual(len(fake.calls), 2)
+        first_payload = cast(dict[str, Any], fake.calls[0][1]["payload"])
+        second_payload = cast(dict[str, Any], fake.calls[1][1]["payload"])
+        self.assertEqual(
+            first_payload["reasoning"],
+            {"effort": "high", "summary": "auto"},
+        )
+        self.assertEqual(second_payload["reasoning"], {"effort": "high"})
+
+        summary_then_failed = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "Before fallback.",
+                    }
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "message": "This model does not support reasoning summaries."
+                            },
+                        },
+                    }
+                ),
+            ),
+        ]
+        fake = FakeHttp(event_batches=[summary_then_failed, recovered])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        self.assertEqual(
+            [event.type for event in streamed],
+            ["text_delta", "completed"],
+        )
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.text, "Recovered answer.")
+        self.assertEqual(len(fake.calls), 2)
+
+        top_level_failed = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "error",
+                        "code": "invalid_parameter",
+                        "message": "Reasoning summaries are unsupported.",
+                        "param": "reasoning.summary",
+                    }
+                ),
+            )
+        ]
+        fake = FakeHttp(event_batches=[top_level_failed, recovered])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.text, "Recovered answer.")
+        self.assertEqual(len(fake.calls), 2)
+
+    async def test_responses_classifies_in_band_transient_errors(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(
+                type="openai",
+                base_url="https://openai.test/v1",
+                max_retries=0,
+            ),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            data={
+                "status": "failed",
+                "error": {"code": "server_error", "message": "Generation failed."},
+            }
+        )
+
+        with self.assertRaises(ProviderUnavailableError) as unavailable:
+            await provider.complete(self.request)
+
+        self.assertTrue(unavailable.exception.retryable)
+        self.assertEqual(
+            unavailable.exception.details["error"]["code"],
+            "server_error",
+        )
+
+        cast(Any, provider).http = FakeHttp(
+            data={
+                "type": "error",
+                "code": "rate_limit_exceeded",
+                "message": "Slow down.",
+            }
+        )
+
+        with self.assertRaises(ProviderRateLimitError) as rate_limited:
+            await provider.complete(self.request)
+
+        self.assertTrue(rate_limited.exception.retryable)
+        self.assertEqual(rate_limited.exception.details["code"], "rate_limit_exceeded")
+
     async def test_openai_payload_helpers_and_response_complete_error(self) -> None:
         provider = OpenAIProvider(
             ProviderConfig(type="openai", base_url="https://x", api_style="responses"), ""
         )
         payload = provider._responses_payload(self.request, stream=True)
-        self.assertEqual(payload["reasoning"], {"effort": "high"})
+        self.assertEqual(
+            payload["reasoning"],
+            {"effort": "high", "summary": "auto"},
+        )
         self.assertEqual(payload["temperature"], 0.2)
         self.assertEqual(payload["text"]["format"]["type"], "json_schema")
         self.assertFalse(payload["parallel_tool_calls"])

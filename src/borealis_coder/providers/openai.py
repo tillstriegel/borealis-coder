@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 from ..config import ProviderConfig
-from ..errors import ProviderError
+from ..errors import ProviderError, ProviderRateLimitError, ProviderUnavailableError
 from ..models import ContinuationState, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
-from .base import Provider, ProviderStreamEvent
+from .base import Provider, ProviderStreamEvent, classify_provider_error
 from .http import HttpClient
 
 
@@ -49,7 +50,11 @@ class OpenAIProvider(Provider):
         return headers
 
     def _responses_payload(
-        self, request: ProviderRequest, *, stream: bool = False
+        self,
+        request: ProviderRequest,
+        *,
+        stream: bool = False,
+        include_reasoning_summary: bool = True,
     ) -> dict[str, Any]:
         input_items = self._responses_input(request)
         payload: dict[str, Any] = {
@@ -78,7 +83,11 @@ class OpenAIProvider(Provider):
         if self.name == "openai":
             payload["include"] = ["reasoning.encrypted_content"]
         if request.reasoning_effort:
-            payload["reasoning"] = {"effort": request.reasoning_effort}
+            payload["reasoning"] = {
+                "effort": request.reasoning_effort,
+            }
+            if include_reasoning_summary:
+                payload["reasoning"]["summary"] = "auto"
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.response_schema:
@@ -93,20 +102,113 @@ class OpenAIProvider(Provider):
         return payload
 
     async def _complete_responses(self, request: ProviderRequest) -> ModelResponse:
+        try:
+            return await self._complete_responses_once(
+                request,
+                include_reasoning_summary=True,
+            )
+        except ProviderError as error:
+            if not request.reasoning_effort or not _reasoning_summary_unsupported(error):
+                raise
+        return await self._complete_responses_once(
+            request,
+            include_reasoning_summary=False,
+        )
+
+    async def _complete_responses_once(
+        self,
+        request: ProviderRequest,
+        *,
+        include_reasoning_summary: bool,
+    ) -> ModelResponse:
         url = self.config.base_url.rstrip("/") + "/responses"
         response = await self.http.post_json(
-            url, headers=self._headers(), payload=self._responses_payload(request)
+            url,
+            headers=self._headers(),
+            payload=self._responses_payload(
+                request,
+                include_reasoning_summary=include_reasoning_summary,
+            ),
         )
         if not isinstance(response.data, dict):
             raise ProviderError("OpenAI returned a non-object response")
+        _raise_in_band_failure(response.data)
         return self._parse_responses(response.data, retain_raw=True)
 
     async def _stream_responses(
         self, request: ProviderRequest
     ) -> AsyncIterator[ProviderStreamEvent]:
+        actionable_output_emitted = False
+        try:
+            async for event in self._stream_responses_committed_once(
+                request,
+                include_reasoning_summary=True,
+            ):
+                if event.type in {"text_delta", "tool_call_delta"}:
+                    actionable_output_emitted = True
+                yield event
+            return
+        except ProviderError as error:
+            if (
+                actionable_output_emitted
+                or not request.reasoning_effort
+                or not _reasoning_summary_unsupported(error)
+            ):
+                raise
+        async for event in self._stream_responses_committed_once(
+            request,
+            include_reasoning_summary=False,
+        ):
+            yield event
+
+    async def _stream_responses_committed_once(
+        self,
+        request: ProviderRequest,
+        *,
+        include_reasoning_summary: bool,
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        pending_reasoning: list[ProviderStreamEvent] = []
+        actionable_output_emitted = False
+        async for event in self._stream_responses_once(
+            request,
+            include_reasoning_summary=include_reasoning_summary,
+        ):
+            if event.type == "reasoning_summary_delta" and not actionable_output_emitted:
+                pending_reasoning.append(event)
+                continue
+            if event.type == "completed" and event.response is not None:
+                if _has_actionable_output(event.response):
+                    for pending in pending_reasoning:
+                        yield pending
+                    pending_reasoning.clear()
+                    yield event
+                    return
+                pending_reasoning.clear()
+                event.response.reasoning_summary = ""
+                yield event
+                return
+            if event.type in {"text_delta", "tool_call_delta"}:
+                for pending in pending_reasoning:
+                    yield pending
+                pending_reasoning.clear()
+                actionable_output_emitted = True
+            yield event
+
+    async def _stream_responses_once(
+        self,
+        request: ProviderRequest,
+        *,
+        include_reasoning_summary: bool,
+    ) -> AsyncIterator[ProviderStreamEvent]:
         url = self.config.base_url.rstrip("/") + "/responses"
-        payload = self._responses_payload(request, stream=True)
+        payload = self._responses_payload(
+            request,
+            stream=True,
+            include_reasoning_summary=include_reasoning_summary,
+        )
         text_parts: list[str] = []
+        reasoning_summary_parts: list[str] = []
+        reasoning_summary_key: tuple[str, str, str] | None = None
         calls: dict[str, dict[str, Any]] = {}
         call_aliases: dict[str, str] = {}
         final_data: dict[str, Any] | None = None
@@ -118,7 +220,26 @@ class OpenAIProvider(Provider):
             except json.JSONDecodeError:
                 continue
             event_type = str(data.get("type") or item.event)
-            if event_type == "response.output_text.delta":
+            if event_type == "response.reasoning_summary_text.delta":
+                delta = str(data.get("delta") or "")
+                if not delta:
+                    continue
+                if any(
+                    name in data for name in ("item_id", "output_index", "summary_index")
+                ):
+                    next_key = (
+                        str(data.get("item_id") or ""),
+                        str(data.get("output_index") or ""),
+                        str(data.get("summary_index") or ""),
+                    )
+                    if reasoning_summary_key is not None and next_key != reasoning_summary_key:
+                        separator = _reasoning_summary_separator(reasoning_summary_parts, delta)
+                        if separator:
+                            delta = separator + delta
+                    reasoning_summary_key = next_key
+                reasoning_summary_parts.append(delta)
+                yield ProviderStreamEvent(type="reasoning_summary_delta", text=delta)
+            elif event_type in {"response.output_text.delta", "response.refusal.delta"}:
                 delta = str(data.get("delta") or "")
                 text_parts.append(delta)
                 yield ProviderStreamEvent(type="text_delta", text=delta)
@@ -156,13 +277,33 @@ class OpenAIProvider(Provider):
                     },
                 )
             elif event_type in {"response.completed", "response.done"}:
-                final_data = (
+                completed_data = (
                     data.get("response") if isinstance(data.get("response"), dict) else data
                 )
+                _raise_in_band_failure(completed_data)
+                final_data = completed_data
+            elif event_type in {"response.failed", "error"}:
+                failed = (
+                    data.get("response") if isinstance(data.get("response"), dict) else data
+                )
+                _raise_in_band_failure(failed, default_message="Responses stream failed")
         if final_data:
             result = self._parse_responses(final_data, retain_raw=True)
             if not result.text:
                 result.text = "".join(text_parts)
+            streamed_summary = "".join(reasoning_summary_parts)
+            if not result.reasoning_summary:
+                result.reasoning_summary = streamed_summary
+            else:
+                remaining_summary = _remaining_stream_delta(
+                    streamed_summary,
+                    result.reasoning_summary,
+                )
+                if remaining_summary:
+                    yield ProviderStreamEvent(
+                        type="reasoning_summary_delta",
+                        text=remaining_summary,
+                    )
             final_calls = {call.id: call for call in result.tool_calls}
             for call_id, partial_data in calls.items():
                 final_call = final_calls.get(call_id)
@@ -185,7 +326,11 @@ class OpenAIProvider(Provider):
             )
         else:
             result_calls = [self._call_from_partial(item) for item in calls.values()]
-            result = ModelResponse(text="".join(text_parts), tool_calls=result_calls)
+            result = ModelResponse(
+                text="".join(text_parts),
+                tool_calls=result_calls,
+                reasoning_summary="".join(reasoning_summary_parts),
+            )
         yield ProviderStreamEvent(type="completed", response=result)
 
     def _responses_input(self, request: ProviderRequest) -> list[dict[str, Any]]:
@@ -256,11 +401,12 @@ class OpenAIProvider(Provider):
             item_type = item.get("type")
             if item_type == "message":
                 for block in item.get("content", []) or []:
-                    if isinstance(block, dict) and block.get("type") in {
-                        "output_text",
-                        "text",
-                    }:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in {"output_text", "text"}:
                         text.append(str(block.get("text") or ""))
+                    elif block.get("type") == "refusal":
+                        text.append(str(block.get("refusal") or ""))
             elif item_type in {"function_call", "custom_tool_call"}:
                 raw_arguments = item.get("arguments") or item.get("input") or "{}"
                 calls.append(
@@ -290,6 +436,7 @@ class OpenAIProvider(Provider):
             continuation_state=(
                 ContinuationState(kind="openai.responses.reasoning", items=state) if state else None
             ),
+            reasoning_summary=_extract_reasoning_summary(data),
         )
 
     def _chat_payload(self, request: ProviderRequest, *, stream: bool = False) -> dict[str, Any]:
@@ -372,6 +519,37 @@ class OpenAIProvider(Provider):
         return payload
 
     async def _complete_chat(self, request: ProviderRequest) -> ModelResponse:
+        prior_usage = Usage()
+        try:
+            response = await self._complete_chat_once(request)
+        except ProviderError as error:
+            if not request.reasoning_effort or not _reasoning_controls_unsupported(error):
+                raise
+        else:
+            if _has_actionable_output(response):
+                return response
+            if not request.reasoning_effort:
+                raise ProviderUnavailableError(
+                    "OpenAI-compatible provider returned an empty response",
+                    retryable=True,
+                )
+            prior_usage.add(response.usage)
+        try:
+            response = await self._complete_chat_once(replace(request, reasoning_effort=None))
+        except ProviderError as error:
+            _attach_usage_to_error(error, prior_usage)
+            raise
+        if not _has_actionable_output(response):
+            usage = _copy_usage(prior_usage).add(response.usage)
+            raise ProviderUnavailableError(
+                "OpenAI-compatible provider returned an empty response with reasoning disabled",
+                retryable=False,
+                usage=usage if not usage.is_empty else None,
+            )
+        response.usage = prior_usage.add(response.usage)
+        return response
+
+    async def _complete_chat_once(self, request: ProviderRequest) -> ModelResponse:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         response = await self.http.post_json(
             url, headers=self._headers(), payload=self._chat_payload(request)
@@ -381,9 +559,88 @@ class OpenAIProvider(Provider):
         return self._parse_chat(response.data, retain_raw=True)
 
     async def _stream_chat(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
+        actionable_output_emitted = False
+        empty_response = False
+        pending_reasoning: list[ProviderStreamEvent] = []
+        prior_usage = Usage()
+        try:
+            async for event in self._stream_chat_once(request):
+                if event.type == "reasoning_summary_delta" and not actionable_output_emitted:
+                    pending_reasoning.append(event)
+                    continue
+                if event.type == "completed" and event.response is not None:
+                    if _has_actionable_output(event.response):
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                        yield event
+                        return
+                    prior_usage.add(event.response.usage)
+                    event.response.reasoning_summary = ""
+                    empty_response = True
+                    continue
+                if event.type in {"text_delta", "tool_call_delta"}:
+                    for pending in pending_reasoning:
+                        yield pending
+                    pending_reasoning.clear()
+                    actionable_output_emitted = True
+                yield event
+        except ProviderError as error:
+            if (
+                actionable_output_emitted
+                or not request.reasoning_effort
+                or not _reasoning_controls_unsupported(error)
+            ):
+                raise
+            empty_response = True
+        if request.reasoning_effort and not actionable_output_emitted and empty_response:
+            pending_reasoning.clear()
+            fallback = replace(request, reasoning_effort=None)
+            fallback_output_emitted = False
+            try:
+                async for event in self._stream_chat_once(fallback):
+                    if event.type == "reasoning_summary_delta" and not fallback_output_emitted:
+                        pending_reasoning.append(event)
+                        continue
+                    if event.type == "completed" and event.response is not None:
+                        if not _has_actionable_output(event.response):
+                            usage = _copy_usage(prior_usage).add(event.response.usage)
+                            event.response.reasoning_summary = ""
+                            raise ProviderUnavailableError(
+                                "OpenAI-compatible provider returned an empty response "
+                                "with reasoning disabled",
+                                retryable=False,
+                                usage=usage if not usage.is_empty else None,
+                            )
+                        event.response.usage = prior_usage.add(event.response.usage)
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                    elif event.type in {"text_delta", "tool_call_delta"}:
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                        fallback_output_emitted = True
+                    yield event
+            except ProviderError as error:
+                _attach_usage_to_error(error, prior_usage)
+                raise
+            return
+        error = ProviderUnavailableError(
+            "OpenAI-compatible provider returned an empty response",
+            retryable=not actionable_output_emitted,
+        )
+        _attach_usage_to_error(error, prior_usage)
+        raise error
+
+    async def _stream_chat_once(
+        self, request: ProviderRequest
+    ) -> AsyncIterator[ProviderStreamEvent]:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         payload = self._chat_payload(request, stream=True)
         text_parts: list[str] = []
+        reasoning_summary_parts: list[str] = []
+        reasoning_summary_key: tuple[str, str] | None = None
         calls: dict[int, dict[str, Any]] = {}
         usage = Usage()
         model: str | None = None
@@ -396,6 +653,11 @@ class OpenAIProvider(Provider):
                 data = json.loads(item.data)
             except json.JSONDecodeError:
                 continue
+            if data.get("error") or str(data.get("type") or "").lower() == "error":
+                _raise_in_band_failure(
+                    data,
+                    default_message="Chat Completions stream failed",
+                )
             model = data.get("model") or model
             response_id = data.get("id") or response_id
             if data.get("usage"):
@@ -404,8 +666,23 @@ class OpenAIProvider(Provider):
             for choice in data.get("choices", []) or []:
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta") or {}
-                if delta.get("content"):
-                    text = str(delta["content"])
+                for key, summary in _chat_reasoning_summaries(delta):
+                    if reasoning_summary_key is not None and key != reasoning_summary_key:
+                        separator = _reasoning_summary_separator(
+                            reasoning_summary_parts,
+                            summary,
+                        )
+                        if separator:
+                            summary = separator + summary
+                    reasoning_summary_key = key
+                    reasoning_summary_parts.append(summary)
+                    yield ProviderStreamEvent(
+                        type="reasoning_summary_delta",
+                        text=summary,
+                    )
+                content = delta.get("content") or delta.get("refusal")
+                if content:
+                    text = str(content)
                     text_parts.append(text)
                     yield ProviderStreamEvent(type="text_delta", text=text)
                 for call_delta in delta.get("tool_calls", []) or []:
@@ -431,6 +708,7 @@ class OpenAIProvider(Provider):
             stop_reason=finish_reason,
             response_id=response_id,
             model=model,
+            reasoning_summary="".join(reasoning_summary_parts),
         )
         yield ProviderStreamEvent(type="completed", response=result)
 
@@ -454,7 +732,7 @@ class OpenAIProvider(Provider):
             )
         usage_data = data.get("usage") or {}
         usage = self._usage_from_chat(usage_data)
-        content = message.get("content") or ""
+        content = message.get("content") or message.get("refusal") or ""
         if isinstance(content, list):
             content = "".join(
                 str(item.get("text") or "") for item in content if isinstance(item, dict)
@@ -467,6 +745,7 @@ class OpenAIProvider(Provider):
             response_id=data.get("id"),
             model=data.get("model"),
             raw=data if retain_raw else None,
+            reasoning_summary=_extract_chat_reasoning_summary(message),
         )
 
     def _usage_from_responses(self, usage_data: dict[str, Any]) -> Usage:
@@ -592,6 +871,182 @@ def _extract_encrypted_reasoning_state(data: dict[str, Any]) -> list[dict[str, A
             value["id"] = str(item["id"])
         state.append(value)
     return state
+
+
+def _extract_reasoning_summary(data: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for item in data.get("output", []) or []:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        for summary in item.get("summary", []) or []:
+            if isinstance(summary, dict) and summary.get("type") == "summary_text":
+                parts.append(str(summary.get("text") or ""))
+    return _join_reasoning_summary_parts(parts)
+
+
+def _chat_reasoning_summaries(data: dict[str, Any]) -> list[tuple[tuple[str, str], str]]:
+    summaries: list[tuple[tuple[str, str], str]] = []
+    details = data.get("reasoning_details")
+    if isinstance(details, list):
+        for position, detail in enumerate(details):
+            if not isinstance(detail, dict) or detail.get("type") not in {
+                "reasoning.summary",
+                "summary_text",
+            }:
+                continue
+            text = str(detail.get("summary") or detail.get("text") or "")
+            if not text:
+                continue
+            index = detail.get("index")
+            summaries.append(
+                (
+                    (
+                        str(detail.get("id") or ""),
+                        str(position if index is None else index),
+                    ),
+                    text,
+                )
+            )
+    if summaries:
+        return summaries
+    explicit = data.get("reasoning_summary")
+    if isinstance(explicit, str) and explicit:
+        return [(("reasoning_summary", "0"), explicit)]
+    return []
+
+
+def _extract_chat_reasoning_summary(data: dict[str, Any]) -> str:
+    return _join_reasoning_summary_parts(
+        [summary for _, summary in _chat_reasoning_summaries(data)]
+    )
+
+
+def _join_reasoning_summary_parts(parts: list[str]) -> str:
+    joined: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        separator = _reasoning_summary_separator(joined, part)
+        if separator:
+            joined.append(separator)
+        joined.append(part)
+    return "".join(joined)
+
+
+def _reasoning_summary_separator(parts: list[str], next_part: str) -> str:
+    if not parts or parts[-1].endswith(("\n", "\r")) or next_part.startswith(("\n", "\r")):
+        return ""
+    return "\n"
+
+
+def _remaining_stream_delta(streamed: str, completed: str) -> str:
+    if completed.startswith(streamed):
+        return completed[len(streamed) :]
+    return ""
+
+
+def _has_actionable_output(response: ModelResponse) -> bool:
+    return bool(response.text or response.tool_calls)
+
+
+def _attach_usage_to_error(error: ProviderError, usage: Usage) -> None:
+    if usage.is_empty:
+        return
+    merged = _copy_usage(usage)
+    if error.usage is not None:
+        merged.add(error.usage)
+    error.usage = merged
+
+
+def _copy_usage(usage: Usage) -> Usage:
+    return replace(usage)
+
+
+def _raise_in_band_failure(
+    data: dict[str, Any],
+    *,
+    default_message: str | None = None,
+) -> None:
+    error = data.get("error")
+    failed = str(data.get("status") or "").lower() == "failed"
+    error_event = str(data.get("type") or "").lower() == "error"
+    if not error and not failed and not error_event and default_message is None:
+        return
+    if isinstance(error, dict):
+        error_data = error
+        message = str(
+            error_data.get("message")
+            or error_data.get("code")
+            or default_message
+            or error_data
+        )
+    else:
+        error_data = data
+        message = str(
+            error
+            or error_data.get("message")
+            or error_data.get("code")
+            or default_message
+            or "Responses request failed"
+        )
+    raw_code = error_data.get("code")
+    code = str(raw_code or "").lower()
+    status: int | None = None
+    if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+        status = raw_code
+    elif isinstance(raw_code, str) and raw_code.isdecimal():
+        status = int(raw_code)
+    if code in {"rate_limit_error", "rate_limit_exceeded", "too_many_requests"}:
+        raise ProviderRateLimitError(message, retryable=True, details=data)
+    if code in {
+        "internal_server_error",
+        "request_timeout",
+        "server_error",
+        "service_unavailable",
+    }:
+        raise ProviderUnavailableError(message, retryable=True, details=data)
+    raise classify_provider_error(status, message, details=data)
+
+
+def _reasoning_summary_unsupported(error: ProviderError) -> bool:
+    text = _provider_error_text(error)
+    return any(term in text for term in ("summar", "generate_summary")) and any(
+        term in text
+        for term in (
+            "does not support",
+            "not supported",
+            "unsupported",
+            "unknown",
+            "unrecognized",
+            "invalid parameter",
+            "not allowed",
+            "not permitted",
+            "extra inputs",
+        )
+    )
+
+
+def _reasoning_controls_unsupported(error: ProviderError) -> bool:
+    text = _provider_error_text(error)
+    return any(term in text for term in ("reasoning", "reasoning_effort")) and any(
+        term in text
+        for term in (
+            "does not support",
+            "not supported",
+            "unsupported",
+            "unknown",
+            "unrecognized",
+            "invalid parameter",
+            "not allowed",
+            "not permitted",
+            "extra inputs",
+        )
+    )
+
+
+def _provider_error_text(error: ProviderError) -> str:
+    details = "" if error.details is None else repr(error.details)
+    return f"{error} {details}".lower()
 
 
 def _parse_arguments(value: Any) -> dict[str, Any]:

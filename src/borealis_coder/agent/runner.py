@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +35,7 @@ from ..models import (
 )
 from ..providers.base import Provider
 from ..safety import ApprovalManager
+from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import ToolContext, ToolRegistry, VerificationPlanner
 from ..util import json_dumps, new_id, truncate_text
@@ -439,6 +440,7 @@ class AgentRunner:
                     turn=budget.turns,
                     message_id=assistant.id,
                     text=response.text,
+                    reasoning_summary=response.reasoning_summary,
                     tool_calls=[call.to_dict() for call in response.tool_calls],
                     usage=response.usage.to_dict(),
                     stop_reason=response.stop_reason,
@@ -576,6 +578,7 @@ class AgentRunner:
         assistant_message_id: str,
     ) -> tuple[ModelResponse, ProviderRoute]:
         errors: list[str] = []
+        failed_usage = Usage()
         cache_misses = 0
         for index, route in enumerate(self.providers):
             self._check_cancel(cancel)
@@ -610,6 +613,9 @@ class AgentRunner:
                     )
                     response = ModelResponse(
                         text=str(payload.get("text") or ""),
+                        reasoning_summary=self._redact_reasoning_summary(
+                            str(payload.get("reasoning_summary") or "")
+                        ),
                         usage=usage,
                         stop_reason=payload.get("stop_reason"),
                         model=str(payload.get("model") or route.model),
@@ -629,6 +635,16 @@ class AgentRunner:
                         saved_tokens=usage.application_cache_saved_tokens,
                         saved_cost_usd=usage.application_cache_saved_cost_usd,
                     )
+                    if response.reasoning_summary:
+                        await self.events.emit(
+                            "model.reasoning_delta",
+                            session_id=session_id,
+                            run_id=run_id,
+                            message_id=assistant_message_id,
+                            text=response.reasoning_summary,
+                            provider=route.name,
+                            model=route.model,
+                        )
                     if response.text:
                         await self.events.emit(
                             "model.text_delta",
@@ -639,6 +655,8 @@ class AgentRunner:
                             provider=route.name,
                             model=route.model,
                         )
+                    if not failed_usage.is_empty:
+                        response.usage = failed_usage.add(response.usage)
                     return response, route
                 if self.config.cache.response_cache_enabled:
                     cache_misses += 1
@@ -662,6 +680,7 @@ class AgentRunner:
                     if _is_cacheable_response(response):
                         cached_response: dict[str, Any] = {
                             "text": response.text,
+                            "reasoning_summary": response.reasoning_summary,
                             "stop_reason": response.stop_reason,
                             "model": response.model or route.model,
                         }
@@ -682,6 +701,8 @@ class AgentRunner:
                             ttl_seconds=self.config.cache.response_cache_ttl_seconds,
                             max_entries=self.config.cache.response_cache_max_entries,
                         )
+                if not failed_usage.is_empty:
+                    response.usage = failed_usage.add(response.usage)
                 if index:
                     await self.events.emit(
                         "model.fallback_succeeded",
@@ -693,6 +714,8 @@ class AgentRunner:
                 return response, route
             except (ProviderUnavailableError, ProviderRateLimitError) as error:
                 errors.append(f"{route.name}/{route.model}: {error}")
+                if error.usage is not None:
+                    failed_usage.add(error.usage)
                 await self.events.emit(
                     "model.route_failed",
                     session_id=session_id,
@@ -706,7 +729,9 @@ class AgentRunner:
             except ProviderError:
                 raise
         raise ProviderUnavailableError(
-            "All provider routes failed: " + "; ".join(errors), retryable=False
+            "All provider routes failed: " + "; ".join(errors),
+            retryable=False,
+            usage=failed_usage if not failed_usage.is_empty else None,
         )
 
     def _response_cache_key(
@@ -827,19 +852,64 @@ class AgentRunner:
     ) -> ModelResponse:
         attempts = max(0, route.provider.config.max_retries) + 1
         delay = max(0.0, route.provider.config.initial_backoff_seconds)
+        failed_usage = Usage()
         for attempt in range(attempts):
-            emitted = False
+            actionable_emitted = False
             try:
 
                 async def consume() -> ModelResponse | None:
-                    nonlocal emitted
+                    nonlocal actionable_emitted
                     completed: ModelResponse | None = None
+                    pending_reasoning: list[str] = []
+                    reasoning_redactor = StreamingRedactor(self.events.redactor)
+                    reasoning_committed = False
                     stream = route.provider.stream(request).__aiter__()
+
+                    async def emit_reasoning(text: str) -> None:
+                        if not text:
+                            return
+                        await self.events.emit(
+                            "model.reasoning_delta",
+                            session_id=session_id,
+                            run_id=run_id,
+                            message_id=assistant_message_id,
+                            text=text,
+                            provider=route.name,
+                            model=route.model,
+                        )
+
+                    async def commit_reasoning() -> None:
+                        nonlocal reasoning_committed
+                        if reasoning_committed:
+                            return
+                        pending_reasoning.append(
+                            reasoning_redactor.flush(mask_incomplete=True)
+                        )
+                        for text in pending_reasoning:
+                            await emit_reasoning(text)
+                        pending_reasoning.clear()
+                        reasoning_committed = True
+
+                    async def flush_committed_reasoning() -> None:
+                        if reasoning_committed:
+                            await emit_reasoning(
+                                reasoning_redactor.flush(mask_incomplete=True)
+                            )
+
                     try:
                         async for item in stream:
                             self._check_cancel(cancel)
+                            if item.type == "reasoning_summary_delta" and item.text:
+                                text = reasoning_redactor.feed(item.text)
+                                if reasoning_committed:
+                                    await emit_reasoning(text)
+                                else:
+                                    pending_reasoning.append(text)
+                                continue
+
                             if item.type == "text_delta" and item.text:
-                                emitted = True
+                                await commit_reasoning()
+                                actionable_emitted = True
                                 await self.events.emit(
                                     "model.text_delta",
                                     session_id=session_id,
@@ -850,7 +920,8 @@ class AgentRunner:
                                     model=route.model,
                                 )
                             elif item.type == "tool_call_delta":
-                                emitted = True
+                                await commit_reasoning()
+                                actionable_emitted = True
                                 await self.events.emit(
                                     "model.tool_call_delta",
                                     session_id=session_id,
@@ -860,8 +931,13 @@ class AgentRunner:
                                     **item.data,
                                 )
                             elif item.type == "completed" and item.response is not None:
+                                if item.response.text or item.response.tool_calls:
+                                    await commit_reasoning()
+                                else:
+                                    await flush_committed_reasoning()
                                 completed = item.response
                     finally:
+                        await flush_committed_reasoning()
                         close = getattr(stream, "aclose", None)
                         if close is not None:
                             with contextlib.suppress(Exception):
@@ -892,9 +968,25 @@ class AgentRunner:
                         f"Provider {route.name} stream ended without a completed response",
                         retryable=True,
                     )
+                completed.reasoning_summary = self._redact_reasoning_summary(
+                    completed.reasoning_summary
+                )
+                if not completed.text and not completed.tool_calls:
+                    usage = replace(completed.usage)
+                    raise ProviderUnavailableError(
+                        f"Provider {route.name} returned an empty response",
+                        retryable=True,
+                        usage=usage if not usage.is_empty else None,
+                    )
+                if not failed_usage.is_empty:
+                    completed.usage = failed_usage.add(completed.usage)
                 return completed
             except (ProviderUnavailableError, ProviderRateLimitError) as error:
-                if emitted or attempt + 1 >= attempts:
+                if error.usage is not None:
+                    failed_usage.add(error.usage)
+                if actionable_emitted or not error.retryable or attempt + 1 >= attempts:
+                    if not failed_usage.is_empty:
+                        error.usage = failed_usage
                     raise
                 retry_delay = min(
                     route.provider.config.max_backoff_seconds,
@@ -913,7 +1005,11 @@ class AgentRunner:
                 )
                 await asyncio.sleep(retry_delay)
                 delay = max(0.25, delay * 2)
-        raise ProviderUnavailableError(f"Provider {route.name} exhausted retries", retryable=False)
+        raise ProviderUnavailableError(
+            f"Provider {route.name} exhausted retries",
+            retryable=False,
+            usage=failed_usage if not failed_usage.is_empty else None,
+        )
 
     async def _execute_calls(
         self,
@@ -997,6 +1093,12 @@ class AgentRunner:
     def _check_cancel(cancel: asyncio.Event) -> None:
         if cancel.is_set():
             raise Cancelled("Run cancelled")
+
+    def _redact_reasoning_summary(self, text: str) -> str:
+        if not text:
+            return ""
+        redactor = StreamingRedactor(self.events.redactor)
+        return redactor.feed(text) + redactor.flush(mask_incomplete=True)
 
 
 def _title(prompt: str) -> str:

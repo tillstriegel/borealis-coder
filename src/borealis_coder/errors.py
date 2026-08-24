@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .models import Usage
 
 
 class BorealisError(Exception):
@@ -24,11 +27,13 @@ class ProviderError(BorealisError):
         status_code: int | None = None,
         retryable: bool = False,
         details: Any = None,
+        usage: Usage | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
         self.details = details
+        self.usage = usage
 
 
 class ProviderAuthenticationError(ProviderError):

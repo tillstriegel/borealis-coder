@@ -51,15 +51,32 @@ class ChatGPTProvider(OpenAIProvider):
             self._active_credentials = await self.credentials.ensure_valid(
                 force_refresh=auth_attempt > 0
             )
-            emitted = False
+            actionable_output_emitted = False
+            pending_reasoning: list[ProviderStreamEvent] = []
             try:
                 async for event in super().stream(request):
+                    if event.type == "reasoning_summary_delta" and not actionable_output_emitted:
+                        pending_reasoning.append(event)
+                        continue
+                    if event.type == "completed" and event.response is not None:
+                        if event.response.text or event.response.tool_calls:
+                            for pending in pending_reasoning:
+                                yield pending
+                            pending_reasoning.clear()
+                        else:
+                            pending_reasoning.clear()
+                            event.response.reasoning_summary = ""
+                        yield event
+                        return
                     if event.type in {"text_delta", "tool_call_delta"}:
-                        emitted = True
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                        actionable_output_emitted = True
                     yield event
                 return
             except ProviderAuthenticationError:
-                if emitted or auth_attempt > 0:
+                if actionable_output_emitted or auth_attempt > 0:
                     raise
                 # A 401/403 can arrive before the JWT expiry timestamp. Refresh once
                 # and replay only because the stream emitted no user-visible content.
@@ -82,9 +99,17 @@ class ChatGPTProvider(OpenAIProvider):
         return headers
 
     def _responses_payload(
-        self, request: ProviderRequest, *, stream: bool = False
+        self,
+        request: ProviderRequest,
+        *,
+        stream: bool = False,
+        include_reasoning_summary: bool = True,
     ) -> dict[str, Any]:
-        payload = super()._responses_payload(request, stream=stream)
+        payload = super()._responses_payload(
+            request,
+            stream=stream,
+            include_reasoning_summary=include_reasoning_summary,
+        )
         # Match the Codex backend contract rather than the public API's optional
         # generation controls. ChatGPT plans enforce their own usage/output limits.
         payload.pop("max_output_tokens", None)

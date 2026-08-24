@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +20,9 @@ from borealis_coder.models import (
     Usage,
 )
 from borealis_coder.providers.base import Provider, ProviderStreamEvent
+from borealis_coder.providers.http import SSEEvent
 from borealis_coder.providers.mock import MockProvider
+from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.providers.registry import ProviderRegistry
 from tests.helpers import make_config
 
@@ -52,6 +56,7 @@ class CountingProvider(Provider):
         self.calls += 1
         return ModelResponse(
             text="cacheable answer",
+            reasoning_summary="Checked cacheability.",
             stop_reason="end_turn",
             response_id=f"response-{self.calls}",
             usage=Usage(input_tokens=20, output_tokens=3, requests=1, cost_usd=0.2),
@@ -165,12 +170,123 @@ class BurstProvider(Provider):
         return ModelResponse(text="abc", stop_reason="end_turn")
 
     async def stream(self, request):
+        yield ProviderStreamEvent(
+            type="reasoning_summary_delta",
+            text="Checked the stream.",
+        )
         for text in "abc":
             yield ProviderStreamEvent(type="text_delta", text=text)
         yield ProviderStreamEvent(
             type="completed",
-            response=ModelResponse(text="abc", stop_reason="end_turn"),
+            response=ModelResponse(
+                text="abc",
+                reasoning_summary="Checked the stream.",
+                stop_reason="end_turn",
+            ),
         )
+
+
+class SplitSecretReasoningProvider(Provider):
+    name = "split_secret_reasoning"
+
+    async def complete(self, request):
+        return ModelResponse(text="done", stop_reason="end_turn")
+
+    async def stream(self, request):
+        yield ProviderStreamEvent(
+            type="reasoning_summary_delta",
+            text="Checked sk-abc",
+        )
+        yield ProviderStreamEvent(
+            type="reasoning_summary_delta",
+            text="defghijklmnop safely.",
+        )
+        yield ProviderStreamEvent(type="text_delta", text="done")
+        yield ProviderStreamEvent(
+            type="completed",
+            response=ModelResponse(
+                text="done",
+                reasoning_summary="Checked sk-abcdefghijklmnop safely.",
+                stop_reason="end_turn",
+            ),
+        )
+
+
+class SummaryOnlyRetryProvider(Provider):
+    name = "summary_only_retry"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+
+    async def complete(self, request):
+        return ModelResponse(text="unused")
+
+    async def stream(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            yield ProviderStreamEvent(
+                type="reasoning_summary_delta",
+                text="Abandoned summary.",
+            )
+            yield ProviderStreamEvent(
+                type="completed",
+                response=ModelResponse(
+                    reasoning_summary="Abandoned summary.",
+                    usage=Usage(input_tokens=3, requests=1),
+                ),
+            )
+            return
+        yield ProviderStreamEvent(type="reasoning_summary_delta", text="Checked ")
+        yield ProviderStreamEvent(type="reasoning_summary_delta", text="the retry.")
+        yield ProviderStreamEvent(type="text_delta", text="answer")
+        yield ProviderStreamEvent(
+            type="completed",
+            response=ModelResponse(
+                text="answer",
+                reasoning_summary="Checked the retry.",
+                stop_reason="end_turn",
+                usage=Usage(input_tokens=4, requests=1),
+            ),
+        )
+
+
+class UnsafeSummaryProvider(Provider):
+    name = "unsafe_summary"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+
+    async def complete(self, request):
+        self.calls += 1
+        return ModelResponse(
+            text="done",
+            reasoning_summary="Unsafe sk-",
+            stop_reason="end_turn",
+            usage=Usage(input_tokens=2, output_tokens=1, requests=1, cost_usd=0.1),
+        )
+
+
+class FakeOpenAIStreamHttp:
+    def __init__(self, event_batches):
+        self.event_batches = event_batches
+        self.calls = []
+
+    async def stream_sse(self, url, **kwargs):
+        self.calls.append((url, dict(kwargs)))
+        for event in self.event_batches.pop(0):
+            yield event
+
+    def close(self):
+        return None
+
+
+class EmptyProvider(Provider):
+    name = "empty"
+
+    async def complete(self, request):
+        return ModelResponse(stop_reason="stop")
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
@@ -230,7 +346,277 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                         "msg_1",
                     )
                 self.assertEqual(response.text, "abc")
+                self.assertEqual(response.reasoning_summary, "Checked the stream.")
+                await runner.events.flush()
+                reasoning = [
+                    event.data["text"]
+                    for _, event in runner.sessions.events(session.id)
+                    if event.type == "model.reasoning_delta"
+                ]
+                self.assertEqual(reasoning, ["Checked the stream."])
                 self.assertEqual(create_task.call_count, 2)
+            finally:
+                await runner.close()
+
+    async def test_reasoning_stream_redacts_secrets_across_chunks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "split_secret_reasoning"})
+            config.providers["split_secret_reasoning"] = ProviderConfig(
+                type="split_secret_reasoning",
+                model="split-secret-reasoning",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register(
+                "split_secret_reasoning",
+                lambda cfg, key: SplitSecretReasoningProvider(cfg, key),
+            )
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_TEST_SECRET": "sk-abcdefghijklmnop"},
+                clear=False,
+            ):
+                runner = await build_runner(
+                    root,
+                    config=config,
+                    interactive=False,
+                    provider_registry=registry,
+                )
+            try:
+                session = runner.sessions.create_session(
+                    workspace=root,
+                    provider="split_secret_reasoning",
+                    model="split-secret-reasoning",
+                )
+                await runner._stream_route(
+                    runner.providers[0],
+                    ProviderRequest(
+                        model="split-secret-reasoning",
+                        system="",
+                        messages=[],
+                    ),
+                    session.id,
+                    "run_1",
+                    asyncio.Event(),
+                    "msg_1",
+                )
+                await runner.events.flush()
+                reasoning = [
+                    str(event.data.get("text") or "")
+                    for _, event in runner.sessions.events(session.id)
+                    if event.type == "model.reasoning_delta"
+                ]
+                self.assertEqual("".join(reasoning), "Checked [REDACTED] safely.")
+            finally:
+                await runner.close()
+
+    async def test_summary_only_response_can_retry_same_route(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "summary_only_retry"})
+            config.providers["summary_only_retry"] = ProviderConfig(
+                type="summary_only_retry",
+                model="summary-only-retry",
+                max_retries=1,
+                initial_backoff_seconds=0,
+                max_backoff_seconds=0,
+            )
+            provider: SummaryOnlyRetryProvider | None = None
+
+            def factory(cfg, key):
+                nonlocal provider
+                provider = SummaryOnlyRetryProvider(cfg, key)
+                return provider
+
+            registry = ProviderRegistry()
+            registry.register("summary_only_retry", factory)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                session = runner.sessions.create_session(
+                    workspace=root,
+                    provider="summary_only_retry",
+                    model="summary-only-retry",
+                )
+                response = await runner._stream_route(
+                    runner.providers[0],
+                    ProviderRequest(model="summary-only-retry", system="", messages=[]),
+                    session.id,
+                    "run_1",
+                    asyncio.Event(),
+                    "msg_1",
+                )
+                await runner.events.flush()
+                assert provider is not None
+                self.assertEqual(provider.calls, 2)
+                self.assertEqual(response.text, "answer")
+                self.assertEqual(response.usage.input_tokens, 7)
+                self.assertEqual(response.usage.requests, 2)
+                events = [event for _, event in runner.sessions.events(session.id)]
+                self.assertTrue(any(event.type == "model.retrying" for event in events))
+                reasoning = [
+                    str(event.data.get("text") or "")
+                    for event in events
+                    if event.type == "model.reasoning_delta"
+                ]
+                self.assertEqual(reasoning, ["Checked ", "the retry."])
+            finally:
+                await runner.close()
+
+    async def test_streaming_chat_retry_preserves_usage_from_failed_internal_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "openrouter_fake", "reasoning_effort": "high"},
+            )
+            config.providers["openrouter_fake"] = ProviderConfig(
+                type="openrouter_fake",
+                model="openrouter-fake",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=1,
+                initial_backoff_seconds=0,
+                max_backoff_seconds=0,
+            )
+            first = [
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "id": "empty",
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {
+                                                "type": "reasoning.summary",
+                                                "summary": "Billed summary.",
+                                                "index": 0,
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+                        }
+                    ),
+                ),
+                SSEEvent("message", "[DONE]"),
+            ]
+            failed_fallback = [
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": 503,
+                                "message": "Fallback provider unavailable.",
+                            }
+                        }
+                    ),
+                )
+            ]
+            recovered = [
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "id": "recovered",
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "delta": {"content": "Recovered answer."},
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+                        }
+                    ),
+                ),
+                SSEEvent("message", "[DONE]"),
+            ]
+            fake_http = FakeOpenAIStreamHttp([first, failed_fallback, recovered])
+
+            def factory(cfg, key):
+                provider = OpenRouterProvider(cfg, key)
+                provider.http = fake_http  # type: ignore[assignment]
+                return provider
+
+            registry = ProviderRegistry()
+            registry.register("openrouter_fake", factory)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("recover with paid failed attempt")
+                self.assertEqual(result.text, "Recovered answer.")
+                self.assertEqual(result.usage.input_tokens, 9)
+                self.assertEqual(result.usage.output_tokens, 5)
+                self.assertEqual(result.usage.requests, 2)
+                self.assertEqual(len(fake_http.calls), 3)
+                events = [event for _, event in runner.sessions.events(result.session_id)]
+                self.assertTrue(any(event.type == "model.retrying" for event in events))
+            finally:
+                await runner.close()
+
+    async def test_completed_and_cached_reasoning_summaries_use_stream_redaction(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "unsafe_summary"})
+            config.providers["unsafe_summary"] = ProviderConfig(
+                type="unsafe_summary",
+                model="unsafe-summary",
+                max_retries=0,
+            )
+            provider: UnsafeSummaryProvider | None = None
+
+            def factory(cfg, key):
+                nonlocal provider
+                provider = UnsafeSummaryProvider(cfg, key)
+                return provider
+
+            registry = ProviderRegistry()
+            registry.register("unsafe_summary", factory)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                first = await runner.run("same exact unsafe request")
+                second = await runner.run("same exact unsafe request")
+                assert provider is not None
+                self.assertEqual(provider.calls, 1)
+
+                for result in (first, second):
+                    events = [event for _, event in runner.sessions.events(result.session_id)]
+                    completed = next(event for event in events if event.type == "model.completed")
+                    self.assertEqual(
+                        completed.data["reasoning_summary"],
+                        "Unsafe [REDACTED]",
+                    )
+                    all_event_text = " ".join(str(event.data) for event in events)
+                    self.assertNotIn("sk-", all_event_text)
+
+                cached_events = [
+                    event for _, event in runner.sessions.events(second.session_id)
+                ]
+                cached_reasoning = [
+                    str(event.data.get("text") or "")
+                    for event in cached_events
+                    if event.type == "model.reasoning_delta"
+                ]
+                self.assertEqual(cached_reasoning, ["Unsafe [REDACTED]"])
             finally:
                 await runner.close()
 
@@ -265,6 +651,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(second.usage.application_cache_hits, 1)
                 self.assertEqual(second.usage.application_cache_saved_tokens, 23)
                 self.assertEqual(second.usage.cost_usd, 0.0)
+                for result in (first, second):
+                    reasoning = "".join(
+                        str(event.data.get("text") or "")
+                        for _, event in runner.sessions.events(result.session_id)
+                        if event.type == "model.reasoning_delta"
+                    )
+                    self.assertEqual(reasoning, "Checked cacheability.")
                 first_messages = runner.sessions.messages(first.session_id)
                 second_messages = runner.sessions.messages(second.session_id)
                 first_state = first_messages[-1].metadata.get("continuation_state")
@@ -414,6 +807,38 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(started.data["model"], "slow")
                 self.assertEqual(retry.data["attempt"], 2)
                 self.assertEqual(retry.data["max_attempts"], 2)
+            finally:
+                await runner.close()
+
+    async def test_empty_provider_response_uses_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "empty", "provider_fallbacks": ["mock"]},
+            )
+            config.providers["empty"] = ProviderConfig(
+                type="empty",
+                model="empty",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register("empty", lambda cfg, key: EmptyProvider(cfg, key))
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("hello")
+                events = [event for _, event in runner.sessions.events(result.session_id)]
+                route_failure = next(
+                    event for event in events if event.type == "model.route_failed"
+                )
+                self.assertIn("empty response", route_failure.data["error"])
+                self.assertIn("Offline mock", result.text)
+                self.assertEqual(result.stop_reason.value, "end_turn")
             finally:
                 await runner.close()
 

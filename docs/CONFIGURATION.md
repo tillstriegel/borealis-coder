@@ -182,7 +182,7 @@ Model identifiers change over time. Treat built-in IDs as dated defaults, not a 
 | `prompt_cache_enabled` | `true` | Emit supported provider prompt-cache directives. |
 | `anthropic_ttl` | `"5m"` | Anthropic cache TTL: `5m` or `1h`. |
 | `conversation_cache_enabled` | `true` | Cache the growing Anthropic conversation in addition to the explicit stable prefix. |
-| `response_cache_enabled` | `true` | Reuse exact successful text-only model responses locally. |
+| `response_cache_enabled` | `true` | Reuse exact successful text-only model responses and their reasoning summaries locally. |
 | `response_cache_ttl_seconds` | `300` | Exact-response cache lifetime. Zero disables writes. |
 | `response_cache_max_entries` | `256` | Global LRU-like entry bound in the session database. |
 | `adaptive` | `true` | Fall back to stable-prefix-only caching and a shorter compaction window after sustained write-heavy low hit rates. |
@@ -192,8 +192,9 @@ Model identifiers change over time. Treat built-in IDs as dated defaults, not a 
 
 The exact-response cache key covers the effective provider configuration, model, system context,
 semantic message history, tool schemas, and generation settings. Prompt text is not stored in the
-cache table; only its SHA-256 key, the final text, accounting metadata, and any validated
-provider-selected continuation items are persisted. Full raw provider responses are never cached.
+cache table; only its SHA-256 key, the final text, reasoning summary, accounting metadata, and any
+validated provider-selected continuation items are persisted. Full raw provider responses are
+never cached.
 
 ### ChatGPT credential resolution
 
