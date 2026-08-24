@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..config import Config, load_config
 from ..context import ContextBuilder
+from ..errors import ConfigurationError
 from ..events import EventBus, JsonlTrace
 from ..mcp import MCPManager
 from ..plugins import load_entrypoint_tools, load_workspace_plugins
@@ -39,6 +40,16 @@ async def build_runner(
     roots = WorkspaceRoots(
         workspace, additional_roots, allow_outside=config.safety.allow_outside_workspace
     )
+    storage = config.storage_dir
+    invalid_roots = [
+        root for root in roots.roots if root == storage or storage in root.parents
+    ]
+    if invalid_roots:
+        displays = ", ".join(str(root) for root in invalid_roots)
+        raise ConfigurationError(
+            "storage.directory must not equal or contain a workspace root: "
+            f"{displays}"
+        )
     sessions = SessionStore(config.database_path)
     mcp: MCPManager | None = None
     routes: list[ProviderRoute] = []

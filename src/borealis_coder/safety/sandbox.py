@@ -138,7 +138,9 @@ class NativeProcessDriver(ProcessDriver):
         self.roots = roots
         self.safety = safety
         self.sandbox = sandbox
-        self.guarantees_bounded_lifecycle = os.name == "posix"
+        # A POSIX process group is useful cleanup, but descendants can escape it
+        # with setsid(). Native execution has no inescapable lifecycle boundary.
+        self.guarantees_bounded_lifecycle = False
 
     async def run(
         self,
@@ -298,7 +300,7 @@ class NativeProcessDriver(ProcessDriver):
         ]
         process_task = asyncio.create_task(process.wait())
         exit_code: int | None = None
-        lifecycle_complete = os.name == "posix"
+        lifecycle_complete = False
         abandon_io = False
         try:
             completion_tasks: set[asyncio.Task[object]] = {process_task}
@@ -312,12 +314,10 @@ class NativeProcessDriver(ProcessDriver):
             if status_task is not None and status_task in done:
                 exit_code = status_task.result()
                 if exit_code is None:
-                    lifecycle_complete = False
                     abandon_io = True
                 else:
-                    lifecycle_complete = await _kill_supervised_process_group(process)
+                    await _kill_supervised_process_group(process)
             elif process_task in done:
-                lifecycle_complete = False
                 abandon_io = True
                 exit_code = process.returncode
             else:

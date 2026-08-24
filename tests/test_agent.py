@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import AgentRunner, build_runner
 from borealis_coder.config import ProviderConfig
-from borealis_coder.errors import SessionError
+from borealis_coder.errors import ConfigurationError, SessionError
 from borealis_coder.models import (
     ContinuationState,
     Effect,
@@ -313,12 +313,16 @@ class ShellMutationFinalTurnProvider(Provider):
     def __init__(self, config, api_key=""):
         super().__init__(config, api_key)
         self.calls = 0
+        self.tool_name = "shell"
+        self.tool_arguments: dict[str, object] = {"command": "true"}
 
     async def complete(self, request):
         self.calls += 1
         if self.calls == 1:
             return ModelResponse(
-                tool_calls=[ToolCall(name="shell", arguments={"command": "true"})],
+                tool_calls=[
+                    ToolCall(name=self.tool_name, arguments=self.tool_arguments)
+                ],
                 usage=Usage(requests=1),
             )
         return ModelResponse(
@@ -1620,6 +1624,59 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 release_verification.set()
                 await runner.close()
 
+    async def test_max_turns_verification_stops_on_run_cancellation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            verification_started = asyncio.Event()
+            verification_cancelled = asyncio.Event()
+
+            async def block_verification(*_args):
+                verification_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    verification_cancelled.set()
+                    raise
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new=AsyncMock(side_effect=block_verification),
+                ):
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(verification_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    self.assertTrue(runner.cancel(session_id))
+                    result = await asyncio.wait_for(task, timeout=1)
+
+                self.assertTrue(verification_cancelled.is_set())
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(
+                    result.verification,
+                    {"ok": False, "steps": [], "error": "Run cancelled"},
+                )
+                self.assertIn("Automatic verification was interrupted", result.error or "")
+            finally:
+                await runner.close()
+
     async def test_max_turns_survives_a_deadline_during_verification(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1879,6 +1936,114 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(dependency_file.resolve(), after)
                 self.assertIn(ignored_file.resolve(), before)
                 self.assertEqual(runner.tool_context.changed_files, {"ignored.txt"})
+            finally:
+                await runner.close()
+
+    async def test_runner_rejects_storage_that_contains_a_workspace_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            root.mkdir()
+            config = make_config(root, storage={"directory": td})
+
+            with self.assertRaisesRegex(
+                ConfigurationError,
+                "storage.directory must not equal or contain a workspace root",
+            ):
+                await build_runner(root, config=config, interactive=False)
+
+    async def test_verify_command_mutations_are_reconciled(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "verify-generated.txt"
+            config = make_config(
+                root,
+                agent={"provider": "verify_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["verify_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="verify-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["verify_mutation"]
+            )
+            provider.tool_name = "verify"
+            provider.tool_arguments = {
+                "command": "true",
+                "timeout_seconds": 10,
+            }
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            async def mutate_during_verification(*_args, **_kwargs):
+                mutated_path.write_text("generated")
+                return ProcessResult("true", 0, "", "", 1)
+
+            runner.tool_context.process.run = AsyncMock(
+                side_effect=mutate_during_verification
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.detect",
+                    return_value=[],
+                ):
+                    result = await runner.run("run a mutating verification command")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, ["verify-generated.txt"])
+                self.assertEqual(result.verification, {"ok": True, "steps": []})
+            finally:
+                await runner.close()
+
+    async def test_external_mutation_effect_marks_tracking_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "external_mutation", "max_turns": 2},
+            )
+            config.providers["external_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="external-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["external_mutation"]
+            )
+            provider.tool_name = "external_mutation"
+            provider.tool_arguments = {}
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="external_mutation",
+                    description="Test an externally executed mutation.",
+                    parameters=object_schema({}),
+                    function=lambda arguments, context: ToolResult("mutated externally"),
+                    effect=Effect.CONTROL,
+                )
+            )
+            try:
+                result = await runner.run("mutate external state")
+
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                self.assertEqual(result.changed_files, [])
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertEqual(verification["roots"], ["."])
             finally:
                 await runner.close()
 

@@ -42,7 +42,7 @@ from ..providers.base import Provider
 from ..safety import ApprovalManager
 from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
-from ..tools import ToolContext, ToolRegistry, VerificationPlanner
+from ..tools import MutationScope, ToolContext, ToolRegistry, VerificationPlanner
 from ..util import json_dumps, new_id, truncate_text
 from .budget import Budget, estimate_request_tokens, max_turns_recovery_message
 from .compaction import Summarizer, compact_messages_with_summary
@@ -549,7 +549,7 @@ class AgentRunner:
             if (
                 context.changed_roots or context.mutation_tracking == "incomplete"
             ) and self.config.agent.auto_verify:
-                verification = await self._verify_changes(context)
+                verification = await self._verify_changes(context, cancel)
         except Cancelled as error:
             stop_reason = StopReason.CANCELLED
             error_message = str(error)
@@ -582,7 +582,7 @@ class AgentRunner:
                 and self.config.agent.auto_verify
             ):
                 try:
-                    verification = await self._verify_changes(context)
+                    verification = await self._verify_changes(context, cancel)
                 except Cancelled as verification_error:
                     verification = {
                         "ok": False,
@@ -667,7 +667,12 @@ class AgentRunner:
         )
         return result
 
-    async def _verify_changes(self, context: ToolContext) -> dict[str, Any]:
+    async def _verify_changes(
+        self,
+        context: ToolContext,
+        cancel: asyncio.Event,
+    ) -> dict[str, Any]:
+        self._check_cancel(cancel)
         await self.events.emit(
             "verification.started",
             session_id=context.session_id,
@@ -678,6 +683,7 @@ class AgentRunner:
         reports: list[tuple[Path, Any]] = []
         skipped_roots = 0
         for index, root in enumerate(roots):
+            self._check_cancel(cancel)
             root_count = len(roots) - index
             root_seconds = remaining_seconds // root_count
             if root_seconds <= 0:
@@ -686,7 +692,10 @@ class AgentRunner:
             remaining_seconds -= root_seconds
             planner = VerificationPlanner(root)
             steps = planner.detect(max_seconds=root_seconds)
-            report = await planner.run(context, steps)
+            report = await self._await_until_cancelled(
+                planner.run(context, steps),
+                cancel,
+            )
             reports.append((root, report))
             if not report.ok:
                 break
@@ -1237,8 +1246,12 @@ class AgentRunner:
             call.arguments,
         )
         workspace_before = None
+        tool = self.tools.get(call.name)
+        mutation_scope = (
+            tool.effective_mutation_scope if tool is not None else MutationScope.NONE
+        )
         try:
-            if call.name == "shell":
+            if mutation_scope == MutationScope.WORKSPACE:
                 workspace_before = await self._await_until_cancelled(
                     self._workspace_snapshot(), cancel
                 )
@@ -1260,6 +1273,9 @@ class AgentRunner:
                 cancelled_result.metadata["workspace_change_tracking"] = (
                     context.mutation_tracking
                 )
+            elif mutation_scope == MutationScope.EXTERNAL:
+                self._mark_workspace_tracking_incomplete(context)
+                cancelled_result.metadata["workspace_change_tracking"] = "incomplete"
             await asyncio.to_thread(
                 self.sessions.cancel_tool_call,
                 context.session_id,
@@ -1285,6 +1301,13 @@ class AgentRunner:
                     self._mark_workspace_tracking_incomplete(context)
                 if context.mutation_tracking == "incomplete":
                     result.metadata["workspace_change_tracking"] = "incomplete"
+            elif (
+                mutation_scope == MutationScope.EXTERNAL
+                and result.metadata.get("error_type")
+                not in {"ApprovalDenied", "PolicyError", "ToolValidationError"}
+            ):
+                self._mark_workspace_tracking_incomplete(context)
+                result.metadata["workspace_change_tracking"] = "incomplete"
             if cancel.is_set():
                 await self._finish_after_tool_result(
                     asyncio.to_thread(
@@ -1499,6 +1522,11 @@ class AgentRunner:
         ignored_directories = set(self.config.context.ignored_dirs)
         state: dict[Path, tuple[Path, int, int, int, int, int, str]] = {}
         for root in self.tool_context.roots.roots:
+            storage_subtree = (
+                storage
+                if storage != root and _path_is_within(storage, root)
+                else None
+            )
             if stop is not None and stop.is_set():
                 return None
             for current, directories, filenames in os.walk(root, followlinks=False):
@@ -1511,7 +1539,10 @@ class AgentRunner:
                     if stop is not None and stop.is_set():
                         return None
                     path = current_path / name
-                    if name in ignored_directories or _path_is_within(path, storage):
+                    if name in ignored_directories or (
+                        storage_subtree is not None
+                        and _path_is_within(path, storage_subtree)
+                    ):
                         continue
                     if _is_non_traversable_directory(path):
                         link_directories.append(name)
@@ -1522,7 +1553,9 @@ class AgentRunner:
                     if stop is not None and stop.is_set():
                         return None
                     path = current_path / name
-                    if _path_is_within(path, storage):
+                    if storage_subtree is not None and _path_is_within(
+                        path, storage_subtree
+                    ):
                         continue
                     try:
                         file_stat = path.lstat()

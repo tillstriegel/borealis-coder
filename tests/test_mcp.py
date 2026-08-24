@@ -9,14 +9,15 @@ import urllib.error
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 from borealis_coder.config import MCPServerConfig
 from borealis_coder.errors import ProtocolError
-from borealis_coder.mcp import MCPManager
-from borealis_coder.mcp.client import HttpMCPClient, MCPToolDefinition
+from borealis_coder.mcp import MCPManager, MCPTool
+from borealis_coder.mcp.client import HttpMCPClient, MCPClient, MCPToolDefinition
 from borealis_coder.models import ToolCall
-from borealis_coder.tools import build_builtin_registry
+from borealis_coder.tools import MutationScope, build_builtin_registry
 from tests.helpers import make_config, make_context
 
 SERVER = r'''
@@ -40,6 +41,13 @@ for line in sys.stdin:
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    def test_mutating_mcp_tools_declare_external_mutation_scope(self):
+        definition = MCPToolDefinition("mutate", "Mutate state", {}, {})
+        client = cast(MCPClient, SimpleNamespace())
+        tool = MCPTool("server", definition, client, read_only=False)
+
+        self.assertEqual(tool.effective_mutation_scope, MutationScope.EXTERNAL)
+
     def test_http_error_response_is_closed(self):
         with tempfile.TemporaryDirectory() as td:
             stream = io.BytesIO(b'{"error":"down"}')

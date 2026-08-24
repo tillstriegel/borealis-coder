@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,15 @@ class ToolContext:
     mutation_tracking: str = "complete"
 
 
+class MutationScope(StrEnum):
+    """How the runner accounts for a tool's mutations."""
+
+    NONE = "none"
+    TRACKED = "tracked"
+    WORKSPACE = "workspace"
+    EXTERNAL = "external"
+
+
 class Tool:
     name: str = "tool"
     description: str = ""
@@ -55,6 +65,17 @@ class Tool:
     effect: Effect = Effect.READ
     concurrent: bool = False
     default_risk: str = "low"
+    mutation_scope: MutationScope | None = None
+
+    @property
+    def effective_mutation_scope(self) -> MutationScope:
+        if self.mutation_scope is not None:
+            return self.mutation_scope
+        if self.effect in {Effect.WRITE, Effect.EXECUTE}:
+            return MutationScope.WORKSPACE
+        if self.effect in {Effect.NETWORK, Effect.CONTROL}:
+            return MutationScope.EXTERNAL
+        return MutationScope.NONE
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         raise NotImplementedError
@@ -84,6 +105,7 @@ class FunctionTool(Tool):
         effect: Effect = Effect.READ,
         concurrent: bool = False,
         default_risk: str = "low",
+        mutation_scope: MutationScope | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -92,6 +114,7 @@ class FunctionTool(Tool):
         self.effect = effect
         self.concurrent = concurrent
         self.default_risk = default_risk
+        self.mutation_scope = mutation_scope
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         result = self.function(arguments, context)

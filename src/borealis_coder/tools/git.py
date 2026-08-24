@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..models import Effect, ToolResult
-from .base import Tool, ToolContext, nullable, object_schema
+from .base import MutationScope, Tool, ToolContext, nullable, object_schema
 
 
 async def _git(context: ToolContext, args: list[str], timeout: int = 120) -> ToolResult:
@@ -84,6 +84,7 @@ class GitPushTool(Tool):
     name = "git_push"
     description = "Push the current branch to a configured remote. Requires explicit network and publish permission."
     effect = Effect.NETWORK
+    mutation_scope = MutationScope.EXTERNAL
     default_risk = "critical"
     parameters = object_schema({
         "remote": {"type": "string", "minLength": 1},

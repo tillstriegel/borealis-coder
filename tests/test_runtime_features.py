@@ -797,7 +797,8 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(result.exit_code, 0)
-            self.assertTrue(result.lifecycle_complete)
+            self.assertFalse(driver.guarantees_bounded_lifecycle)
+            self.assertFalse(result.lifecycle_complete)
             self.assertTrue((root / "child-ready").is_file())
             try:
                 writer = os.open(trigger, os.O_WRONLY | os.O_NONBLOCK)
@@ -810,6 +811,48 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 os.close(writer)
             self.assertFalse(child_survived)
             self.assertFalse((root / "generated").exists())
+
+    @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
+    async def test_process_reports_detached_descendant_lifecycle_as_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ready = root / "detached-ready"
+            generated = root / "detached-generated"
+            child_code = (
+                "import os,sys,time\n"
+                "os.setsid()\n"
+                "null = os.open(os.devnull, os.O_RDWR)\n"
+                "os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2)\n"
+                "open(sys.argv[1], 'w').close()\n"
+                "time.sleep(0.2)\n"
+                "open(sys.argv[2], 'w').close()\n"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, "
+                f"{str(ready)!r}, {str(generated)!r}])\n"
+                f"ready = pathlib.Path({str(ready)!r})\n"
+                "deadline = time.monotonic() + 2\n"
+                "while not ready.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+            )
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+
+            result = await driver.run(
+                [sys.executable, "-c", parent_code],
+                cwd=root,
+                timeout=5,
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(result.lifecycle_complete)
+            for _ in range(100):
+                if generated.exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(generated.exists())
 
     async def test_verification_commands_pass_through_policy(self):
         with tempfile.TemporaryDirectory() as td:
