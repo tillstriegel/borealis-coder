@@ -1915,7 +1915,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.stop_reason, "incomplete")
         self.assertEqual(final.tool_calls, [])
 
-    async def test_gemini_stream_complete_partial_and_helpers(self) -> None:
+    async def test_gemini_truncated_stream_hides_partial_call(self) -> None:
         provider = GeminiProvider(
             ProviderConfig(type="gemini", base_url="https://gemini.test/v1beta"), "key"
         )
@@ -1964,7 +1964,13 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         partial = partial_events[-1].response
         assert partial is not None
         self.assertEqual(partial.text, "yes")
-        self.assertEqual(partial.tool_calls[0].arguments, {"path": "z"})
+        self.assertEqual(partial.tool_calls, [])
+        self.assertEqual(partial.stop_reason, "incomplete")
+
+    async def test_gemini_stream_complete_and_helpers(self) -> None:
+        provider = GeminiProvider(
+            ProviderConfig(type="gemini", base_url="https://gemini.test/v1beta"), "key"
+        )
 
         final_events = [
             SSEEvent(
@@ -2027,6 +2033,26 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         provider.http = FakeHttp(data="bad")  # type: ignore[assignment]
         with self.assertRaises(ProviderError):
             await provider.complete(self.request)
+
+    async def test_gemini_stream_error_raises_provider_failure(self) -> None:
+        provider = GeminiProvider(
+            ProviderConfig(type="gemini", base_url="https://gemini.test/v1beta"), "key"
+        )
+        provider.http = FakeHttp(  # type: ignore[assignment]
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "interaction.failed",
+                            "interaction": {"error": {"message": "generation failed"}},
+                        }
+                    ),
+                )
+            ]
+        )
+        with self.assertRaisesRegex(ProviderError, "generation failed"):
+            _ = [item async for item in provider.stream(self.request)]
 
 
 if __name__ == "__main__":

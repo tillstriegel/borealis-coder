@@ -1543,6 +1543,21 @@ class AgentRunner:
             )
             if stop is not None and stop.is_set():
                 return None
+            try:
+                root_stat = root.lstat()
+                change_time, fallback_digest = _file_change_signal(root, root_stat)
+            except OSError:
+                pass
+            else:
+                state[root] = (
+                    root,
+                    root_stat.st_mtime_ns,
+                    change_time,
+                    root_stat.st_size,
+                    root_stat.st_mode,
+                    root_stat.st_ino,
+                    fallback_digest,
+                )
             for current, directories, filenames in os.walk(root, followlinks=False):
                 if stop is not None and stop.is_set():
                     return None

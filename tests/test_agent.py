@@ -2372,7 +2372,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     result = await runner.run("run a mutating verification command")
 
                 self.assertEqual(result.stop_reason.value, "max_turns")
-                self.assertEqual(result.changed_files, ["verify-generated.txt"])
+                self.assertEqual(result.changed_files, [".", "verify-generated.txt"])
                 self.assertEqual(
                     result.verification,
                     {
@@ -2583,6 +2583,27 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 await runner.close()
 
     @unittest.skipIf(os.name == "nt", "POSIX directory permission bits are required")
+    async def test_workspace_snapshot_tracks_workspace_root_mutations(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            original_mode = stat.S_IMODE(root.stat().st_mode)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                before = runner._workspace_file_state()
+                root.chmod(original_mode ^ stat.S_IXUSR)
+                after = runner._workspace_file_state()
+
+                assert before is not None and after is not None
+                self.assertIn(root, before)
+                runner._record_workspace_changes(before, after, runner.tool_context)
+
+                self.assertEqual(runner.tool_context.changed_files, {"."})
+                self.assertEqual(runner.tool_context.changed_roots, {root})
+            finally:
+                root.chmod(original_mode)
+                await runner.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory permission bits are required")
     async def test_workspace_snapshot_tracks_empty_directory_mutations(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2608,6 +2629,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     runner.tool_context.changed_files,
                     {
+                        ".",
                         "created-directory",
                         "deleted-directory",
                         "permission-directory",
@@ -2665,7 +2687,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     result = await runner.run("create an empty directory through shell")
 
                 self.assertEqual(result.stop_reason.value, "max_turns")
-                self.assertEqual(result.changed_files, ["empty-directory"])
+                self.assertEqual(result.changed_files, [".", "empty-directory"])
                 verify.assert_awaited_once()
                 verification_call = verify.await_args
                 assert verification_call is not None
@@ -3251,7 +3273,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     result = await runner.run("create workspace symlinks")
 
                 self.assertEqual(result.stop_reason.value, "max_turns")
-                self.assertEqual(result.changed_files, ["directory-link", "file-link"])
+                self.assertEqual(
+                    result.changed_files,
+                    [".", "directory-link", "file-link"],
+                )
                 self.assertEqual(
                     runner.sessions.tool_calls(result.session_id)[0]["status"], "completed"
                 )
@@ -3267,11 +3292,16 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             original_stat = changed.stat()
             runner = await build_runner(root, config=make_config(root), interactive=False)
             try:
+                file_change_times = iter((100, 200))
+
+                def change_time(path):
+                    return 50 if path == root else next(file_change_times)
+
                 with (
                     patch("borealis_coder.agent.runner._IS_WINDOWS", True),
                     patch(
                         "borealis_coder.agent.runner._windows_change_time_ns",
-                        side_effect=[100, 200],
+                        side_effect=change_time,
                     ),
                 ):
                     before = runner._workspace_file_state()
