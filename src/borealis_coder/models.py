@@ -325,6 +325,7 @@ class AgentResult:
     verification: dict[str, Any] | None = None
     error: str | None = None
     incomplete: bool = False
+    mutation_tracking: str = "complete"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -335,6 +336,7 @@ class AgentResult:
             "usage": self.usage.to_dict(),
             "turns": self.turns,
             "changed_files": self.changed_files,
+            "mutation_tracking": self.mutation_tracking,
             "verification": self.verification,
             "error": self.error,
             "incomplete": self.incomplete,

@@ -7,11 +7,12 @@ import contextlib
 import hashlib
 import os
 import stat
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 from ..config import Config
 from ..context import ContextBuilder
@@ -60,12 +61,14 @@ class ProviderRoute:
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
 _INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
 _TOOL_FINALIZATION_GRACE_SECONDS = 0.5
+_WORKSPACE_SCAN_STOP_GRACE_SECONDS = 0.05
 _IS_WINDOWS = os.name == "nt"
 _WINDOWS_FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
 _WINDOWS_OPEN_EXISTING = 3
 _WINDOWS_OPEN_REPARSE_POINT = 0x00200000
 _WINDOWS_BACKUP_SEMANTICS = 0x02000000
 _WINDOWS_FILE_BASIC_INFO = 0
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _FINAL_TURN_INSTRUCTION = """# Final model turn
 This is the last model turn available for this run. Tools are unavailable. Return the best
 final answer now. State what was completed and what remains.
@@ -234,6 +237,7 @@ class AgentRunner:
                         usage=Usage(),
                         turns=0,
                         error=error,
+                        mutation_tracking="incomplete",
                     )
             finally:
                 self._accepting_steering.discard(session_id)
@@ -491,7 +495,8 @@ class AgentRunner:
                 )
                 if response.text:
                     final_text = response.text
-                final_response_incomplete = final_turn and _is_incomplete_response(response)
+                response_incomplete = _is_incomplete_response(response)
+                final_response_incomplete = final_turn and response_incomplete
                 if final_turn and (response.tool_calls or final_response_incomplete):
                     await self._drain_steering(session_id, run_id, messages)
                     recovery_message = max_turns_recovery_message(
@@ -509,6 +514,8 @@ class AgentRunner:
                     )
                 if usage_budget_error is not None:
                     raise usage_budget_error
+                if response_incomplete and not response.tool_calls:
+                    continue
                 if not response.tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
                         continue
@@ -538,7 +545,9 @@ class AgentRunner:
                     messages.append(tool_message)
                     await asyncio.to_thread(self.sessions.append_message, session_id, tool_message)
                 await self._drain_steering(session_id, run_id, messages)
-            if context.changed_files and self.config.agent.auto_verify:
+            if (
+                context.changed_files or context.mutation_tracking == "incomplete"
+            ) and self.config.agent.auto_verify:
                 verification = await self._verify_changes(context)
         except Cancelled as error:
             stop_reason = StopReason.CANCELLED
@@ -568,7 +577,7 @@ class AgentRunner:
             if (
                 stop_reason == StopReason.MAX_TURNS
                 and verification is None
-                and context.changed_files
+                and (context.changed_files or context.mutation_tracking == "incomplete")
                 and self.config.agent.auto_verify
             ):
                 try:
@@ -628,6 +637,16 @@ class AgentRunner:
             if queue is not None and queue.empty():
                 self._steering.pop(session_id, None)
             await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
+        if context.mutation_tracking == "incomplete" and verification is None:
+            verification = {
+                "ok": False,
+                "steps": [],
+                "error": "Workspace mutation tracking is incomplete; verification is required.",
+                "roots": [
+                    context.roots.display(root)
+                    for root in sorted(context.changed_roots, key=lambda item: item.as_posix())
+                ],
+            }
         usage = budget.usage or Usage()
         result = AgentResult(
             session_id=session_id,
@@ -637,6 +656,7 @@ class AgentRunner:
             usage=usage,
             turns=budget.turns,
             changed_files=sorted(context.changed_files),
+            mutation_tracking=context.mutation_tracking,
             verification=verification,
             error=error_message,
             incomplete=stop_reason == StopReason.MAX_TURNS,
@@ -1210,7 +1230,7 @@ class AgentRunner:
         try:
             if call.name == "shell":
                 workspace_before = await self._await_until_cancelled(
-                    asyncio.to_thread(self._workspace_file_state), cancel
+                    self._workspace_snapshot(), cancel
                 )
             result = await self._await_until_cancelled(self.tools.execute(call, context), cancel)
         except (asyncio.CancelledError, Cancelled):
@@ -1219,6 +1239,17 @@ class AgentRunner:
                 is_error=True,
                 metadata={"cancelled": True},
             )
+            if workspace_before is not None:
+                try:
+                    workspace_after = await self._workspace_snapshot(
+                        timeout=_TOOL_FINALIZATION_GRACE_SECONDS
+                    )
+                except asyncio.CancelledError:
+                    workspace_after = None
+                self._record_workspace_changes(workspace_before, workspace_after, context)
+                cancelled_result.metadata["workspace_change_tracking"] = (
+                    context.mutation_tracking
+                )
             await asyncio.to_thread(
                 self.sessions.cancel_tool_call,
                 context.session_id,
@@ -1231,24 +1262,15 @@ class AgentRunner:
         try:
             if workspace_before is not None:
                 workspace_after = await self._finish_after_tool_result(
-                    asyncio.to_thread(self._workspace_file_state),
+                    self._workspace_snapshot(
+                        timeout=_TOOL_FINALIZATION_GRACE_SECONDS * 0.8
+                    ),
                     cancel,
                     required=False,
                 )
-                if workspace_after is None:
+                self._record_workspace_changes(workspace_before, workspace_after, context)
+                if context.mutation_tracking == "incomplete":
                     result.metadata["workspace_change_tracking"] = "incomplete"
-                    context.changed_roots.update(context.roots.roots)
-                else:
-                    changed_paths = {
-                        path
-                        for path in workspace_before.keys() | workspace_after.keys()
-                        if workspace_before.get(path) != workspace_after.get(path)
-                    }
-                    for path in changed_paths:
-                        entry = workspace_after.get(path) or workspace_before[path]
-                        root = entry[0]
-                        context.changed_files.add(self._display_workspace_path(path, root))
-                        context.changed_roots.add(root)
             if cancel.is_set():
                 await self._finish_after_tool_result(
                     asyncio.to_thread(
@@ -1324,6 +1346,79 @@ class AgentRunner:
             with contextlib.suppress(asyncio.CancelledError):
                 await cancel_task
 
+    async def _workspace_snapshot(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]] | None:
+        """Run a cooperatively cancellable scan outside the default executor."""
+
+        stop = threading.Event()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[
+            dict[Path, tuple[Path, int, int, int, int, int, str]] | None
+        ] = loop.create_future()
+
+        def scan() -> None:
+            try:
+                result = self._workspace_file_state(stop)
+            except BaseException as error:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_set_future_exception, future, error)
+            else:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_set_future_result, future, result)
+
+        threading.Thread(
+            target=scan,
+            name="borealis-workspace-snapshot",
+            daemon=True,
+        ).start()
+
+        async def stop_and_drain() -> None:
+            stop.set()
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=_WORKSPACE_SCAN_STOP_GRACE_SECONDS,
+                )
+
+        future.add_done_callback(
+            lambda completed: completed.exception() if not completed.cancelled() else None
+        )
+        try:
+            if timeout is None:
+                return await asyncio.shield(future)
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            except TimeoutError:
+                await stop_and_drain()
+                return None
+        except asyncio.CancelledError:
+            await stop_and_drain()
+            raise
+
+    def _record_workspace_changes(
+        self,
+        before: dict[Path, tuple[Path, int, int, int, int, int, str]],
+        after: dict[Path, tuple[Path, int, int, int, int, int, str]] | None,
+        context: ToolContext,
+    ) -> None:
+        if after is None:
+            context.mutation_tracking = "incomplete"
+            context.changed_roots.update(context.roots.roots)
+            return
+        changed_paths = {
+            path
+            for path in before.keys() | after.keys()
+            if before.get(path) != after.get(path)
+        }
+        for path in changed_paths:
+            entry = after.get(path) or before[path]
+            root = entry[0]
+            context.changed_files.add(self._display_workspace_path(path, root))
+            context.changed_roots.add(root)
+
     @staticmethod
     async def _finish_after_tool_result(
         operation: Awaitable[Any],
@@ -1364,26 +1459,48 @@ class AgentRunner:
             with contextlib.suppress(asyncio.CancelledError):
                 await cancel_task
 
+    @overload
     def _workspace_file_state(
         self,
-    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]]:
+        stop: None = None,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]]: ...
+
+    @overload
+    def _workspace_file_state(
+        self,
+        stop: threading.Event,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]] | None: ...
+
+    def _workspace_file_state(
+        self,
+        stop: threading.Event | None = None,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]] | None:
         storage = self.config.storage_dir
+        ignored_directories = set(self.config.context.ignored_dirs)
         state: dict[Path, tuple[Path, int, int, int, int, int, str]] = {}
         for root in self.tool_context.roots.roots:
+            if stop is not None and stop.is_set():
+                return None
             for current, directories, filenames in os.walk(root, followlinks=False):
+                if stop is not None and stop.is_set():
+                    return None
                 current_path = Path(current)
-                symlink_directories: list[str] = []
+                link_directories: list[str] = []
                 traversable_directories: list[str] = []
                 for name in directories:
+                    if stop is not None and stop.is_set():
+                        return None
                     path = current_path / name
-                    if name == ".git" or _path_is_within(path, storage):
+                    if name in ignored_directories or _path_is_within(path, storage):
                         continue
-                    if path.is_symlink():
-                        symlink_directories.append(name)
+                    if _is_non_traversable_directory(path):
+                        link_directories.append(name)
                     else:
                         traversable_directories.append(name)
                 directories[:] = traversable_directories
-                for name in [*filenames, *symlink_directories]:
+                for name in [*filenames, *link_directories]:
+                    if stop is not None and stop.is_set():
+                        return None
                     path = current_path / name
                     if _path_is_within(path, storage):
                         continue
@@ -1401,6 +1518,8 @@ class AgentRunner:
                         file_stat.st_ino,
                         fallback_digest,
                     )
+        if stop is not None and stop.is_set():
+            return None
         return state
 
     def _lexical_workspace_root(self, path: Path) -> Path:
@@ -1441,6 +1560,28 @@ def _file_change_signal(path: Path, file_stat: os.stat_result) -> tuple[int, str
         else:
             digest = ""
         return file_stat.st_ctime_ns, digest
+
+
+def _set_future_result(future: asyncio.Future[Any], result: Any) -> None:
+    if not future.done():
+        future.set_result(result)
+
+
+def _set_future_exception(future: asyncio.Future[Any], error: BaseException) -> None:
+    if not future.done():
+        future.set_exception(error)
+
+
+def _is_non_traversable_directory(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        if not _IS_WINDOWS:
+            return False
+        file_attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(file_attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 @cache

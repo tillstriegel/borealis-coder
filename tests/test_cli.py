@@ -610,17 +610,21 @@ class CLITests(unittest.TestCase):
             usage=Usage(input_tokens=1, output_tokens=2, cost_usd=0.5),
             turns=4,
             changed_files=["a"],
+            mutation_tracking="incomplete",
             verification={"ok": False},
             error="boom",
             incomplete=True,
         )
         footer = cli._result_footer(result)
         self.assertIn("changed=1", footer)
+        self.assertIn("mutation_tracking=incomplete", footer)
         self.assertIn("incomplete=true", footer)
         self.assertIn("verified=False", footer)
         self.assertIn("error=boom", footer)
         self.assertIn("incomplete · session preserved", interactive._turn_footer(result))
+        self.assertIn("mutation tracking incomplete", interactive._turn_footer(result))
         self.assertTrue(result.to_dict()["incomplete"])
+        self.assertEqual(result.to_dict()["mutation_tracking"], "incomplete")
 
     def test_renderer_streams_bounded_tool_output_without_repeating_it(self) -> None:
         async def render() -> str:

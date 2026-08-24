@@ -40,6 +40,7 @@ class ToolContext:
     changed_files: set[str] = field(default_factory=set)
     changed_roots: set[Path] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
+    mutation_tracking: str = "complete"
 
 
 class Tool:

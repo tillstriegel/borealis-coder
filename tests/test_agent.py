@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import AgentRunner, build_runner
@@ -124,6 +125,38 @@ class IncompleteProvider(Provider):
         return ModelResponse(
             text="partial answer",
             usage=Usage(input_tokens=20, output_tokens=3, requests=1),
+        )
+
+
+class RecoveringIncompleteProvider(Provider):
+    name = "recovering_incomplete"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.repeat = False
+        self.saw_continuation = False
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls > 1:
+            self.saw_continuation = any(
+                "continuation_state" in message.metadata for message in request.messages
+            )
+        if self.calls == 1 or self.repeat:
+            return ModelResponse(
+                text=f"partial-{self.calls}",
+                stop_reason="max_tokens",
+                usage=Usage(requests=1),
+                continuation_state=ContinuationState(
+                    kind="recovering.state",
+                    items=[{"type": "opaque", "value": f"state-{self.calls}"}],
+                ),
+            )
+        return ModelResponse(
+            text="complete answer",
+            stop_reason="end_turn",
+            usage=Usage(requests=1),
         )
 
 
@@ -923,6 +956,73 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_pre_final_incomplete_response_uses_remaining_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "recovering", "max_turns": 2},
+            )
+            config.providers["recovering"] = ProviderConfig(
+                type="recovering_incomplete",
+                model="recovering",
+                max_retries=0,
+            )
+            provider = RecoveringIncompleteProvider(config.providers["recovering"])
+            registry = ProviderRegistry()
+            registry.register("recovering_incomplete", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish the answer")
+
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertFalse(result.incomplete)
+                self.assertEqual(result.text, "complete answer")
+                self.assertEqual(result.turns, 2)
+                self.assertEqual(provider.calls, 2)
+                self.assertTrue(provider.saw_continuation)
+            finally:
+                await runner.close()
+
+    async def test_repeated_incomplete_response_exhausts_final_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "recovering", "max_turns": 2},
+            )
+            config.providers["recovering"] = ProviderConfig(
+                type="recovering_incomplete",
+                model="recovering",
+                max_retries=0,
+            )
+            provider = RecoveringIncompleteProvider(config.providers["recovering"])
+            provider.repeat = True
+            registry = ProviderRegistry()
+            registry.register("recovering_incomplete", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish the answer")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(result.text, "partial-2")
+                self.assertEqual(provider.calls, 2)
+                self.assertTrue(provider.saw_continuation)
+                self.assertIn("final response was incomplete", result.error or "")
+            finally:
+                await runner.close()
+
     async def test_offline_tool_cycle_resume_and_full_history(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1505,6 +1605,173 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_workspace_snapshot_prunes_configured_dependency_trees(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dependency_file = root / "node_modules" / "package" / "index.js"
+            dependency_file.parent.mkdir(parents=True)
+            dependency_file.write_text("before")
+            ignored_file = root / "ignored.txt"
+            ignored_file.write_text("before")
+            (root / ".gitignore").write_text("ignored.txt\n")
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            from borealis_coder.agent import runner as runner_module
+
+            original_change_signal = runner_module._file_change_signal
+
+            def reject_dependency_traversal(path, file_stat):
+                self.assertNotIn("node_modules", path.parts)
+                return original_change_signal(path, file_stat)
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner._file_change_signal",
+                    side_effect=reject_dependency_traversal,
+                ):
+                    before = runner._workspace_file_state()
+                    dependency_file.write_text("after")
+                    ignored_file.write_text("after")
+                    after = runner._workspace_file_state()
+
+                assert before is not None and after is not None
+                runner._record_workspace_changes(before, after, runner.tool_context)
+                self.assertNotIn(dependency_file.resolve(), before)
+                self.assertNotIn(dependency_file.resolve(), after)
+                self.assertIn(ignored_file.resolve(), before)
+                self.assertEqual(runner.tool_context.changed_files, {"ignored.txt"})
+            finally:
+                await runner.close()
+
+    async def test_shell_write_is_reconciled_after_cancellation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            command_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def write_then_block(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                command_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test cancelled shell mutation tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=write_then_block,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                task = asyncio.create_task(runner.run("write and block"))
+                await asyncio.wait_for(command_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                self.assertTrue(runner.cancel(session_id))
+                result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.changed_files, ["shell-mutated.txt"])
+                self.assertEqual(result.mutation_tracking, "complete")
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(
+                    tool_message.metadata["workspace_change_tracking"],
+                    "complete",
+                )
+            finally:
+                never_complete.set()
+                await runner.close()
+
+    async def test_cancelled_shell_exposes_incomplete_mutation_tracking(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            before = runner._workspace_file_state()
+            assert before is not None
+            command_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def write_then_block(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                command_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test incomplete shell mutation tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=write_then_block,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch.object(
+                    runner,
+                    "_workspace_snapshot",
+                    new_callable=AsyncMock,
+                    side_effect=[before, None],
+                ):
+                    task = asyncio.create_task(runner.run("write and block"))
+                    await asyncio.wait_for(command_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.cancel(session_id)
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.changed_files, [])
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertFalse(verification["ok"])
+                self.assertEqual(verification["roots"], ["."])
+            finally:
+                never_complete.set()
+                await runner.close()
+
     @unittest.skipIf(os.name == "nt", "POSIX permission bits are required")
     async def test_max_turns_verifies_shell_permission_changes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1601,8 +1868,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             release_snapshot = threading.Event()
             snapshot_calls = 0
 
-            def pause_after_snapshot():
+            def pause_after_snapshot(stop=None):
                 nonlocal snapshot_calls
+                del stop
                 snapshot_calls += 1
                 state = original_file_state()
                 if snapshot_calls == 2:
@@ -1656,7 +1924,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             release_snapshot = threading.Event()
             tool_executed = False
 
-            def pause_initial_snapshot():
+            def pause_initial_snapshot(stop=None):
+                del stop
                 snapshot_started.set()
                 release_snapshot.wait(timeout=2)
                 return {}
@@ -1746,6 +2015,65 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
         finally:
             release.set()
+
+    async def test_cancelling_real_threaded_snapshot_stops_the_scan(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            scan_started = threading.Event()
+            pause = threading.Event()
+            iterations = 0
+
+            def slow_walk(path, *, followlinks):
+                nonlocal iterations
+                del path, followlinks
+                for _ in range(1_000):
+                    scan_started.set()
+                    pause.wait(0.02)
+                    iterations += 1
+                    yield str(root), [], []
+
+            try:
+                with patch("borealis_coder.agent.runner.os.walk", side_effect=slow_walk):
+                    task = asyncio.create_task(runner._workspace_snapshot())
+                    started = await asyncio.to_thread(scan_started.wait, 1)
+                    self.assertTrue(started)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, timeout=0.3)
+
+                self.assertLess(iterations, 10)
+            finally:
+                pause.set()
+                await runner.close()
+
+    async def test_windows_reparse_directory_is_not_traversable(self):
+        from borealis_coder.agent import runner as runner_module
+
+        path = Path("junction")
+        with (
+            patch("borealis_coder.agent.runner._IS_WINDOWS", True),
+            patch.object(Path, "is_symlink", return_value=False),
+            patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_file_attributes=runner_module._WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+                ),
+            ),
+        ):
+            self.assertTrue(runner_module._is_non_traversable_directory(path))
+
+        with (
+            patch("borealis_coder.agent.runner._IS_WINDOWS", True),
+            patch.object(Path, "is_symlink", return_value=False),
+            patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(st_file_attributes=0),
+            ),
+        ):
+            self.assertFalse(runner_module._is_non_traversable_directory(path))
 
     @unittest.skipIf(os.name == "nt" or not hasattr(os, "symlink"), "symlinks unavailable")
     async def test_shell_tracks_file_and_directory_symlinks_without_following_targets(self):
