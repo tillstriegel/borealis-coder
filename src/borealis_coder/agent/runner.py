@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -12,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import Config
 from ..context import ContextBuilder
-from ..context.ignore import IgnoreMatcher, repository_files
 from ..errors import (
     BudgetExceeded,
     Cancelled,
@@ -32,6 +32,7 @@ from ..models import (
     Role,
     StopReason,
     ToolCall,
+    ToolResult,
     Usage,
 )
 from ..providers.base import Provider
@@ -524,14 +525,7 @@ class AgentRunner:
                     )
                 results = await self._execute_calls(response.tool_calls, cancel, context)
                 for call, result in zip(response.tool_calls, results, strict=True):
-                    tool_message = Message(
-                        role=Role.TOOL,
-                        content=result.output,
-                        tool_call_id=call.id,
-                        tool_name=call.name,
-                        is_error=result.is_error,
-                        metadata=result.metadata,
-                    )
+                    tool_message = self._tool_result_message(call, result)
                     messages.append(tool_message)
                     await asyncio.to_thread(self.sessions.append_message, session_id, tool_message)
                 await self._drain_steering(session_id, run_id, messages)
@@ -1232,7 +1226,9 @@ class AgentRunner:
             )
             raise
         if workspace_before is not None:
-            workspace_after = await asyncio.to_thread(self._workspace_file_state)
+            workspace_after = await self._finish_after_tool_result(
+                asyncio.to_thread(self._workspace_file_state)
+            )
             changed_paths = {
                 path
                 for path in workspace_before.keys() | workspace_after.keys()
@@ -1242,35 +1238,79 @@ class AgentRunner:
             context.changed_roots.update(
                 context.roots.resolve(path).root for path in changed_paths
             )
-        await asyncio.to_thread(
-            self.sessions.complete_tool_call,
-            context.session_id,
-            call.id,
-            output=result.output,
+        await self._finish_after_tool_result(
+            asyncio.to_thread(
+                self.sessions.complete_tool_call,
+                context.session_id,
+                call.id,
+                output=result.output,
+                is_error=result.is_error,
+                metadata=result.metadata,
+            )
+        )
+        if cancel.is_set():
+            tool_message = self._tool_result_message(call, result)
+            await self._finish_after_tool_result(
+                asyncio.to_thread(
+                    self.sessions.append_message,
+                    context.session_id,
+                    tool_message,
+                )
+            )
+            raise asyncio.CancelledError
+        return result
+
+    @staticmethod
+    def _tool_result_message(call: ToolCall, result: ToolResult) -> Message:
+        return Message(
+            role=Role.TOOL,
+            content=result.output,
+            tool_call_id=call.id,
+            tool_name=call.name,
             is_error=result.is_error,
             metadata=result.metadata,
         )
-        return result
 
-    def _workspace_file_state(self) -> dict[Path, tuple[int, int, str]]:
+    @staticmethod
+    async def _finish_after_tool_result(operation: Awaitable[Any]) -> Any:
+        """Finish durable bookkeeping after a tool has already returned."""
+
+        task = asyncio.ensure_future(operation)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The run's cancel event stops the loop at the next safe boundary.
+                continue
+        return task.result()
+
+    def _workspace_file_state(self) -> dict[Path, tuple[int, int, int, int, int]]:
         storage = self.config.storage_dir
-        state: dict[Path, tuple[int, int, str]] = {}
+        state: dict[Path, tuple[int, int, int, int, int]] = {}
         for root in self.tool_context.roots.roots:
-            matcher = (
-                self.context_builder.matcher
-                if root == self.workspace
-                else IgnoreMatcher(root, ignored_dirs=self.config.context.ignored_dirs)
-            )
-            for path in repository_files(root, matcher):
-                if path == storage or storage in path.parents:
-                    continue
-                try:
-                    stat = path.stat()
-                    with path.open("rb") as handle:
-                        digest = hashlib.file_digest(handle, "sha256").hexdigest()
-                except OSError:
-                    continue
-                state[path] = (stat.st_mtime_ns, stat.st_size, digest)
+            for current, directories, filenames in os.walk(root, followlinks=False):
+                current_path = Path(current)
+                directories[:] = [
+                    name
+                    for name in directories
+                    if name != ".git"
+                    and not _path_is_within(current_path / name, storage)
+                ]
+                for name in filenames:
+                    path = current_path / name
+                    if _path_is_within(path, storage):
+                        continue
+                    try:
+                        file_stat = path.lstat()
+                    except OSError:
+                        continue
+                    state[path] = (
+                        file_stat.st_mtime_ns,
+                        file_stat.st_ctime_ns,
+                        file_stat.st_size,
+                        file_stat.st_mode,
+                        file_stat.st_ino,
+                    )
         return state
 
     @staticmethod
@@ -1303,3 +1343,7 @@ def _is_incomplete_response(response: ModelResponse) -> bool:
         return bool(response.stop_reason)
     stop_reason = str(response.stop_reason or "").strip().lower()
     return stop_reason in _INCOMPLETE_STOP_REASONS
+
+
+def _path_is_within(path: Path, directory: Path) -> bool:
+    return path == directory or directory in path.parents

@@ -276,7 +276,7 @@ class OpenAIProvider(Provider):
                         "delta": data.get("delta", ""),
                     },
                 )
-            elif event_type in {"response.completed", "response.done"}:
+            elif event_type in {"response.completed", "response.done", "response.incomplete"}:
                 completed_data = (
                     data.get("response") if isinstance(data.get("response"), dict) else data
                 )

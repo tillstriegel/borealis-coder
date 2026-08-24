@@ -265,7 +265,6 @@ class ACPServer:
                 "content": [{"type": "text", "text": prompt}],
             },
         )
-        await self._update(session_id, {"sessionUpdate": "state_update", "state": "running"})
         task = asyncio.create_task(
             self._run_prompt(runner, session_id, prompt, message_id),
             name=f"acp:{session_id}",
@@ -310,7 +309,12 @@ class ACPServer:
 
     async def _event_update(self, session_id: str, runner: AgentRunner, event: Event) -> None:
         data = event.data
-        if event.type == "model.reasoning_delta" and data.get("text"):
+        if event.type == "run.started":
+            await self._update(
+                session_id,
+                {"sessionUpdate": "state_update", "state": "running"},
+            )
+        elif event.type == "model.reasoning_delta" and data.get("text"):
             await self._update(
                 session_id,
                 {

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -1432,6 +1434,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             extra_root = Path(extra)
             mutated_path = extra_root / "shell-mutated.txt"
             mutated_path.write_text("before")
+            (extra_root / ".gitignore").write_text("shell-mutated.txt\n")
             original_stat = mutated_path.stat()
             config = make_config(
                 root,
@@ -1500,6 +1503,135 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 assert process_call is not None
                 self.assertEqual(process_call.kwargs["cwd"], extra_root.resolve())
             finally:
+                await runner.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are required")
+    async def test_max_turns_verifies_shell_permission_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "script.sh"
+            mutated_path.write_text("#!/bin/sh\n")
+            original_mode = stat.S_IMODE(mutated_path.stat().st_mode)
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def mutate_permissions(arguments, context):
+                del arguments, context
+                mutated_path.chmod(original_mode ^ stat.S_IXUSR)
+                return ToolResult("changed permissions through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test shell permission tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_permissions,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("change permissions through shell")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, ["script.sh"])
+                verify.assert_awaited_once()
+            finally:
+                await runner.close()
+
+    async def test_shell_result_is_durable_when_cancelled_during_change_detection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def mutate_workspace(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                return ToolResult("changed through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test durable shell results.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_workspace,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            original_file_state = runner._workspace_file_state
+            after_snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            snapshot_calls = 0
+
+            def pause_after_snapshot():
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                state = original_file_state()
+                if snapshot_calls == 2:
+                    after_snapshot_started.set()
+                    release_snapshot.wait(timeout=2)
+                return state
+
+            try:
+                with patch.object(runner, "_workspace_file_state", side_effect=pause_after_snapshot):
+                    task = asyncio.create_task(runner.run("change a file through shell"))
+                    started = await asyncio.to_thread(after_snapshot_started.wait, 1)
+                    self.assertTrue(started)
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    release_snapshot.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(tool_call["status"], "completed")
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                ]
+                self.assertEqual(len(tool_messages), 1)
+                self.assertEqual(tool_messages[0].content, "changed through shell")
+            finally:
+                release_snapshot.set()
                 await runner.close()
 
     async def test_late_steering_is_durable_when_final_turn_is_already_running(self):

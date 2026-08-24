@@ -55,6 +55,22 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         prompt, arguments = runner.run_arguments
         self.assertEqual(prompt, "continue")
         self.assertTrue(arguments["wait_for_active_run"])
+        updates = [params["update"] for _, params in fake.notifications]
+        self.assertEqual([item["sessionUpdate"] for item in updates], ["user_message"])
+
+    async def test_run_started_sends_running_state(self):
+        server = ACPServer()
+        fake = FakeConnection()
+        server.connection = cast(Any, fake)
+
+        await server._event_update(
+            "session_1",
+            cast(Any, None),
+            Event(type="run.started", session_id="session_1"),
+        )
+
+        update = fake.notifications[0][1]["update"]
+        self.assertEqual(update, {"sessionUpdate": "state_update", "state": "running"})
 
     async def test_reasoning_summary_is_forwarded_as_agent_thought(self):
         server = ACPServer()

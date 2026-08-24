@@ -386,6 +386,49 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(partial.text, "partial")
         self.assertEqual(partial.tool_calls[0].arguments, {"_raw": "not-json"})
 
+    async def test_openai_responses_stream_preserves_incomplete_status(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(
+                type="openai",
+                base_url="https://example.test/v1",
+                api_style="responses",
+            ),
+            "secret",
+        )
+        provider.http = FakeHttp(  # type: ignore[assignment]
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {"type": "response.output_text.delta", "delta": "partial answer"}
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.incomplete",
+                            "response": {
+                                "id": "resp-incomplete",
+                                "model": "model",
+                                "status": "incomplete",
+                                "incomplete_details": {"reason": "max_output_tokens"},
+                                "output": [],
+                                "usage": {"input_tokens": 10, "output_tokens": 5},
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.text, "partial answer")
+        self.assertEqual(final.stop_reason, "incomplete")
+
     async def test_responses_emits_summary_found_only_in_completed_event(self) -> None:
         provider = OpenAIProvider(
             ProviderConfig(type="openai", base_url="https://openai.test/v1"),
