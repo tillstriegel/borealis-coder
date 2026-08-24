@@ -312,6 +312,12 @@ class AgentRunner:
                 turn_system = (
                     f"{system}\n\n{_FINAL_TURN_INSTRUCTION}" if final_turn else system
                 )
+                turn_system_blocks = prompt_context.system_blocks
+                if final_turn:
+                    turn_system_blocks = [
+                        *turn_system_blocks,
+                        {"text": _FINAL_TURN_INSTRUCTION, "cacheable": False},
+                    ]
                 estimated = estimate_request_tokens(turn_system, messages, schemas)
                 threshold = int(
                     self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio
@@ -360,7 +366,7 @@ class AgentRunner:
                         "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
                         "prompt_cache_ttl": self.config.cache.anthropic_ttl,
                         "anthropic_conversation_cache": conversation_cache,
-                        "system_blocks": prompt_context.system_blocks,
+                        "system_blocks": turn_system_blocks,
                     },
                 )
                 await self.events.emit(
@@ -423,7 +429,9 @@ class AgentRunner:
                     "model": response.model or used_route.model,
                     "response_id": response.response_id,
                 }
-                if response.continuation_state is not None:
+                if response.continuation_state is not None and not (
+                    final_turn and response.tool_calls
+                ):
                     continuation = response.continuation_state.to_metadata(
                         provider=used_route.name,
                         model=used_route.model,

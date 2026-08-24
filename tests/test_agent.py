@@ -145,9 +145,13 @@ class FinalTurnProvider(Provider):
     def __init__(self, config, api_key=""):
         super().__init__(config, api_key)
         self.tool_counts: list[int] = []
+        self.systems: list[str] = []
+        self.system_blocks: list[list[dict[str, object]]] = []
 
     async def complete(self, request):
         self.tool_counts.append(len(request.tools))
+        self.systems.append(request.system)
+        self.system_blocks.append(list(request.metadata["system_blocks"]))
         if len(self.tool_counts) == 1:
             return ModelResponse(
                 tool_calls=[
@@ -203,6 +207,17 @@ class DefiantFinalTurnProvider(Provider):
                     )
                 ],
                 usage=Usage(requests=1),
+                continuation_state=ContinuationState(
+                    kind="gemini.interactions.steps",
+                    items=[
+                        {
+                            "type": "function_call",
+                            "id": "rejected-call",
+                            "name": "write_file",
+                            "arguments": {"path": "must-not-run.txt"},
+                        }
+                    ],
+                ),
             )
         return ModelResponse(text="Resumed to completion.", usage=Usage(requests=1))
 
@@ -1068,6 +1083,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.turns, 2)
                 self.assertGreater(provider.tool_counts[0], 0)
                 self.assertEqual(provider.tool_counts[1], 0)
+                self.assertEqual(
+                    "\n\n".join(str(block["text"]) for block in provider.system_blocks[1]),
+                    provider.systems[1],
+                )
+                self.assertFalse(provider.system_blocks[1][-1]["cacheable"])
                 self.assertEqual((root / "completed.txt").read_text(), "done")
             finally:
                 await runner.close()
@@ -1110,6 +1130,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 persisted = runner.sessions.messages(result.session_id)
                 self.assertEqual(persisted[-1].role, Role.ASSISTANT)
                 self.assertEqual(persisted[-1].tool_calls, [])
+                self.assertNotIn("continuation_state", persisted[-1].metadata)
                 self.assertEqual(
                     runner.sessions.get_session(result.session_id).status,
                     "idle",
