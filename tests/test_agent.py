@@ -161,6 +161,34 @@ class RecoveringIncompleteProvider(Provider):
         )
 
 
+class TruncatedToolProvider(Provider):
+    name = "truncated_tool"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="truncated-call",
+                        name="permissive_mutator",
+                        arguments={"_raw": '{"path":"danger.txt"'},
+                    )
+                ],
+                stop_reason="length",
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            text="Recovered safely.",
+            stop_reason="end_turn",
+            usage=Usage(requests=1),
+        )
+
+
 class InflightSteeringIncompleteProvider(Provider):
     name = "inflight_steering_incomplete"
 
@@ -1191,6 +1219,59 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                         for item in recovery_input
                     )
                 )
+            finally:
+                await runner.close()
+
+    async def test_incomplete_provider_tool_call_is_never_executed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "truncated", "max_turns": 2},
+            )
+            config.providers["truncated"] = ProviderConfig(
+                type="truncated_tool",
+                model="truncated",
+                max_retries=0,
+            )
+            provider = TruncatedToolProvider(config.providers["truncated"])
+            registry = ProviderRegistry()
+            registry.register("truncated_tool", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            executions = 0
+
+            def mutate(arguments, context):
+                nonlocal executions
+                del arguments, context
+                executions += 1
+                return ToolResult("mutated")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="permissive_mutator",
+                    description="Accept arbitrary arguments for the regression.",
+                    parameters={"type": "object", "additionalProperties": True},
+                    function=mutate,
+                    effect=Effect.CONTROL,
+                )
+            )
+            try:
+                result = await runner.run("recover from a truncated call")
+
+                self.assertEqual(result.text, "Recovered safely.")
+                self.assertEqual(executions, 0)
+                self.assertEqual(runner.sessions.tool_calls(result.session_id), [])
+                first_assistant = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.ASSISTANT
+                )
+                self.assertEqual(first_assistant.tool_calls, [])
             finally:
                 await runner.close()
 
@@ -2428,6 +2509,76 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(verification)
                 assert verification is not None
                 self.assertEqual(verification["roots"], ["."])
+            finally:
+                await runner.close()
+
+    async def test_git_commit_cancel_race_marks_mutation_tracking_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            git_dir = root / ".git"
+            git_dir.mkdir()
+            head = git_dir / "HEAD"
+            head.write_text("before\n")
+            config = make_config(
+                root,
+                agent={"provider": "git_commit_race", "max_turns": 2},
+                safety={"allow_git_commit": True},
+            )
+            config.providers["git_commit_race"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="git-commit-race",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["git_commit_race"]
+            )
+            provider.tool_name = "git_commit"
+            provider.tool_arguments = {"message": "race commit"}
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            async def commit_then_cancel(command, **kwargs):
+                del command, kwargs
+                head.write_text("after\n")
+                session_id = next(iter(runner._cancel))
+                self.assertTrue(runner.cancel(session_id))
+                return ProcessResult(
+                    command="git commit",
+                    exit_code=0,
+                    stdout="committed",
+                    stderr="",
+                    duration_ms=1,
+                    lifecycle_complete=True,
+                )
+
+            try:
+                with patch.object(
+                    runner.tool_context.process,
+                    "run",
+                    new=AsyncMock(side_effect=commit_then_cancel),
+                ):
+                    result = await runner.run("commit the staged change")
+
+                self.assertEqual(head.read_text(), "after\n")
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(tool_call["status"], "cancelled")
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(
+                    tool_message.metadata["workspace_change_tracking"],
+                    "incomplete",
+                )
             finally:
                 await runner.close()
 

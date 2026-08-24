@@ -13,6 +13,8 @@ from ..util import json_dumps
 from .base import Provider, ProviderStreamEvent
 from .http import HttpClient
 
+_INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
+
 
 class AnthropicProvider(Provider):
     name = "anthropic"
@@ -81,6 +83,7 @@ class AnthropicProvider(Provider):
         payload = self._payload(request, stream=True)
         text_parts: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
+        completed_call_indexes: set[int] = set()
         usage = Usage(requests=1)
         message_id: str | None = None
         model: str | None = None
@@ -130,6 +133,10 @@ class AnthropicProvider(Provider):
                             "delta": partial,
                         },
                     )
+            elif event_type == "content_block_stop":
+                index = int(data.get("index", 0))
+                if index in calls:
+                    completed_call_indexes.add(index)
             elif event_type == "message_delta":
                 delta = data.get("delta") or {}
                 stop_reason = delta.get("stop_reason") or stop_reason
@@ -141,7 +148,9 @@ class AnthropicProvider(Provider):
                 error = data.get("error") or {}
                 raise ProviderError(str(error.get("message") or error))
         tool_calls: list[ToolCall] = []
-        for _, item in sorted(calls.items()):
+        for index, item in sorted(calls.items()):
+            if index not in completed_call_indexes:
+                continue
             raw = str(item.get("arguments") or "")
             arguments = _parse_arguments(raw) if raw else dict(item.get("input") or {})
             tool_calls.append(
@@ -212,12 +221,13 @@ class AnthropicProvider(Provider):
     ) -> ModelResponse:
         text: list[str] = []
         calls: list[ToolCall] = []
+        response_incomplete = _is_incomplete_stop_reason(data.get("stop_reason"))
         for block in data.get("content", []) or []:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text":
                 text.append(str(block.get("text") or ""))
-            elif block.get("type") == "tool_use":
+            elif block.get("type") == "tool_use" and not response_incomplete:
                 arguments = block.get("input") or {}
                 calls.append(
                     ToolCall(
@@ -270,6 +280,10 @@ def _parse_arguments(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"_raw": raw}
     return value if isinstance(value, dict) else {"value": value}
+
+
+def _is_incomplete_stop_reason(value: Any) -> bool:
+    return str(value or "").strip().lower() in _INCOMPLETE_STOP_REASONS
 
 
 def _system_blocks(request: ProviderRequest) -> list[dict[str, Any]]:

@@ -70,6 +70,7 @@ class GitCommitTool(Tool):
     name = "git_commit"
     description = "Create a local git commit from already staged changes. Never stages files automatically."
     effect = Effect.WRITE
+    mutation_scope = MutationScope.EXTERNAL
     default_risk = "high"
     parameters = object_schema({"message": {"type": "string", "minLength": 1, "maxLength": 1000}})
 

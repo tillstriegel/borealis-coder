@@ -959,6 +959,59 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProviderError):
             await provider.complete(self.request)
 
+    async def test_openai_chat_stream_hides_length_truncated_tool_call(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(type="openai_compatible", base_url="https://chat.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "id": "truncated-chat",
+                            "choices": [
+                                {
+                                    "finish_reason": None,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": "truncated-call",
+                                                "function": {
+                                                    "name": "write_file",
+                                                    "arguments": '{"path":"danger.txt"',
+                                                },
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "choices": [
+                                {"finish_reason": "length", "delta": {}}
+                            ]
+                        }
+                    ),
+                ),
+                SSEEvent("message", "[DONE]"),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.stop_reason, "length")
+        self.assertEqual(final.tool_calls, [])
+
     async def test_chat_reasoning_streams_text_before_response_finishes(self) -> None:
         provider = OpenRouterProvider(
             ProviderConfig(
@@ -1594,6 +1647,10 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             ),
             SSEEvent(
                 "message",
+                json.dumps({"type": "content_block_stop", "index": 1}),
+            ),
+            SSEEvent(
+                "message",
                 json.dumps(
                     {
                         "type": "message_delta",
@@ -1669,6 +1726,62 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         cast(Any, provider).http = FakeHttp(data="bad")
         with self.assertRaises(ProviderError):
             await provider.complete(self.request)
+
+    async def test_anthropic_stream_hides_max_tokens_truncated_tool_call(self) -> None:
+        provider = AnthropicProvider(
+            ProviderConfig(type="anthropic", base_url="https://anthropic.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": "truncated-call",
+                                "name": "write_file",
+                                "input": {},
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": '{"path":"danger.txt"',
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "max_tokens"},
+                            "usage": {"output_tokens": 4},
+                        }
+                    ),
+                ),
+                SSEEvent("message", json.dumps({"type": "message_stop"})),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.stop_reason, "max_tokens")
+        self.assertEqual(final.tool_calls, [])
 
     async def test_gemini_stream_complete_partial_and_helpers(self) -> None:
         provider = GeminiProvider(

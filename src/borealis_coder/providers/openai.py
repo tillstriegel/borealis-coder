@@ -15,6 +15,8 @@ from ..util import json_dumps
 from .base import Provider, ProviderStreamEvent, classify_provider_error
 from .http import HttpClient
 
+_INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
+
 
 class OpenAIProvider(Provider):
     name = "openai"
@@ -584,6 +586,12 @@ class OpenAIProvider(Provider):
                     pending_reasoning.append(event)
                     continue
                 if event.type == "completed" and event.response is not None:
+                    if _is_incomplete_stop_reason(event.response.stop_reason):
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                        yield event
+                        return
                     if _has_actionable_output(event.response):
                         for pending in pending_reasoning:
                             yield pending
@@ -618,6 +626,13 @@ class OpenAIProvider(Provider):
                         pending_reasoning.append(event)
                         continue
                     if event.type == "completed" and event.response is not None:
+                        if _is_incomplete_stop_reason(event.response.stop_reason):
+                            event.response.usage = prior_usage.add(event.response.usage)
+                            for pending in pending_reasoning:
+                                yield pending
+                            pending_reasoning.clear()
+                            yield event
+                            return
                         if not _has_actionable_output(event.response):
                             usage = _copy_usage(prior_usage).add(event.response.usage)
                             event.response.reasoning_summary = ""
@@ -716,9 +731,13 @@ class OpenAIProvider(Provider):
                             "delta": function.get("arguments", ""),
                         },
                     )
+        completed_calls = {} if _is_incomplete_stop_reason(finish_reason) else calls
         result = ModelResponse(
             text="".join(text_parts),
-            tool_calls=[self._call_from_partial(item) for _, item in sorted(calls.items())],
+            tool_calls=[
+                self._call_from_partial(item)
+                for _, item in sorted(completed_calls.items())
+            ],
             usage=usage,
             stop_reason=finish_reason,
             response_id=response_id,
@@ -734,7 +753,12 @@ class OpenAIProvider(Provider):
         choice = choices[0]
         message = choice.get("message") or {}
         calls: list[ToolCall] = []
-        for item in message.get("tool_calls", []) or []:
+        raw_calls = (
+            []
+            if _is_incomplete_stop_reason(choice.get("finish_reason"))
+            else message.get("tool_calls", []) or []
+        )
+        for item in raw_calls:
             function = item.get("function") or {}
             raw_arguments = function.get("arguments") or "{}"
             calls.append(
@@ -1079,6 +1103,10 @@ def _parse_arguments(value: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"_raw": str(value)}
     return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _is_incomplete_stop_reason(value: Any) -> bool:
+    return str(value or "").strip().lower() in _INCOMPLETE_STOP_REASONS
 
 
 def _strict_schema_compatible(schema: dict[str, Any]) -> bool:

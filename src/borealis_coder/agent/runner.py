@@ -455,12 +455,16 @@ class AgentRunner:
                     provider=used_route.name,
                     model=used_route.model,
                 )
+                response_incomplete = _is_incomplete_response(response)
+                response_tool_calls = (
+                    [] if response_incomplete else response.tool_calls
+                )
                 assistant_metadata = {
                     "model": response.model or used_route.model,
                     "response_id": response.response_id,
                 }
                 if response.continuation_state is not None and not (
-                    final_turn and response.tool_calls
+                    final_turn and response_tool_calls
                 ):
                     continuation = response.continuation_state.to_metadata(
                         provider=used_route.name,
@@ -474,7 +478,7 @@ class AgentRunner:
                     id=assistant_message_id,
                     role=Role.ASSISTANT,
                     content=response.text,
-                    tool_calls=[] if final_turn else response.tool_calls,
+                    tool_calls=[] if final_turn else response_tool_calls,
                     metadata=assistant_metadata,
                 )
                 messages.append(assistant)
@@ -488,16 +492,15 @@ class AgentRunner:
                     text=response.text,
                     reasoning_summary=response.reasoning_summary,
                     tool_calls=(
-                        [] if final_turn else [call.to_dict() for call in response.tool_calls]
+                        [] if final_turn else [call.to_dict() for call in response_tool_calls]
                     ),
                     usage=response.usage.to_dict(),
                     stop_reason=response.stop_reason,
                 )
                 if response.text:
                     final_text = response.text
-                response_incomplete = _is_incomplete_response(response)
                 final_response_incomplete = final_turn and response_incomplete
-                if final_turn and (response.tool_calls or final_response_incomplete):
+                if final_turn and (response_tool_calls or final_response_incomplete):
                     await self._drain_steering(session_id, run_id, messages)
                     recovery_message = max_turns_recovery_message(
                         self.config.agent.max_turns
@@ -514,10 +517,10 @@ class AgentRunner:
                     )
                 if usage_budget_error is not None:
                     raise usage_budget_error
-                if response_incomplete and not response.tool_calls:
+                if response_incomplete:
                     await self._drain_steering(session_id, run_id, messages)
                     continue
-                if not response.tool_calls:
+                if not response_tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
                         continue
                     break
@@ -525,7 +528,7 @@ class AgentRunner:
                     json_dumps(
                         [
                             {"name": call.name, "arguments": call.arguments}
-                            for call in response.tool_calls
+                            for call in response_tool_calls
                         ]
                     ).encode()
                 ).hexdigest()
@@ -541,7 +544,7 @@ class AgentRunner:
                         f"Repeated identical tool-call batch {repeated_batch_count} times",
                     )
                 tool_messages = await self._execute_calls(
-                    response.tool_calls,
+                    response_tool_calls,
                     cancel,
                     context,
                 )

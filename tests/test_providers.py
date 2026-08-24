@@ -253,6 +253,52 @@ class ProviderAdapterTests(unittest.TestCase):
         self.assertEqual(parsed.text, "ok")
         self.assertEqual(parsed.tool_calls[0].name, "read_file")
 
+    def test_incomplete_non_stream_responses_hide_tool_calls(self):
+        openai = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://x", api_style="chat"),
+            "key",
+        )._parse_chat(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "partial",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": '{"path":"danger.txt"',
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            retain_raw=False,
+        )
+        anthropic = AnthropicProvider(
+            ProviderConfig(type="anthropic", base_url="https://x"),
+            "key",
+        )._parse(
+            {
+                "stop_reason": "max_tokens",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "partial",
+                        "name": "write_file",
+                        "input": {"path": "danger.txt"},
+                    }
+                ],
+            },
+            retain_raw=False,
+        )
+
+        self.assertEqual(openai.tool_calls, [])
+        self.assertEqual(anthropic.tool_calls, [])
+
     def test_gemini_payload_and_parser(self):
         provider = GeminiProvider(ProviderConfig(type="gemini", base_url="https://x"), "key")
         payload = provider._payload(self.request)
