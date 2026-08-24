@@ -531,6 +531,21 @@ class EmptyProvider(Provider):
         return ModelResponse(stop_reason="stop")
 
 
+class EmptyIncompleteProvider(Provider):
+    name = "empty_incomplete"
+
+    async def complete(self, request):
+        return ModelResponse(
+            stop_reason="incomplete",
+            reasoning_summary="More reasoning is required.",
+            usage=Usage(input_tokens=3, output_tokens=2, requests=1),
+            continuation_state=ContinuationState(
+                kind="empty-incomplete.state",
+                items=[{"type": "opaque", "value": "resume-me"}],
+            ),
+        )
+
+
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_event_persistence_failure_cannot_return_a_successful_run(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1196,6 +1211,47 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_empty_incomplete_response_uses_max_turn_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "empty_incomplete", "max_turns": 1},
+            )
+            config.providers["empty_incomplete"] = ProviderConfig(
+                type="empty_incomplete",
+                model="empty-incomplete",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register(
+                "empty_incomplete",
+                lambda cfg, key: EmptyIncompleteProvider(cfg, key),
+            )
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("continue reasoning")
+                messages = runner.sessions.messages(result.session_id)
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(result.text, "")
+                self.assertIn("final response was incomplete", result.error or "")
+                self.assertFalse(
+                    any(
+                        event.type == "model.route_failed"
+                        for _, event in runner.sessions.events(result.session_id)
+                    )
+                )
+                self.assertIn("continuation_state", messages[-1].metadata)
+            finally:
+                await runner.close()
+
     async def test_cancel(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1823,6 +1879,98 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(dependency_file.resolve(), after)
                 self.assertIn(ignored_file.resolve(), before)
                 self.assertEqual(runner.tool_context.changed_files, {"ignored.txt"})
+            finally:
+                await runner.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory permission bits are required")
+    async def test_workspace_snapshot_tracks_empty_directory_mutations(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            deleted = root / "deleted-directory"
+            renamed = root / "renamed-directory"
+            permissions = root / "permission-directory"
+            deleted.mkdir()
+            renamed.mkdir()
+            permissions.mkdir()
+            original_mode = stat.S_IMODE(permissions.stat().st_mode)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                before = runner._workspace_file_state()
+                (root / "created-directory").mkdir()
+                deleted.rmdir()
+                renamed.rename(root / "renamed-directory-new")
+                permissions.chmod(original_mode ^ stat.S_IXUSR)
+                after = runner._workspace_file_state()
+
+                assert before is not None and after is not None
+                runner._record_workspace_changes(before, after, runner.tool_context)
+
+                self.assertEqual(
+                    runner.tool_context.changed_files,
+                    {
+                        "created-directory",
+                        "deleted-directory",
+                        "permission-directory",
+                        "renamed-directory",
+                        "renamed-directory-new",
+                    },
+                )
+                self.assertEqual(runner.tool_context.changed_roots, {root.resolve()})
+            finally:
+                await runner.close()
+
+    async def test_max_turns_verifies_empty_directory_created_by_shell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def create_directory(arguments, context):
+                del arguments, context
+                (root / "empty-directory").mkdir()
+                return ToolResult("created empty directory through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test empty directory tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=create_directory,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("create an empty directory through shell")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, ["empty-directory"])
+                verify.assert_awaited_once()
+                verification_call = verify.await_args
+                assert verification_call is not None
+                verified_context = verification_call.args[0]
+                self.assertEqual(verified_context.changed_roots, {root.resolve()})
             finally:
                 await runner.close()
 

@@ -72,6 +72,21 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error, result.output)
         self.assertFalse((self.root/"b.txt").exists())
 
+    async def test_make_directory_tracks_new_directories_and_root(self):
+        result = await self.call("make_directory", {"path": "parent/child"})
+
+        self.assertFalse(result.is_error, result.output)
+        self.assertTrue((self.root / "parent" / "child").is_dir())
+        self.assertEqual(self.context.changed_files, {"parent", "parent/child"})
+        self.assertEqual(self.context.changed_roots, {self.root.resolve()})
+
+        self.context.changed_files.clear()
+        self.context.changed_roots.clear()
+        existing = await self.call("make_directory", {"path": "parent/child"})
+        self.assertFalse(existing.is_error, existing.output)
+        self.assertEqual(self.context.changed_files, set())
+        self.assertEqual(self.context.changed_roots, set())
+
     async def test_patch_prevalidation_is_atomic(self):
         (self.root/"a.txt").write_text("a\n")
         (self.root/"b.txt").write_text("b\n")

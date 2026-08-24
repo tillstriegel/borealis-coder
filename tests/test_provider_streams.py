@@ -429,6 +429,64 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.text, "partial answer")
         self.assertEqual(final.stop_reason, "incomplete")
 
+    async def test_openai_responses_stream_preserves_empty_incomplete_state(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(
+                type="openai",
+                base_url="https://example.test/v1",
+                api_style="responses",
+            ),
+            "secret",
+        )
+        provider.http = FakeHttp(  # type: ignore[assignment]
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.incomplete",
+                            "response": {
+                                "id": "resp-incomplete-reasoning",
+                                "model": "model",
+                                "status": "incomplete",
+                                "incomplete_details": {"reason": "max_output_tokens"},
+                                "output": [
+                                    {
+                                        "type": "reasoning",
+                                        "id": "reasoning_1",
+                                        "encrypted_content": "opaque-state",
+                                        "summary": [],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 10, "output_tokens": 5},
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        self.assertEqual([item.type for item in streamed], ["completed"])
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.text, "")
+        self.assertEqual(final.tool_calls, [])
+        self.assertEqual(final.stop_reason, "incomplete")
+        assert final.continuation_state is not None
+        self.assertEqual(
+            final.continuation_state.items,
+            [
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_1",
+                    "encrypted_content": "opaque-state",
+                    "summary": [],
+                }
+            ],
+        )
+
     async def test_responses_emits_summary_found_only_in_completed_event(self) -> None:
         provider = OpenAIProvider(
             ProviderConfig(type="openai", base_url="https://openai.test/v1"),

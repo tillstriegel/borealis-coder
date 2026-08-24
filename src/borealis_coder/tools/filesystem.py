@@ -169,7 +169,16 @@ class MakeDirectoryTool(Tool):
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         resolved = context.roots.resolve(arguments["path"])
         context.roots.assert_writable(resolved.path, context.config.safety.protected_paths)
+        missing_directories: list[Path] = []
+        candidate = resolved.path
+        while not candidate.exists() and candidate != resolved.root:
+            missing_directories.append(candidate)
+            candidate = candidate.parent
         resolved.path.mkdir(parents=True, exist_ok=True)
+        for path in missing_directories:
+            context.changed_files.add(context.roots.display(path))
+        if missing_directories:
+            context.changed_roots.add(resolved.root)
         return ToolResult(f"Directory ready: {resolved.display}", metadata={"path": resolved.display})
 
 

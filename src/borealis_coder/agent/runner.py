@@ -547,7 +547,7 @@ class AgentRunner:
                     await asyncio.to_thread(self.sessions.append_message, session_id, tool_message)
                 await self._drain_steering(session_id, run_id, messages)
             if (
-                context.changed_files or context.mutation_tracking == "incomplete"
+                context.changed_roots or context.mutation_tracking == "incomplete"
             ) and self.config.agent.auto_verify:
                 verification = await self._verify_changes(context)
         except Cancelled as error:
@@ -578,7 +578,7 @@ class AgentRunner:
             if (
                 stop_reason == StopReason.MAX_TURNS
                 and verification is None
-                and (context.changed_files or context.mutation_tracking == "incomplete")
+                and (context.changed_roots or context.mutation_tracking == "incomplete")
                 and self.config.agent.auto_verify
             ):
                 try:
@@ -1144,7 +1144,11 @@ class AgentRunner:
                 completed.reasoning_summary = self._redact_reasoning_summary(
                     completed.reasoning_summary
                 )
-                if not completed.text and not completed.tool_calls:
+                if (
+                    not completed.text
+                    and not completed.tool_calls
+                    and not _is_incomplete_response(completed)
+                ):
                     usage = replace(completed.usage)
                     raise ProviderUnavailableError(
                         f"Provider {route.name} returned an empty response",
@@ -1514,7 +1518,7 @@ class AgentRunner:
                     else:
                         traversable_directories.append(name)
                 directories[:] = traversable_directories
-                for name in [*filenames, *link_directories]:
+                for name in [*filenames, *traversable_directories, *link_directories]:
                     if stop is not None and stop.is_set():
                         return None
                     path = current_path / name
