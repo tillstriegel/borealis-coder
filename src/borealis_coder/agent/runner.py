@@ -540,11 +540,13 @@ class AgentRunner:
                         "stuck",
                         f"Repeated identical tool-call batch {repeated_batch_count} times",
                     )
-                results = await self._execute_calls(response.tool_calls, cancel, context)
-                for call, result in zip(response.tool_calls, results, strict=True):
-                    tool_message = self._tool_result_message(call, result)
+                tool_messages = await self._execute_calls(
+                    response.tool_calls,
+                    cancel,
+                    context,
+                )
+                for tool_message in tool_messages:
                     messages.append(tool_message)
-                    await asyncio.to_thread(self.sessions.append_message, session_id, tool_message)
                 await self._drain_steering(session_id, run_id, messages)
             if (
                 context.changed_roots or context.mutation_tracking == "incomplete"
@@ -701,6 +703,9 @@ class AgentRunner:
                 break
         verification = {
             "ok": not skipped_roots and all(report.ok for _, report in reports),
+            "process_lifecycle_complete": all(
+                report.lifecycle_complete for _, report in reports
+            ),
             "steps": [
                 {
                     **step,
@@ -718,6 +723,8 @@ class AgentRunner:
             verification["error"] = (
                 f"Verification time budget was too small for {skipped_roots} root(s)"
             )
+        if not verification["process_lifecycle_complete"]:
+            self._mark_workspace_tracking_incomplete(context)
         await self.events.emit(
             "verification.completed",
             session_id=context.session_id,
@@ -1203,7 +1210,7 @@ class AgentRunner:
         cancel: asyncio.Event,
         context: ToolContext,
     ):
-        results: dict[str, Any] = {}
+        messages: dict[str, Message] = {}
         reads: list[ToolCall] = []
         writes: list[ToolCall] = []
         for call in calls:
@@ -1219,17 +1226,20 @@ class AgentRunner:
         if reads:
             read_tasks = [asyncio.create_task(run_read(call)) for call in reads]
             try:
-                read_results = await asyncio.gather(*read_tasks)
+                read_messages = await asyncio.gather(*read_tasks)
             except BaseException:
                 await asyncio.gather(*read_tasks, return_exceptions=True)
                 raise
-            results.update(
-                {call.id: result for call, result in zip(reads, read_results, strict=True)}
+            messages.update(
+                {
+                    call.id: message
+                    for call, message in zip(reads, read_messages, strict=True)
+                }
             )
         for call in writes:
             self._check_cancel(cancel)
-            results[call.id] = await self._execute_one(call, context, cancel)
-        return [results[call.id] for call in calls]
+            messages[call.id] = await self._execute_one(call, context, cancel)
+        return [messages[call.id] for call in calls]
 
     async def _execute_one(
         self,
@@ -1330,6 +1340,7 @@ class AgentRunner:
                     output=result.output,
                     is_error=result.is_error,
                     metadata=result.metadata,
+                    message=cancellation_message,
                 ),
                 cancel,
             )
@@ -1349,7 +1360,7 @@ class AgentRunner:
                 )
             )
             raise
-        return result
+        return cancellation_message
 
     @staticmethod
     def _tool_result_message(call: ToolCall, result: ToolResult) -> Message:

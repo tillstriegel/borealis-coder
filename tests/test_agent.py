@@ -27,6 +27,7 @@ from borealis_coder.models import (
 from borealis_coder.providers.base import Provider, ProviderStreamEvent
 from borealis_coder.providers.http import SSEEvent
 from borealis_coder.providers.mock import MockProvider
+from borealis_coder.providers.openai import OpenAIProvider
 from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.providers.registry import ProviderRegistry
 from borealis_coder.safety import ProcessResult
@@ -1052,6 +1053,147 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_incomplete_partial_openai_call_is_recovered_without_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "partial_openai", "max_turns": 2},
+            )
+            config.providers["partial_openai"] = ProviderConfig(
+                type="partial_openai",
+                model="partial-openai",
+                base_url="https://example.test/v1",
+                api_style="responses",
+                max_retries=0,
+            )
+            partial_arguments = json.dumps(
+                {
+                    "path": "must-not-run.txt",
+                    "content": "partial",
+                    "expected_sha256": None,
+                }
+            )
+            first = [
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.output_item.added",
+                            "item": {
+                                "type": "function_call",
+                                "id": "partial-item",
+                                "call_id": "partial-call",
+                                "name": "write_file",
+                                "arguments": "",
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "call_id": "partial-call",
+                            "delta": partial_arguments,
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.incomplete",
+                            "response": {
+                                "id": "partial-response",
+                                "model": "partial-openai",
+                                "status": "incomplete",
+                                "incomplete_details": {
+                                    "reason": "max_output_tokens"
+                                },
+                                "output": [
+                                    {
+                                        "type": "reasoning",
+                                        "id": "reasoning-partial",
+                                        "encrypted_content": "resume-partial",
+                                        "summary": [],
+                                    },
+                                    {
+                                        "type": "function_call",
+                                        "id": "partial-item",
+                                        "call_id": "partial-call",
+                                        "name": "write_file",
+                                        "arguments": partial_arguments,
+                                        "status": "in_progress",
+                                    },
+                                ],
+                                "usage": {"input_tokens": 2, "output_tokens": 1},
+                            },
+                        }
+                    ),
+                ),
+            ]
+            second = [
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "complete-response",
+                                "model": "partial-openai",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "Recovered safely.",
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 3, "output_tokens": 2},
+                            },
+                        }
+                    ),
+                )
+            ]
+            fake_http = FakeOpenAIStreamHttp([first, second])
+
+            def factory(cfg, key):
+                provider = OpenAIProvider(cfg, key)
+                provider.http = fake_http  # type: ignore[assignment]
+                return provider
+
+            registry = ProviderRegistry()
+            registry.register("partial_openai", factory)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("recover a partial tool call")
+
+                self.assertEqual(result.text, "Recovered safely.")
+                self.assertFalse((root / "must-not-run.txt").exists())
+                self.assertEqual(runner.sessions.tool_calls(result.session_id), [])
+                self.assertEqual(len(fake_http.calls), 2)
+                recovery_input = fake_http.calls[1][1]["payload"]["input"]
+                self.assertTrue(
+                    any(
+                        item.get("encrypted_content") == "resume-partial"
+                        for item in recovery_input
+                    )
+                )
+            finally:
+                await runner.close()
+
     async def test_pre_final_incomplete_response_drains_inflight_steering(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1372,6 +1514,88 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 never_complete.set()
                 await runner.close()
 
+    async def test_parallel_read_success_persists_message_before_batch_cancellation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "parallel"})
+            config.providers["parallel"] = ProviderConfig(
+                type="parallel_reads",
+                model="parallel",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register(
+                "parallel_reads",
+                lambda cfg, key: ParallelReadProvider(cfg, key),
+            )
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            fast_persisted = threading.Event()
+
+            async def fast_read(arguments, context):
+                del arguments, context
+                return ToolResult("fast result")
+
+            async def cancelled_read(arguments, context):
+                del arguments, context
+                await asyncio.to_thread(fast_persisted.wait, 1)
+                raise asyncio.CancelledError
+
+            runner.tools.register(
+                FunctionTool(
+                    name="fast_read",
+                    description="Complete before the parallel batch is cancelled.",
+                    parameters=object_schema({}),
+                    function=fast_read,
+                    concurrent=True,
+                )
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="blocked_read",
+                    description="Cancel the parallel batch after the first result.",
+                    parameters=object_schema({}),
+                    function=cancelled_read,
+                    concurrent=True,
+                )
+            )
+            original_complete_tool_call = runner.sessions.complete_tool_call
+
+            def record_completion(session_id, call_id, **kwargs):
+                original_complete_tool_call(session_id, call_id, **kwargs)
+                if call_id == "fast-read":
+                    fast_persisted.set()
+
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "complete_tool_call",
+                    side_effect=record_completion,
+                ):
+                    result = await runner.run("read in parallel")
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                tool_calls = {
+                    call["tool_call_id"]: call
+                    for call in runner.sessions.tool_calls(result.session_id)
+                }
+                self.assertEqual(tool_calls["fast-read"]["status"], "completed")
+                fast_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                    and message.tool_call_id == "fast-read"
+                ]
+                self.assertEqual(len(fast_messages), 1)
+                self.assertEqual(fast_messages[0].content, "fast result")
+            finally:
+                fast_persisted.set()
+                await runner.close()
+
     async def test_max_time_is_an_end_to_end_deadline(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1542,7 +1766,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     result = await task
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertTrue(result.incomplete)
-                self.assertEqual(result.verification, {"ok": True, "steps": []})
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": True,
+                        "process_lifecycle_complete": True,
+                        "steps": [],
+                    },
+                )
                 verify.assert_awaited_once()
                 self.assertEqual((root / "durable.txt").read_text(), "durable")
                 self.assertFalse((root / "must-not-run.txt").exists())
@@ -1820,8 +2051,72 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.incomplete)
                 self.assertIn("maximum 2 model turns reached", result.error or "")
                 self.assertIn("exceeded $1.00", result.error or "")
-                self.assertEqual(result.verification, {"ok": True, "steps": []})
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": True,
+                        "process_lifecycle_complete": True,
+                        "steps": [],
+                    },
+                )
                 verify.assert_awaited_once()
+            finally:
+                await runner.close()
+
+    async def test_automatic_verification_propagates_incomplete_process_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            report = VerificationReport(
+                ok=True,
+                steps=[
+                    {
+                        "name": "Detached verification",
+                        "command": "true",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "",
+                        "stderr": "",
+                        "process_lifecycle_complete": False,
+                    }
+                ],
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=report,
+                ):
+                    result = await runner.run("make a durable change")
+
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                assert result.verification is not None
+                self.assertFalse(
+                    result.verification["process_lifecycle_complete"]
+                )
+                self.assertFalse(
+                    result.verification["steps"][0][
+                        "process_lifecycle_complete"
+                    ]
+                )
             finally:
                 await runner.close()
 
@@ -1997,7 +2292,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertEqual(result.changed_files, ["verify-generated.txt"])
-                self.assertEqual(result.verification, {"ok": True, "steps": []})
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": True,
+                        "process_lifecycle_complete": True,
+                        "steps": [],
+                    },
+                )
             finally:
                 await runner.close()
 

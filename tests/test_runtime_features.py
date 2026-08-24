@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import (
@@ -708,6 +709,56 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result.stdout, "€")
             self.assertEqual("".join(chunks), "€")
+
+    async def test_windows_process_exit_drains_trailing_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root),
+                SafetyConfig(),
+                SandboxConfig(),
+            )
+
+            class DelayedStream:
+                def __init__(self, value: bytes):
+                    self.value = value
+
+                async def read(self, _size):
+                    await asyncio.sleep(0.01)
+                    value, self.value = self.value, b""
+                    return value
+
+            class CompletedProcess:
+                def __init__(self):
+                    self.stdout = DelayedStream(b"trailing stdout")
+                    self.stderr = DelayedStream(b"trailing stderr")
+                    self.returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = CompletedProcess()
+            with (
+                patch.object(
+                    driver.roots,
+                    "resolve",
+                    return_value=SimpleNamespace(path=root),
+                ),
+                patch("borealis_coder.safety.sandbox.os.name", "nt"),
+                patch(
+                    "borealis_coder.safety.sandbox.asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=process),
+                ),
+            ):
+                result = await driver.run(
+                    ["fake-command"],
+                    cwd=root,
+                    timeout=5,
+                )
+
+            self.assertEqual(result.stdout, "trailing stdout")
+            self.assertEqual(result.stderr, "trailing stderr")
+            self.assertTrue(result.stream_complete)
 
     async def test_process_bounds_streamed_output(self):
         with tempfile.TemporaryDirectory() as td:

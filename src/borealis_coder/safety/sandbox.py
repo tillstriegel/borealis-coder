@@ -320,9 +320,9 @@ class NativeProcessDriver(ProcessDriver):
                     abandon_io = True
                 _kill_supervised_process_group(process)
             elif process_task in done:
-                abandon_io = True
                 exit_code = process.returncode
                 if status_task is not None:
+                    abandon_io = True
                     _kill_supervised_process_group(process)
             else:
                 timed_out = True

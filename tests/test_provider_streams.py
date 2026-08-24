@@ -384,7 +384,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         partial = [item async for item in provider.stream(self.request)][-1].response
         assert partial is not None
         self.assertEqual(partial.text, "partial")
-        self.assertEqual(partial.tool_calls[0].arguments, {"_raw": "not-json"})
+        self.assertEqual(partial.tool_calls, [])
 
     async def test_openai_responses_stream_preserves_incomplete_status(self) -> None:
         provider = OpenAIProvider(
@@ -428,6 +428,76 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         assert final is not None
         self.assertEqual(final.text, "partial answer")
         self.assertEqual(final.stop_reason, "incomplete")
+
+    async def test_openai_responses_stream_hides_incomplete_partial_call(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(
+                type="openai",
+                base_url="https://example.test/v1",
+                api_style="responses",
+            ),
+            "secret",
+        )
+        partial_call = {
+            "type": "function_call",
+            "id": "item-partial",
+            "call_id": "call-partial",
+            "name": "write_file",
+            "arguments": '{"path":"must-not-run.txt","content":"partial"}',
+            "status": "in_progress",
+        }
+        provider.http = FakeHttp(  # type: ignore[assignment]
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.output_item.added",
+                            "item": {
+                                **partial_call,
+                                "arguments": "",
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "call_id": "call-partial",
+                            "delta": partial_call["arguments"],
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.incomplete",
+                            "response": {
+                                "id": "resp-partial-call",
+                                "model": "model",
+                                "status": "incomplete",
+                                "incomplete_details": {
+                                    "reason": "max_output_tokens"
+                                },
+                                "output": [partial_call],
+                                "usage": {"input_tokens": 10, "output_tokens": 5},
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.tool_calls, [])
+        assert final.raw is not None
+        self.assertEqual(final.raw["output"], [partial_call])
 
     async def test_openai_responses_stream_preserves_empty_incomplete_state(self) -> None:
         provider = OpenAIProvider(

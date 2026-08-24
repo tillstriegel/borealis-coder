@@ -211,6 +211,7 @@ class OpenAIProvider(Provider):
         reasoning_summary_key: tuple[str, str, str] | None = None
         calls: dict[str, dict[str, Any]] = {}
         call_aliases: dict[str, str] = {}
+        completed_call_ids: set[str] = set()
         final_data: dict[str, Any] | None = None
         async for item in self.http.stream_sse(url, headers=self._headers(), payload=payload):
             if item.data == "[DONE]":
@@ -263,6 +264,8 @@ class OpenAIProvider(Provider):
                     call["name"] = str(output.get("name") or call["name"])
                     if output.get("arguments"):
                         call["arguments"] = str(output["arguments"])
+                    if event_type == "response.output_item.done":
+                        completed_call_ids.add(key)
             elif event_type == "response.function_call_arguments.delta":
                 raw_key = str(data.get("call_id") or data.get("item_id") or "")
                 key = call_aliases.get(raw_key, raw_key)
@@ -289,6 +292,7 @@ class OpenAIProvider(Provider):
                 _raise_in_band_failure(failed, default_message="Responses stream failed")
         if final_data:
             result = self._parse_responses(final_data, retain_raw=True)
+            response_incomplete = _responses_data_is_incomplete(final_data)
             if not result.text:
                 result.text = "".join(text_parts)
             streamed_summary = "".join(reasoning_summary_parts)
@@ -323,9 +327,17 @@ class OpenAIProvider(Provider):
                 self._call_from_partial(item)
                 for item in calls.values()
                 if str(item.get("id") or "") not in final_calls
+                and (
+                    not response_incomplete
+                    or str(item.get("id") or "") in completed_call_ids
+                )
             )
         else:
-            result_calls = [self._call_from_partial(item) for item in calls.values()]
+            result_calls = [
+                self._call_from_partial(item)
+                for item in calls.values()
+                if str(item.get("id") or "") in completed_call_ids
+            ]
             result = ModelResponse(
                 text="".join(text_parts),
                 tool_calls=result_calls,
@@ -395,6 +407,7 @@ class OpenAIProvider(Provider):
     def _parse_responses(self, data: dict[str, Any], *, retain_raw: bool) -> ModelResponse:
         text: list[str] = []
         calls: list[ToolCall] = []
+        response_incomplete = _responses_data_is_incomplete(data)
         for item in data.get("output", []) or []:
             if not isinstance(item, dict):
                 continue
@@ -408,6 +421,8 @@ class OpenAIProvider(Provider):
                     elif block.get("type") == "refusal":
                         text.append(str(block.get("refusal") or ""))
             elif item_type in {"function_call", "custom_tool_call"}:
+                if response_incomplete and item.get("status") != "completed":
+                    continue
                 raw_arguments = item.get("arguments") or item.get("input") or "{}"
                 calls.append(
                     ToolCall(
@@ -852,6 +867,11 @@ def _supports_explicit_cache_breakpoints(model: str) -> bool:
     if match is None:
         return False
     return (int(match.group(1)), int(match.group(2) or 0)) >= (5, 6)
+
+
+def _responses_data_is_incomplete(data: dict[str, Any]) -> bool:
+    status = str(data.get("status") or "").strip().lower()
+    return status == "incomplete" or bool(data.get("incomplete_details"))
 
 
 def _extract_encrypted_reasoning_state(data: dict[str, Any]) -> list[dict[str, Any]]:
