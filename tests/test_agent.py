@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from borealis_coder.agent import build_runner
+from borealis_coder.agent import AgentRunner, build_runner
 from borealis_coder.config import ProviderConfig
 from borealis_coder.errors import SessionError
 from borealis_coder.models import (
@@ -1632,6 +1632,233 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(tool_messages[0].content, "changed through shell")
             finally:
                 release_snapshot.set()
+                await runner.close()
+
+    async def test_shell_cancellation_during_initial_snapshot_is_durable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            tool_executed = False
+
+            def pause_initial_snapshot():
+                snapshot_started.set()
+                release_snapshot.wait(timeout=2)
+                return {}
+
+            def execute_tool(arguments, context):
+                nonlocal tool_executed
+                del arguments, context
+                tool_executed = True
+                return ToolResult("must not execute")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test initial snapshot cancellation.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=execute_tool,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch.object(
+                    runner, "_workspace_file_state", side_effect=pause_initial_snapshot
+                ):
+                    task = asyncio.create_task(runner.run("run a shell command"))
+                    started = await asyncio.to_thread(snapshot_started.wait, 1)
+                    self.assertTrue(started)
+                    task.cancel()
+                    release_snapshot.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertFalse(tool_executed)
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(tool_call["status"], "cancelled")
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                ]
+                self.assertEqual(len(tool_messages), 1)
+                self.assertEqual(tool_messages[0].content, "Run cancelled")
+                self.assertTrue(tool_messages[0].metadata["cancelled"])
+            finally:
+                release_snapshot.set()
+                await runner.close()
+
+    async def test_post_tool_finalization_grace_is_bounded(self):
+        release = asyncio.Event()
+        cancel = asyncio.Event()
+        cancel.set()
+
+        async def blocked_operation():
+            await release.wait()
+
+        try:
+            result = await asyncio.wait_for(
+                AgentRunner._finish_after_tool_result(
+                    blocked_operation(),
+                    cancel,
+                    required=False,
+                ),
+                timeout=1,
+            )
+            self.assertIsNone(result)
+        finally:
+            release.set()
+
+    async def test_second_cancellation_forces_post_tool_finalization(self):
+        release = asyncio.Event()
+        cancel = asyncio.Event()
+        operation_started = asyncio.Event()
+
+        async def blocked_operation():
+            operation_started.set()
+            await release.wait()
+
+        task = asyncio.create_task(
+            AgentRunner._finish_after_tool_result(blocked_operation(), cancel)
+        )
+        try:
+            await operation_started.wait()
+            cancel.set()
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+        finally:
+            release.set()
+
+    @unittest.skipIf(os.name == "nt" or not hasattr(os, "symlink"), "symlinks unavailable")
+    async def test_shell_tracks_file_and_directory_symlinks_without_following_targets(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside:
+            root = Path(td)
+            outside_root = Path(outside)
+            outside_file = outside_root / "outside.txt"
+            outside_directory = outside_root / "outside-directory"
+            outside_file.write_text("outside")
+            outside_directory.mkdir()
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def create_symlinks(arguments, context):
+                del arguments, context
+                (root / "file-link").symlink_to(outside_file)
+                (root / "directory-link").symlink_to(
+                    outside_directory,
+                    target_is_directory=True,
+                )
+                return ToolResult("created symlinks")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test symlink tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=create_symlinks,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("create workspace symlinks")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, ["directory-link", "file-link"])
+                self.assertEqual(
+                    runner.sessions.tool_calls(result.session_id)[0]["status"], "completed"
+                )
+                verify.assert_awaited_once()
+            finally:
+                await runner.close()
+
+    async def test_windows_change_time_detects_same_size_write_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            changed = root / "changed.txt"
+            changed.write_text("before")
+            original_stat = changed.stat()
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                with (
+                    patch("borealis_coder.agent.runner._IS_WINDOWS", True),
+                    patch(
+                        "borealis_coder.agent.runner._windows_change_time_ns",
+                        side_effect=[100, 200],
+                    ),
+                ):
+                    before = runner._workspace_file_state()
+                    changed.write_text("after!")
+                    os.utime(
+                        changed,
+                        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                    )
+                    after = runner._workspace_file_state()
+
+                self.assertNotEqual(before[changed], after[changed])
+                self.assertEqual(before[changed][2], 100)
+                self.assertEqual(after[changed][2], 200)
+            finally:
+                await runner.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows change-time API is required")
+    async def test_windows_native_change_time_detects_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            changed = root / "changed.txt"
+            changed.write_text("before")
+            original_stat = changed.stat()
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                before = runner._workspace_file_state()
+                changed.write_text("after!")
+                os.utime(
+                    changed,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+                after = runner._workspace_file_state()
+
+                self.assertNotEqual(before[changed], after[changed])
+            finally:
                 await runner.close()
 
     async def test_late_steering_is_durable_when_final_turn_is_already_running(self):

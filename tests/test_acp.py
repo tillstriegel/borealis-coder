@@ -58,6 +58,55 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         updates = [params["update"] for _, params in fake.notifications]
         self.assertEqual([item["sessionUpdate"] for item in updates], ["user_message"])
 
+    async def test_cancel_stops_all_queued_prompt_tasks(self):
+        class QueuedRunner:
+            def __init__(self):
+                self.started = 0
+                self.all_started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.executed = 0
+                self.cancelled_sessions = []
+
+            def accepts_steering(self, session_id):
+                return False
+
+            def cancel(self, session_id):
+                self.cancelled_sessions.append(session_id)
+                return True
+
+            async def run(self, prompt, **arguments):
+                del prompt, arguments
+                self.started += 1
+                if self.started == 2:
+                    self.all_started.set()
+                await self.release.wait()
+                self.executed += 1
+
+        server = ACPServer()
+        server.connection = cast(Any, FakeConnection())
+        runner = QueuedRunner()
+        server.runners["session_1"] = cast(Any, runner)
+
+        await server._session_prompt(
+            {"sessionId": "session_1", "prompt": [{"type": "text", "text": "first"}]}
+        )
+        first = server.tasks["session_1"]
+        await server._session_prompt(
+            {"sessionId": "session_1", "prompt": [{"type": "text", "text": "second"}]}
+        )
+        second = server.tasks["session_1"]
+        await asyncio.wait_for(runner.all_started.wait(), timeout=1)
+
+        cancelled = await server._session_cancel({"sessionId": "session_1"})
+        self.assertEqual(cancelled, {})
+        results = await asyncio.gather(first, second, return_exceptions=True)
+
+        self.assertTrue(all(isinstance(result, asyncio.CancelledError) for result in results))
+        self.assertEqual(runner.cancelled_sessions, ["session_1"])
+        self.assertEqual(runner.executed, 0)
+        self.assertNotIn("session_1", server.tasks)
+        self.assertNotIn("session_1", server._prompt_tasks)
+
     async def test_run_started_sends_running_state(self):
         server = ACPServer()
         fake = FakeConnection()

@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import stat
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +59,13 @@ class ProviderRoute:
 
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
 _INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
+_TOOL_FINALIZATION_GRACE_SECONDS = 0.5
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_OPEN_REPARSE_POINT = 0x00200000
+_WINDOWS_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_BASIC_INFO = 0
 _FINAL_TURN_INSTRUCTION = """# Final model turn
 This is the last model turn available for this run. Tools are unavailable. Return the best
 final answer now. State what was completed and what remains.
@@ -1198,66 +1207,87 @@ class AgentRunner:
             call.arguments,
         )
         workspace_before = None
-        if call.name == "shell":
-            workspace_before = await asyncio.to_thread(self._workspace_file_state)
-        tool_task = asyncio.create_task(self.tools.execute(call, context))
-        cancel_task = asyncio.create_task(cancel.wait())
         try:
-            done, _ = await asyncio.wait(
-                {tool_task, cancel_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if cancel_task in done and cancel.is_set():
-                tool_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await tool_task
-                raise Cancelled("Run cancelled")
-            cancel_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await cancel_task
-            result = await tool_task
+            if call.name == "shell":
+                workspace_before = await self._await_until_cancelled(
+                    asyncio.to_thread(self._workspace_file_state), cancel
+                )
+            result = await self._await_until_cancelled(self.tools.execute(call, context), cancel)
         except (asyncio.CancelledError, Cancelled):
-            tool_task.cancel()
-            cancel_task.cancel()
+            cancelled_result = ToolResult(
+                "Run cancelled",
+                is_error=True,
+                metadata={"cancelled": True},
+            )
             await asyncio.to_thread(
                 self.sessions.cancel_tool_call,
                 context.session_id,
                 call.id,
+                reason=cancelled_result.output,
+                message=self._tool_result_message(call, cancelled_result),
             )
             raise
-        if workspace_before is not None:
-            workspace_after = await self._finish_after_tool_result(
-                asyncio.to_thread(self._workspace_file_state)
-            )
-            changed_paths = {
-                path
-                for path in workspace_before.keys() | workspace_after.keys()
-                if workspace_before.get(path) != workspace_after.get(path)
-            }
-            context.changed_files.update(context.roots.display(path) for path in changed_paths)
-            context.changed_roots.update(
-                context.roots.resolve(path).root for path in changed_paths
-            )
-        await self._finish_after_tool_result(
-            asyncio.to_thread(
-                self.sessions.complete_tool_call,
-                context.session_id,
-                call.id,
-                output=result.output,
-                is_error=result.is_error,
-                metadata=result.metadata,
-            )
-        )
-        if cancel.is_set():
-            tool_message = self._tool_result_message(call, result)
+        cancellation_message = self._tool_result_message(call, result)
+        try:
+            if workspace_before is not None:
+                workspace_after = await self._finish_after_tool_result(
+                    asyncio.to_thread(self._workspace_file_state),
+                    cancel,
+                    required=False,
+                )
+                if workspace_after is None:
+                    result.metadata["workspace_change_tracking"] = "incomplete"
+                    context.changed_roots.update(context.roots.roots)
+                else:
+                    changed_paths = {
+                        path
+                        for path in workspace_before.keys() | workspace_after.keys()
+                        if workspace_before.get(path) != workspace_after.get(path)
+                    }
+                    for path in changed_paths:
+                        entry = workspace_after.get(path) or workspace_before[path]
+                        root = entry[0]
+                        context.changed_files.add(self._display_workspace_path(path, root))
+                        context.changed_roots.add(root)
+            if cancel.is_set():
+                await self._finish_after_tool_result(
+                    asyncio.to_thread(
+                        self.sessions.complete_tool_call,
+                        context.session_id,
+                        call.id,
+                        output=result.output,
+                        is_error=result.is_error,
+                        metadata=result.metadata,
+                        message=cancellation_message,
+                    ),
+                    cancel,
+                )
+                raise asyncio.CancelledError
             await self._finish_after_tool_result(
                 asyncio.to_thread(
-                    self.sessions.append_message,
+                    self.sessions.complete_tool_call,
                     context.session_id,
-                    tool_message,
+                    call.id,
+                    output=result.output,
+                    is_error=result.is_error,
+                    metadata=result.metadata,
+                ),
+                cancel,
+            )
+        except asyncio.CancelledError:
+            result.metadata.setdefault("workspace_change_tracking", "incomplete")
+            await asyncio.shield(
+                asyncio.to_thread(
+                    self.sessions.complete_tool_call,
+                    context.session_id,
+                    call.id,
+                    output=result.output,
+                    is_error=result.is_error,
+                    metadata=result.metadata,
+                    message=cancellation_message,
                 )
             )
-            raise asyncio.CancelledError
+            raise
         return result
 
     @staticmethod
@@ -1272,46 +1302,118 @@ class AgentRunner:
         )
 
     @staticmethod
-    async def _finish_after_tool_result(operation: Awaitable[Any]) -> Any:
-        """Finish durable bookkeeping after a tool has already returned."""
+    async def _await_until_cancelled(operation: Awaitable[Any], cancel: asyncio.Event) -> Any:
+        task = asyncio.ensure_future(operation)
+        cancel_task = asyncio.create_task(cancel.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_task in done and cancel.is_set():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise Cancelled("Run cancelled")
+            return await task
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            cancel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_task
+
+    @staticmethod
+    async def _finish_after_tool_result(
+        operation: Awaitable[Any],
+        cancel: asyncio.Event,
+        *,
+        required: bool = True,
+    ) -> Any:
+        """Give post-tool bookkeeping a short grace period after cancellation."""
 
         task = asyncio.ensure_future(operation)
-        while not task.done():
+        cancel_task = asyncio.create_task(cancel.wait())
+        try:
             try:
-                await asyncio.shield(task)
+                done, _ = await asyncio.wait(
+                    {task, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             except asyncio.CancelledError:
-                # The run's cancel event stops the loop at the next safe boundary.
-                continue
-        return task.result()
+                pass
+            else:
+                if task in done:
+                    return task.result()
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=_TOOL_FINALIZATION_GRACE_SECONDS,
+                )
+            except TimeoutError:
+                task.cancel()
+                if required:
+                    raise asyncio.CancelledError from None
+                return None
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+        finally:
+            cancel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_task
 
-    def _workspace_file_state(self) -> dict[Path, tuple[int, int, int, int, int]]:
+    def _workspace_file_state(
+        self,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]]:
         storage = self.config.storage_dir
-        state: dict[Path, tuple[int, int, int, int, int]] = {}
+        state: dict[Path, tuple[Path, int, int, int, int, int, str]] = {}
         for root in self.tool_context.roots.roots:
             for current, directories, filenames in os.walk(root, followlinks=False):
                 current_path = Path(current)
-                directories[:] = [
-                    name
-                    for name in directories
-                    if name != ".git"
-                    and not _path_is_within(current_path / name, storage)
-                ]
-                for name in filenames:
+                symlink_directories: list[str] = []
+                traversable_directories: list[str] = []
+                for name in directories:
+                    path = current_path / name
+                    if name == ".git" or _path_is_within(path, storage):
+                        continue
+                    if path.is_symlink():
+                        symlink_directories.append(name)
+                    else:
+                        traversable_directories.append(name)
+                directories[:] = traversable_directories
+                for name in [*filenames, *symlink_directories]:
                     path = current_path / name
                     if _path_is_within(path, storage):
                         continue
                     try:
                         file_stat = path.lstat()
+                        change_time, fallback_digest = _file_change_signal(path, file_stat)
                     except OSError:
                         continue
                     state[path] = (
+                        self._lexical_workspace_root(path),
                         file_stat.st_mtime_ns,
-                        file_stat.st_ctime_ns,
+                        change_time,
                         file_stat.st_size,
                         file_stat.st_mode,
                         file_stat.st_ino,
+                        fallback_digest,
                     )
         return state
+
+    def _lexical_workspace_root(self, path: Path) -> Path:
+        matches = [
+            root for root in self.tool_context.roots.roots if path == root or root in path.parents
+        ]
+        return max(matches, key=lambda item: len(item.parts))
+
+    def _display_workspace_path(self, path: Path, root: Path) -> str:
+        relative = path.relative_to(root).as_posix() or "."
+        if root == self.tool_context.roots.primary:
+            return relative
+        return f"{root.name}:{relative}"
 
     @staticmethod
     def _check_cancel(cancel: asyncio.Event) -> None:
@@ -1323,6 +1425,95 @@ class AgentRunner:
             return ""
         redactor = StreamingRedactor(self.events.redactor)
         return redactor.feed(text) + redactor.flush(mask_incomplete=True)
+
+
+def _file_change_signal(path: Path, file_stat: os.stat_result) -> tuple[int, str]:
+    if not _IS_WINDOWS:
+        return file_stat.st_ctime_ns, ""
+    try:
+        return _windows_change_time_ns(path), ""
+    except OSError:
+        if stat.S_ISLNK(file_stat.st_mode):
+            digest = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+        elif stat.S_ISREG(file_stat.st_mode):
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        else:
+            digest = ""
+        return file_stat.st_ctime_ns, digest
+
+
+@cache
+def _windows_file_api() -> tuple[Any, Any, Any, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+        ]
+
+    win_dll: Any = vars(ctypes)["WinDLL"]
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    get_file_information = kernel32.GetFileInformationByHandleEx
+    get_file_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    get_file_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = wintypes.BOOL
+    return FileBasicInfo, create_file, get_file_information, close_handle
+
+
+def _windows_change_time_ns(path: Path) -> int:
+    import ctypes
+
+    file_basic_info, create_file, get_file_information, close_handle = _windows_file_api()
+    get_last_error: Callable[[], int] = vars(ctypes)["get_last_error"]
+    handle = create_file(
+        str(path),
+        0,
+        _WINDOWS_FILE_SHARE_ALL,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_BACKUP_SEMANTICS | _WINDOWS_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        error_code = get_last_error()
+        raise OSError(error_code, os.strerror(error_code), str(path))
+    try:
+        info = file_basic_info()
+        if not get_file_information(
+            handle,
+            _WINDOWS_FILE_BASIC_INFO,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            error_code = get_last_error()
+            raise OSError(error_code, os.strerror(error_code), str(path))
+        return int(info.ChangeTime) * 100
+    finally:
+        close_handle(handle)
 
 
 def _title(prompt: str) -> str:
