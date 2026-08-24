@@ -13,10 +13,12 @@ from borealis_coder.config import ProviderConfig
 from borealis_coder.errors import SessionError
 from borealis_coder.models import (
     ContinuationState,
+    Effect,
     ModelResponse,
     ProviderRequest,
     Role,
     ToolCall,
+    ToolResult,
     Usage,
 )
 from borealis_coder.providers.base import Provider, ProviderStreamEvent
@@ -24,6 +26,7 @@ from borealis_coder.providers.http import SSEEvent
 from borealis_coder.providers.mock import MockProvider
 from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.providers.registry import ProviderRegistry
+from borealis_coder.tools import FunctionTool, object_schema
 from borealis_coder.tools.verification import VerificationReport
 from tests.helpers import make_config
 
@@ -176,6 +179,9 @@ class DefiantFinalTurnProvider(Provider):
         super().__init__(config, api_key)
         self.calls = 0
         self.tool_counts: list[int] = []
+        self.pause_final = False
+        self.final_started = asyncio.Event()
+        self.release_final = asyncio.Event()
 
     async def complete(self, request):
         self.calls += 1
@@ -195,6 +201,9 @@ class DefiantFinalTurnProvider(Provider):
                 usage=Usage(requests=1),
             )
         if self.calls == 2:
+            if self.pause_final:
+                self.final_started.set()
+                await self.release_final.wait()
             return ModelResponse(
                 tool_calls=[
                     ToolCall(
@@ -220,6 +229,26 @@ class DefiantFinalTurnProvider(Provider):
                 ),
             )
         return ModelResponse(text="Resumed to completion.", usage=Usage(requests=1))
+
+
+class ShellMutationFinalTurnProvider(Provider):
+    name = "shell_mutation_final_turn"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[ToolCall(name="shell", arguments={"command": "true"})],
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            tool_calls=[ToolCall(name="write_file", arguments={})],
+            usage=Usage(requests=1),
+        )
 
 
 class LateSteeringProvider(Provider):
@@ -1105,6 +1134,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 max_retries=0,
             )
             provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            provider.pause_final = True
             registry = ProviderRegistry()
             registry.register("defiant_final_turn", lambda cfg, key: provider)
             runner = await build_runner(
@@ -1119,7 +1149,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     new_callable=AsyncMock,
                     return_value=VerificationReport(ok=True),
                 ) as verify:
-                    result = await runner.run("make a durable change")
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(provider.final_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.steer(session_id, "late direction", message_id="late-message")
+                    provider.release_final.set()
+                    result = await task
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertTrue(result.incomplete)
                 self.assertEqual(result.verification, {"ok": True, "steps": []})
@@ -1128,9 +1163,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse((root / "must-not-run.txt").exists())
                 self.assertEqual(provider.tool_counts, [len(runner.tools.schemas()), 0])
                 persisted = runner.sessions.messages(result.session_id)
-                self.assertEqual(persisted[-1].role, Role.ASSISTANT)
-                self.assertEqual(persisted[-1].tool_calls, [])
-                self.assertNotIn("continuation_state", persisted[-1].metadata)
+                final_assistant = persisted[-2]
+                self.assertEqual(final_assistant.role, Role.ASSISTANT)
+                self.assertEqual(final_assistant.tool_calls, [])
+                self.assertNotIn("continuation_state", final_assistant.metadata)
+                self.assertEqual(persisted[-1].id, "late-message")
+                self.assertTrue(persisted[-1].metadata["steering"])
+                self.assertEqual(runner.queued_prompts(result.session_id), 0)
                 self.assertEqual(
                     runner.sessions.get_session(result.session_id).status,
                     "idle",
@@ -1140,6 +1179,57 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resumed.stop_reason.value, "end_turn")
                 self.assertFalse(resumed.incomplete)
                 self.assertEqual(resumed.text, "Resumed to completion.")
+            finally:
+                await runner.close()
+
+    async def test_max_turns_verifies_files_mutated_by_shell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def mutate_workspace(arguments, context):
+                del arguments
+                (context.workspace / "shell-mutated.txt").write_text("changed")
+                return ToolResult("changed through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test shell mutation tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_workspace,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("change a file through shell")
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, ["shell-mutated.txt"])
+                self.assertEqual(result.verification, {"ok": True, "steps": []})
+                verify.assert_awaited_once()
             finally:
                 await runner.close()
 

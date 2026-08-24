@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import Config
 from ..context import ContextBuilder
+from ..context.ignore import repository_files
 from ..errors import (
     BudgetExceeded,
     Cancelled,
@@ -468,6 +469,7 @@ class AgentRunner:
                 if usage_budget_error is not None:
                     raise usage_budget_error
                 if final_turn and response.tool_calls:
+                    await self._drain_steering(session_id, run_id, messages)
                     raise BudgetExceeded(
                         "turns",
                         max_turns_recovery_message(self.config.agent.max_turns),
@@ -1120,6 +1122,9 @@ class AgentRunner:
             call.name,
             call.arguments,
         )
+        workspace_before = None
+        if call.name == "shell":
+            workspace_before = await asyncio.to_thread(self._workspace_file_state)
         tool_task = asyncio.create_task(self.tools.execute(call, context))
         cancel_task = asyncio.create_task(cancel.wait())
         try:
@@ -1145,6 +1150,13 @@ class AgentRunner:
                 call.id,
             )
             raise
+        if workspace_before is not None:
+            workspace_after = await asyncio.to_thread(self._workspace_file_state)
+            context.changed_files.update(
+                path
+                for path in workspace_before.keys() | workspace_after.keys()
+                if workspace_before.get(path) != workspace_after.get(path)
+            )
         await asyncio.to_thread(
             self.sessions.complete_tool_call,
             context.session_id,
@@ -1154,6 +1166,20 @@ class AgentRunner:
             metadata=result.metadata,
         )
         return result
+
+    def _workspace_file_state(self) -> dict[str, tuple[int, int]]:
+        storage = self.config.storage_dir
+        state: dict[str, tuple[int, int]] = {}
+        for path in repository_files(self.workspace, self.context_builder.matcher):
+            if path == storage or storage in path.parents:
+                continue
+            try:
+                stat = path.stat()
+                display = path.relative_to(self.workspace).as_posix()
+            except (OSError, ValueError):
+                continue
+            state[display] = (stat.st_mtime_ns, stat.st_size)
+        return state
 
     @staticmethod
     def _check_cancel(cancel: asyncio.Event) -> None:
