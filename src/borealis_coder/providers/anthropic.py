@@ -13,7 +13,9 @@ from ..util import json_dumps
 from .base import Provider, ProviderStreamEvent
 from .http import HttpClient
 
-_INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
+_INCOMPLETE_STOP_REASONS = frozenset(
+    {"incomplete", "length", "max_tokens", "model_context_window_exceeded"}
+)
 
 
 class AnthropicProvider(Provider):

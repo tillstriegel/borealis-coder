@@ -283,7 +283,7 @@ class ProviderAdapterTests(unittest.TestCase):
             "key",
         )._parse(
             {
-                "stop_reason": "max_tokens",
+                "stop_reason": "model_context_window_exceeded",
                 "content": [
                     {
                         "type": "tool_use",

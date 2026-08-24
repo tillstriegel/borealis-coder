@@ -59,7 +59,9 @@ class ProviderRoute:
 
 
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
-_INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
+_INCOMPLETE_STOP_REASONS = frozenset(
+    {"incomplete", "length", "max_tokens", "model_context_window_exceeded"}
+)
 _TOOL_FINALIZATION_GRACE_SECONDS = 0.5
 _WORKSPACE_SCAN_STOP_GRACE_SECONDS = 0.05
 _IS_WINDOWS = os.name == "nt"

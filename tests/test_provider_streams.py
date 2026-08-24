@@ -1864,6 +1864,55 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.stop_reason, "max_tokens")
         self.assertEqual(final.tool_calls, [])
 
+    async def test_anthropic_stream_hides_context_window_truncated_tool_call(self) -> None:
+        provider = AnthropicProvider(
+            ProviderConfig(type="anthropic", base_url="https://anthropic.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": "truncated-call",
+                                "name": "write_file",
+                                "input": {"path": "danger.txt"},
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps({"type": "content_block_stop", "index": 0}),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": "model_context_window_exceeded"
+                            },
+                            "usage": {"output_tokens": 4},
+                        }
+                    ),
+                ),
+                SSEEvent("message", json.dumps({"type": "message_stop"})),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.stop_reason, "model_context_window_exceeded")
+        self.assertEqual(final.tool_calls, [])
+
     async def test_anthropic_stream_hides_call_without_stop_reason(self) -> None:
         provider = AnthropicProvider(
             ProviderConfig(type="anthropic", base_url="https://anthropic.test/v1"),

@@ -179,7 +179,7 @@ class TruncatedToolProvider(Provider):
                         arguments={"_raw": '{"path":"danger.txt"'},
                     )
                 ],
-                stop_reason="length",
+                stop_reason="model_context_window_exceeded",
                 usage=Usage(requests=1),
             )
         return ModelResponse(
@@ -1222,7 +1222,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
-    async def test_incomplete_provider_tool_call_is_never_executed(self):
+    async def test_context_window_truncated_tool_call_is_never_executed(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(
