@@ -466,6 +466,8 @@ async def _terminate_process(
 def _kill_supervised_process_group(process: asyncio.subprocess.Process) -> bool:
     """Kill a POSIX command group, including after its supervisor has exited."""
 
+    if os.name != "posix":
+        return False
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -518,6 +520,8 @@ def _consume_task_result(task: asyncio.Task[object]) -> None:
 
 
 async def _read_process_status(fd: int) -> int | None:
+    if os.name != "posix":
+        raise RuntimeError("Process status pipes require POSIX")
     loop = asyncio.get_running_loop()
     future: asyncio.Future[int | None] = loop.create_future()
     buffer = bytearray()

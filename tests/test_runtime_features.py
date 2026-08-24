@@ -833,6 +833,9 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
     async def test_process_kills_background_group_before_returning(self):
+        if os.name != "posix":
+            self.skipTest("POSIX process groups are required")
+            return
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             trigger = root / "trigger"
@@ -867,6 +870,9 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
     async def test_process_kills_group_after_supervisor_exits(self):
+        if os.name != "posix":
+            self.skipTest("POSIX process groups are required")
+            return
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             trigger = root / "trigger"
@@ -925,6 +931,9 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
     async def test_process_bounds_pipe_drain_for_detached_descendant(self):
+        if os.name != "posix":
+            self.skipTest("setsid is POSIX-specific")
+            return
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             pid_path = root / "detached-pid"
@@ -974,6 +983,9 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
     async def test_process_bounds_cancel_cleanup_with_detached_pipe(self):
+        if os.name != "posix":
+            self.skipTest("setsid is POSIX-specific")
+            return
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             pid_path = root / "detached-pid"
