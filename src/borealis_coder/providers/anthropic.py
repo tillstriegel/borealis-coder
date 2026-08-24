@@ -147,9 +147,10 @@ class AnthropicProvider(Provider):
             elif event_type == "error":
                 error = data.get("error") or {}
                 raise ProviderError(str(error.get("message") or error))
+        response_incomplete = stop_reason is None or _is_incomplete_stop_reason(stop_reason)
         tool_calls: list[ToolCall] = []
         for index, item in sorted(calls.items()):
-            if index not in completed_call_indexes:
+            if response_incomplete or index not in completed_call_indexes:
                 continue
             raw = str(item.get("arguments") or "")
             arguments = _parse_arguments(raw) if raw else dict(item.get("input") or {})
@@ -169,7 +170,7 @@ class AnthropicProvider(Provider):
             text="".join(text_parts),
             tool_calls=tool_calls,
             usage=usage,
-            stop_reason=stop_reason,
+            stop_reason=stop_reason or "incomplete",
             response_id=message_id,
             model=model,
         )

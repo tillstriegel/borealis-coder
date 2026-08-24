@@ -429,6 +429,42 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.text, "partial answer")
         self.assertEqual(final.stop_reason, "incomplete")
 
+    async def test_openai_responses_stream_hides_call_without_terminal_response(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(
+                type="openai",
+                base_url="https://example.test/v1",
+                api_style="responses",
+            ),
+            "secret",
+        )
+        provider.http = FakeHttp(  # type: ignore[assignment]
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.output_item.done",
+                            "item": {
+                                "type": "function_call",
+                                "id": "item-truncated",
+                                "call_id": "call-truncated",
+                                "name": "write_file",
+                                "arguments": '{"path":"must-not-run.txt","content":"done"}',
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.stop_reason, "incomplete")
+        self.assertEqual(final.tool_calls, [])
+
     async def test_openai_responses_stream_hides_incomplete_partial_call(self) -> None:
         provider = OpenAIProvider(
             ProviderConfig(
@@ -1010,6 +1046,51 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         final = streamed[-1].response
         assert final is not None
         self.assertEqual(final.stop_reason, "length")
+        self.assertEqual(final.tool_calls, [])
+
+    async def test_openai_chat_stream_hides_call_without_finish_reason(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(type="openai_compatible", base_url="https://chat.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "id": "truncated-chat",
+                            "choices": [
+                                {
+                                    "finish_reason": None,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": "truncated-call",
+                                                "function": {
+                                                    "name": "write_file",
+                                                    "arguments": (
+                                                        '{"path":"must-not-run.txt",'
+                                                        '"content":"done"}'
+                                                    ),
+                                                },
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.stop_reason, "incomplete")
         self.assertEqual(final.tool_calls, [])
 
     async def test_chat_reasoning_streams_text_before_response_finishes(self) -> None:
@@ -1781,6 +1862,57 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         final = streamed[-1].response
         assert final is not None
         self.assertEqual(final.stop_reason, "max_tokens")
+        self.assertEqual(final.tool_calls, [])
+
+    async def test_anthropic_stream_hides_call_without_stop_reason(self) -> None:
+        provider = AnthropicProvider(
+            ProviderConfig(type="anthropic", base_url="https://anthropic.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": "truncated-call",
+                                "name": "write_file",
+                                "input": {},
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": (
+                                    '{"path":"must-not-run.txt","content":"done"}'
+                                ),
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps({"type": "content_block_stop", "index": 0}),
+                ),
+            ]
+        )
+
+        streamed = [item async for item in provider.stream(self.request)]
+
+        final = streamed[-1].response
+        assert final is not None
+        self.assertEqual(final.stop_reason, "incomplete")
         self.assertEqual(final.tool_calls, [])
 
     async def test_gemini_stream_complete_partial_and_helpers(self) -> None:

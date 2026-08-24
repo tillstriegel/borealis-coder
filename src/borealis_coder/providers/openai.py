@@ -335,15 +335,11 @@ class OpenAIProvider(Provider):
                 )
             )
         else:
-            result_calls = [
-                self._call_from_partial(item)
-                for item in calls.values()
-                if str(item.get("id") or "") in completed_call_ids
-            ]
             result = ModelResponse(
                 text="".join(text_parts),
-                tool_calls=result_calls,
+                tool_calls=[],
                 reasoning_summary="".join(reasoning_summary_parts),
+                stop_reason="incomplete",
             )
         yield ProviderStreamEvent(type="completed", response=result)
 
@@ -731,7 +727,10 @@ class OpenAIProvider(Provider):
                             "delta": function.get("arguments", ""),
                         },
                     )
-        completed_calls = {} if _is_incomplete_stop_reason(finish_reason) else calls
+        response_complete = finish_reason is not None and not _is_incomplete_stop_reason(
+            finish_reason
+        )
+        completed_calls = calls if response_complete else {}
         result = ModelResponse(
             text="".join(text_parts),
             tool_calls=[
@@ -739,7 +738,7 @@ class OpenAIProvider(Provider):
                 for _, item in sorted(completed_calls.items())
             ],
             usage=usage,
-            stop_reason=finish_reason,
+            stop_reason=finish_reason or "incomplete",
             response_id=response_id,
             model=model,
             reasoning_summary="".join(reasoning_summary_parts),
