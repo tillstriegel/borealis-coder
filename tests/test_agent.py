@@ -224,16 +224,20 @@ class SummaryOnlyRetryProvider(Provider):
 
     async def stream(self, request):
         self.calls += 1
-        yield ProviderStreamEvent(type="reasoning_summary_delta", text="Checked ")
         if self.calls == 1:
+            yield ProviderStreamEvent(
+                type="reasoning_summary_delta",
+                text="Abandoned summary.",
+            )
             yield ProviderStreamEvent(
                 type="completed",
                 response=ModelResponse(
-                    reasoning_summary="Checked ",
+                    reasoning_summary="Abandoned summary.",
                     usage=Usage(input_tokens=3, requests=1),
                 ),
             )
             return
+        yield ProviderStreamEvent(type="reasoning_summary_delta", text="Checked ")
         yield ProviderStreamEvent(type="reasoning_summary_delta", text="the retry.")
         yield ProviderStreamEvent(type="text_delta", text="answer")
         yield ProviderStreamEvent(

@@ -853,36 +853,21 @@ class AgentRunner:
         attempts = max(0, route.provider.config.max_retries) + 1
         delay = max(0.0, route.provider.config.initial_backoff_seconds)
         failed_usage = Usage()
-        visible_reasoning_summary = ""
         for attempt in range(attempts):
             actionable_emitted = False
             try:
 
                 async def consume() -> ModelResponse | None:
-                    nonlocal actionable_emitted, visible_reasoning_summary
+                    nonlocal actionable_emitted
                     completed: ModelResponse | None = None
-                    attempt_reasoning_summary = ""
+                    pending_reasoning: list[str] = []
                     reasoning_redactor = StreamingRedactor(self.events.redactor)
+                    reasoning_committed = False
                     stream = route.provider.stream(request).__aiter__()
 
                     async def emit_reasoning(text: str) -> None:
-                        nonlocal attempt_reasoning_summary, visible_reasoning_summary
                         if not text:
                             return
-                        attempt_reasoning_summary += text
-                        if attempt_reasoning_summary.startswith(visible_reasoning_summary):
-                            text = attempt_reasoning_summary[len(visible_reasoning_summary) :]
-                        elif visible_reasoning_summary.startswith(attempt_reasoning_summary):
-                            text = ""
-                        elif (
-                            visible_reasoning_summary
-                            and not visible_reasoning_summary.endswith(("\n", "\r"))
-                            and not text.startswith(("\n", "\r"))
-                        ):
-                            text = "\n" + text
-                        if not text:
-                            return
-                        visible_reasoning_summary += text
                         await self.events.emit(
                             "model.reasoning_delta",
                             session_id=session_id,
@@ -893,17 +878,37 @@ class AgentRunner:
                             model=route.model,
                         )
 
+                    async def commit_reasoning() -> None:
+                        nonlocal reasoning_committed
+                        if reasoning_committed:
+                            return
+                        pending_reasoning.append(
+                            reasoning_redactor.flush(mask_incomplete=True)
+                        )
+                        for text in pending_reasoning:
+                            await emit_reasoning(text)
+                        pending_reasoning.clear()
+                        reasoning_committed = True
+
+                    async def flush_committed_reasoning() -> None:
+                        if reasoning_committed:
+                            await emit_reasoning(
+                                reasoning_redactor.flush(mask_incomplete=True)
+                            )
+
                     try:
                         async for item in stream:
                             self._check_cancel(cancel)
                             if item.type == "reasoning_summary_delta" and item.text:
-                                await emit_reasoning(reasoning_redactor.feed(item.text))
+                                text = reasoning_redactor.feed(item.text)
+                                if reasoning_committed:
+                                    await emit_reasoning(text)
+                                else:
+                                    pending_reasoning.append(text)
                                 continue
 
-                            await emit_reasoning(
-                                reasoning_redactor.flush(mask_incomplete=True)
-                            )
                             if item.type == "text_delta" and item.text:
+                                await commit_reasoning()
                                 actionable_emitted = True
                                 await self.events.emit(
                                     "model.text_delta",
@@ -915,6 +920,7 @@ class AgentRunner:
                                     model=route.model,
                                 )
                             elif item.type == "tool_call_delta":
+                                await commit_reasoning()
                                 actionable_emitted = True
                                 await self.events.emit(
                                     "model.tool_call_delta",
@@ -925,8 +931,13 @@ class AgentRunner:
                                     **item.data,
                                 )
                             elif item.type == "completed" and item.response is not None:
+                                if item.response.text or item.response.tool_calls:
+                                    await commit_reasoning()
+                                else:
+                                    await flush_committed_reasoning()
                                 completed = item.response
                     finally:
+                        await flush_committed_reasoning()
                         close = getattr(stream, "aclose", None)
                         if close is not None:
                             with contextlib.suppress(Exception):

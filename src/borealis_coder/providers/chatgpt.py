@@ -52,9 +52,26 @@ class ChatGPTProvider(OpenAIProvider):
                 force_refresh=auth_attempt > 0
             )
             actionable_output_emitted = False
+            pending_reasoning: list[ProviderStreamEvent] = []
             try:
                 async for event in super().stream(request):
+                    if event.type == "reasoning_summary_delta" and not actionable_output_emitted:
+                        pending_reasoning.append(event)
+                        continue
+                    if event.type == "completed" and event.response is not None:
+                        if event.response.text or event.response.tool_calls:
+                            for pending in pending_reasoning:
+                                yield pending
+                            pending_reasoning.clear()
+                        else:
+                            pending_reasoning.clear()
+                            event.response.reasoning_summary = ""
+                        yield event
+                        return
                     if event.type in {"text_delta", "tool_call_delta"}:
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
                         actionable_output_emitted = True
                     yield event
                 return

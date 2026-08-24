@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from collections.abc import AsyncIterator
@@ -434,6 +435,59 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         assert streamed[-1].response is not None
         self.assertEqual(streamed[-1].response.reasoning_summary, streamed[0].text)
 
+    async def test_responses_discards_summary_only_completed_attempt(self) -> None:
+        provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": "reasoning_1",
+                            "output_index": 0,
+                            "summary_index": 0,
+                            "delta": "Abandoned summary.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "summary-only",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "reasoning",
+                                        "summary": [
+                                            {
+                                                "type": "summary_text",
+                                                "text": "Abandoned summary.",
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 2, "output_tokens": 1},
+                            },
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        self.assertEqual([event.type for event in streamed], ["completed"])
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.reasoning_summary, "")
+        self.assertEqual(streamed[-1].response.usage.input_tokens, 2)
+
     async def test_reasoning_summary_separators_are_not_duplicated(self) -> None:
         responses_provider = OpenAIProvider(
             ProviderConfig(type="openai", base_url="https://openai.test/v1"),
@@ -673,9 +727,9 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             [item.type for item in streamed],
             [
                 "reasoning_summary_delta",
-                "reasoning_summary_delta",
                 "text_delta",
                 "tool_call_delta",
+                "reasoning_summary_delta",
                 "text_delta",
                 "tool_call_delta",
                 "completed",
@@ -733,6 +787,84 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         provider.http = FakeHttp(data=["not", "object"])  # type: ignore[assignment]
         with self.assertRaises(ProviderError):
             await provider.complete(self.request)
+
+    async def test_chat_reasoning_streams_text_before_response_finishes(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+            ),
+            "key",
+        )
+
+        class GatedHttp:
+            def __init__(self) -> None:
+                self.release = asyncio.Event()
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def stream_sse(
+                self,
+                url: str,
+                **kwargs: object,
+            ) -> AsyncIterator[SSEEvent]:
+                self.calls.append((url, dict(kwargs)))
+                yield SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "id": "chat1",
+                            "choices": [
+                                {
+                                    "finish_reason": None,
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {
+                                                "type": "reasoning.summary",
+                                                "summary": "Checked.",
+                                                "id": "summary_1",
+                                                "index": 0,
+                                            }
+                                        ],
+                                        "content": "Live text.",
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                )
+                await self.release.wait()
+                yield SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "choices": [{"finish_reason": "stop", "delta": {}}],
+                            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                        }
+                    ),
+                )
+                yield SSEEvent("message", "[DONE]")
+
+        fake = GatedHttp()
+        provider.http = fake  # type: ignore[assignment]
+        stream = provider.stream(self.request).__aiter__()
+        try:
+            summary = await asyncio.wait_for(stream.__anext__(), timeout=0.5)
+            text = await asyncio.wait_for(stream.__anext__(), timeout=0.5)
+            self.assertEqual(summary.type, "reasoning_summary_delta")
+            self.assertEqual(summary.text, "Checked.")
+            self.assertEqual(text.type, "text_delta")
+            self.assertEqual(text.text, "Live text.")
+            fake.release.set()
+            rest = [event async for event in stream]
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+
+        self.assertEqual([event.type for event in rest], ["completed"])
+        assert rest[-1].response is not None
+        self.assertEqual(rest[-1].response.text, "Live text.")
 
     async def test_chat_retries_empty_reasoning_response_without_reasoning_controls(self) -> None:
         provider = OpenRouterProvider(
@@ -1122,9 +1254,8 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [event.type for event in streamed],
-            ["reasoning_summary_delta", "text_delta", "completed"],
+            ["text_delta", "completed"],
         )
-        self.assertEqual(streamed[0].text, "Before fallback.")
         assert streamed[-1].response is not None
         self.assertEqual(streamed[-1].response.text, "Recovered answer.")
         self.assertEqual(len(fake.calls), 2)

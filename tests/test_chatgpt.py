@@ -383,7 +383,11 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refresh_calls, [False, True])
         self.assertEqual(
             [event.type for event in events],
-            ["reasoning_summary_delta", "text_delta", "completed"],
+            ["text_delta", "completed"],
+        )
+        self.assertNotIn(
+            "Retriable summary.",
+            "".join(str(event.text) for event in events),
         )
 
     async def test_custom_credential_endpoints_require_process_opt_in(self) -> None:

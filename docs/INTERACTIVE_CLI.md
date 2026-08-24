@@ -169,9 +169,11 @@ Provider credentials are never written to prompt history by Borealis, but users
 should still avoid pasting secrets into model prompts.
 
 When a provider supplies a reasoning summary, Borealis displays it by default
-under a separate `Reasoning summary` label before the assistant answer. This is a
-provider-generated summary, not hidden chain-of-thought. Encrypted reasoning used
-for stateless continuation remains opaque.
+under a separate `Reasoning summary` label. Initial summary text is shown before
+the first assistant answer or tool-call delta for the committed attempt. Later
+provider summary chunks can appear in that same labelled stream while the answer
+continues. This is a provider-generated summary, not hidden chain-of-thought.
+Encrypted reasoning used for stateless continuation remains opaque.
 
 ## Automation boundary
 
