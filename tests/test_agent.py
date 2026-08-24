@@ -154,6 +154,7 @@ class FinalTurnProvider(Provider):
         self.tool_counts: list[int] = []
         self.systems: list[str] = []
         self.system_blocks: list[list[dict[str, object]]] = []
+        self.final_stop_reason: str | None = None
 
     async def complete(self, request):
         self.tool_counts.append(len(request.tools))
@@ -173,7 +174,11 @@ class FinalTurnProvider(Provider):
                 ],
                 usage=Usage(requests=1),
             )
-        return ModelResponse(text="Completed cleanly.", usage=Usage(requests=1))
+        return ModelResponse(
+            text="Completed cleanly.",
+            stop_reason=self.final_stop_reason,
+            usage=Usage(requests=1),
+        )
 
 
 class DefiantFinalTurnProvider(Provider):
@@ -1126,6 +1131,35 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_truncated_final_turn_preserves_recovery_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "final", "max_turns": 2})
+            config.providers["final"] = ProviderConfig(
+                type="final_turn",
+                model="final",
+                max_retries=0,
+            )
+            provider = FinalTurnProvider(config.providers["final"])
+            provider.final_stop_reason = "max_tokens"
+            registry = ProviderRegistry()
+            registry.register("final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish within the limit")
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(result.text, "Completed cleanly.")
+                self.assertIn("final response was incomplete", result.error or "")
+                self.assertIn("send 'continue' to resume", result.error or "")
+            finally:
+                await runner.close()
+
     async def test_max_turns_verifies_mutations_and_resumes_without_dangling_tools(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1244,6 +1278,110 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 release_verification.set()
                 await runner.close()
 
+    async def test_max_turns_survives_a_deadline_during_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "defiant",
+                    "max_turns": 2,
+                    "max_time_seconds": 1,
+                    "auto_verify": True,
+                },
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            verification_started = asyncio.Event()
+
+            async def block_verification(*_args):
+                verification_started.set()
+                await asyncio.Event().wait()
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new=AsyncMock(side_effect=block_verification),
+                ):
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(verification_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.steer(
+                        session_id,
+                        "verification direction",
+                        message_id="deadline-message",
+                    )
+                    result = await task
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertIn("maximum 2 model turns reached", result.error or "")
+                self.assertIn("Maximum 1s run time reached", result.error or "")
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": False,
+                        "steps": [],
+                        "error": "Maximum 1s run time reached",
+                    },
+                )
+                persisted = runner.sessions.messages(session_id)
+                self.assertEqual(
+                    [message.id for message in persisted].count("deadline-message"),
+                    1,
+                )
+                self.assertEqual(runner.queued_prompts(session_id), 0)
+            finally:
+                await runner.close()
+
+    async def test_max_turns_closes_steering_before_completion_event(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "defiant", "max_turns": 2})
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            completion_seen = asyncio.Event()
+
+            async def reject_cleanup_steering(event):
+                if event.type != "run.completed":
+                    return
+                self.assertFalse(runner.accepts_steering(event.session_id or ""))
+                with self.assertRaises(SessionError):
+                    runner.steer(event.session_id or "", "too late")
+                completion_seen.set()
+
+            runner.events.subscribe(reject_cleanup_steering)
+            try:
+                result = await runner.run("make a durable change")
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(completion_seen.is_set())
+            finally:
+                await runner.close()
+
     async def test_final_turn_cost_overrun_preserves_max_turn_recovery(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1292,6 +1430,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as extra:
             root = Path(td)
             extra_root = Path(extra)
+            mutated_path = extra_root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            original_stat = mutated_path.stat()
             config = make_config(
                 root,
                 agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
@@ -1314,7 +1455,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
             def mutate_workspace(arguments, context):
                 del arguments, context
-                (extra_root / "shell-mutated.txt").write_text("changed")
+                mutated_path.write_text("change")
+                os.utime(
+                    mutated_path,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
                 return ToolResult("changed through shell")
 
             runner.tools.register(

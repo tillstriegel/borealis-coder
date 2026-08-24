@@ -28,6 +28,34 @@ class FakeConnection:
 
 
 class ACPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_waits_for_a_finishing_run(self):
+        class FinishingRunner:
+            def __init__(self):
+                self.run_arguments = None
+
+            def accepts_steering(self, session_id):
+                return False
+
+            async def run(self, prompt, **arguments):
+                self.run_arguments = (prompt, arguments)
+
+        server = ACPServer()
+        fake = FakeConnection()
+        server.connection = cast(Any, fake)
+        runner = FinishingRunner()
+        server.runners["session_1"] = cast(Any, runner)
+
+        accepted = await server._session_prompt(
+            {"sessionId": "session_1", "prompt": [{"type": "text", "text": "continue"}]}
+        )
+        self.assertEqual(accepted, {})
+        await server.tasks["session_1"]
+
+        assert runner.run_arguments is not None
+        prompt, arguments = runner.run_arguments
+        self.assertEqual(prompt, "continue")
+        self.assertTrue(arguments["wait_for_active_run"])
+
     async def test_reasoning_summary_is_forwarded_as_agent_thought(self):
         server = ACPServer()
         fake = FakeConnection()

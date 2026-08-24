@@ -55,6 +55,7 @@ class ProviderRoute:
 
 
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
+_INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
 _FINAL_TURN_INSTRUCTION = """# Final model turn
 This is the last model turn available for this run. Tools are unavailable. Return the best
 final answer now. State what was completed and what remains.
@@ -90,6 +91,7 @@ class AgentRunner:
             str,
             asyncio.Queue[tuple[str, str | None, dict[str, Any]]],
         ] = {}
+        self._accepting_steering: set[str] = set()
         self._approval_managers: dict[str, ApprovalManager] = {}
         self.mcp_manager: MCPManager | None = None
 
@@ -116,6 +118,9 @@ class AgentRunner:
         lock = self._locks.get(session_id)
         return bool(lock and lock.locked())
 
+    def accepts_steering(self, session_id: str) -> bool:
+        return self.is_busy(session_id) and session_id in self._accepting_steering
+
     def steer(
         self,
         session_id: str,
@@ -127,7 +132,7 @@ class AgentRunner:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("Steering prompt cannot be empty")
-        if not self.is_busy(session_id):
+        if not self.accepts_steering(session_id):
             raise SessionError(f"Session {session_id} has no active run to steer")
         self._steering.setdefault(session_id, asyncio.Queue()).put_nowait(
             (prompt, message_id, dict(metadata or {}))
@@ -144,6 +149,7 @@ class AgentRunner:
         session_id: str | None = None,
         user_message_id: str | None = None,
         user_metadata: dict[str, Any] | None = None,
+        wait_for_active_run: bool = False,
     ) -> AgentResult:
         prompt = prompt.strip()
         if not prompt:
@@ -166,53 +172,61 @@ class AgentRunner:
                     f"Session workspace is {session.workspace}, not {self.workspace}"
                 )
         lock = self._locks.setdefault(session_id, asyncio.Lock())
-        if lock.locked():
+        if lock.locked() and not wait_for_active_run:
             raise SessionError(f"Session {session_id} is already running")
         async with lock:
-            run_id = new_id("run")
-            deadline_expired = asyncio.Event()
-            worker = asyncio.create_task(
-                self._run_locked(
-                    prompt,
-                    session_id,
-                    run_id=run_id,
-                    deadline_expired=deadline_expired,
-                    user_message_id=user_message_id,
-                    user_metadata=user_metadata,
-                )
-            )
+            self._accepting_steering.add(session_id)
             try:
-                return await asyncio.wait_for(
-                    asyncio.shield(worker),
-                    timeout=self.config.agent.max_time_seconds,
+                run_id = new_id("run")
+                deadline_expired = asyncio.Event()
+                worker = asyncio.create_task(
+                    self._run_locked(
+                        prompt,
+                        session_id,
+                        run_id=run_id,
+                        deadline_expired=deadline_expired,
+                        user_message_id=user_message_id,
+                        user_metadata=user_metadata,
+                    )
                 )
-            except TimeoutError:
-                deadline_expired.set()
-            except asyncio.CancelledError:
-                pass
-            self.cancel(session_id)
-            worker.cancel()
-            try:
-                return await worker
-            except asyncio.CancelledError:
-                await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
-                stop_reason = (
-                    StopReason.BUDGET if deadline_expired.is_set() else StopReason.CANCELLED
-                )
-                error = (
-                    f"Maximum {self.config.agent.max_time_seconds}s run time reached"
-                    if deadline_expired.is_set()
-                    else "Run cancelled"
-                )
-                return AgentResult(
-                    session_id=session_id,
-                    run_id=run_id,
-                    text="",
-                    stop_reason=stop_reason,
-                    usage=Usage(),
-                    turns=0,
-                    error=error,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(worker),
+                        timeout=self.config.agent.max_time_seconds,
+                    )
+                except TimeoutError:
+                    deadline_expired.set()
+                except asyncio.CancelledError:
+                    pass
+                self.cancel(session_id)
+                worker.cancel()
+                try:
+                    return await worker
+                except asyncio.CancelledError:
+                    await asyncio.to_thread(
+                        self.sessions.update_session, session_id, status="idle"
+                    )
+                    stop_reason = (
+                        StopReason.BUDGET
+                        if deadline_expired.is_set()
+                        else StopReason.CANCELLED
+                    )
+                    error = (
+                        f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+                        if deadline_expired.is_set()
+                        else "Run cancelled"
+                    )
+                    return AgentResult(
+                        session_id=session_id,
+                        run_id=run_id,
+                        text="",
+                        stop_reason=stop_reason,
+                        usage=Usage(),
+                        turns=0,
+                        error=error,
+                    )
+            finally:
+                self._accepting_steering.discard(session_id)
 
     async def _run_locked(
         self,
@@ -467,11 +481,16 @@ class AgentRunner:
                 )
                 if response.text:
                     final_text = response.text
-                if final_turn and response.tool_calls:
+                final_response_incomplete = final_turn and _is_incomplete_response(response)
+                if final_turn and (response.tool_calls or final_response_incomplete):
                     await self._drain_steering(session_id, run_id, messages)
                     recovery_message = max_turns_recovery_message(
                         self.config.agent.max_turns
                     )
+                    if final_response_incomplete:
+                        recovery_message = (
+                            f"{recovery_message} The provider's final response was incomplete."
+                        )
                     if usage_budget_error is not None:
                         recovery_message = f"{recovery_message} {usage_budget_error}"
                     raise BudgetExceeded(
@@ -552,17 +571,37 @@ class AgentRunner:
                 try:
                     verification = await self._verify_changes(context)
                 except Cancelled as verification_error:
-                    stop_reason = StopReason.CANCELLED
-                    error_message = str(verification_error)
+                    verification = {
+                        "ok": False,
+                        "steps": [],
+                        "error": str(verification_error),
+                    }
+                    recovery_message = error_message or max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    error_message = (
+                        f"{recovery_message} Automatic verification was interrupted: "
+                        f"{verification_error}."
+                    )
                 except asyncio.CancelledError:
                     if deadline_expired.is_set():
-                        stop_reason = StopReason.BUDGET
-                        error_message = (
+                        verification_error = (
                             f"Maximum {self.config.agent.max_time_seconds}s run time reached"
                         )
                     else:
-                        stop_reason = StopReason.CANCELLED
-                        error_message = "Run cancelled"
+                        verification_error = "Run cancelled"
+                    verification = {
+                        "ok": False,
+                        "steps": [],
+                        "error": verification_error,
+                    }
+                    recovery_message = error_message or max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    error_message = (
+                        f"{recovery_message} Automatic verification was interrupted: "
+                        f"{verification_error}."
+                    )
                 except Exception as verification_error:
                     verification = {
                         "ok": False,
@@ -579,6 +618,7 @@ class AgentRunner:
                         f"{verification['error']}"
                     )
             if stop_reason == StopReason.MAX_TURNS:
+                self._accepting_steering.discard(session_id)
                 await self._drain_steering(session_id, run_id, messages)
             self._cancel.pop(session_id, None)
             queue = self._steering.get(session_id)
@@ -1212,9 +1252,9 @@ class AgentRunner:
         )
         return result
 
-    def _workspace_file_state(self) -> dict[Path, tuple[int, int]]:
+    def _workspace_file_state(self) -> dict[Path, tuple[int, int, str]]:
         storage = self.config.storage_dir
-        state: dict[Path, tuple[int, int]] = {}
+        state: dict[Path, tuple[int, int, str]] = {}
         for root in self.tool_context.roots.roots:
             matcher = (
                 self.context_builder.matcher
@@ -1226,9 +1266,11 @@ class AgentRunner:
                     continue
                 try:
                     stat = path.stat()
+                    with path.open("rb") as handle:
+                        digest = hashlib.file_digest(handle, "sha256").hexdigest()
                 except OSError:
                     continue
-                state[path] = (stat.st_mtime_ns, stat.st_size)
+                state[path] = (stat.st_mtime_ns, stat.st_size, digest)
         return state
 
     @staticmethod
@@ -1254,3 +1296,10 @@ def _is_cacheable_response(response: ModelResponse) -> bool:
     return bool(
         response.text and not response.tool_calls and stop_reason in _CACHEABLE_STOP_REASONS
     )
+
+
+def _is_incomplete_response(response: ModelResponse) -> bool:
+    if isinstance(response.stop_reason, dict):
+        return bool(response.stop_reason)
+    stop_reason = str(response.stop_reason or "").strip().lower()
+    return stop_reason in _INCOMPLETE_STOP_REASONS

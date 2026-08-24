@@ -241,7 +241,7 @@ class ACPServer:
             raise ProtocolError("Session is not active; call session/resume first")
         prompt = _prompt_text(params.get("prompt"))
         message_id = new_id("msg")
-        if runner.is_busy(session_id):
+        if runner.accepts_steering(session_id):
             runner.steer(
                 session_id,
                 prompt,
@@ -294,9 +294,11 @@ class ACPServer:
                 session_id=session_id,
                 user_message_id=message_id,
                 user_metadata={"acp": True},
+                wait_for_active_run=True,
             )
         finally:
-            self.tasks.pop(session_id, None)
+            if self.tasks.get(session_id) is asyncio.current_task():
+                self.tasks.pop(session_id, None)
 
     def _subscribe(self, session_id: str, runner: AgentRunner) -> None:
         async def handler(event: Event) -> None:
