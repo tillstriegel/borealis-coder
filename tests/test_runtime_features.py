@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import signal
 import sys
 import tempfile
 import unittest
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -811,6 +813,161 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 os.close(writer)
             self.assertFalse(child_survived)
             self.assertFalse((root / "generated").exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+    async def test_process_kills_group_after_supervisor_exits(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            trigger = root / "trigger"
+            supervisor_pid_path = root / "supervisor-pid"
+            os.mkfifo(trigger)
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            command = (
+                "(exec 3<> trigger; printf ready > child-ready; "
+                "IFS= read -r _ <&3; printf x > generated) >/dev/null 2>&1 & "
+                "while [ ! -f child-ready ]; do :; done; "
+                "printf '%s' \"$PPID\" > supervisor-pid; "
+                "while :; do sleep 1; done"
+            )
+            run_task = asyncio.create_task(
+                driver.run(command, cwd=root, timeout=5, shell=True)
+            )
+
+            try:
+                for _ in range(200):
+                    if supervisor_pid_path.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(supervisor_pid_path.exists())
+                supervisor_pid = int(supervisor_pid_path.read_text())
+
+                # Only signal the driver's dedicated group leader. A driver
+                # without the supervisor reports this pytest process as PPID,
+                # which must never be signalled by the regression itself.
+                self.assertGreater(supervisor_pid, 1)
+                self.assertNotEqual(supervisor_pid, os.getpid())
+                self.assertNotEqual(supervisor_pid, os.getpgrp())
+                self.assertEqual(os.getpgid(supervisor_pid), supervisor_pid)
+                os.kill(supervisor_pid, signal.SIGKILL)
+
+                result = await asyncio.wait_for(run_task, timeout=2)
+            finally:
+                if not run_task.done():
+                    run_task.cancel()
+                    await asyncio.gather(run_task, return_exceptions=True)
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertTrue((root / "child-ready").is_file())
+            try:
+                writer = os.open(trigger, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                self.assertEqual(error.errno, errno.ENXIO)
+                child_survived = False
+            else:
+                child_survived = True
+                os.write(writer, b"continue\n")
+                os.close(writer)
+            self.assertFalse(child_survived)
+            self.assertFalse((root / "generated").exists())
+
+    @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
+    async def test_process_bounds_pipe_drain_for_detached_descendant(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pid_path = root / "detached-pid"
+            child_code = (
+                "import os,sys,time\n"
+                "os.setsid()\n"
+                "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                "time.sleep(10)\n"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, "
+                f"{str(pid_path)!r}])\n"
+                f"pid_path = pathlib.Path({str(pid_path)!r})\n"
+                "deadline = time.monotonic() + 2\n"
+                "while not pid_path.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+            )
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            detached_pid = None
+            started = asyncio.get_running_loop().time()
+
+            try:
+                result = await asyncio.wait_for(
+                    driver.run(
+                        [sys.executable, "-c", parent_code],
+                        cwd=root,
+                        timeout=5,
+                    ),
+                    timeout=2,
+                )
+                elapsed = asyncio.get_running_loop().time() - started
+                detached_pid = int(pid_path.read_text())
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertFalse(result.stream_complete)
+                self.assertFalse(result.lifecycle_complete)
+                self.assertLess(elapsed, 1.5)
+            finally:
+                if detached_pid is None and pid_path.exists():
+                    detached_pid = int(pid_path.read_text())
+                if detached_pid is not None:
+                    with suppress(ProcessLookupError):
+                        os.kill(detached_pid, signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
+    async def test_process_bounds_cancel_cleanup_with_detached_pipe(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pid_path = root / "detached-pid"
+            child_code = (
+                "import os,sys,time\n"
+                "os.setsid()\n"
+                "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                "time.sleep(10)\n"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, "
+                f"{str(pid_path)!r}])\n"
+                f"pid_path = pathlib.Path({str(pid_path)!r})\n"
+                "deadline = time.monotonic() + 2\n"
+                "while not pid_path.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(10)\n"
+            )
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            detached_pid = None
+            started = asyncio.get_running_loop().time()
+
+            try:
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(
+                        driver.run(
+                            [sys.executable, "-c", parent_code],
+                            cwd=root,
+                            timeout=5,
+                        ),
+                        timeout=0.3,
+                    )
+                elapsed = asyncio.get_running_loop().time() - started
+                detached_pid = int(pid_path.read_text())
+
+                self.assertLess(elapsed, 1.2)
+            finally:
+                if detached_pid is None and pid_path.exists():
+                    detached_pid = int(pid_path.read_text())
+                if detached_pid is not None:
+                    with suppress(ProcessLookupError):
+                        os.kill(detached_pid, signal.SIGKILL)
 
     @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
     async def test_process_reports_detached_descendant_lifecycle_as_incomplete(self):

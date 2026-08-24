@@ -2001,6 +2001,88 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_verify_command_marks_delayed_process_lifecycle_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            delayed_path = root / "verify-delayed.txt"
+            config = make_config(
+                root,
+                agent={"provider": "verify_mutation", "max_turns": 2},
+            )
+            config.providers["verify_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="verify-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["verify_mutation"]
+            )
+            provider.tool_name = "verify"
+            provider.tool_arguments = {
+                "command": "true",
+                "timeout_seconds": 10,
+            }
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            release_mutation = asyncio.Event()
+            delayed_task: asyncio.Task[None] | None = None
+
+            async def delay_mutation():
+                await release_mutation.wait()
+                delayed_path.write_text("generated")
+
+            async def start_detached_mutation(*_args, **_kwargs):
+                nonlocal delayed_task
+                delayed_task = asyncio.create_task(delay_mutation())
+                return ProcessResult(
+                    "true",
+                    0,
+                    "",
+                    "",
+                    1,
+                    lifecycle_complete=False,
+                )
+
+            runner.tool_context.process.run = AsyncMock(
+                side_effect=start_detached_mutation
+            )
+            try:
+                result = await runner.run("run a detached verification command")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, [])
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertFalse(
+                    tool_call["metadata"]["process_lifecycle_complete"]
+                )
+                self.assertFalse(
+                    tool_call["metadata"]["steps"][0][
+                        "process_lifecycle_complete"
+                    ]
+                )
+                self.assertEqual(
+                    tool_call["metadata"]["workspace_change_tracking"],
+                    "incomplete",
+                )
+                self.assertFalse(delayed_path.exists())
+
+                release_mutation.set()
+                assert delayed_task is not None
+                await delayed_task
+                self.assertTrue(delayed_path.exists())
+            finally:
+                release_mutation.set()
+                if delayed_task is not None:
+                    await delayed_task
+                await runner.close()
+
     async def test_external_mutation_effect_marks_tracking_incomplete(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

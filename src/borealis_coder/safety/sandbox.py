@@ -10,6 +10,7 @@ import shutil
 import signal
 import sys
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from .paths import WorkspaceRoots
 OutputSink = Callable[[str, str], Awaitable[None] | None]
 OUTPUT_TRUNCATION_MARKER = "\n… output truncated …\n"
 _OUTPUT_OBSERVER_DRAIN_SECONDS = 1.0
+_PROCESS_IO_DRAIN_SECONDS = 0.5
+_PROCESS_IO_CANCEL_SECONDS = 0.2
 _POSIX_PROCESS_SUPERVISOR = """
 import os
 import signal
@@ -315,30 +318,37 @@ class NativeProcessDriver(ProcessDriver):
                 exit_code = status_task.result()
                 if exit_code is None:
                     abandon_io = True
-                else:
-                    await _kill_supervised_process_group(process)
+                _kill_supervised_process_group(process)
             elif process_task in done:
                 abandon_io = True
                 exit_code = process.returncode
+                if status_task is not None:
+                    _kill_supervised_process_group(process)
             else:
                 timed_out = True
                 await _terminate_process(
                     process,
                     grace_seconds=0.2 if status_task is not None else 2.0,
                 )
-            if abandon_io:
-                for task in io_tasks:
-                    task.cancel()
-                await asyncio.gather(process_task, *io_tasks, return_exceptions=True)
-            else:
-                await asyncio.gather(process_task, *io_tasks)
-            stream_complete = await finish_output(drain=True) and not abandon_io
+            process_io_complete = await _finish_process_io(
+                process,
+                process_task,
+                io_tasks,
+                drain=not abandon_io,
+            )
+            output_complete = await finish_output(drain=True)
+            stream_complete = process_io_complete and output_complete and not abandon_io
         except asyncio.CancelledError:
             await _terminate_process(
                 process,
                 grace_seconds=0.2 if status_task is not None else 2.0,
             )
-            await asyncio.gather(process_task, *io_tasks, return_exceptions=True)
+            await _finish_process_io(
+                process,
+                process_task,
+                io_tasks,
+                drain=False,
+            )
             await finish_output(drain=False)
             raise
         finally:
@@ -433,6 +443,8 @@ async def _terminate_process(
     grace_seconds: float = 2.0,
 ) -> None:
     if process.returncode is not None:
+        if os.name == "posix" and process.pid:
+            _kill_supervised_process_group(process)
         return
     try:
         if os.name == "posix" and process.pid:
@@ -441,26 +453,68 @@ async def _terminate_process(
             process.terminate()
         await asyncio.wait_for(process.wait(), timeout=grace_seconds)
     except (ProcessLookupError, TimeoutError):
-        try:
-            if os.name == "posix" and process.pid:
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
-            pass
+        pass
+    try:
+        if os.name == "posix" and process.pid:
+            os.killpg(process.pid, signal.SIGKILL)
+        elif process.returncode is None:
+            process.kill()
+    except ProcessLookupError:
+        pass
 
 
-async def _kill_supervised_process_group(process: asyncio.subprocess.Process) -> bool:
-    """Kill a POSIX command group while its supervisor still owns the group ID."""
+def _kill_supervised_process_group(process: asyncio.subprocess.Process) -> bool:
+    """Kill a POSIX command group, including after its supervisor has exited."""
 
-    if process.returncode is not None:
-        return False
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         return False
-    await process.wait()
     return True
+
+
+async def _finish_process_io(
+    process: asyncio.subprocess.Process,
+    process_task: asyncio.Task[int],
+    io_tasks: list[asyncio.Task[None]],
+    *,
+    drain: bool,
+) -> bool:
+    """Drain process pipes briefly, then force all local waiters to finish."""
+
+    tasks: set[asyncio.Task[object]] = {process_task, *io_tasks}
+    if not drain:
+        for task in io_tasks:
+            task.cancel()
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=_PROCESS_IO_DRAIN_SECONDS if drain else _PROCESS_IO_CANCEL_SECONDS,
+    )
+    if done:
+        await asyncio.gather(*done, return_exceptions=True)
+    if not pending:
+        return drain
+
+    for task in pending:
+        task.cancel()
+    _close_subprocess_transport(process)
+    done, pending = await asyncio.wait(pending, timeout=_PROCESS_IO_CANCEL_SECONDS)
+    if done:
+        await asyncio.gather(*done, return_exceptions=True)
+    for task in pending:
+        task.add_done_callback(_consume_task_result)
+    return False
+
+
+def _close_subprocess_transport(process: asyncio.subprocess.Process) -> None:
+    transport = getattr(process, "_transport", None)
+    if transport is not None:
+        transport.close()
+
+
+def _consume_task_result(task: asyncio.Task[object]) -> None:
+    with suppress(asyncio.CancelledError, Exception):
+        task.result()
 
 
 async def _read_process_status(fd: int) -> int | None:

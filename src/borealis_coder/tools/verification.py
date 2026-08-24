@@ -27,8 +27,18 @@ class VerificationReport:
     ok: bool
     steps: list[dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def lifecycle_complete(self) -> bool:
+        return all(
+            step.get("process_lifecycle_complete", True) for step in self.steps
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "steps": self.steps}
+        return {
+            "ok": self.ok,
+            "steps": self.steps,
+            "process_lifecycle_complete": self.lifecycle_complete,
+        }
 
     def render(self) -> str:
         rows = [f"verification_ok={str(self.ok).lower()}"]
@@ -144,6 +154,7 @@ class VerificationPlanner:
                 "name": step.name, "command": step.command, "exit_code": result.exit_code,
                 "duration_ms": result.duration_ms, "timed_out": result.timed_out,
                 "stdout": result.stdout, "stderr": result.stderr,
+                "process_lifecycle_complete": result.lifecycle_complete,
             })
             if not result.ok:
                 report.ok = False
@@ -169,7 +180,10 @@ class VerifyTool(Tool):
         else:
             steps = planner.detect(max_seconds=context.config.agent.auto_verify_max_seconds)
         report = await planner.run(context, steps)
-        return ToolResult(report.render(), is_error=not report.ok, metadata=report.to_dict())
+        metadata = report.to_dict()
+        if not report.lifecycle_complete:
+            metadata["workspace_change_tracking"] = "incomplete"
+        return ToolResult(report.render(), is_error=not report.ok, metadata=metadata)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
