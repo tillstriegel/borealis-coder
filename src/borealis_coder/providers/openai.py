@@ -15,6 +15,8 @@ from ..util import json_dumps
 from .base import Provider, ProviderStreamEvent, classify_provider_error
 from .http import HttpClient
 
+_INCOMPLETE_STOP_REASONS = frozenset({"incomplete", "length", "max_tokens"})
+
 
 class OpenAIProvider(Provider):
     name = "openai"
@@ -211,6 +213,7 @@ class OpenAIProvider(Provider):
         reasoning_summary_key: tuple[str, str, str] | None = None
         calls: dict[str, dict[str, Any]] = {}
         call_aliases: dict[str, str] = {}
+        completed_call_ids: set[str] = set()
         final_data: dict[str, Any] | None = None
         async for item in self.http.stream_sse(url, headers=self._headers(), payload=payload):
             if item.data == "[DONE]":
@@ -263,6 +266,8 @@ class OpenAIProvider(Provider):
                     call["name"] = str(output.get("name") or call["name"])
                     if output.get("arguments"):
                         call["arguments"] = str(output["arguments"])
+                    if event_type == "response.output_item.done":
+                        completed_call_ids.add(key)
             elif event_type == "response.function_call_arguments.delta":
                 raw_key = str(data.get("call_id") or data.get("item_id") or "")
                 key = call_aliases.get(raw_key, raw_key)
@@ -276,7 +281,7 @@ class OpenAIProvider(Provider):
                         "delta": data.get("delta", ""),
                     },
                 )
-            elif event_type in {"response.completed", "response.done"}:
+            elif event_type in {"response.completed", "response.done", "response.incomplete"}:
                 completed_data = (
                     data.get("response") if isinstance(data.get("response"), dict) else data
                 )
@@ -289,6 +294,7 @@ class OpenAIProvider(Provider):
                 _raise_in_band_failure(failed, default_message="Responses stream failed")
         if final_data:
             result = self._parse_responses(final_data, retain_raw=True)
+            response_incomplete = _responses_data_is_incomplete(final_data)
             if not result.text:
                 result.text = "".join(text_parts)
             streamed_summary = "".join(reasoning_summary_parts)
@@ -323,13 +329,17 @@ class OpenAIProvider(Provider):
                 self._call_from_partial(item)
                 for item in calls.values()
                 if str(item.get("id") or "") not in final_calls
+                and (
+                    not response_incomplete
+                    or str(item.get("id") or "") in completed_call_ids
+                )
             )
         else:
-            result_calls = [self._call_from_partial(item) for item in calls.values()]
             result = ModelResponse(
                 text="".join(text_parts),
-                tool_calls=result_calls,
+                tool_calls=[],
                 reasoning_summary="".join(reasoning_summary_parts),
+                stop_reason="incomplete",
             )
         yield ProviderStreamEvent(type="completed", response=result)
 
@@ -395,6 +405,7 @@ class OpenAIProvider(Provider):
     def _parse_responses(self, data: dict[str, Any], *, retain_raw: bool) -> ModelResponse:
         text: list[str] = []
         calls: list[ToolCall] = []
+        response_incomplete = _responses_data_is_incomplete(data)
         for item in data.get("output", []) or []:
             if not isinstance(item, dict):
                 continue
@@ -408,6 +419,8 @@ class OpenAIProvider(Provider):
                     elif block.get("type") == "refusal":
                         text.append(str(block.get("refusal") or ""))
             elif item_type in {"function_call", "custom_tool_call"}:
+                if response_incomplete and item.get("status") != "completed":
+                    continue
                 raw_arguments = item.get("arguments") or item.get("input") or "{}"
                 calls.append(
                     ToolCall(
@@ -569,6 +582,12 @@ class OpenAIProvider(Provider):
                     pending_reasoning.append(event)
                     continue
                 if event.type == "completed" and event.response is not None:
+                    if _is_incomplete_stop_reason(event.response.stop_reason):
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                        yield event
+                        return
                     if _has_actionable_output(event.response):
                         for pending in pending_reasoning:
                             yield pending
@@ -603,6 +622,13 @@ class OpenAIProvider(Provider):
                         pending_reasoning.append(event)
                         continue
                     if event.type == "completed" and event.response is not None:
+                        if _is_incomplete_stop_reason(event.response.stop_reason):
+                            event.response.usage = prior_usage.add(event.response.usage)
+                            for pending in pending_reasoning:
+                                yield pending
+                            pending_reasoning.clear()
+                            yield event
+                            return
                         if not _has_actionable_output(event.response):
                             usage = _copy_usage(prior_usage).add(event.response.usage)
                             event.response.reasoning_summary = ""
@@ -701,11 +727,18 @@ class OpenAIProvider(Provider):
                             "delta": function.get("arguments", ""),
                         },
                     )
+        response_complete = finish_reason is not None and not _is_incomplete_stop_reason(
+            finish_reason
+        )
+        completed_calls = calls if response_complete else {}
         result = ModelResponse(
             text="".join(text_parts),
-            tool_calls=[self._call_from_partial(item) for _, item in sorted(calls.items())],
+            tool_calls=[
+                self._call_from_partial(item)
+                for _, item in sorted(completed_calls.items())
+            ],
             usage=usage,
-            stop_reason=finish_reason,
+            stop_reason=finish_reason or "incomplete",
             response_id=response_id,
             model=model,
             reasoning_summary="".join(reasoning_summary_parts),
@@ -719,7 +752,12 @@ class OpenAIProvider(Provider):
         choice = choices[0]
         message = choice.get("message") or {}
         calls: list[ToolCall] = []
-        for item in message.get("tool_calls", []) or []:
+        raw_calls = (
+            []
+            if _is_incomplete_stop_reason(choice.get("finish_reason"))
+            else message.get("tool_calls", []) or []
+        )
+        for item in raw_calls:
             function = item.get("function") or {}
             raw_arguments = function.get("arguments") or "{}"
             calls.append(
@@ -852,6 +890,11 @@ def _supports_explicit_cache_breakpoints(model: str) -> bool:
     if match is None:
         return False
     return (int(match.group(1)), int(match.group(2) or 0)) >= (5, 6)
+
+
+def _responses_data_is_incomplete(data: dict[str, Any]) -> bool:
+    status = str(data.get("status") or "").strip().lower()
+    return status == "incomplete" or bool(data.get("incomplete_details"))
 
 
 def _extract_encrypted_reasoning_state(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1059,6 +1102,10 @@ def _parse_arguments(value: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"_raw": str(value)}
     return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _is_incomplete_stop_reason(value: Any) -> bool:
+    return str(value or "").strip().lower() in _INCOMPLETE_STOP_REASONS
 
 
 def _strict_schema_compatible(schema: dict[str, Any]) -> bool:

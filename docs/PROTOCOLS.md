@@ -78,6 +78,10 @@ A session has a primary absolute `cwd`. Additional directories expand the effect
 - usage updates
 - final state `idle` with stop reason
 
+When the model-turn limit prevents completion, the adapter sends an agent message with the
+recovery instruction before the final `idle`/`max_turns` state update. The durable session can
+then continue with another prompt.
+
 When a prompt arrives while the session is running, Borealis queues it as steering for the next safe turn boundary rather than starting a second conflicting mutation loop.
 
 ### Permission requests

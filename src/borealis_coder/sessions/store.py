@@ -462,6 +462,7 @@ class SessionStore:
         output: str,
         is_error: bool,
         metadata: dict[str, Any] | None = None,
+        message: Message | None = None,
     ) -> None:
         with self._lock, self._connection:
             self._connection.execute(
@@ -478,8 +479,17 @@ class SessionStore:
                     call_id,
                 ),
             )
+            if message is not None:
+                self._append_message_locked(session_id, message)
 
-    def cancel_tool_call(self, session_id: str, call_id: str, *, reason: str = "cancelled") -> None:
+    def cancel_tool_call(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        reason: str = "cancelled",
+        message: Message | None = None,
+    ) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 """UPDATE tool_calls SET
@@ -487,6 +497,28 @@ class SessionStore:
                 WHERE session_id=? AND tool_call_id=?""",
                 (reason, utc_now(), json_dumps({"cancelled": True}), session_id, call_id),
             )
+            if message is not None:
+                self._append_message_locked(session_id, message)
+
+    def _append_message_locked(self, session_id: str, message: Message) -> None:
+        self._connection.execute(
+            """INSERT INTO messages(session_id,message_id,role,payload_json,created_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(session_id,message_id) DO UPDATE SET
+                role=excluded.role,
+                payload_json=excluded.payload_json,
+                created_at=excluded.created_at""",
+            (
+                session_id,
+                message.id,
+                message.role.value,
+                json_dumps(message.to_dict()),
+                message.created_at,
+            ),
+        )
+        self._connection.execute(
+            "UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id)
+        )
 
     def tool_calls(self, session_id: str) -> list[dict[str, Any]]:
         self.get_session(session_id)

@@ -11,7 +11,7 @@ from typing import Any
 from ..config import Config
 from ..errors import ProtocolError
 from ..models import Effect, ToolResult
-from ..tools.base import Tool, ToolContext, ToolRegistry
+from ..tools.base import MutationScope, Tool, ToolContext, ToolRegistry
 from ..util import json_dumps
 from .client import HttpMCPClient, MCPClient, MCPToolDefinition, StdioMCPClient
 
@@ -42,6 +42,8 @@ class MCPTool(Tool):
             self.effect = Effect.READ
         else:
             self.effect = Effect.CONTROL
+        if self.effect != Effect.READ:
+            self.mutation_scope = MutationScope.EXTERNAL
         self.concurrent = read_only and not (open_world or destructive)
         self.default_risk = (
             "critical" if destructive else ("high" if open_world or not read_only else "low")

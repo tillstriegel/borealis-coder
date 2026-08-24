@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from ..models import Effect, ToolResult
@@ -63,14 +64,30 @@ class ShellTool(Tool):
                 return
             await emit_output(stream, redacted)
 
-        result = await context.process.run(command, cwd=cwd, timeout=timeout, shell=True, on_output=on_output)
+        try:
+            result = await context.process.run(
+                command,
+                cwd=cwd,
+                timeout=timeout,
+                shell=True,
+                on_output=on_output,
+            )
+        except asyncio.CancelledError:
+            if not context.process.guarantees_bounded_lifecycle:
+                context.mutation_tracking = "incomplete"
+                context.changed_roots.update(context.roots.roots)
+            raise
         for stream, redactor in output_redactors.items():
             redacted = redactor.flush()
             if redacted:
                 await emit_output(stream, redacted)
-        return ToolResult(result.render(), is_error=not result.ok, metadata={
+        metadata = {
             "exit_code": result.exit_code, "duration_ms": result.duration_ms,
             "timed_out": result.timed_out, "cwd": context.roots.display(cwd),
             "stream_truncated": result.stream_truncated,
             "stream_complete": result.stream_complete,
-        })
+            "process_lifecycle_complete": result.lifecycle_complete,
+        }
+        if not result.lifecycle_complete:
+            metadata["workspace_change_tracking"] = "incomplete"
+        return ToolResult(result.render(), is_error=not result.ok, metadata=metadata)

@@ -10,7 +10,7 @@ from typing import Any
 from ..errors import ToolError
 from ..models import Effect, ToolResult
 from ..util import atomic_write_text, sha256_bytes, sha256_text, truncate_text
-from .base import Tool, ToolContext, nullable, object_schema
+from .base import MutationScope, Tool, ToolContext, nullable, object_schema
 
 
 class ReadFileTool(Tool):
@@ -52,6 +52,7 @@ class WriteFileTool(Tool):
     name = "write_file"
     description = "Atomically create or replace a UTF-8 text file. Use expected_sha256 to prevent stale writes."
     effect = Effect.WRITE
+    mutation_scope = MutationScope.TRACKED
     default_risk = "medium"
     parameters = object_schema({
         "path": {"type": "string", "minLength": 1},
@@ -82,6 +83,7 @@ class WriteFileTool(Tool):
         checkpoint = context.checkpoints.create([resolved.path], label=f"write_file {resolved.display}")
         atomic_write_text(resolved.path, content)
         context.changed_files.add(resolved.display)
+        context.changed_roots.add(resolved.root)
         return ToolResult(
             f"Wrote {size} bytes to {resolved.display}\nsha256: {sha256_text(content)}",
             metadata={"path": resolved.display, "sha256": sha256_text(content), "checkpoint_id": checkpoint.id if checkpoint else None, "created": not existed},
@@ -92,6 +94,7 @@ class ReplaceInFileTool(Tool):
     name = "replace_in_file"
     description = "Atomically replace exact text in a file with occurrence-count and hash guards."
     effect = Effect.WRITE
+    mutation_scope = MutationScope.TRACKED
     default_risk = "medium"
     parameters = object_schema({
         "path": {"type": "string", "minLength": 1},
@@ -125,6 +128,7 @@ class ReplaceInFileTool(Tool):
         checkpoint = context.checkpoints.create([resolved.path], label=f"replace_in_file {resolved.display}")
         atomic_write_text(resolved.path, updated)
         context.changed_files.add(resolved.display)
+        context.changed_roots.add(resolved.root)
         return ToolResult(
             f"Replaced {count} occurrence(s) in {resolved.display}\nsha256: {sha256_text(updated)}",
             metadata={"path": resolved.display, "replacements": count, "sha256": sha256_text(updated), "checkpoint_id": checkpoint.id if checkpoint else None},
@@ -135,6 +139,7 @@ class DeleteFileTool(Tool):
     name = "delete_file"
     description = "Delete one workspace file after checkpointing it. Directories are never deleted."
     effect = Effect.WRITE
+    mutation_scope = MutationScope.TRACKED
     default_risk = "high"
     parameters = object_schema({
         "path": {"type": "string", "minLength": 1},
@@ -153,6 +158,7 @@ class DeleteFileTool(Tool):
         checkpoint = context.checkpoints.create([resolved.path], label=f"delete_file {resolved.display}")
         resolved.path.unlink()
         context.changed_files.add(resolved.display)
+        context.changed_roots.add(resolved.root)
         return ToolResult(f"Deleted {resolved.display}", metadata={"path": resolved.display, "checkpoint_id": checkpoint.id if checkpoint else None})
 
 
@@ -160,13 +166,23 @@ class MakeDirectoryTool(Tool):
     name = "make_directory"
     description = "Create a directory and missing parents inside the workspace."
     effect = Effect.WRITE
+    mutation_scope = MutationScope.TRACKED
     default_risk = "low"
     parameters = object_schema({"path": {"type": "string", "minLength": 1}})
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         resolved = context.roots.resolve(arguments["path"])
         context.roots.assert_writable(resolved.path, context.config.safety.protected_paths)
+        missing_directories: list[Path] = []
+        candidate = resolved.path
+        while not candidate.exists() and candidate != resolved.root:
+            missing_directories.append(candidate)
+            candidate = candidate.parent
         resolved.path.mkdir(parents=True, exist_ok=True)
+        for path in missing_directories:
+            context.changed_files.add(context.roots.display(path))
+        if missing_directories:
+            context.changed_roots.add(resolved.root)
         return ToolResult(f"Directory ready: {resolved.display}", metadata={"path": resolved.display})
 
 

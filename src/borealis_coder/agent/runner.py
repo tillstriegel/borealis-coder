@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
+import stat
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
+from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 from ..config import Config
 from ..context import ContextBuilder
@@ -31,15 +35,16 @@ from ..models import (
     Role,
     StopReason,
     ToolCall,
+    ToolResult,
     Usage,
 )
 from ..providers.base import Provider
 from ..safety import ApprovalManager
 from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
-from ..tools import ToolContext, ToolRegistry, VerificationPlanner
+from ..tools import MutationScope, ToolContext, ToolRegistry, VerificationPlanner
 from ..util import json_dumps, new_id, truncate_text
-from .budget import Budget, estimate_request_tokens
+from .budget import Budget, estimate_request_tokens, max_turns_recovery_message
 from .compaction import Summarizer, compact_messages_with_summary
 
 if TYPE_CHECKING:
@@ -54,6 +59,22 @@ class ProviderRoute:
 
 
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
+_INCOMPLETE_STOP_REASONS = frozenset(
+    {"incomplete", "length", "max_tokens", "model_context_window_exceeded"}
+)
+_TOOL_FINALIZATION_GRACE_SECONDS = 0.5
+_WORKSPACE_SCAN_STOP_GRACE_SECONDS = 0.05
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_OPEN_REPARSE_POINT = 0x00200000
+_WINDOWS_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_BASIC_INFO = 0
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_FINAL_TURN_INSTRUCTION = """# Final model turn
+This is the last model turn available for this run. Tools are unavailable. Return the best
+final answer now. State what was completed and what remains.
+"""
 
 
 class AgentRunner:
@@ -85,6 +106,7 @@ class AgentRunner:
             str,
             asyncio.Queue[tuple[str, str | None, dict[str, Any]]],
         ] = {}
+        self._accepting_steering: set[str] = set()
         self._approval_managers: dict[str, ApprovalManager] = {}
         self.mcp_manager: MCPManager | None = None
 
@@ -111,6 +133,9 @@ class AgentRunner:
         lock = self._locks.get(session_id)
         return bool(lock and lock.locked())
 
+    def accepts_steering(self, session_id: str) -> bool:
+        return self.is_busy(session_id) and session_id in self._accepting_steering
+
     def steer(
         self,
         session_id: str,
@@ -122,7 +147,7 @@ class AgentRunner:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("Steering prompt cannot be empty")
-        if not self.is_busy(session_id):
+        if not self.accepts_steering(session_id):
             raise SessionError(f"Session {session_id} has no active run to steer")
         self._steering.setdefault(session_id, asyncio.Queue()).put_nowait(
             (prompt, message_id, dict(metadata or {}))
@@ -139,6 +164,7 @@ class AgentRunner:
         session_id: str | None = None,
         user_message_id: str | None = None,
         user_metadata: dict[str, Any] | None = None,
+        wait_for_active_run: bool = False,
     ) -> AgentResult:
         prompt = prompt.strip()
         if not prompt:
@@ -161,53 +187,62 @@ class AgentRunner:
                     f"Session workspace is {session.workspace}, not {self.workspace}"
                 )
         lock = self._locks.setdefault(session_id, asyncio.Lock())
-        if lock.locked():
+        if lock.locked() and not wait_for_active_run:
             raise SessionError(f"Session {session_id} is already running")
         async with lock:
-            run_id = new_id("run")
-            deadline_expired = asyncio.Event()
-            worker = asyncio.create_task(
-                self._run_locked(
-                    prompt,
-                    session_id,
-                    run_id=run_id,
-                    deadline_expired=deadline_expired,
-                    user_message_id=user_message_id,
-                    user_metadata=user_metadata,
-                )
-            )
+            self._accepting_steering.add(session_id)
             try:
-                return await asyncio.wait_for(
-                    asyncio.shield(worker),
-                    timeout=self.config.agent.max_time_seconds,
+                run_id = new_id("run")
+                deadline_expired = asyncio.Event()
+                worker = asyncio.create_task(
+                    self._run_locked(
+                        prompt,
+                        session_id,
+                        run_id=run_id,
+                        deadline_expired=deadline_expired,
+                        user_message_id=user_message_id,
+                        user_metadata=user_metadata,
+                    )
                 )
-            except TimeoutError:
-                deadline_expired.set()
-            except asyncio.CancelledError:
-                pass
-            self.cancel(session_id)
-            worker.cancel()
-            try:
-                return await worker
-            except asyncio.CancelledError:
-                await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
-                stop_reason = (
-                    StopReason.BUDGET if deadline_expired.is_set() else StopReason.CANCELLED
-                )
-                error = (
-                    f"Maximum {self.config.agent.max_time_seconds}s run time reached"
-                    if deadline_expired.is_set()
-                    else "Run cancelled"
-                )
-                return AgentResult(
-                    session_id=session_id,
-                    run_id=run_id,
-                    text="",
-                    stop_reason=stop_reason,
-                    usage=Usage(),
-                    turns=0,
-                    error=error,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(worker),
+                        timeout=self.config.agent.max_time_seconds,
+                    )
+                except TimeoutError:
+                    deadline_expired.set()
+                except asyncio.CancelledError:
+                    pass
+                self.cancel(session_id)
+                worker.cancel()
+                try:
+                    return await worker
+                except asyncio.CancelledError:
+                    await asyncio.to_thread(
+                        self.sessions.update_session, session_id, status="idle"
+                    )
+                    stop_reason = (
+                        StopReason.BUDGET
+                        if deadline_expired.is_set()
+                        else StopReason.CANCELLED
+                    )
+                    error = (
+                        f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+                        if deadline_expired.is_set()
+                        else "Run cancelled"
+                    )
+                    return AgentResult(
+                        session_id=session_id,
+                        run_id=run_id,
+                        text="",
+                        stop_reason=stop_reason,
+                        usage=Usage(),
+                        turns=0,
+                        error=error,
+                        mutation_tracking="incomplete",
+                    )
+            finally:
+                self._accepting_steering.discard(session_id)
 
     async def _run_locked(
         self,
@@ -242,6 +277,7 @@ class AgentRunner:
             session_id=session_id,
             run_id=run_id,
             changed_files=set(),
+            changed_roots=set(),
             metadata=dict(self.tool_context.metadata),
         )
         context.metadata["context_builder"] = self.context_builder
@@ -303,8 +339,18 @@ class AgentRunner:
             while True:
                 self._check_cancel(cancel)
                 budget.before_turn()
-                schemas = self.tools.schemas()
-                estimated = estimate_request_tokens(system, messages, schemas)
+                final_turn = budget.turns == self.config.agent.max_turns
+                schemas = [] if final_turn else self.tools.schemas()
+                turn_system = (
+                    f"{system}\n\n{_FINAL_TURN_INSTRUCTION}" if final_turn else system
+                )
+                turn_system_blocks = prompt_context.system_blocks
+                if final_turn:
+                    turn_system_blocks = [
+                        *turn_system_blocks,
+                        {"text": _FINAL_TURN_INSTRUCTION, "cacheable": False},
+                    ]
+                estimated = estimate_request_tokens(turn_system, messages, schemas)
                 threshold = int(
                     self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio
                 )
@@ -330,7 +376,7 @@ class AgentRunner:
                             estimated_tokens=estimated,
                             messages=len(messages),
                         )
-                        estimated = estimate_request_tokens(system, messages, schemas)
+                        estimated = estimate_request_tokens(turn_system, messages, schemas)
                 if estimated > self.config.agent.max_input_tokens:
                     raise BudgetExceeded(
                         "context",
@@ -339,7 +385,7 @@ class AgentRunner:
                     )
                 request = ProviderRequest(
                     model=self.providers[0].model,
-                    system=system,
+                    system=turn_system,
                     messages=messages,
                     tools=schemas,
                     max_output_tokens=self.config.agent.max_output_tokens,
@@ -352,7 +398,7 @@ class AgentRunner:
                         "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
                         "prompt_cache_ttl": self.config.cache.anthropic_ttl,
                         "anthropic_conversation_cache": conversation_cache,
-                        "system_blocks": prompt_context.system_blocks,
+                        "system_blocks": turn_system_blocks,
                     },
                 )
                 await self.events.emit(
@@ -411,11 +457,17 @@ class AgentRunner:
                     provider=used_route.name,
                     model=used_route.model,
                 )
+                response_incomplete = _is_incomplete_response(response)
+                response_tool_calls = (
+                    [] if response_incomplete else response.tool_calls
+                )
                 assistant_metadata = {
                     "model": response.model or used_route.model,
                     "response_id": response.response_id,
                 }
-                if response.continuation_state is not None:
+                if response.continuation_state is not None and not (
+                    final_turn and response_tool_calls
+                ):
                     continuation = response.continuation_state.to_metadata(
                         provider=used_route.name,
                         model=used_route.model,
@@ -428,7 +480,7 @@ class AgentRunner:
                     id=assistant_message_id,
                     role=Role.ASSISTANT,
                     content=response.text,
-                    tool_calls=response.tool_calls,
+                    tool_calls=[] if final_turn else response_tool_calls,
                     metadata=assistant_metadata,
                 )
                 messages.append(assistant)
@@ -441,15 +493,36 @@ class AgentRunner:
                     message_id=assistant.id,
                     text=response.text,
                     reasoning_summary=response.reasoning_summary,
-                    tool_calls=[call.to_dict() for call in response.tool_calls],
+                    tool_calls=(
+                        [] if final_turn else [call.to_dict() for call in response_tool_calls]
+                    ),
                     usage=response.usage.to_dict(),
                     stop_reason=response.stop_reason,
                 )
                 if response.text:
                     final_text = response.text
+                final_response_incomplete = final_turn and response_incomplete
+                if final_turn and (response_tool_calls or final_response_incomplete):
+                    await self._drain_steering(session_id, run_id, messages)
+                    recovery_message = max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    if final_response_incomplete:
+                        recovery_message = (
+                            f"{recovery_message} The provider's final response was incomplete."
+                        )
+                    if usage_budget_error is not None:
+                        recovery_message = f"{recovery_message} {usage_budget_error}"
+                    raise BudgetExceeded(
+                        "turns",
+                        recovery_message,
+                    )
                 if usage_budget_error is not None:
                     raise usage_budget_error
-                if not response.tool_calls:
+                if response_incomplete:
+                    await self._drain_steering(session_id, run_id, messages)
+                    continue
+                if not response_tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
                         continue
                     break
@@ -457,7 +530,7 @@ class AgentRunner:
                     json_dumps(
                         [
                             {"name": call.name, "arguments": call.arguments}
-                            for call in response.tool_calls
+                            for call in response_tool_calls
                         ]
                     ).encode()
                 ).hexdigest()
@@ -472,31 +545,18 @@ class AgentRunner:
                         "stuck",
                         f"Repeated identical tool-call batch {repeated_batch_count} times",
                     )
-                results = await self._execute_calls(response.tool_calls, cancel, context)
-                for call, result in zip(response.tool_calls, results, strict=True):
-                    tool_message = Message(
-                        role=Role.TOOL,
-                        content=result.output,
-                        tool_call_id=call.id,
-                        tool_name=call.name,
-                        is_error=result.is_error,
-                        metadata=result.metadata,
-                    )
+                tool_messages = await self._execute_calls(
+                    response_tool_calls,
+                    cancel,
+                    context,
+                )
+                for tool_message in tool_messages:
                     messages.append(tool_message)
-                    await asyncio.to_thread(self.sessions.append_message, session_id, tool_message)
                 await self._drain_steering(session_id, run_id, messages)
-            if context.changed_files and self.config.agent.auto_verify:
-                planner = VerificationPlanner(self.workspace)
-                await self.events.emit(
-                    "verification.started",
-                    session_id=session_id,
-                    run_id=run_id,
-                )
-                report = await planner.run(context)
-                verification = report.to_dict()
-                await self.events.emit(
-                    "verification.completed", session_id=session_id, run_id=run_id, **verification
-                )
+            if (
+                context.changed_roots or context.mutation_tracking == "incomplete"
+            ) and self.config.agent.auto_verify:
+                verification = await self._verify_changes(context, cancel)
         except Cancelled as error:
             stop_reason = StopReason.CANCELLED
             error_message = str(error)
@@ -522,11 +582,79 @@ class AgentRunner:
                 "run.error", session_id=session_id, run_id=run_id, error=error_message
             )
         finally:
+            if (
+                stop_reason == StopReason.MAX_TURNS
+                and verification is None
+                and (context.changed_roots or context.mutation_tracking == "incomplete")
+                and self.config.agent.auto_verify
+            ):
+                try:
+                    verification = await self._verify_changes(context, cancel)
+                except Cancelled as verification_error:
+                    verification = {
+                        "ok": False,
+                        "steps": [],
+                        "error": str(verification_error),
+                    }
+                    recovery_message = error_message or max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    error_message = (
+                        f"{recovery_message} Automatic verification was interrupted: "
+                        f"{verification_error}."
+                    )
+                except asyncio.CancelledError:
+                    if deadline_expired.is_set():
+                        verification_error = (
+                            f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+                        )
+                    else:
+                        verification_error = "Run cancelled"
+                    verification = {
+                        "ok": False,
+                        "steps": [],
+                        "error": verification_error,
+                    }
+                    recovery_message = error_message or max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    error_message = (
+                        f"{recovery_message} Automatic verification was interrupted: "
+                        f"{verification_error}."
+                    )
+                except Exception as verification_error:
+                    verification = {
+                        "ok": False,
+                        "steps": [],
+                        "error": (
+                            f"{type(verification_error).__name__}: {verification_error}"
+                        ),
+                    }
+                    recovery_message = error_message or max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    error_message = (
+                        f"{recovery_message} Automatic verification could not run: "
+                        f"{verification['error']}"
+                    )
+            if stop_reason == StopReason.MAX_TURNS:
+                self._accepting_steering.discard(session_id)
+                await self._drain_steering(session_id, run_id, messages)
             self._cancel.pop(session_id, None)
             queue = self._steering.get(session_id)
             if queue is not None and queue.empty():
                 self._steering.pop(session_id, None)
             await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
+        if context.mutation_tracking == "incomplete" and verification is None:
+            verification = {
+                "ok": False,
+                "steps": [],
+                "error": "Workspace mutation tracking is incomplete; verification is required.",
+                "roots": [
+                    context.roots.display(root)
+                    for root in sorted(context.changed_roots, key=lambda item: item.as_posix())
+                ],
+            }
         usage = budget.usage or Usage()
         result = AgentResult(
             session_id=session_id,
@@ -536,13 +664,79 @@ class AgentRunner:
             usage=usage,
             turns=budget.turns,
             changed_files=sorted(context.changed_files),
+            mutation_tracking=context.mutation_tracking,
             verification=verification,
             error=error_message,
+            incomplete=stop_reason == StopReason.MAX_TURNS,
         )
         await self.events.emit(
             "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
         )
         return result
+
+    async def _verify_changes(
+        self,
+        context: ToolContext,
+        cancel: asyncio.Event,
+    ) -> dict[str, Any]:
+        self._check_cancel(cancel)
+        await self.events.emit(
+            "verification.started",
+            session_id=context.session_id,
+            run_id=context.run_id,
+        )
+        roots = sorted(context.changed_roots or {self.workspace}, key=lambda item: item.as_posix())
+        remaining_seconds = self.config.agent.auto_verify_max_seconds
+        reports: list[tuple[Path, Any]] = []
+        skipped_roots = 0
+        for index, root in enumerate(roots):
+            self._check_cancel(cancel)
+            root_count = len(roots) - index
+            root_seconds = remaining_seconds // root_count
+            if root_seconds <= 0:
+                skipped_roots = root_count
+                break
+            remaining_seconds -= root_seconds
+            planner = VerificationPlanner(root)
+            steps = planner.detect(max_seconds=root_seconds)
+            report = await self._await_until_cancelled(
+                planner.run(context, steps),
+                cancel,
+            )
+            reports.append((root, report))
+            if not report.ok:
+                break
+        verification = {
+            "ok": not skipped_roots and all(report.ok for _, report in reports),
+            "process_lifecycle_complete": all(
+                report.lifecycle_complete for _, report in reports
+            ),
+            "steps": [
+                {
+                    **step,
+                    **(
+                        {"root": context.roots.display(root)}
+                        if len(roots) > 1 or root != self.workspace
+                        else {}
+                    ),
+                }
+                for root, report in reports
+                for step in report.steps
+            ],
+        }
+        if skipped_roots:
+            verification["error"] = (
+                f"Verification time budget was too small for {skipped_roots} root(s)"
+            )
+        if not verification["process_lifecycle_complete"]:
+            self._mark_workspace_tracking_incomplete(context)
+        await self.events.emit(
+            "verification.completed",
+            session_id=context.session_id,
+            run_id=context.run_id,
+            **verification,
+        )
+        return verification
 
     async def _drain_steering(self, session_id: str, run_id: str, messages: list[Message]) -> bool:
         queue = self._steering.get(session_id)
@@ -971,7 +1165,11 @@ class AgentRunner:
                 completed.reasoning_summary = self._redact_reasoning_summary(
                     completed.reasoning_summary
                 )
-                if not completed.text and not completed.tool_calls:
+                if (
+                    not completed.text
+                    and not completed.tool_calls
+                    and not _is_incomplete_response(completed)
+                ):
                     usage = replace(completed.usage)
                     raise ProviderUnavailableError(
                         f"Provider {route.name} returned an empty response",
@@ -1017,7 +1215,7 @@ class AgentRunner:
         cancel: asyncio.Event,
         context: ToolContext,
     ):
-        results: dict[str, Any] = {}
+        messages: dict[str, Message] = {}
         reads: list[ToolCall] = []
         writes: list[ToolCall] = []
         for call in calls:
@@ -1031,14 +1229,22 @@ class AgentRunner:
                 return await self._execute_one(call, context, cancel)
 
         if reads:
-            read_results = await asyncio.gather(*(run_read(call) for call in reads))
-            results.update(
-                {call.id: result for call, result in zip(reads, read_results, strict=True)}
+            read_tasks = [asyncio.create_task(run_read(call)) for call in reads]
+            try:
+                read_messages = await asyncio.gather(*read_tasks)
+            except BaseException:
+                await asyncio.gather(*read_tasks, return_exceptions=True)
+                raise
+            messages.update(
+                {
+                    call.id: message
+                    for call, message in zip(reads, read_messages, strict=True)
+                }
             )
         for call in writes:
             self._check_cancel(cancel)
-            results[call.id] = await self._execute_one(call, context, cancel)
-        return [results[call.id] for call in calls]
+            messages[call.id] = await self._execute_one(call, context, cancel)
+        return [messages[call.id] for call in calls]
 
     async def _execute_one(
         self,
@@ -1054,40 +1260,363 @@ class AgentRunner:
             call.name,
             call.arguments,
         )
-        tool_task = asyncio.create_task(self.tools.execute(call, context))
-        cancel_task = asyncio.create_task(cancel.wait())
+        workspace_before = None
+        tool = self.tools.get(call.name)
+        mutation_scope = (
+            tool.effective_mutation_scope if tool is not None else MutationScope.NONE
+        )
         try:
-            done, _ = await asyncio.wait(
-                {tool_task, cancel_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if cancel_task in done and cancel.is_set():
-                tool_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await tool_task
-                raise Cancelled("Run cancelled")
-            cancel_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await cancel_task
-            result = await tool_task
+            if mutation_scope == MutationScope.WORKSPACE:
+                workspace_before = await self._await_until_cancelled(
+                    self._workspace_snapshot(), cancel
+                )
+            result = await self._await_until_cancelled(self.tools.execute(call, context), cancel)
         except (asyncio.CancelledError, Cancelled):
-            tool_task.cancel()
-            cancel_task.cancel()
+            cancelled_result = ToolResult(
+                "Run cancelled",
+                is_error=True,
+                metadata={"cancelled": True},
+            )
+            if workspace_before is not None:
+                try:
+                    workspace_after = await self._workspace_snapshot(
+                        timeout=_TOOL_FINALIZATION_GRACE_SECONDS
+                    )
+                except asyncio.CancelledError:
+                    workspace_after = None
+                self._record_workspace_changes(workspace_before, workspace_after, context)
+                cancelled_result.metadata["workspace_change_tracking"] = (
+                    context.mutation_tracking
+                )
+            elif mutation_scope == MutationScope.EXTERNAL:
+                self._mark_workspace_tracking_incomplete(context)
+                cancelled_result.metadata["workspace_change_tracking"] = "incomplete"
             await asyncio.to_thread(
                 self.sessions.cancel_tool_call,
                 context.session_id,
                 call.id,
+                reason=cancelled_result.output,
+                message=self._tool_result_message(call, cancelled_result),
             )
             raise
-        await asyncio.to_thread(
-            self.sessions.complete_tool_call,
-            context.session_id,
-            call.id,
-            output=result.output,
+        cancellation_message = self._tool_result_message(call, result)
+        workspace_reconciled = workspace_before is None
+        try:
+            if workspace_before is not None:
+                workspace_after = await self._finish_after_tool_result(
+                    self._workspace_snapshot(
+                        timeout=_TOOL_FINALIZATION_GRACE_SECONDS * 0.8
+                    ),
+                    cancel,
+                    required=False,
+                )
+                self._record_workspace_changes(workspace_before, workspace_after, context)
+                workspace_reconciled = True
+                if result.metadata.get("workspace_change_tracking") == "incomplete":
+                    self._mark_workspace_tracking_incomplete(context)
+                if context.mutation_tracking == "incomplete":
+                    result.metadata["workspace_change_tracking"] = "incomplete"
+            elif (
+                mutation_scope == MutationScope.EXTERNAL
+                and result.metadata.get("error_type")
+                not in {"ApprovalDenied", "PolicyError", "ToolValidationError"}
+            ):
+                self._mark_workspace_tracking_incomplete(context)
+                result.metadata["workspace_change_tracking"] = "incomplete"
+            if cancel.is_set():
+                await self._finish_after_tool_result(
+                    asyncio.to_thread(
+                        self.sessions.complete_tool_call,
+                        context.session_id,
+                        call.id,
+                        output=result.output,
+                        is_error=result.is_error,
+                        metadata=result.metadata,
+                        message=cancellation_message,
+                    ),
+                    cancel,
+                )
+                raise asyncio.CancelledError
+            await self._finish_after_tool_result(
+                asyncio.to_thread(
+                    self.sessions.complete_tool_call,
+                    context.session_id,
+                    call.id,
+                    output=result.output,
+                    is_error=result.is_error,
+                    metadata=result.metadata,
+                    message=cancellation_message,
+                ),
+                cancel,
+            )
+        except asyncio.CancelledError:
+            if not workspace_reconciled:
+                self._mark_workspace_tracking_incomplete(context)
+            result.metadata.setdefault("workspace_change_tracking", "incomplete")
+            await asyncio.shield(
+                asyncio.to_thread(
+                    self.sessions.complete_tool_call,
+                    context.session_id,
+                    call.id,
+                    output=result.output,
+                    is_error=result.is_error,
+                    metadata=result.metadata,
+                    message=cancellation_message,
+                )
+            )
+            raise
+        return cancellation_message
+
+    @staticmethod
+    def _tool_result_message(call: ToolCall, result: ToolResult) -> Message:
+        return Message(
+            role=Role.TOOL,
+            content=result.output,
+            tool_call_id=call.id,
+            tool_name=call.name,
             is_error=result.is_error,
             metadata=result.metadata,
         )
-        return result
+
+    @staticmethod
+    async def _await_until_cancelled(operation: Awaitable[Any], cancel: asyncio.Event) -> Any:
+        task = asyncio.ensure_future(operation)
+        cancel_task = asyncio.create_task(cancel.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_task in done and cancel.is_set():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise Cancelled("Run cancelled")
+            return await task
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            cancel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_task
+
+    async def _workspace_snapshot(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]] | None:
+        """Run a cooperatively cancellable scan outside the default executor."""
+
+        stop = threading.Event()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[
+            dict[Path, tuple[Path, int, int, int, int, int, str]] | None
+        ] = loop.create_future()
+
+        def scan() -> None:
+            try:
+                result = self._workspace_file_state(stop)
+            except BaseException as error:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_set_future_exception, future, error)
+            else:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_set_future_result, future, result)
+
+        threading.Thread(
+            target=scan,
+            name="borealis-workspace-snapshot",
+            daemon=True,
+        ).start()
+
+        async def stop_and_drain() -> None:
+            stop.set()
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=_WORKSPACE_SCAN_STOP_GRACE_SECONDS,
+                )
+
+        future.add_done_callback(
+            lambda completed: completed.exception() if not completed.cancelled() else None
+        )
+        try:
+            if timeout is None:
+                return await asyncio.shield(future)
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            except TimeoutError:
+                await stop_and_drain()
+                return None
+        except asyncio.CancelledError:
+            await stop_and_drain()
+            raise
+
+    def _record_workspace_changes(
+        self,
+        before: dict[Path, tuple[Path, int, int, int, int, int, str]],
+        after: dict[Path, tuple[Path, int, int, int, int, int, str]] | None,
+        context: ToolContext,
+    ) -> None:
+        if after is None:
+            self._mark_workspace_tracking_incomplete(context)
+            return
+        changed_paths = {
+            path
+            for path in before.keys() | after.keys()
+            if before.get(path) != after.get(path)
+        }
+        for path in changed_paths:
+            entry = after.get(path) or before[path]
+            root = entry[0]
+            context.changed_files.add(self._display_workspace_path(path, root))
+            context.changed_roots.add(root)
+
+    @staticmethod
+    def _mark_workspace_tracking_incomplete(context: ToolContext) -> None:
+        context.mutation_tracking = "incomplete"
+        context.changed_roots.update(context.roots.roots)
+
+    @staticmethod
+    async def _finish_after_tool_result(
+        operation: Awaitable[Any],
+        cancel: asyncio.Event,
+        *,
+        required: bool = True,
+    ) -> Any:
+        """Give post-tool bookkeeping a short grace period after cancellation."""
+
+        task = asyncio.ensure_future(operation)
+        cancel_task = asyncio.create_task(cancel.wait())
+        try:
+            try:
+                done, _ = await asyncio.wait(
+                    {task, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                pass
+            else:
+                if task in done:
+                    return task.result()
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=_TOOL_FINALIZATION_GRACE_SECONDS,
+                )
+            except TimeoutError:
+                task.cancel()
+                if required:
+                    raise asyncio.CancelledError from None
+                return None
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+        finally:
+            cancel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_task
+
+    @overload
+    def _workspace_file_state(
+        self,
+        stop: None = None,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]]: ...
+
+    @overload
+    def _workspace_file_state(
+        self,
+        stop: threading.Event,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]] | None: ...
+
+    def _workspace_file_state(
+        self,
+        stop: threading.Event | None = None,
+    ) -> dict[Path, tuple[Path, int, int, int, int, int, str]] | None:
+        storage = self.config.storage_dir
+        ignored_directories = set(self.config.context.ignored_dirs)
+        state: dict[Path, tuple[Path, int, int, int, int, int, str]] = {}
+        for root in self.tool_context.roots.roots:
+            storage_subtree = (
+                storage
+                if storage != root and _path_is_within(storage, root)
+                else None
+            )
+            if stop is not None and stop.is_set():
+                return None
+            try:
+                root_stat = root.lstat()
+                change_time, fallback_digest = _file_change_signal(root, root_stat)
+            except OSError:
+                pass
+            else:
+                state[root] = (
+                    root,
+                    root_stat.st_mtime_ns,
+                    change_time,
+                    root_stat.st_size,
+                    root_stat.st_mode,
+                    root_stat.st_ino,
+                    fallback_digest,
+                )
+            for current, directories, filenames in os.walk(root, followlinks=False):
+                if stop is not None and stop.is_set():
+                    return None
+                current_path = Path(current)
+                link_directories: list[str] = []
+                traversable_directories: list[str] = []
+                for name in directories:
+                    if stop is not None and stop.is_set():
+                        return None
+                    path = current_path / name
+                    if name in ignored_directories or (
+                        storage_subtree is not None
+                        and _path_is_within(path, storage_subtree)
+                    ):
+                        continue
+                    if _is_non_traversable_directory(path):
+                        link_directories.append(name)
+                    else:
+                        traversable_directories.append(name)
+                directories[:] = traversable_directories
+                for name in [*filenames, *traversable_directories, *link_directories]:
+                    if stop is not None and stop.is_set():
+                        return None
+                    path = current_path / name
+                    if storage_subtree is not None and _path_is_within(
+                        path, storage_subtree
+                    ):
+                        continue
+                    try:
+                        file_stat = path.lstat()
+                        change_time, fallback_digest = _file_change_signal(path, file_stat)
+                    except OSError:
+                        continue
+                    state[path] = (
+                        self._lexical_workspace_root(path),
+                        file_stat.st_mtime_ns,
+                        change_time,
+                        file_stat.st_size,
+                        file_stat.st_mode,
+                        file_stat.st_ino,
+                        fallback_digest,
+                    )
+        if stop is not None and stop.is_set():
+            return None
+        return state
+
+    def _lexical_workspace_root(self, path: Path) -> Path:
+        matches = [
+            root for root in self.tool_context.roots.roots if path == root or root in path.parents
+        ]
+        return max(matches, key=lambda item: len(item.parts))
+
+    def _display_workspace_path(self, path: Path, root: Path) -> str:
+        relative = path.relative_to(root).as_posix() or "."
+        if root == self.tool_context.roots.primary:
+            return relative
+        return f"{root.name}:{relative}"
 
     @staticmethod
     def _check_cancel(cancel: asyncio.Event) -> None:
@@ -1101,6 +1630,117 @@ class AgentRunner:
         return redactor.feed(text) + redactor.flush(mask_incomplete=True)
 
 
+def _file_change_signal(path: Path, file_stat: os.stat_result) -> tuple[int, str]:
+    if not _IS_WINDOWS:
+        return file_stat.st_ctime_ns, ""
+    try:
+        return _windows_change_time_ns(path), ""
+    except OSError:
+        if stat.S_ISLNK(file_stat.st_mode):
+            digest = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+        elif stat.S_ISREG(file_stat.st_mode):
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        else:
+            digest = ""
+        return file_stat.st_ctime_ns, digest
+
+
+def _set_future_result(future: asyncio.Future[Any], result: Any) -> None:
+    if not future.done():
+        future.set_result(result)
+
+
+def _set_future_exception(future: asyncio.Future[Any], error: BaseException) -> None:
+    if not future.done():
+        future.set_exception(error)
+
+
+def _is_non_traversable_directory(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        if not _IS_WINDOWS:
+            return False
+        file_attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(file_attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+@cache
+def _windows_file_api() -> tuple[Any, Any, Any, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+        ]
+
+    win_dll: Any = vars(ctypes)["WinDLL"]
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    get_file_information = kernel32.GetFileInformationByHandleEx
+    get_file_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    get_file_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = wintypes.BOOL
+    return FileBasicInfo, create_file, get_file_information, close_handle
+
+
+def _windows_change_time_ns(path: Path) -> int:
+    import ctypes
+
+    file_basic_info, create_file, get_file_information, close_handle = _windows_file_api()
+    get_last_error: Callable[[], int] = vars(ctypes)["get_last_error"]
+    handle = create_file(
+        str(path),
+        0,
+        _WINDOWS_FILE_SHARE_ALL,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_BACKUP_SEMANTICS | _WINDOWS_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        error_code = get_last_error()
+        raise OSError(error_code, os.strerror(error_code), str(path))
+    try:
+        info = file_basic_info()
+        if not get_file_information(
+            handle,
+            _WINDOWS_FILE_BASIC_INFO,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            error_code = get_last_error()
+            raise OSError(error_code, os.strerror(error_code), str(path))
+        return int(info.ChangeTime) * 100
+    finally:
+        close_handle(handle)
+
+
 def _title(prompt: str) -> str:
     words = prompt.replace("\n", " ").split()
     value = " ".join(words[:10])
@@ -1112,3 +1752,14 @@ def _is_cacheable_response(response: ModelResponse) -> bool:
     return bool(
         response.text and not response.tool_calls and stop_reason in _CACHEABLE_STOP_REASONS
     )
+
+
+def _is_incomplete_response(response: ModelResponse) -> bool:
+    if isinstance(response.stop_reason, dict):
+        return bool(response.stop_reason)
+    stop_reason = str(response.stop_reason or "").strip().lower()
+    return stop_reason in _INCOMPLETE_STOP_REASONS
+
+
+def _path_is_within(path: Path, directory: Path) -> bool:
+    return path == directory or directory in path.parents

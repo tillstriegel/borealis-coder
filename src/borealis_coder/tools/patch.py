@@ -10,7 +10,7 @@ from typing import Any
 from ..errors import PatchError
 from ..models import Effect, ToolResult
 from ..util import atomic_write_text, sha256_text
-from .base import Tool, ToolContext, object_schema
+from .base import MutationScope, Tool, ToolContext, object_schema
 
 
 @dataclass(slots=True)
@@ -41,6 +41,7 @@ class ApplyPatchTool(Tool):
     name = "apply_patch"
     description = "Apply an exact unified diff or *** Begin Patch envelope with context validation and rollback checkpoints."
     effect = Effect.WRITE
+    mutation_scope = MutationScope.TRACKED
     default_risk = "medium"
     parameters = object_schema({
         "patch": {"type": "string", "minLength": 1, "maxLength": 5_000_000}
@@ -112,6 +113,7 @@ class ApplyPatchTool(Tool):
                     atomic_write_text(target, content)
                     outcomes.append(f"{'added' if operation == 'add' else 'updated'} {display} sha256={sha256_text(content)}")
                 context.changed_files.add(display)
+                context.changed_roots.add(context.roots.resolve(target).root)
         except Exception:
             if checkpoint is not None:
                 context.checkpoints.restore(checkpoint.id)

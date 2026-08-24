@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -27,6 +28,7 @@ class ACPServer:
         self.connection = JsonRpcConnection(self.handle)
         self.runners: dict[str, AgentRunner] = {}
         self.tasks: dict[str, asyncio.Task[Any]] = {}
+        self._prompt_tasks: dict[str, list[asyncio.Task[Any]]] = {}
         self.session_locations: dict[str, Path] = {}
         self.initialized = False
         self.client_capabilities: dict[str, Any] = {}
@@ -36,14 +38,21 @@ class ACPServer:
         await self.close()
 
     async def close(self) -> None:
-        for session_id, task in list(self.tasks.items()):
-            if not task.done():
-                runner = self.runners.get(session_id)
-                if runner:
-                    runner.cancel(session_id)
+        for session_id, runner in self.runners.items():
+            runner.cancel(session_id)
+        prompt_tasks = [task for tasks in self._prompt_tasks.values() for task in tasks]
+        for task in prompt_tasks:
+            task.cancel()
+        if prompt_tasks:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*prompt_tasks, return_exceptions=True), timeout=5
+                )
         await asyncio.gather(
             *(runner.close() for runner in set(self.runners.values())), return_exceptions=True
         )
+        self.tasks.clear()
+        self._prompt_tasks.clear()
         self.runners.clear()
 
     async def handle(self, method: str, params: dict[str, Any]) -> Any:
@@ -204,14 +213,18 @@ class ACPServer:
     async def _session_close(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = _required_str(params, "sessionId")
         runner = self.runners.pop(session_id, None)
-        task = self.tasks.pop(session_id, None)
+        tasks = self._prompt_tasks.pop(session_id, [])
+        latest = self.tasks.pop(session_id, None)
+        if latest is not None and latest not in tasks:
+            tasks.append(latest)
         if runner:
             runner.cancel(session_id)
-        if task and not task.done():
-            try:
-                await asyncio.wait_for(task, timeout=5)
-            except TimeoutError:
+        for task in tasks:
+            if not task.done():
                 task.cancel()
+        if tasks:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
         if runner:
             await runner.close()
         return {}
@@ -241,7 +254,7 @@ class ACPServer:
             raise ProtocolError("Session is not active; call session/resume first")
         prompt = _prompt_text(params.get("prompt"))
         message_id = new_id("msg")
-        if runner.is_busy(session_id):
+        if runner.accepts_steering(session_id):
             runner.steer(
                 session_id,
                 prompt,
@@ -265,12 +278,12 @@ class ACPServer:
                 "content": [{"type": "text", "text": prompt}],
             },
         )
-        await self._update(session_id, {"sessionUpdate": "state_update", "state": "running"})
         task = asyncio.create_task(
             self._run_prompt(runner, session_id, prompt, message_id),
             name=f"acp:{session_id}",
         )
         self.tasks[session_id] = task
+        self._prompt_tasks.setdefault(session_id, []).append(task)
         return {}
 
     async def _session_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -278,6 +291,9 @@ class ACPServer:
         runner = self.runners.get(session_id)
         if runner:
             runner.cancel(session_id)
+        for task in self._prompt_tasks.get(session_id, []):
+            if not task.done():
+                task.cancel()
         return {}
 
     async def _run_prompt(
@@ -294,9 +310,21 @@ class ACPServer:
                 session_id=session_id,
                 user_message_id=message_id,
                 user_metadata={"acp": True},
+                wait_for_active_run=True,
             )
         finally:
-            self.tasks.pop(session_id, None)
+            current = asyncio.current_task()
+            tasks = self._prompt_tasks.get(session_id, [])
+            if current is not None:
+                with contextlib.suppress(ValueError):
+                    tasks.remove(current)
+            if not tasks:
+                self._prompt_tasks.pop(session_id, None)
+            if self.tasks.get(session_id) is current:
+                if tasks:
+                    self.tasks[session_id] = tasks[-1]
+                else:
+                    self.tasks.pop(session_id, None)
 
     def _subscribe(self, session_id: str, runner: AgentRunner) -> None:
         async def handler(event: Event) -> None:
@@ -308,7 +336,12 @@ class ACPServer:
 
     async def _event_update(self, session_id: str, runner: AgentRunner, event: Event) -> None:
         data = event.data
-        if event.type == "model.reasoning_delta" and data.get("text"):
+        if event.type == "run.started":
+            await self._update(
+                session_id,
+                {"sessionUpdate": "state_update", "state": "running"},
+            )
+        elif event.type == "model.reasoning_delta" and data.get("text"):
             await self._update(
                 session_id,
                 {
@@ -408,6 +441,33 @@ class ACPServer:
             )
         elif event.type == "run.completed":
             result = data.get("result") or {}
+            emitted_messages: list[str] = []
+            if result.get("incomplete") and result.get("error"):
+                emitted_messages.append(result["error"])
+                await self._update(
+                    session_id,
+                    {
+                        "sessionUpdate": "agent_message",
+                        "messageId": new_id("msg"),
+                        "content": [{"type": "text", "text": result["error"]}],
+                    },
+                )
+            mutation_warning = (
+                "Workspace mutation tracking is incomplete; verification is required."
+            )
+            if result.get("mutation_tracking") == "incomplete" and not any(
+                "mutation tracking" in message.lower().replace("_", " ")
+                and "incomplete" in message.lower()
+                for message in emitted_messages
+            ):
+                await self._update(
+                    session_id,
+                    {
+                        "sessionUpdate": "agent_message",
+                        "messageId": new_id("msg"),
+                        "content": [{"type": "text", "text": mutation_warning}],
+                    },
+                )
             await self._update(
                 session_id,
                 {

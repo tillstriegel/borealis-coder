@@ -3,27 +3,39 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from borealis_coder.agent import build_runner
+from borealis_coder.agent import AgentRunner, build_runner
 from borealis_coder.config import ProviderConfig
-from borealis_coder.errors import SessionError
+from borealis_coder.errors import ConfigurationError, SessionError
 from borealis_coder.models import (
     ContinuationState,
+    Effect,
     ModelResponse,
     ProviderRequest,
     Role,
     ToolCall,
+    ToolResult,
     Usage,
 )
 from borealis_coder.providers.base import Provider, ProviderStreamEvent
 from borealis_coder.providers.http import SSEEvent
 from borealis_coder.providers.mock import MockProvider
+from borealis_coder.providers.openai import OpenAIProvider
 from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.providers.registry import ProviderRegistry
+from borealis_coder.safety import ProcessResult
+from borealis_coder.tools import FunctionTool, object_schema
+from borealis_coder.tools.verification import (
+    VerificationReport,
+    VerificationStep,
+)
 from tests.helpers import make_config
 
 
@@ -117,6 +129,97 @@ class IncompleteProvider(Provider):
         )
 
 
+class RecoveringIncompleteProvider(Provider):
+    name = "recovering_incomplete"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.repeat = False
+        self.saw_continuation = False
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls > 1:
+            self.saw_continuation = any(
+                "continuation_state" in message.metadata for message in request.messages
+            )
+        if self.calls == 1 or self.repeat:
+            return ModelResponse(
+                text=f"partial-{self.calls}",
+                stop_reason="max_tokens",
+                usage=Usage(requests=1),
+                continuation_state=ContinuationState(
+                    kind="recovering.state",
+                    items=[{"type": "opaque", "value": f"state-{self.calls}"}],
+                ),
+            )
+        return ModelResponse(
+            text="complete answer",
+            stop_reason="end_turn",
+            usage=Usage(requests=1),
+        )
+
+
+class TruncatedToolProvider(Provider):
+    name = "truncated_tool"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="truncated-call",
+                        name="permissive_mutator",
+                        arguments={"_raw": '{"path":"danger.txt"'},
+                    )
+                ],
+                stop_reason="model_context_window_exceeded",
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            text="Recovered safely.",
+            stop_reason="end_turn",
+            usage=Usage(requests=1),
+        )
+
+
+class InflightSteeringIncompleteProvider(Provider):
+    name = "inflight_steering_incomplete"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.saw_steering = False
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            self.first_started.set()
+            await self.release_first.wait()
+            return ModelResponse(
+                text="partial answer",
+                stop_reason="max_tokens",
+                usage=Usage(requests=1),
+            )
+        self.saw_steering = any(
+            message.role == Role.USER and message.content == "change direction"
+            for message in request.messages
+        )
+        return ModelResponse(
+            text="steering handled" if self.saw_steering else "steering missing",
+            stop_reason="end_turn",
+            usage=Usage(requests=1),
+        )
+
+
 class OneToolProvider(Provider):
     name = "one_tool"
 
@@ -134,6 +237,165 @@ class OneToolProvider(Provider):
                     },
                 )
             ],
+            usage=Usage(requests=1),
+        )
+
+
+class FinalTurnProvider(Provider):
+    name = "final_turn"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.tool_counts: list[int] = []
+        self.systems: list[str] = []
+        self.system_blocks: list[list[dict[str, object]]] = []
+        self.final_stop_reason: str | None = None
+
+    async def complete(self, request):
+        self.tool_counts.append(len(request.tools))
+        self.systems.append(request.system)
+        self.system_blocks.append(list(request.metadata["system_blocks"]))
+        if len(self.tool_counts) == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="write_file",
+                        arguments={
+                            "path": "completed.txt",
+                            "content": "done",
+                            "expected_sha256": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            text="Completed cleanly.",
+            stop_reason=self.final_stop_reason,
+            usage=Usage(requests=1),
+        )
+
+
+class DefiantFinalTurnProvider(Provider):
+    name = "defiant_final_turn"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.tool_counts: list[int] = []
+        self.pause_final = False
+        self.final_cost_usd = 0.0
+        self.final_started = asyncio.Event()
+        self.release_final = asyncio.Event()
+
+    async def complete(self, request):
+        self.calls += 1
+        self.tool_counts.append(len(request.tools))
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="write_file",
+                        arguments={
+                            "path": "durable.txt",
+                            "content": "durable",
+                            "expected_sha256": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        if self.calls == 2:
+            if self.pause_final:
+                self.final_started.set()
+                await self.release_final.wait()
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="write_file",
+                        arguments={
+                            "path": "must-not-run.txt",
+                            "content": "unexpected",
+                            "expected_sha256": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1, cost_usd=self.final_cost_usd),
+                continuation_state=ContinuationState(
+                    kind="gemini.interactions.steps",
+                    items=[
+                        {
+                            "type": "function_call",
+                            "id": "rejected-call",
+                            "name": "write_file",
+                            "arguments": {"path": "must-not-run.txt"},
+                        }
+                    ],
+                ),
+            )
+        return ModelResponse(text="Resumed to completion.", usage=Usage(requests=1))
+
+
+class ShellMutationFinalTurnProvider(Provider):
+    name = "shell_mutation_final_turn"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.tool_name = "shell"
+        self.tool_arguments: dict[str, object] = {"command": "true"}
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(name=self.tool_name, arguments=self.tool_arguments)
+                ],
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            tool_calls=[ToolCall(name="write_file", arguments={})],
+            usage=Usage(requests=1),
+        )
+
+
+class LateSteeringProvider(Provider):
+    name = "late_steering"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.final_started = asyncio.Event()
+        self.release_final = asyncio.Event()
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="read_file",
+                        arguments={
+                            "path": "a.txt",
+                            "start_line": None,
+                            "end_line": None,
+                            "max_chars": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        if self.calls == 2:
+            self.final_started.set()
+            await self.release_final.wait()
+            return ModelResponse(text="Initial request complete.", usage=Usage(requests=1))
+        saw_steering = any(
+            message.role == Role.USER and message.content == "late direction"
+            for message in request.messages
+        )
+        return ModelResponse(
+            text="Late steering handled." if saw_steering else "Late steering missing.",
             usage=Usage(requests=1),
         )
 
@@ -158,6 +420,19 @@ class ConcurrentProvider(Provider):
                         "expected_sha256": None,
                     },
                 )
+            ],
+            usage=Usage(requests=1),
+        )
+
+
+class ParallelReadProvider(Provider):
+    name = "parallel_reads"
+
+    async def complete(self, request):
+        return ModelResponse(
+            tool_calls=[
+                ToolCall(id="fast-read", name="fast_read", arguments={}),
+                ToolCall(id="blocked-read", name="blocked_read", arguments={}),
             ],
             usage=Usage(requests=1),
         )
@@ -287,6 +562,21 @@ class EmptyProvider(Provider):
 
     async def complete(self, request):
         return ModelResponse(stop_reason="stop")
+
+
+class EmptyIncompleteProvider(Provider):
+    name = "empty_incomplete"
+
+    async def complete(self, request):
+        return ModelResponse(
+            stop_reason="incomplete",
+            reasoning_summary="More reasoning is required.",
+            usage=Usage(input_tokens=3, output_tokens=2, requests=1),
+            continuation_state=ContinuationState(
+                kind="empty-incomplete.state",
+                items=[{"type": "opaque", "value": "resume-me"}],
+            ),
+        )
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
@@ -758,6 +1048,312 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_pre_final_incomplete_response_uses_remaining_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "recovering", "max_turns": 2},
+            )
+            config.providers["recovering"] = ProviderConfig(
+                type="recovering_incomplete",
+                model="recovering",
+                max_retries=0,
+            )
+            provider = RecoveringIncompleteProvider(config.providers["recovering"])
+            registry = ProviderRegistry()
+            registry.register("recovering_incomplete", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish the answer")
+
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertFalse(result.incomplete)
+                self.assertEqual(result.text, "complete answer")
+                self.assertEqual(result.turns, 2)
+                self.assertEqual(provider.calls, 2)
+                self.assertTrue(provider.saw_continuation)
+            finally:
+                await runner.close()
+
+    async def test_incomplete_partial_openai_call_is_recovered_without_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "partial_openai", "max_turns": 2},
+            )
+            config.providers["partial_openai"] = ProviderConfig(
+                type="partial_openai",
+                model="partial-openai",
+                base_url="https://example.test/v1",
+                api_style="responses",
+                max_retries=0,
+            )
+            partial_arguments = json.dumps(
+                {
+                    "path": "must-not-run.txt",
+                    "content": "partial",
+                    "expected_sha256": None,
+                }
+            )
+            first = [
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.output_item.added",
+                            "item": {
+                                "type": "function_call",
+                                "id": "partial-item",
+                                "call_id": "partial-call",
+                                "name": "write_file",
+                                "arguments": "",
+                            },
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "call_id": "partial-call",
+                            "delta": partial_arguments,
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.incomplete",
+                            "response": {
+                                "id": "partial-response",
+                                "model": "partial-openai",
+                                "status": "incomplete",
+                                "incomplete_details": {
+                                    "reason": "max_output_tokens"
+                                },
+                                "output": [
+                                    {
+                                        "type": "reasoning",
+                                        "id": "reasoning-partial",
+                                        "encrypted_content": "resume-partial",
+                                        "summary": [],
+                                    },
+                                    {
+                                        "type": "function_call",
+                                        "id": "partial-item",
+                                        "call_id": "partial-call",
+                                        "name": "write_file",
+                                        "arguments": partial_arguments,
+                                        "status": "in_progress",
+                                    },
+                                ],
+                                "usage": {"input_tokens": 2, "output_tokens": 1},
+                            },
+                        }
+                    ),
+                ),
+            ]
+            second = [
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "complete-response",
+                                "model": "partial-openai",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "Recovered safely.",
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 3, "output_tokens": 2},
+                            },
+                        }
+                    ),
+                )
+            ]
+            fake_http = FakeOpenAIStreamHttp([first, second])
+
+            def factory(cfg, key):
+                provider = OpenAIProvider(cfg, key)
+                provider.http = fake_http  # type: ignore[assignment]
+                return provider
+
+            registry = ProviderRegistry()
+            registry.register("partial_openai", factory)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("recover a partial tool call")
+
+                self.assertEqual(result.text, "Recovered safely.")
+                self.assertFalse((root / "must-not-run.txt").exists())
+                self.assertEqual(runner.sessions.tool_calls(result.session_id), [])
+                self.assertEqual(len(fake_http.calls), 2)
+                recovery_input = fake_http.calls[1][1]["payload"]["input"]
+                self.assertTrue(
+                    any(
+                        item.get("encrypted_content") == "resume-partial"
+                        for item in recovery_input
+                    )
+                )
+            finally:
+                await runner.close()
+
+    async def test_context_window_truncated_tool_call_is_never_executed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "truncated", "max_turns": 2},
+            )
+            config.providers["truncated"] = ProviderConfig(
+                type="truncated_tool",
+                model="truncated",
+                max_retries=0,
+            )
+            provider = TruncatedToolProvider(config.providers["truncated"])
+            registry = ProviderRegistry()
+            registry.register("truncated_tool", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            executions = 0
+
+            def mutate(arguments, context):
+                nonlocal executions
+                del arguments, context
+                executions += 1
+                return ToolResult("mutated")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="permissive_mutator",
+                    description="Accept arbitrary arguments for the regression.",
+                    parameters={"type": "object", "additionalProperties": True},
+                    function=mutate,
+                    effect=Effect.CONTROL,
+                )
+            )
+            try:
+                result = await runner.run("recover from a truncated call")
+
+                self.assertEqual(result.text, "Recovered safely.")
+                self.assertEqual(executions, 0)
+                self.assertEqual(runner.sessions.tool_calls(result.session_id), [])
+                first_assistant = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.ASSISTANT
+                )
+                self.assertEqual(first_assistant.tool_calls, [])
+            finally:
+                await runner.close()
+
+    async def test_pre_final_incomplete_response_drains_inflight_steering(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "inflight", "max_turns": 2},
+            )
+            config.providers["inflight"] = ProviderConfig(
+                type="inflight_steering_incomplete",
+                model="inflight",
+                max_retries=0,
+            )
+            provider = InflightSteeringIncompleteProvider(config.providers["inflight"])
+            registry = ProviderRegistry()
+            registry.register(
+                "inflight_steering_incomplete",
+                lambda cfg, key: provider,
+            )
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                task = asyncio.create_task(runner.run("start"))
+                await asyncio.wait_for(provider.first_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                runner.steer(session_id, "change direction", message_id="inflight-message")
+                provider.release_first.set()
+                result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertEqual(result.text, "steering handled")
+                self.assertTrue(provider.saw_steering)
+                self.assertEqual(provider.calls, 2)
+                persisted = runner.sessions.messages(session_id)
+                self.assertEqual(
+                    [message.id for message in persisted].count("inflight-message"),
+                    1,
+                )
+            finally:
+                provider.release_first.set()
+                await runner.close()
+
+    async def test_repeated_incomplete_response_exhausts_final_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "recovering", "max_turns": 2},
+            )
+            config.providers["recovering"] = ProviderConfig(
+                type="recovering_incomplete",
+                model="recovering",
+                max_retries=0,
+            )
+            provider = RecoveringIncompleteProvider(config.providers["recovering"])
+            provider.repeat = True
+            registry = ProviderRegistry()
+            registry.register("recovering_incomplete", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish the answer")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(result.text, "partial-2")
+                self.assertEqual(provider.calls, 2)
+                self.assertTrue(provider.saw_continuation)
+                self.assertIn("final response was incomplete", result.error or "")
+            finally:
+                await runner.close()
+
     async def test_offline_tool_cycle_resume_and_full_history(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -842,6 +1438,47 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_empty_incomplete_response_uses_max_turn_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "empty_incomplete", "max_turns": 1},
+            )
+            config.providers["empty_incomplete"] = ProviderConfig(
+                type="empty_incomplete",
+                model="empty-incomplete",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register(
+                "empty_incomplete",
+                lambda cfg, key: EmptyIncompleteProvider(cfg, key),
+            )
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("continue reasoning")
+                messages = runner.sessions.messages(result.session_id)
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(result.text, "")
+                self.assertIn("final response was incomplete", result.error or "")
+                self.assertFalse(
+                    any(
+                        event.type == "model.route_failed"
+                        for _, event in runner.sessions.events(result.session_id)
+                    )
+                )
+                self.assertIn("continuation_state", messages[-1].metadata)
+            finally:
+                await runner.close()
+
     async def test_cancel(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -862,6 +1499,183 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(asyncio.get_running_loop().time() - started, 0.75)
             self.assertEqual(result.stop_reason.value, "cancelled")
             await runner.close()
+
+    async def test_cancel_waits_for_all_parallel_read_finalizers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "parallel"})
+            config.providers["parallel"] = ProviderConfig(
+                type="parallel_reads",
+                model="parallel",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register("parallel_reads", lambda cfg, key: ParallelReadProvider(cfg, key))
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            tools_started = 0
+            all_tools_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def blocked_read(arguments, context):
+                nonlocal tools_started
+                del arguments, context
+                tools_started += 1
+                if tools_started == 2:
+                    all_tools_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            for name in ("fast_read", "blocked_read"):
+                runner.tools.register(
+                    FunctionTool(
+                        name=name,
+                        description="Test parallel cancellation finalization.",
+                        parameters=object_schema({}),
+                        function=blocked_read,
+                        concurrent=True,
+                    )
+                )
+
+            original_cancel_tool_call = runner.sessions.cancel_tool_call
+            blocked_finalizer_started = threading.Event()
+            fast_finalizer_finished = threading.Event()
+            release_finalizer = threading.Event()
+
+            def finalize_tool_call(session_id, call_id, **kwargs):
+                if call_id == "blocked-read":
+                    blocked_finalizer_started.set()
+                    release_finalizer.wait(timeout=3)
+                original_cancel_tool_call(session_id, call_id, **kwargs)
+                if call_id == "fast-read":
+                    fast_finalizer_finished.set()
+
+            history_at_completion: list[Role] = []
+
+            def capture_completion(event):
+                if event.type == "run.completed":
+                    history_at_completion.extend(
+                        message.role
+                        for message in runner.sessions.messages(event.session_id or "")
+                    )
+
+            runner.events.subscribe(capture_completion)
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "cancel_tool_call",
+                    side_effect=finalize_tool_call,
+                ):
+                    task = asyncio.create_task(runner.run("read in parallel"))
+                    await asyncio.wait_for(all_tools_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    self.assertTrue(runner.cancel(session_id))
+                    self.assertTrue(
+                        await asyncio.to_thread(blocked_finalizer_started.wait, 1)
+                    )
+                    self.assertTrue(await asyncio.to_thread(fast_finalizer_finished.wait, 1))
+                    self.assertFalse(task.done())
+                    self.assertEqual(runner.sessions.get_session(session_id).status, "running")
+                    release_finalizer.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(history_at_completion.count(Role.TOOL), 2)
+                self.assertEqual(
+                    [call["status"] for call in runner.sessions.tool_calls(session_id)],
+                    ["cancelled", "cancelled"],
+                )
+                self.assertEqual(runner.sessions.get_session(session_id).status, "idle")
+            finally:
+                release_finalizer.set()
+                never_complete.set()
+                await runner.close()
+
+    async def test_parallel_read_success_persists_message_before_batch_cancellation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "parallel"})
+            config.providers["parallel"] = ProviderConfig(
+                type="parallel_reads",
+                model="parallel",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register(
+                "parallel_reads",
+                lambda cfg, key: ParallelReadProvider(cfg, key),
+            )
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            fast_persisted = threading.Event()
+
+            async def fast_read(arguments, context):
+                del arguments, context
+                return ToolResult("fast result")
+
+            async def cancelled_read(arguments, context):
+                del arguments, context
+                await asyncio.to_thread(fast_persisted.wait, 1)
+                raise asyncio.CancelledError
+
+            runner.tools.register(
+                FunctionTool(
+                    name="fast_read",
+                    description="Complete before the parallel batch is cancelled.",
+                    parameters=object_schema({}),
+                    function=fast_read,
+                    concurrent=True,
+                )
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="blocked_read",
+                    description="Cancel the parallel batch after the first result.",
+                    parameters=object_schema({}),
+                    function=cancelled_read,
+                    concurrent=True,
+                )
+            )
+            original_complete_tool_call = runner.sessions.complete_tool_call
+
+            def record_completion(session_id, call_id, **kwargs):
+                original_complete_tool_call(session_id, call_id, **kwargs)
+                if call_id == "fast-read":
+                    fast_persisted.set()
+
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "complete_tool_call",
+                    side_effect=record_completion,
+                ):
+                    result = await runner.run("read in parallel")
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                tool_calls = {
+                    call["tool_call_id"]: call
+                    for call in runner.sessions.tool_calls(result.session_id)
+                }
+                self.assertEqual(tool_calls["fast-read"]["status"], "completed")
+                fast_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                    and message.tool_call_id == "fast-read"
+                ]
+                self.assertEqual(len(fast_messages), 1)
+                self.assertEqual(fast_messages[0].content, "fast result")
+            finally:
+                fast_persisted.set()
+                await runner.close()
 
     async def test_max_time_is_an_end_to_end_deadline(self):
         with tempfile.TemporaryDirectory() as td:
@@ -926,6 +1740,1646 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             try:
                 result = await runner.run("hello")
                 self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertIn("send 'continue' to resume", result.error or "")
+                assistant = runner.sessions.messages(result.session_id)[-1]
+                self.assertEqual(assistant.role, Role.ASSISTANT)
+                self.assertEqual(assistant.tool_calls, [])
+            finally:
+                await runner.close()
+
+    async def test_last_allowed_turn_disables_tools_and_can_finish_cleanly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "final", "max_turns": 2})
+            config.providers["final"] = ProviderConfig(
+                type="final_turn",
+                model="final",
+                max_retries=0,
+            )
+            provider = FinalTurnProvider(config.providers["final"])
+            registry = ProviderRegistry()
+            registry.register("final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish within the limit")
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertFalse(result.incomplete)
+                self.assertEqual(result.turns, 2)
+                self.assertGreater(provider.tool_counts[0], 0)
+                self.assertEqual(provider.tool_counts[1], 0)
+                self.assertEqual(
+                    "\n\n".join(str(block["text"]) for block in provider.system_blocks[1]),
+                    provider.systems[1],
+                )
+                self.assertFalse(provider.system_blocks[1][-1]["cacheable"])
+                self.assertEqual((root / "completed.txt").read_text(), "done")
+            finally:
+                await runner.close()
+
+    async def test_truncated_final_turn_preserves_recovery_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "final", "max_turns": 2})
+            config.providers["final"] = ProviderConfig(
+                type="final_turn",
+                model="final",
+                max_retries=0,
+            )
+            provider = FinalTurnProvider(config.providers["final"])
+            provider.final_stop_reason = "max_tokens"
+            registry = ProviderRegistry()
+            registry.register("final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish within the limit")
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(result.text, "Completed cleanly.")
+                self.assertIn("final response was incomplete", result.error or "")
+                self.assertIn("send 'continue' to resume", result.error or "")
+            finally:
+                await runner.close()
+
+    async def test_max_turns_verifies_mutations_and_resumes_without_dangling_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            provider.pause_final = True
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(provider.final_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.steer(session_id, "late direction", message_id="late-message")
+                    provider.release_final.set()
+                    result = await task
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": True,
+                        "process_lifecycle_complete": True,
+                        "steps": [],
+                    },
+                )
+                verify.assert_awaited_once()
+                self.assertEqual((root / "durable.txt").read_text(), "durable")
+                self.assertFalse((root / "must-not-run.txt").exists())
+                self.assertEqual(provider.tool_counts, [len(runner.tools.schemas()), 0])
+                persisted = runner.sessions.messages(result.session_id)
+                final_assistant = persisted[-2]
+                self.assertEqual(final_assistant.role, Role.ASSISTANT)
+                self.assertEqual(final_assistant.tool_calls, [])
+                self.assertNotIn("continuation_state", final_assistant.metadata)
+                self.assertEqual(persisted[-1].id, "late-message")
+                self.assertTrue(persisted[-1].metadata["steering"])
+                self.assertEqual(runner.queued_prompts(result.session_id), 0)
+                self.assertEqual(
+                    runner.sessions.get_session(result.session_id).status,
+                    "idle",
+                )
+
+                resumed = await runner.run("continue", session_id=result.session_id)
+                self.assertEqual(resumed.stop_reason.value, "end_turn")
+                self.assertFalse(resumed.incomplete)
+                self.assertEqual(resumed.text, "Resumed to completion.")
+            finally:
+                await runner.close()
+
+    async def test_max_turns_persists_steering_queued_during_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            verification_started = asyncio.Event()
+            release_verification = asyncio.Event()
+
+            async def pause_verification(*_args):
+                verification_started.set()
+                await release_verification.wait()
+                return VerificationReport(ok=True)
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new=AsyncMock(side_effect=pause_verification),
+                ):
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(verification_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.steer(
+                        session_id,
+                        "verification direction",
+                        message_id="verification-message",
+                    )
+                    release_verification.set()
+                    result = await task
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                persisted = runner.sessions.messages(session_id)
+                steering = [
+                    message for message in persisted if message.id == "verification-message"
+                ]
+                self.assertEqual(len(steering), 1)
+                self.assertTrue(steering[0].metadata["steering"])
+                self.assertEqual(runner.queued_prompts(session_id), 0)
+            finally:
+                release_verification.set()
+                await runner.close()
+
+    async def test_max_turns_verification_stops_on_run_cancellation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            verification_started = asyncio.Event()
+            verification_cancelled = asyncio.Event()
+
+            async def block_verification(*_args):
+                verification_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    verification_cancelled.set()
+                    raise
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new=AsyncMock(side_effect=block_verification),
+                ):
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(verification_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    self.assertTrue(runner.cancel(session_id))
+                    result = await asyncio.wait_for(task, timeout=1)
+
+                self.assertTrue(verification_cancelled.is_set())
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(
+                    result.verification,
+                    {"ok": False, "steps": [], "error": "Run cancelled"},
+                )
+                self.assertIn("Automatic verification was interrupted", result.error or "")
+            finally:
+                await runner.close()
+
+    async def test_max_turns_survives_a_deadline_during_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "defiant",
+                    "max_turns": 2,
+                    "max_time_seconds": 1,
+                    "auto_verify": True,
+                },
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            verification_started = asyncio.Event()
+
+            async def block_verification(*_args):
+                verification_started.set()
+                await asyncio.Event().wait()
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new=AsyncMock(side_effect=block_verification),
+                ):
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(verification_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.steer(
+                        session_id,
+                        "verification direction",
+                        message_id="deadline-message",
+                    )
+                    result = await task
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertIn("maximum 2 model turns reached", result.error or "")
+                self.assertIn("Maximum 1s run time reached", result.error or "")
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": False,
+                        "steps": [],
+                        "error": "Maximum 1s run time reached",
+                    },
+                )
+                persisted = runner.sessions.messages(session_id)
+                self.assertEqual(
+                    [message.id for message in persisted].count("deadline-message"),
+                    1,
+                )
+                self.assertEqual(runner.queued_prompts(session_id), 0)
+            finally:
+                await runner.close()
+
+    async def test_max_turns_closes_steering_before_completion_event(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "defiant", "max_turns": 2})
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            completion_seen = asyncio.Event()
+
+            async def reject_cleanup_steering(event):
+                if event.type != "run.completed":
+                    return
+                self.assertFalse(runner.accepts_steering(event.session_id or ""))
+                with self.assertRaises(SessionError):
+                    runner.steer(event.session_id or "", "too late")
+                completion_seen.set()
+
+            runner.events.subscribe(reject_cleanup_steering)
+            try:
+                result = await runner.run("make a durable change")
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(completion_seen.is_set())
+            finally:
+                await runner.close()
+
+    async def test_final_turn_cost_overrun_preserves_max_turn_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "defiant",
+                    "max_turns": 2,
+                    "max_cost_usd": 1.0,
+                    "auto_verify": True,
+                },
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            provider.final_cost_usd = 2.0
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("make a durable change")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertIn("maximum 2 model turns reached", result.error or "")
+                self.assertIn("exceeded $1.00", result.error or "")
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": True,
+                        "process_lifecycle_complete": True,
+                        "steps": [],
+                    },
+                )
+                verify.assert_awaited_once()
+            finally:
+                await runner.close()
+
+    async def test_automatic_verification_propagates_incomplete_process_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            report = VerificationReport(
+                ok=True,
+                steps=[
+                    {
+                        "name": "Detached verification",
+                        "command": "true",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "",
+                        "stderr": "",
+                        "process_lifecycle_complete": False,
+                    }
+                ],
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=report,
+                ):
+                    result = await runner.run("make a durable change")
+
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                assert result.verification is not None
+                self.assertFalse(
+                    result.verification["process_lifecycle_complete"]
+                )
+                self.assertFalse(
+                    result.verification["steps"][0][
+                        "process_lifecycle_complete"
+                    ]
+                )
+            finally:
+                await runner.close()
+
+    async def test_max_turns_verifies_files_mutated_by_shell_in_an_additional_root(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as extra:
+            root = Path(td)
+            extra_root = Path(extra)
+            mutated_path = extra_root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            (extra_root / ".gitignore").write_text("shell-mutated.txt\n")
+            original_stat = mutated_path.stat()
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+                additional_roots=[extra_root],
+            )
+
+            def mutate_workspace(arguments, context):
+                del arguments, context
+                mutated_path.write_text("change")
+                os.utime(
+                    mutated_path,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+                return ToolResult("changed through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test shell mutation tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_workspace,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            run_process = AsyncMock(
+                return_value=ProcessResult("true", 0, "", "", 1)
+            )
+            runner.tool_context.process.run = run_process
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.detect",
+                    return_value=[VerificationStep("Root check", "true", 10)],
+                ):
+                    result = await runner.run("change a file through shell")
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(
+                    result.changed_files,
+                    [f"{extra_root.name}:shell-mutated.txt"],
+                )
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertTrue(verification["ok"])
+                self.assertEqual(
+                    verification["steps"][0]["root"],
+                    f"{extra_root.name}:.",
+                )
+                run_process.assert_awaited_once()
+                process_call = run_process.await_args
+                assert process_call is not None
+                self.assertEqual(process_call.kwargs["cwd"], extra_root.resolve())
+            finally:
+                await runner.close()
+
+    async def test_workspace_snapshot_prunes_configured_dependency_trees(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dependency_file = root / "node_modules" / "package" / "index.js"
+            dependency_file.parent.mkdir(parents=True)
+            dependency_file.write_text("before")
+            ignored_file = root / "ignored.txt"
+            ignored_file.write_text("before")
+            (root / ".gitignore").write_text("ignored.txt\n")
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            from borealis_coder.agent import runner as runner_module
+
+            original_change_signal = runner_module._file_change_signal
+
+            def reject_dependency_traversal(path, file_stat):
+                self.assertNotIn("node_modules", path.parts)
+                return original_change_signal(path, file_stat)
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner._file_change_signal",
+                    side_effect=reject_dependency_traversal,
+                ):
+                    before = runner._workspace_file_state()
+                    dependency_file.write_text("after")
+                    ignored_file.write_text("after")
+                    after = runner._workspace_file_state()
+
+                assert before is not None and after is not None
+                runner._record_workspace_changes(before, after, runner.tool_context)
+                self.assertNotIn(dependency_file.resolve(), before)
+                self.assertNotIn(dependency_file.resolve(), after)
+                self.assertIn(ignored_file.resolve(), before)
+                self.assertEqual(runner.tool_context.changed_files, {"ignored.txt"})
+            finally:
+                await runner.close()
+
+    async def test_runner_rejects_storage_that_contains_a_workspace_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "workspace"
+            root.mkdir()
+            config = make_config(root, storage={"directory": td})
+
+            with self.assertRaisesRegex(
+                ConfigurationError,
+                "storage.directory must not equal or contain a workspace root",
+            ):
+                await build_runner(root, config=config, interactive=False)
+
+    async def test_verify_command_mutations_are_reconciled(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "verify-generated.txt"
+            config = make_config(
+                root,
+                agent={"provider": "verify_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["verify_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="verify-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["verify_mutation"]
+            )
+            provider.tool_name = "verify"
+            provider.tool_arguments = {
+                "command": "true",
+                "timeout_seconds": 10,
+            }
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            async def mutate_during_verification(*_args, **_kwargs):
+                mutated_path.write_text("generated")
+                return ProcessResult("true", 0, "", "", 1)
+
+            runner.tool_context.process.run = AsyncMock(
+                side_effect=mutate_during_verification
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.detect",
+                    return_value=[],
+                ):
+                    result = await runner.run("run a mutating verification command")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, [".", "verify-generated.txt"])
+                self.assertEqual(
+                    result.verification,
+                    {
+                        "ok": True,
+                        "process_lifecycle_complete": True,
+                        "steps": [],
+                    },
+                )
+            finally:
+                await runner.close()
+
+    async def test_verify_command_marks_delayed_process_lifecycle_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            delayed_path = root / "verify-delayed.txt"
+            config = make_config(
+                root,
+                agent={"provider": "verify_mutation", "max_turns": 2},
+            )
+            config.providers["verify_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="verify-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["verify_mutation"]
+            )
+            provider.tool_name = "verify"
+            provider.tool_arguments = {
+                "command": "true",
+                "timeout_seconds": 10,
+            }
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            release_mutation = asyncio.Event()
+            delayed_task: asyncio.Task[None] | None = None
+
+            async def delay_mutation():
+                await release_mutation.wait()
+                delayed_path.write_text("generated")
+
+            async def start_detached_mutation(*_args, **_kwargs):
+                nonlocal delayed_task
+                delayed_task = asyncio.create_task(delay_mutation())
+                return ProcessResult(
+                    "true",
+                    0,
+                    "",
+                    "",
+                    1,
+                    lifecycle_complete=False,
+                )
+
+            runner.tool_context.process.run = AsyncMock(
+                side_effect=start_detached_mutation
+            )
+            try:
+                result = await runner.run("run a detached verification command")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, [])
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertFalse(
+                    tool_call["metadata"]["process_lifecycle_complete"]
+                )
+                self.assertFalse(
+                    tool_call["metadata"]["steps"][0][
+                        "process_lifecycle_complete"
+                    ]
+                )
+                self.assertEqual(
+                    tool_call["metadata"]["workspace_change_tracking"],
+                    "incomplete",
+                )
+                self.assertFalse(delayed_path.exists())
+
+                release_mutation.set()
+                assert delayed_task is not None
+                await delayed_task
+                self.assertTrue(delayed_path.exists())
+            finally:
+                release_mutation.set()
+                if delayed_task is not None:
+                    await delayed_task
+                await runner.close()
+
+    async def test_external_mutation_effect_marks_tracking_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "external_mutation", "max_turns": 2},
+            )
+            config.providers["external_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="external-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["external_mutation"]
+            )
+            provider.tool_name = "external_mutation"
+            provider.tool_arguments = {}
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="external_mutation",
+                    description="Test an externally executed mutation.",
+                    parameters=object_schema({}),
+                    function=lambda arguments, context: ToolResult("mutated externally"),
+                    effect=Effect.CONTROL,
+                )
+            )
+            try:
+                result = await runner.run("mutate external state")
+
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                self.assertEqual(result.changed_files, [])
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertEqual(verification["roots"], ["."])
+            finally:
+                await runner.close()
+
+    async def test_git_commit_cancel_race_marks_mutation_tracking_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            git_dir = root / ".git"
+            git_dir.mkdir()
+            head = git_dir / "HEAD"
+            head.write_text("before\n")
+            config = make_config(
+                root,
+                agent={"provider": "git_commit_race", "max_turns": 2},
+                safety={"allow_git_commit": True},
+            )
+            config.providers["git_commit_race"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="git-commit-race",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(
+                config.providers["git_commit_race"]
+            )
+            provider.tool_name = "git_commit"
+            provider.tool_arguments = {"message": "race commit"}
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            async def commit_then_cancel(command, **kwargs):
+                del command, kwargs
+                head.write_text("after\n")
+                session_id = next(iter(runner._cancel))
+                self.assertTrue(runner.cancel(session_id))
+                return ProcessResult(
+                    command="git commit",
+                    exit_code=0,
+                    stdout="committed",
+                    stderr="",
+                    duration_ms=1,
+                    lifecycle_complete=True,
+                )
+
+            try:
+                with patch.object(
+                    runner.tool_context.process,
+                    "run",
+                    new=AsyncMock(side_effect=commit_then_cancel),
+                ):
+                    result = await runner.run("commit the staged change")
+
+                self.assertEqual(head.read_text(), "after\n")
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(tool_call["status"], "cancelled")
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(
+                    tool_message.metadata["workspace_change_tracking"],
+                    "incomplete",
+                )
+            finally:
+                await runner.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory permission bits are required")
+    async def test_workspace_snapshot_tracks_workspace_root_mutations(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            original_mode = stat.S_IMODE(root.stat().st_mode)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                before = runner._workspace_file_state()
+                root.chmod(original_mode ^ stat.S_IXUSR)
+                after = runner._workspace_file_state()
+
+                assert before is not None and after is not None
+                self.assertIn(root, before)
+                runner._record_workspace_changes(before, after, runner.tool_context)
+
+                self.assertEqual(runner.tool_context.changed_files, {"."})
+                self.assertEqual(runner.tool_context.changed_roots, {root})
+            finally:
+                root.chmod(original_mode)
+                await runner.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory permission bits are required")
+    async def test_workspace_snapshot_tracks_empty_directory_mutations(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            deleted = root / "deleted-directory"
+            renamed = root / "renamed-directory"
+            permissions = root / "permission-directory"
+            deleted.mkdir()
+            renamed.mkdir()
+            permissions.mkdir()
+            original_mode = stat.S_IMODE(permissions.stat().st_mode)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                before = runner._workspace_file_state()
+                (root / "created-directory").mkdir()
+                deleted.rmdir()
+                renamed.rename(root / "renamed-directory-new")
+                permissions.chmod(original_mode ^ stat.S_IXUSR)
+                after = runner._workspace_file_state()
+
+                assert before is not None and after is not None
+                runner._record_workspace_changes(before, after, runner.tool_context)
+
+                self.assertEqual(
+                    runner.tool_context.changed_files,
+                    {
+                        ".",
+                        "created-directory",
+                        "deleted-directory",
+                        "permission-directory",
+                        "renamed-directory",
+                        "renamed-directory-new",
+                    },
+                )
+                self.assertEqual(runner.tool_context.changed_roots, {root.resolve()})
+            finally:
+                await runner.close()
+
+    async def test_max_turns_verifies_empty_directory_created_by_shell(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def create_directory(arguments, context):
+                del arguments, context
+                (root / "empty-directory").mkdir()
+                return ToolResult("created empty directory through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test empty directory tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=create_directory,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("create an empty directory through shell")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, [".", "empty-directory"])
+                verify.assert_awaited_once()
+                verification_call = verify.await_args
+                assert verification_call is not None
+                verified_context = verification_call.args[0]
+                self.assertEqual(verified_context.changed_roots, {root.resolve()})
+            finally:
+                await runner.close()
+
+    async def test_shell_write_is_reconciled_after_cancellation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            command_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def write_then_block(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                command_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test cancelled shell mutation tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=write_then_block,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                task = asyncio.create_task(runner.run("write and block"))
+                await asyncio.wait_for(command_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                self.assertTrue(runner.cancel(session_id))
+                result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.changed_files, ["shell-mutated.txt"])
+                self.assertEqual(result.mutation_tracking, "complete")
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(
+                    tool_message.metadata["workspace_change_tracking"],
+                    "complete",
+                )
+            finally:
+                never_complete.set()
+                await runner.close()
+
+    async def test_cancelled_shell_exposes_incomplete_mutation_tracking(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            before = runner._workspace_file_state()
+            assert before is not None
+            command_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def write_then_block(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                command_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test incomplete shell mutation tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=write_then_block,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch.object(
+                    runner,
+                    "_workspace_snapshot",
+                    new_callable=AsyncMock,
+                    side_effect=[before, None],
+                ):
+                    task = asyncio.create_task(runner.run("write and block"))
+                    await asyncio.wait_for(command_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.cancel(session_id)
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.changed_files, [])
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertFalse(verification["ok"])
+                self.assertEqual(verification["roots"], ["."])
+            finally:
+                never_complete.set()
+                await runner.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are required")
+    async def test_max_turns_verifies_shell_permission_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "script.sh"
+            mutated_path.write_text("#!/bin/sh\n")
+            original_mode = stat.S_IMODE(mutated_path.stat().st_mode)
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def mutate_permissions(arguments, context):
+                del arguments, context
+                mutated_path.chmod(original_mode ^ stat.S_IXUSR)
+                return ToolResult("changed permissions through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test shell permission tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_permissions,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("change permissions through shell")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(result.changed_files, ["script.sh"])
+                verify.assert_awaited_once()
+            finally:
+                await runner.close()
+
+    async def test_shell_result_is_durable_when_cancelled_during_change_detection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def mutate_workspace(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                return ToolResult("changed through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test durable shell results.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_workspace,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            original_file_state = runner._workspace_file_state
+            after_snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            snapshot_calls = 0
+
+            def pause_after_snapshot(stop=None):
+                nonlocal snapshot_calls
+                del stop
+                snapshot_calls += 1
+                state = original_file_state()
+                if snapshot_calls == 2:
+                    after_snapshot_started.set()
+                    release_snapshot.wait(timeout=2)
+                return state
+
+            try:
+                with patch.object(runner, "_workspace_file_state", side_effect=pause_after_snapshot):
+                    task = asyncio.create_task(runner.run("change a file through shell"))
+                    started = await asyncio.to_thread(after_snapshot_started.wait, 1)
+                    self.assertTrue(started)
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    release_snapshot.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(tool_call["status"], "completed")
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                ]
+                self.assertEqual(len(tool_messages), 1)
+                self.assertEqual(tool_messages[0].content, "changed through shell")
+            finally:
+                release_snapshot.set()
+                await runner.close()
+
+    async def test_second_cancellation_marks_shell_reconciliation_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def mutate_workspace(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                return ToolResult("changed through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test interrupted shell reconciliation.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_workspace,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            original_file_state = runner._workspace_file_state
+            after_snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            snapshot_calls = 0
+
+            def pause_after_snapshot(stop=None):
+                nonlocal snapshot_calls
+                del stop
+                snapshot_calls += 1
+                state = original_file_state()
+                if snapshot_calls == 2:
+                    after_snapshot_started.set()
+                    release_snapshot.wait(timeout=3)
+                return state
+
+            try:
+                with patch.object(runner, "_workspace_file_state", side_effect=pause_after_snapshot):
+                    task = asyncio.create_task(runner.run("change a file through shell"))
+                    self.assertTrue(
+                        await asyncio.to_thread(after_snapshot_started.wait, 1)
+                    )
+                    task.cancel()
+                    await asyncio.sleep(0.05)
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    release_snapshot.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertEqual(verification["roots"], ["."])
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(
+                    tool_call["metadata"]["workspace_change_tracking"],
+                    "incomplete",
+                )
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(
+                    tool_message.metadata["workspace_change_tracking"],
+                    "incomplete",
+                )
+            finally:
+                release_snapshot.set()
+                await runner.close()
+
+    async def test_shell_cancellation_during_initial_snapshot_is_durable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            tool_executed = False
+
+            def pause_initial_snapshot(stop=None):
+                del stop
+                snapshot_started.set()
+                release_snapshot.wait(timeout=2)
+                return {}
+
+            def execute_tool(arguments, context):
+                nonlocal tool_executed
+                del arguments, context
+                tool_executed = True
+                return ToolResult("must not execute")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test initial snapshot cancellation.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=execute_tool,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch.object(
+                    runner, "_workspace_file_state", side_effect=pause_initial_snapshot
+                ):
+                    task = asyncio.create_task(runner.run("run a shell command"))
+                    started = await asyncio.to_thread(snapshot_started.wait, 1)
+                    self.assertTrue(started)
+                    task.cancel()
+                    release_snapshot.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertFalse(tool_executed)
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(tool_call["status"], "cancelled")
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                ]
+                self.assertEqual(len(tool_messages), 1)
+                self.assertEqual(tool_messages[0].content, "Run cancelled")
+                self.assertTrue(tool_messages[0].metadata["cancelled"])
+            finally:
+                release_snapshot.set()
+                await runner.close()
+
+    async def test_post_tool_finalization_grace_is_bounded(self):
+        release = asyncio.Event()
+        cancel = asyncio.Event()
+        cancel.set()
+
+        async def blocked_operation():
+            await release.wait()
+
+        try:
+            result = await asyncio.wait_for(
+                AgentRunner._finish_after_tool_result(
+                    blocked_operation(),
+                    cancel,
+                    required=False,
+                ),
+                timeout=1,
+            )
+            self.assertIsNone(result)
+        finally:
+            release.set()
+
+    async def test_second_cancellation_forces_post_tool_finalization(self):
+        release = asyncio.Event()
+        cancel = asyncio.Event()
+        operation_started = asyncio.Event()
+
+        async def blocked_operation():
+            operation_started.set()
+            await release.wait()
+
+        task = asyncio.create_task(
+            AgentRunner._finish_after_tool_result(blocked_operation(), cancel)
+        )
+        try:
+            await operation_started.wait()
+            cancel.set()
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+        finally:
+            release.set()
+
+    async def test_cancelling_real_threaded_snapshot_stops_the_scan(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            scan_started = threading.Event()
+            pause = threading.Event()
+            iterations = 0
+
+            def slow_walk(path, *, followlinks):
+                nonlocal iterations
+                del path, followlinks
+                for _ in range(1_000):
+                    scan_started.set()
+                    pause.wait(0.02)
+                    iterations += 1
+                    yield str(root), [], []
+
+            try:
+                with patch("borealis_coder.agent.runner.os.walk", side_effect=slow_walk):
+                    task = asyncio.create_task(runner._workspace_snapshot())
+                    started = await asyncio.to_thread(scan_started.wait, 1)
+                    self.assertTrue(started)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, timeout=0.3)
+
+                self.assertLess(iterations, 10)
+            finally:
+                pause.set()
+                await runner.close()
+
+    async def test_windows_reparse_directory_is_not_traversable(self):
+        from borealis_coder.agent import runner as runner_module
+
+        path = Path("junction")
+        with (
+            patch("borealis_coder.agent.runner._IS_WINDOWS", True),
+            patch.object(Path, "is_symlink", return_value=False),
+            patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_file_attributes=runner_module._WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+                ),
+            ),
+        ):
+            self.assertTrue(runner_module._is_non_traversable_directory(path))
+
+        with (
+            patch("borealis_coder.agent.runner._IS_WINDOWS", True),
+            patch.object(Path, "is_symlink", return_value=False),
+            patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(st_file_attributes=0),
+            ),
+        ):
+            self.assertFalse(runner_module._is_non_traversable_directory(path))
+
+    @unittest.skipIf(os.name == "nt" or not hasattr(os, "symlink"), "symlinks unavailable")
+    async def test_shell_tracks_file_and_directory_symlinks_without_following_targets(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside:
+            root = Path(td)
+            outside_root = Path(outside)
+            outside_file = outside_root / "outside.txt"
+            outside_directory = outside_root / "outside-directory"
+            outside_file.write_text("outside")
+            outside_directory.mkdir()
+            config = make_config(
+                root,
+                agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def create_symlinks(arguments, context):
+                del arguments, context
+                (root / "file-link").symlink_to(outside_file)
+                (root / "directory-link").symlink_to(
+                    outside_directory,
+                    target_is_directory=True,
+                )
+                return ToolResult("created symlinks")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test symlink tracking.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=create_symlinks,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("create workspace symlinks")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertEqual(
+                    result.changed_files,
+                    [".", "directory-link", "file-link"],
+                )
+                self.assertEqual(
+                    runner.sessions.tool_calls(result.session_id)[0]["status"], "completed"
+                )
+                verify.assert_awaited_once()
+            finally:
+                await runner.close()
+
+    async def test_windows_change_time_detects_same_size_write_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            changed = root / "changed.txt"
+            changed.write_text("before")
+            original_stat = changed.stat()
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                file_change_times = iter((100, 200))
+
+                def change_time(path):
+                    return 50 if path == root else next(file_change_times)
+
+                with (
+                    patch("borealis_coder.agent.runner._IS_WINDOWS", True),
+                    patch(
+                        "borealis_coder.agent.runner._windows_change_time_ns",
+                        side_effect=change_time,
+                    ),
+                ):
+                    before = runner._workspace_file_state()
+                    changed.write_text("after!")
+                    os.utime(
+                        changed,
+                        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                    )
+                    after = runner._workspace_file_state()
+
+                self.assertNotEqual(before[changed], after[changed])
+                self.assertEqual(before[changed][2], 100)
+                self.assertEqual(after[changed][2], 200)
+            finally:
+                await runner.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows change-time API is required")
+    async def test_windows_native_change_time_detects_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            changed = root / "changed.txt"
+            changed.write_text("before")
+            original_stat = changed.stat()
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            try:
+                before = runner._workspace_file_state()
+                changed.write_text("after!")
+                os.utime(
+                    changed,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+                after = runner._workspace_file_state()
+
+                self.assertNotEqual(before[changed], after[changed])
+            finally:
+                await runner.close()
+
+    async def test_late_steering_is_durable_when_final_turn_is_already_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.txt").write_text("a")
+            config = make_config(root, agent={"provider": "late", "max_turns": 2})
+            config.providers["late"] = ProviderConfig(
+                type="late_steering",
+                model="late",
+                max_retries=0,
+            )
+            provider = LateSteeringProvider(config.providers["late"])
+            registry = ProviderRegistry()
+            registry.register("late_steering", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                task = asyncio.create_task(runner.run("start"))
+                await asyncio.wait_for(provider.final_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                runner.steer(session_id, "late direction", message_id="late-message")
+                provider.release_final.set()
+                result = await task
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                steering = [
+                    message
+                    for message in runner.sessions.messages(session_id)
+                    if message.id == "late-message"
+                ]
+                self.assertEqual(len(steering), 1)
+                self.assertTrue(steering[0].metadata["steering"])
+                self.assertEqual(runner.queued_prompts(session_id), 0)
+
+                resumed = await runner.run("continue", session_id=session_id)
+                self.assertEqual(resumed.stop_reason.value, "end_turn")
+                self.assertEqual(resumed.text, "Late steering handled.")
             finally:
                 await runner.close()
 

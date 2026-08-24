@@ -714,6 +714,10 @@ def _turn_footer(result: AgentResult) -> str:
         )
     if result.changed_files:
         parts.append(f"{len(result.changed_files)} changed file(s)")
+    if result.mutation_tracking != "complete":
+        parts.append(f"mutation tracking {result.mutation_tracking}")
+    if result.incomplete:
+        parts.append("incomplete · session preserved")
     if result.verification is not None:
         parts.append("verified" if result.verification.get("ok") else "verification failed")
     return " · ".join(parts)

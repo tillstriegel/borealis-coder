@@ -13,7 +13,7 @@ from typing import Any
 from ..errors import ToolError
 from ..models import Effect, ToolResult
 from ..util import truncate_text
-from .base import Tool, ToolContext, object_schema
+from .base import MutationScope, Tool, ToolContext, object_schema
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
@@ -22,6 +22,7 @@ class FetchUrlTool(Tool):
     name = "fetch_url"
     description = "Fetch a public HTTP(S) URL as text. Disabled unless workspace network access is enabled."
     effect = Effect.NETWORK
+    mutation_scope = MutationScope.NONE
     default_risk = "high"
     parameters = object_schema({
         "url": {"type": "string", "minLength": 8, "maxLength": 4000},

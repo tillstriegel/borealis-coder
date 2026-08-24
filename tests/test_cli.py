@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
-from borealis_coder import cli, terminal
+from borealis_coder import cli, interactive, terminal
 from borealis_coder.config import load_config
 from borealis_coder.models import AgentResult, Event, StopReason, Usage
 from borealis_coder.safety import ApprovalRequest, PolicyAction, PolicyDecision
@@ -188,6 +188,41 @@ class CLITests(unittest.TestCase):
             self.assertTrue(json.loads(out)["ok"])
             code, out, _ = self.run_cli(["eval"], env=env)
             self.assertIn("PASS", out)
+
+    def test_json_run_reports_recoverable_max_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            env = {
+                "BOREALIS_DATA_DIR": str(root / "data"),
+                "BOREALIS_PROVIDER": "mock",
+                "BOREALIS_APPROVAL": "never",
+            }
+
+            code, out, _ = self.run_cli(
+                [
+                    "run",
+                    "--workspace",
+                    str(workspace),
+                    "--provider",
+                    "mock",
+                    "--non-interactive",
+                    "--no-verify",
+                    "--max-turns",
+                    "1",
+                    "--json",
+                    "OFFLINE_WRITE_DEMO",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertEqual(payload["stop_reason"], "max_turns")
+            self.assertTrue(payload["incomplete"])
+            self.assertIn("send 'continue' to resume", payload["error"])
+            self.assertFalse((workspace / "borealis-demo.txt").exists())
 
     def test_session_administration_does_not_build_a_provider_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -575,13 +610,21 @@ class CLITests(unittest.TestCase):
             usage=Usage(input_tokens=1, output_tokens=2, cost_usd=0.5),
             turns=4,
             changed_files=["a"],
+            mutation_tracking="incomplete",
             verification={"ok": False},
             error="boom",
+            incomplete=True,
         )
         footer = cli._result_footer(result)
         self.assertIn("changed=1", footer)
+        self.assertIn("mutation_tracking=incomplete", footer)
+        self.assertIn("incomplete=true", footer)
         self.assertIn("verified=False", footer)
         self.assertIn("error=boom", footer)
+        self.assertIn("incomplete · session preserved", interactive._turn_footer(result))
+        self.assertIn("mutation tracking incomplete", interactive._turn_footer(result))
+        self.assertTrue(result.to_dict()["incomplete"])
+        self.assertEqual(result.to_dict()["mutation_tracking"], "incomplete")
 
     def test_renderer_streams_bounded_tool_output_without_repeating_it(self) -> None:
         async def render() -> str:

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
+import signal
 import sys
 import tempfile
 import unittest
+from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import (
@@ -530,6 +534,32 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             for _, kwargs in output_events:
                 self.assertIn(kwargs["stream"], {"stdout", "stderr"})
 
+    async def test_shell_cancellation_marks_an_unbounded_driver_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            context = make_context(root)
+            shell = build_builtin_registry().get("shell")
+            assert shell is not None
+            context.process.guarantees_bounded_lifecycle = False
+
+            with patch.object(
+                context.process,
+                "run",
+                new=AsyncMock(side_effect=asyncio.CancelledError),
+            ), self.assertRaises(asyncio.CancelledError):
+                await shell.execute(
+                    {
+                        "command": "ignored",
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "description": "cancel",
+                    },
+                    context,
+                )
+
+            self.assertEqual(context.mutation_tracking, "incomplete")
+            self.assertEqual(context.changed_roots, {root.resolve()})
+
     async def test_shell_redacts_secrets_split_across_output_chunks(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -680,6 +710,56 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.stdout, "€")
             self.assertEqual("".join(chunks), "€")
 
+    async def test_windows_process_exit_drains_trailing_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root),
+                SafetyConfig(),
+                SandboxConfig(),
+            )
+
+            class DelayedStream:
+                def __init__(self, value: bytes):
+                    self.value = value
+
+                async def read(self, _size):
+                    await asyncio.sleep(0.01)
+                    value, self.value = self.value, b""
+                    return value
+
+            class CompletedProcess:
+                def __init__(self):
+                    self.stdout = DelayedStream(b"trailing stdout")
+                    self.stderr = DelayedStream(b"trailing stderr")
+                    self.returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = CompletedProcess()
+            with (
+                patch.object(
+                    driver.roots,
+                    "resolve",
+                    return_value=SimpleNamespace(path=root),
+                ),
+                patch("borealis_coder.safety.sandbox.os.name", "nt"),
+                patch(
+                    "borealis_coder.safety.sandbox.asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=process),
+                ),
+            ):
+                result = await driver.run(
+                    ["fake-command"],
+                    cwd=root,
+                    timeout=5,
+                )
+
+            self.assertEqual(result.stdout, "trailing stdout")
+            self.assertEqual(result.stderr, "trailing stderr")
+            self.assertTrue(result.stream_complete)
+
     async def test_process_bounds_streamed_output(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -750,6 +830,249 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.timed_out)
             self.assertIn("final", result.stdout)
             self.assertIn("final", "".join(chunks))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+    async def test_process_kills_background_group_before_returning(self):
+        if os.name != "posix":
+            self.skipTest("POSIX process groups are required")
+            return
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            trigger = root / "trigger"
+            os.mkfifo(trigger)
+            driver = NativeProcessDriver(WorkspaceRoots(root), SafetyConfig(), SandboxConfig())
+            command = (
+                "(exec 3<> trigger; printf ready > child-ready; "
+                "IFS= read -r _ <&3; printf x > generated) >/dev/null 2>&1 & "
+                "while [ ! -f child-ready ]; do :; done"
+            )
+
+            result = await asyncio.wait_for(
+                driver.run(command, cwd=root, timeout=5, shell=True),
+                timeout=7,
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(driver.guarantees_bounded_lifecycle)
+            self.assertFalse(result.lifecycle_complete)
+            self.assertTrue((root / "child-ready").is_file())
+            try:
+                writer = os.open(trigger, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                self.assertEqual(error.errno, errno.ENXIO)
+                child_survived = False
+            else:
+                child_survived = True
+                os.write(writer, b"continue\n")
+                os.close(writer)
+            self.assertFalse(child_survived)
+            self.assertFalse((root / "generated").exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+    async def test_process_kills_group_after_supervisor_exits(self):
+        if os.name != "posix":
+            self.skipTest("POSIX process groups are required")
+            return
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            trigger = root / "trigger"
+            supervisor_pid_path = root / "supervisor-pid"
+            os.mkfifo(trigger)
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            command = (
+                "(exec 3<> trigger; printf ready > child-ready; "
+                "IFS= read -r _ <&3; printf x > generated) >/dev/null 2>&1 & "
+                "while [ ! -f child-ready ]; do :; done; "
+                "printf '%s' \"$PPID\" > supervisor-pid; "
+                "while :; do sleep 1; done"
+            )
+            run_task = asyncio.create_task(
+                driver.run(command, cwd=root, timeout=5, shell=True)
+            )
+
+            try:
+                for _ in range(200):
+                    if supervisor_pid_path.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(supervisor_pid_path.exists())
+                supervisor_pid = int(supervisor_pid_path.read_text())
+
+                # Only signal the driver's dedicated group leader. A driver
+                # without the supervisor reports this pytest process as PPID,
+                # which must never be signalled by the regression itself.
+                self.assertGreater(supervisor_pid, 1)
+                self.assertNotEqual(supervisor_pid, os.getpid())
+                self.assertNotEqual(supervisor_pid, os.getpgrp())
+                self.assertEqual(os.getpgid(supervisor_pid), supervisor_pid)
+                os.kill(supervisor_pid, signal.SIGKILL)
+
+                result = await asyncio.wait_for(run_task, timeout=2)
+            finally:
+                if not run_task.done():
+                    run_task.cancel()
+                    await asyncio.gather(run_task, return_exceptions=True)
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertTrue((root / "child-ready").is_file())
+            try:
+                writer = os.open(trigger, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                self.assertEqual(error.errno, errno.ENXIO)
+                child_survived = False
+            else:
+                child_survived = True
+                os.write(writer, b"continue\n")
+                os.close(writer)
+            self.assertFalse(child_survived)
+            self.assertFalse((root / "generated").exists())
+
+    @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
+    async def test_process_bounds_pipe_drain_for_detached_descendant(self):
+        if os.name != "posix":
+            self.skipTest("setsid is POSIX-specific")
+            return
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pid_path = root / "detached-pid"
+            child_code = (
+                "import os,sys,time\n"
+                "os.setsid()\n"
+                "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                "time.sleep(10)\n"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, "
+                f"{str(pid_path)!r}])\n"
+                f"pid_path = pathlib.Path({str(pid_path)!r})\n"
+                "deadline = time.monotonic() + 2\n"
+                "while not pid_path.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+            )
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            detached_pid = None
+            started = asyncio.get_running_loop().time()
+
+            try:
+                result = await asyncio.wait_for(
+                    driver.run(
+                        [sys.executable, "-c", parent_code],
+                        cwd=root,
+                        timeout=5,
+                    ),
+                    timeout=2,
+                )
+                elapsed = asyncio.get_running_loop().time() - started
+                detached_pid = int(pid_path.read_text())
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertFalse(result.stream_complete)
+                self.assertFalse(result.lifecycle_complete)
+                self.assertLess(elapsed, 1.5)
+            finally:
+                if detached_pid is None and pid_path.exists():
+                    detached_pid = int(pid_path.read_text())
+                if detached_pid is not None:
+                    with suppress(ProcessLookupError):
+                        os.kill(detached_pid, signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
+    async def test_process_bounds_cancel_cleanup_with_detached_pipe(self):
+        if os.name != "posix":
+            self.skipTest("setsid is POSIX-specific")
+            return
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pid_path = root / "detached-pid"
+            child_code = (
+                "import os,sys,time\n"
+                "os.setsid()\n"
+                "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                "time.sleep(10)\n"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, "
+                f"{str(pid_path)!r}])\n"
+                f"pid_path = pathlib.Path({str(pid_path)!r})\n"
+                "deadline = time.monotonic() + 2\n"
+                "while not pid_path.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(10)\n"
+            )
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+            detached_pid = None
+            started = asyncio.get_running_loop().time()
+
+            try:
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(
+                        driver.run(
+                            [sys.executable, "-c", parent_code],
+                            cwd=root,
+                            timeout=5,
+                        ),
+                        timeout=0.3,
+                    )
+                elapsed = asyncio.get_running_loop().time() - started
+                detached_pid = int(pid_path.read_text())
+
+                self.assertLess(elapsed, 1.2)
+            finally:
+                if detached_pid is None and pid_path.exists():
+                    detached_pid = int(pid_path.read_text())
+                if detached_pid is not None:
+                    with suppress(ProcessLookupError):
+                        os.kill(detached_pid, signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == "posix", "setsid is POSIX-specific")
+    async def test_process_reports_detached_descendant_lifecycle_as_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ready = root / "detached-ready"
+            generated = root / "detached-generated"
+            child_code = (
+                "import os,sys,time\n"
+                "os.setsid()\n"
+                "null = os.open(os.devnull, os.O_RDWR)\n"
+                "os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2)\n"
+                "open(sys.argv[1], 'w').close()\n"
+                "time.sleep(0.2)\n"
+                "open(sys.argv[2], 'w').close()\n"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, "
+                f"{str(ready)!r}, {str(generated)!r}])\n"
+                f"ready = pathlib.Path({str(ready)!r})\n"
+                "deadline = time.monotonic() + 2\n"
+                "while not ready.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+            )
+            driver = NativeProcessDriver(
+                WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
+            )
+
+            result = await driver.run(
+                [sys.executable, "-c", parent_code],
+                cwd=root,
+                timeout=5,
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertFalse(result.lifecycle_complete)
+            for _ in range(100):
+                if generated.exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(generated.exists())
 
     async def test_verification_commands_pass_through_policy(self):
         with tempfile.TemporaryDirectory() as td:

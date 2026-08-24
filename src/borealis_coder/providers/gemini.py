@@ -133,12 +133,21 @@ class GeminiProvider(Provider):
                 final_data = (
                     data.get("interaction") if isinstance(data.get("interaction"), dict) else data
                 )
+            elif event_type in {"error", "interaction.error", "interaction.failed"}:
+                error = data.get("error")
+                if error is None and isinstance(data.get("interaction"), dict):
+                    error = data["interaction"].get("error")
+                if isinstance(error, dict):
+                    message = error.get("message") or error.get("status") or error.get("code") or error
+                else:
+                    message = error or data.get("message") or "Gemini stream failed"
+                raise ProviderError(str(message))
         if final_data:
             result = self._parse(final_data, retain_raw=True)
         else:
             result = ModelResponse(
                 text="".join(text_parts),
-                tool_calls=[_partial_call(item) for _, item in sorted(calls.items())],
+                stop_reason="incomplete",
             )
         yield ProviderStreamEvent(type="completed", response=result)
 
@@ -265,13 +274,3 @@ def _parse_arguments(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"_raw": raw}
     return value if isinstance(value, dict) else {"value": value}
-
-
-def _partial_call(item: dict[str, Any]) -> ToolCall:
-    raw = str(item.get("arguments") or "{}")
-    return ToolCall(
-        id=str(item.get("id") or ""),
-        name=str(item.get("name") or ""),
-        arguments=_parse_arguments(raw),
-        raw_arguments=raw,
-    )

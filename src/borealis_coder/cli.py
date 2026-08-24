@@ -623,6 +623,10 @@ def _result_footer(result) -> str:  # type: ignore[no-untyped-def]
     ]
     if result.changed_files:
         parts.append(f"changed={len(result.changed_files)}")
+    if result.mutation_tracking != "complete":
+        parts.append(f"mutation_tracking={result.mutation_tracking}")
+    if result.incomplete:
+        parts.append("incomplete=true")
     if result.usage.cached_input_tokens or result.usage.cache_write_tokens:
         parts.append(f"cache_hit={result.usage.provider_cache_hit_rate:.1%}")
         parts.append(f"cache_read={result.usage.cached_input_tokens}")

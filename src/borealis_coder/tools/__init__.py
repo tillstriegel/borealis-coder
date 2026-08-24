@@ -2,6 +2,7 @@
 
 from .base import (
     FunctionTool,
+    MutationScope,
     Tool,
     ToolContext,
     ToolRegistry,
@@ -14,6 +15,7 @@ from .verification import VerificationPlanner, VerificationReport, VerificationS
 
 __all__ = [
     "FunctionTool",
+    "MutationScope",
     "Tool",
     "ToolContext",
     "ToolRegistry",
