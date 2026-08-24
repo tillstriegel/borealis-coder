@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import Config
 from ..context import ContextBuilder
-from ..context.ignore import repository_files
+from ..context.ignore import IgnoreMatcher, repository_files
 from ..errors import (
     BudgetExceeded,
     Cancelled,
@@ -247,6 +247,7 @@ class AgentRunner:
             session_id=session_id,
             run_id=run_id,
             changed_files=set(),
+            changed_roots=set(),
             metadata=dict(self.tool_context.metadata),
         )
         context.metadata["context_builder"] = self.context_builder
@@ -466,14 +467,19 @@ class AgentRunner:
                 )
                 if response.text:
                     final_text = response.text
-                if usage_budget_error is not None:
-                    raise usage_budget_error
                 if final_turn and response.tool_calls:
                     await self._drain_steering(session_id, run_id, messages)
+                    recovery_message = max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    if usage_budget_error is not None:
+                        recovery_message = f"{recovery_message} {usage_budget_error}"
                     raise BudgetExceeded(
                         "turns",
-                        max_turns_recovery_message(self.config.agent.max_turns),
+                        recovery_message,
                     )
+                if usage_budget_error is not None:
+                    raise usage_budget_error
                 if not response.tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
                         continue
@@ -572,6 +578,8 @@ class AgentRunner:
                         f"{recovery_message} Automatic verification could not run: "
                         f"{verification['error']}"
                     )
+            if stop_reason == StopReason.MAX_TURNS:
+                await self._drain_steering(session_id, run_id, messages)
             self._cancel.pop(session_id, None)
             queue = self._steering.get(session_id)
             if queue is not None and queue.empty():
@@ -596,14 +604,47 @@ class AgentRunner:
         return result
 
     async def _verify_changes(self, context: ToolContext) -> dict[str, Any]:
-        planner = VerificationPlanner(self.workspace)
         await self.events.emit(
             "verification.started",
             session_id=context.session_id,
             run_id=context.run_id,
         )
-        report = await planner.run(context)
-        verification = report.to_dict()
+        roots = sorted(context.changed_roots or {self.workspace}, key=lambda item: item.as_posix())
+        remaining_seconds = self.config.agent.auto_verify_max_seconds
+        reports: list[tuple[Path, Any]] = []
+        skipped_roots = 0
+        for index, root in enumerate(roots):
+            root_count = len(roots) - index
+            root_seconds = remaining_seconds // root_count
+            if root_seconds <= 0:
+                skipped_roots = root_count
+                break
+            remaining_seconds -= root_seconds
+            planner = VerificationPlanner(root)
+            steps = planner.detect(max_seconds=root_seconds)
+            report = await planner.run(context, steps)
+            reports.append((root, report))
+            if not report.ok:
+                break
+        verification = {
+            "ok": not skipped_roots and all(report.ok for _, report in reports),
+            "steps": [
+                {
+                    **step,
+                    **(
+                        {"root": context.roots.display(root)}
+                        if len(roots) > 1 or root != self.workspace
+                        else {}
+                    ),
+                }
+                for root, report in reports
+                for step in report.steps
+            ],
+        }
+        if skipped_roots:
+            verification["error"] = (
+                f"Verification time budget was too small for {skipped_roots} root(s)"
+            )
         await self.events.emit(
             "verification.completed",
             session_id=context.session_id,
@@ -1152,10 +1193,14 @@ class AgentRunner:
             raise
         if workspace_before is not None:
             workspace_after = await asyncio.to_thread(self._workspace_file_state)
-            context.changed_files.update(
+            changed_paths = {
                 path
                 for path in workspace_before.keys() | workspace_after.keys()
                 if workspace_before.get(path) != workspace_after.get(path)
+            }
+            context.changed_files.update(context.roots.display(path) for path in changed_paths)
+            context.changed_roots.update(
+                context.roots.resolve(path).root for path in changed_paths
             )
         await asyncio.to_thread(
             self.sessions.complete_tool_call,
@@ -1167,18 +1212,23 @@ class AgentRunner:
         )
         return result
 
-    def _workspace_file_state(self) -> dict[str, tuple[int, int]]:
+    def _workspace_file_state(self) -> dict[Path, tuple[int, int]]:
         storage = self.config.storage_dir
-        state: dict[str, tuple[int, int]] = {}
-        for path in repository_files(self.workspace, self.context_builder.matcher):
-            if path == storage or storage in path.parents:
-                continue
-            try:
-                stat = path.stat()
-                display = path.relative_to(self.workspace).as_posix()
-            except (OSError, ValueError):
-                continue
-            state[display] = (stat.st_mtime_ns, stat.st_size)
+        state: dict[Path, tuple[int, int]] = {}
+        for root in self.tool_context.roots.roots:
+            matcher = (
+                self.context_builder.matcher
+                if root == self.workspace
+                else IgnoreMatcher(root, ignored_dirs=self.config.context.ignored_dirs)
+            )
+            for path in repository_files(root, matcher):
+                if path == storage or storage in path.parents:
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                state[path] = (stat.st_mtime_ns, stat.st_size)
         return state
 
     @staticmethod

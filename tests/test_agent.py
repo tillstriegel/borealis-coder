@@ -26,8 +26,12 @@ from borealis_coder.providers.http import SSEEvent
 from borealis_coder.providers.mock import MockProvider
 from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.providers.registry import ProviderRegistry
+from borealis_coder.safety import ProcessResult
 from borealis_coder.tools import FunctionTool, object_schema
-from borealis_coder.tools.verification import VerificationReport
+from borealis_coder.tools.verification import (
+    VerificationReport,
+    VerificationStep,
+)
 from tests.helpers import make_config
 
 
@@ -180,6 +184,7 @@ class DefiantFinalTurnProvider(Provider):
         self.calls = 0
         self.tool_counts: list[int] = []
         self.pause_final = False
+        self.final_cost_usd = 0.0
         self.final_started = asyncio.Event()
         self.release_final = asyncio.Event()
 
@@ -215,7 +220,7 @@ class DefiantFinalTurnProvider(Provider):
                         },
                     )
                 ],
-                usage=Usage(requests=1),
+                usage=Usage(requests=1, cost_usd=self.final_cost_usd),
                 continuation_state=ContinuationState(
                     kind="gemini.interactions.steps",
                     items=[
@@ -1182,9 +1187,111 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
-    async def test_max_turns_verifies_files_mutated_by_shell(self):
+    async def test_max_turns_persists_steering_queued_during_verification(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            verification_started = asyncio.Event()
+            release_verification = asyncio.Event()
+
+            async def pause_verification(*_args):
+                verification_started.set()
+                await release_verification.wait()
+                return VerificationReport(ok=True)
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new=AsyncMock(side_effect=pause_verification),
+                ):
+                    task = asyncio.create_task(runner.run("make a durable change"))
+                    await asyncio.wait_for(verification_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    runner.steer(
+                        session_id,
+                        "verification direction",
+                        message_id="verification-message",
+                    )
+                    release_verification.set()
+                    result = await task
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                persisted = runner.sessions.messages(session_id)
+                steering = [
+                    message for message in persisted if message.id == "verification-message"
+                ]
+                self.assertEqual(len(steering), 1)
+                self.assertTrue(steering[0].metadata["steering"])
+                self.assertEqual(runner.queued_prompts(session_id), 0)
+            finally:
+                release_verification.set()
+                await runner.close()
+
+    async def test_final_turn_cost_overrun_preserves_max_turn_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "defiant",
+                    "max_turns": 2,
+                    "max_cost_usd": 1.0,
+                    "auto_verify": True,
+                },
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            provider.final_cost_usd = 2.0
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("make a durable change")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertIn("maximum 2 model turns reached", result.error or "")
+                self.assertIn("exceeded $1.00", result.error or "")
+                self.assertEqual(result.verification, {"ok": True, "steps": []})
+                verify.assert_awaited_once()
+            finally:
+                await runner.close()
+
+    async def test_max_turns_verifies_files_mutated_by_shell_in_an_additional_root(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as extra:
+            root = Path(td)
+            extra_root = Path(extra)
             config = make_config(
                 root,
                 agent={"provider": "shell_mutation", "max_turns": 2, "auto_verify": True},
@@ -1202,11 +1309,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 config=config,
                 interactive=False,
                 provider_registry=registry,
+                additional_roots=[extra_root],
             )
 
             def mutate_workspace(arguments, context):
-                del arguments
-                (context.workspace / "shell-mutated.txt").write_text("changed")
+                del arguments, context
+                (extra_root / "shell-mutated.txt").write_text("changed")
                 return ToolResult("changed through shell")
 
             runner.tools.register(
@@ -1219,17 +1327,33 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 replace=True,
             )
+            run_process = AsyncMock(
+                return_value=ProcessResult("true", 0, "", "", 1)
+            )
+            runner.tool_context.process.run = run_process
             try:
                 with patch(
-                    "borealis_coder.agent.runner.VerificationPlanner.run",
-                    new_callable=AsyncMock,
-                    return_value=VerificationReport(ok=True),
-                ) as verify:
+                    "borealis_coder.agent.runner.VerificationPlanner.detect",
+                    return_value=[VerificationStep("Root check", "true", 10)],
+                ):
                     result = await runner.run("change a file through shell")
                 self.assertEqual(result.stop_reason.value, "max_turns")
-                self.assertEqual(result.changed_files, ["shell-mutated.txt"])
-                self.assertEqual(result.verification, {"ok": True, "steps": []})
-                verify.assert_awaited_once()
+                self.assertEqual(
+                    result.changed_files,
+                    [f"{extra_root.name}:shell-mutated.txt"],
+                )
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertTrue(verification["ok"])
+                self.assertEqual(
+                    verification["steps"][0]["root"],
+                    f"{extra_root.name}:.",
+                )
+                run_process.assert_awaited_once()
+                process_call = run_process.await_args
+                assert process_call is not None
+                self.assertEqual(process_call.kwargs["cwd"], extra_root.resolve())
             finally:
                 await runner.close()
 

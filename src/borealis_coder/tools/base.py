@@ -38,6 +38,7 @@ class ToolContext:
     run_id: str
     tool_call_id: str = ""
     changed_files: set[str] = field(default_factory=set)
+    changed_roots: set[Path] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

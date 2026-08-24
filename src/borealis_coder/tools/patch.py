@@ -112,6 +112,7 @@ class ApplyPatchTool(Tool):
                     atomic_write_text(target, content)
                     outcomes.append(f"{'added' if operation == 'add' else 'updated'} {display} sha256={sha256_text(content)}")
                 context.changed_files.add(display)
+                context.changed_roots.add(context.roots.resolve(target).root)
         except Exception:
             if checkpoint is not None:
                 context.checkpoints.restore(checkpoint.id)

@@ -134,7 +134,12 @@ class VerificationPlanner:
                     "blocked": True,
                 })
                 break
-            result = await context.process.run(step.command, cwd=context.workspace, timeout=step.timeout, shell=True)
+            result = await context.process.run(
+                step.command,
+                cwd=self.workspace,
+                timeout=step.timeout,
+                shell=True,
+            )
             report.steps.append({
                 "name": step.name, "command": step.command, "exit_code": result.exit_code,
                 "duration_ms": result.duration_ms, "timed_out": result.timed_out,
