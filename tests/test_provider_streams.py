@@ -434,6 +434,118 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         assert streamed[-1].response is not None
         self.assertEqual(streamed[-1].response.reasoning_summary, streamed[0].text)
 
+    async def test_reasoning_summary_separators_are_not_duplicated(self) -> None:
+        responses_provider = OpenAIProvider(
+            ProviderConfig(type="openai", base_url="https://openai.test/v1"),
+            "key",
+        )
+        cast(Any, responses_provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": "reasoning_1",
+                            "output_index": 0,
+                            "summary_index": 0,
+                            "delta": "First.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": "reasoning_1",
+                            "output_index": 0,
+                            "summary_index": 1,
+                            "delta": "Second.",
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps({"type": "response.output_text.delta", "delta": "ok"}),
+                ),
+            ]
+        )
+
+        responses = [item async for item in responses_provider.stream(self.request)]
+
+        responses_final = responses[-1].response
+        assert responses_final is not None
+        self.assertEqual(responses_final.reasoning_summary, "First.\nSecond.")
+        self.assertEqual(
+            [item.text for item in responses if item.type == "reasoning_summary_delta"],
+            ["First.", "\nSecond."],
+        )
+
+        chat_provider = OpenAICompatibleProvider(
+            ProviderConfig(type="openai_compatible", base_url="https://chat.test/v1"),
+            "key",
+        )
+        cast(Any, chat_provider).http = FakeHttp(
+            events=[
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {
+                                                "type": "reasoning.summary",
+                                                "summary": "First.",
+                                                "id": "summary_1",
+                                                "index": 0,
+                                            }
+                                        ],
+                                        "content": "ok",
+                                    }
+                                }
+                            ]
+                        }
+                    ),
+                ),
+                SSEEvent(
+                    "message",
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "delta": {
+                                        "reasoning_details": [
+                                            {
+                                                "type": "reasoning.summary",
+                                                "summary": "Second.",
+                                                "id": "summary_2",
+                                                "index": 0,
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        chat = [item async for item in chat_provider.stream(self.request)]
+
+        chat_final = chat[-1].response
+        assert chat_final is not None
+        self.assertEqual(chat_final.reasoning_summary, "First.\nSecond.")
+        self.assertEqual(
+            [item.text for item in chat if item.type == "reasoning_summary_delta"],
+            ["First.", "\nSecond."],
+        )
+
     async def test_responses_stream_preserves_refusal_as_visible_text(self) -> None:
         provider = OpenAIProvider(
             ProviderConfig(type="openai", base_url="https://openai.test/v1"),
@@ -561,13 +673,17 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             [item.type for item in streamed],
             [
                 "reasoning_summary_delta",
+                "reasoning_summary_delta",
                 "text_delta",
                 "tool_call_delta",
-                "reasoning_summary_delta",
                 "text_delta",
                 "tool_call_delta",
                 "completed",
             ],
+        )
+        self.assertEqual(
+            [item.text for item in streamed if item.type == "reasoning_summary_delta"],
+            ["Checked ", "the request."],
         )
         final = streamed[-1].response
         assert final is not None
@@ -718,6 +834,102 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(complete_once.await_count, 2)
         fallback_request = complete_once.await_args_list[1].args[0]
         self.assertIsNone(fallback_request.reasoning_effort)
+
+    async def test_complete_chat_preserves_usage_when_internal_fallback_fails(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=1,
+            ),
+            "key",
+        )
+        first = ModelResponse(usage=Usage(input_tokens=5, output_tokens=3, requests=1))
+        recovered = ModelResponse(
+            text="Recovered answer.",
+            usage=Usage(input_tokens=4, output_tokens=2, requests=1),
+        )
+        complete_once = AsyncMock(
+            side_effect=[
+                first,
+                ProviderUnavailableError("fallback down", retryable=True),
+                recovered,
+            ]
+        )
+
+        with patch.object(provider, "_complete_chat_once", new=complete_once):
+            response = await provider.complete(self.request)
+
+        self.assertEqual(response.text, "Recovered answer.")
+        self.assertEqual(response.usage.input_tokens, 9)
+        self.assertEqual(response.usage.output_tokens, 5)
+        self.assertEqual(response.usage.requests, 2)
+        self.assertEqual(complete_once.await_count, 3)
+        self.assertIsNone(complete_once.await_args_list[1].args[0].reasoning_effort)
+        self.assertEqual(complete_once.await_args_list[2].args[0].reasoning_effort, "high")
+
+    async def test_chat_stream_error_carries_usage_from_failed_internal_fallback(self) -> None:
+        provider = OpenRouterProvider(
+            ProviderConfig(
+                type="openrouter",
+                base_url="https://openrouter.test/api/v1",
+                api_style="chat",
+                max_retries=0,
+            ),
+            "key",
+        )
+        first = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "id": "empty",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.summary",
+                                            "summary": "Billed summary.",
+                                            "index": 0,
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+                    }
+                ),
+            ),
+            SSEEvent("message", "[DONE]"),
+        ]
+        failed_fallback = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "error": {
+                            "code": 503,
+                            "message": "Fallback provider unavailable.",
+                        }
+                    }
+                ),
+            )
+        ]
+        fake = FakeHttp(event_batches=[first, failed_fallback])
+        provider.http = fake  # type: ignore[assignment]
+
+        with self.assertRaises(ProviderUnavailableError) as unavailable:
+            _ = [event async for event in provider.stream(self.request)]
+
+        self.assertIsNotNone(unavailable.exception.usage)
+        assert unavailable.exception.usage is not None
+        self.assertEqual(unavailable.exception.usage.input_tokens, 5)
+        self.assertEqual(unavailable.exception.usage.output_tokens, 3)
+        self.assertEqual(unavailable.exception.usage.requests, 1)
+        self.assertEqual(len(fake.calls), 2)
 
     async def test_chat_buffers_summary_from_abandoned_attempt(self) -> None:
         provider = OpenRouterProvider(
@@ -874,6 +1086,48 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             {"effort": "high", "summary": "auto"},
         )
         self.assertEqual(second_payload["reasoning"], {"effort": "high"})
+
+        summary_then_failed = [
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "reasoning_1",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "Before fallback.",
+                    }
+                ),
+            ),
+            SSEEvent(
+                "message",
+                json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "message": "This model does not support reasoning summaries."
+                            },
+                        },
+                    }
+                ),
+            ),
+        ]
+        fake = FakeHttp(event_batches=[summary_then_failed, recovered])
+        provider.http = fake  # type: ignore[assignment]
+
+        streamed = [event async for event in provider.stream(self.request)]
+
+        self.assertEqual(
+            [event.type for event in streamed],
+            ["reasoning_summary_delta", "text_delta", "completed"],
+        )
+        self.assertEqual(streamed[0].text, "Before fallback.")
+        assert streamed[-1].response is not None
+        self.assertEqual(streamed[-1].response.text, "Recovered answer.")
+        self.assertEqual(len(fake.calls), 2)
 
         top_level_failed = [
             SSEEvent(

@@ -51,19 +51,15 @@ class ChatGPTProvider(OpenAIProvider):
             self._active_credentials = await self.credentials.ensure_valid(
                 force_refresh=auth_attempt > 0
             )
-            emitted = False
+            actionable_output_emitted = False
             try:
                 async for event in super().stream(request):
-                    if event.type in {
-                        "reasoning_summary_delta",
-                        "text_delta",
-                        "tool_call_delta",
-                    }:
-                        emitted = True
+                    if event.type in {"text_delta", "tool_call_delta"}:
+                        actionable_output_emitted = True
                     yield event
                 return
             except ProviderAuthenticationError:
-                if emitted or auth_attempt > 0:
+                if actionable_output_emitted or auth_attempt > 0:
                     raise
                 # A 401/403 can arrive before the JWT expiry timestamp. Refresh once
                 # and replay only because the stream emitted no user-visible content.

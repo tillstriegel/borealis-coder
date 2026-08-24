@@ -65,17 +65,29 @@ class Provider(abc.ABC):
         attempts = max(0, self.config.max_retries) + 1
         delay = max(0.0, self.config.initial_backoff_seconds)
         last_error: Exception | None = None
+        prior_usage = Usage()
         for attempt in range(attempts):
             try:
-                return await operation()
+                result = await operation()
+                if isinstance(result, ModelResponse) and not prior_usage.is_empty:
+                    result.usage = prior_usage.add(result.usage)
+                return result
             except ProviderError as error:
                 last_error = error
+                if error.usage is not None:
+                    prior_usage.add(error.usage)
                 if not error.retryable or attempt + 1 >= attempts:
+                    if not prior_usage.is_empty:
+                        error.usage = prior_usage
                     raise
             except (TimeoutError, OSError) as error:
                 last_error = error
                 if attempt + 1 >= attempts:
-                    raise ProviderUnavailableError(str(error), retryable=True) from error
+                    raise ProviderUnavailableError(
+                        str(error),
+                        retryable=True,
+                        usage=prior_usage if not prior_usage.is_empty else None,
+                    ) from error
             sleep_for = min(self.config.max_backoff_seconds, delay)
             sleep_for *= random.uniform(0.8, 1.2)
             await asyncio.sleep(sleep_for)

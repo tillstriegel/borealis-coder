@@ -359,6 +359,33 @@ class ChatGPTCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 1)
         self.assertEqual(refresh_calls, [False])
 
+        attempts = 0
+        refresh_calls.clear()
+
+        async def summary_parent_stream(self, request):  # type: ignore[no-untyped-def]
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                yield ProviderStreamEvent(
+                    type="reasoning_summary_delta",
+                    text="Retriable summary.",
+                )
+                raise ProviderAuthenticationError("expired")
+            yield ProviderStreamEvent(type="text_delta", text="done")
+            yield ProviderStreamEvent(
+                type="completed",
+                response=ModelResponse(text="done"),
+            )
+
+        with patch.object(OpenAIProvider, "stream", summary_parent_stream):
+            events = [event async for event in provider.stream(request)]
+        self.assertEqual(attempts, 2)
+        self.assertEqual(refresh_calls, [False, True])
+        self.assertEqual(
+            [event.type for event in events],
+            ["reasoning_summary_delta", "text_delta", "completed"],
+        )
+
     async def test_custom_credential_endpoints_require_process_opt_in(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(ConfigurationError):

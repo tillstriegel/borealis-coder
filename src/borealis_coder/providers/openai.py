@@ -138,23 +138,19 @@ class OpenAIProvider(Provider):
     async def _stream_responses(
         self, request: ProviderRequest
     ) -> AsyncIterator[ProviderStreamEvent]:
-        emitted = False
+        actionable_output_emitted = False
         try:
             async for event in self._stream_responses_once(
                 request,
                 include_reasoning_summary=True,
             ):
-                if event.type in {
-                    "reasoning_summary_delta",
-                    "text_delta",
-                    "tool_call_delta",
-                }:
-                    emitted = True
+                if event.type in {"text_delta", "tool_call_delta"}:
+                    actionable_output_emitted = True
                 yield event
             return
         except ProviderError as error:
             if (
-                emitted
+                actionable_output_emitted
                 or not request.reasoning_effort
                 or not _reasoning_summary_unsupported(error)
             ):
@@ -206,7 +202,6 @@ class OpenAIProvider(Provider):
                     if reasoning_summary_key is not None and next_key != reasoning_summary_key:
                         separator = _reasoning_summary_separator(reasoning_summary_parts, delta)
                         if separator:
-                            reasoning_summary_parts.append(separator)
                             delta = separator + delta
                     reasoning_summary_key = next_key
                 reasoning_summary_parts.append(delta)
@@ -506,11 +501,17 @@ class OpenAIProvider(Provider):
                     retryable=True,
                 )
             prior_usage.add(response.usage)
-        response = await self._complete_chat_once(replace(request, reasoning_effort=None))
+        try:
+            response = await self._complete_chat_once(replace(request, reasoning_effort=None))
+        except ProviderError as error:
+            _attach_usage_to_error(error, prior_usage)
+            raise
         if not _has_actionable_output(response):
+            usage = _copy_usage(prior_usage).add(response.usage)
             raise ProviderUnavailableError(
                 "OpenAI-compatible provider returned an empty response with reasoning disabled",
                 retryable=False,
+                usage=usage if not usage.is_empty else None,
             )
         response.usage = prior_usage.add(response.usage)
         return response
@@ -561,32 +562,40 @@ class OpenAIProvider(Provider):
             pending_reasoning.clear()
             fallback = replace(request, reasoning_effort=None)
             fallback_output_emitted = False
-            async for event in self._stream_chat_once(fallback):
-                if event.type == "reasoning_summary_delta" and not fallback_output_emitted:
-                    pending_reasoning.append(event)
-                    continue
-                if event.type == "completed" and event.response is not None:
-                    if not _has_actionable_output(event.response):
-                        raise ProviderUnavailableError(
-                            "OpenAI-compatible provider returned an empty response "
-                            "with reasoning disabled",
-                            retryable=False,
-                        )
-                    event.response.usage = prior_usage.add(event.response.usage)
-                    for pending in pending_reasoning:
-                        yield pending
-                    pending_reasoning.clear()
-                elif event.type in {"text_delta", "tool_call_delta"}:
-                    for pending in pending_reasoning:
-                        yield pending
-                    pending_reasoning.clear()
-                    fallback_output_emitted = True
-                yield event
+            try:
+                async for event in self._stream_chat_once(fallback):
+                    if event.type == "reasoning_summary_delta" and not fallback_output_emitted:
+                        pending_reasoning.append(event)
+                        continue
+                    if event.type == "completed" and event.response is not None:
+                        if not _has_actionable_output(event.response):
+                            usage = _copy_usage(prior_usage).add(event.response.usage)
+                            raise ProviderUnavailableError(
+                                "OpenAI-compatible provider returned an empty response "
+                                "with reasoning disabled",
+                                retryable=False,
+                                usage=usage if not usage.is_empty else None,
+                            )
+                        event.response.usage = prior_usage.add(event.response.usage)
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                    elif event.type in {"text_delta", "tool_call_delta"}:
+                        for pending in pending_reasoning:
+                            yield pending
+                        pending_reasoning.clear()
+                        fallback_output_emitted = True
+                    yield event
+            except ProviderError as error:
+                _attach_usage_to_error(error, prior_usage)
+                raise
             return
-        raise ProviderUnavailableError(
+        error = ProviderUnavailableError(
             "OpenAI-compatible provider returned an empty response",
             retryable=not actionable_output_emitted,
         )
+        _attach_usage_to_error(error, prior_usage)
+        raise error
 
     async def _stream_chat_once(
         self, request: ProviderRequest
@@ -601,6 +610,8 @@ class OpenAIProvider(Provider):
         model: str | None = None
         response_id: str | None = None
         finish_reason: str | None = None
+        defer_actionable = bool(request.reasoning_effort)
+        actionable_events: list[ProviderStreamEvent] = []
         async for item in self.http.stream_sse(url, headers=self._headers(), payload=payload):
             if item.data == "[DONE]":
                 continue
@@ -628,7 +639,6 @@ class OpenAIProvider(Provider):
                             summary,
                         )
                         if separator:
-                            reasoning_summary_parts.append(separator)
                             summary = separator + summary
                     reasoning_summary_key = key
                     reasoning_summary_parts.append(summary)
@@ -640,7 +650,11 @@ class OpenAIProvider(Provider):
                 if content:
                     text = str(content)
                     text_parts.append(text)
-                    yield ProviderStreamEvent(type="text_delta", text=text)
+                    event = ProviderStreamEvent(type="text_delta", text=text)
+                    if defer_actionable:
+                        actionable_events.append(event)
+                    else:
+                        yield event
                 for call_delta in delta.get("tool_calls", []) or []:
                     index = int(call_delta.get("index", 0))
                     call = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
@@ -648,7 +662,7 @@ class OpenAIProvider(Provider):
                     function = call_delta.get("function") or {}
                     call["name"] = function.get("name") or call["name"]
                     call["arguments"] += str(function.get("arguments") or "")
-                    yield ProviderStreamEvent(
+                    event = ProviderStreamEvent(
                         type="tool_call_delta",
                         data={
                             "index": index,
@@ -657,6 +671,12 @@ class OpenAIProvider(Provider):
                             "delta": function.get("arguments", ""),
                         },
                     )
+                    if defer_actionable:
+                        actionable_events.append(event)
+                    else:
+                        yield event
+        for event in actionable_events:
+            yield event
         result = ModelResponse(
             text="".join(text_parts),
             tool_calls=[self._call_from_partial(item) for _, item in sorted(calls.items())],
@@ -903,6 +923,19 @@ def _remaining_stream_delta(streamed: str, completed: str) -> str:
 
 def _has_actionable_output(response: ModelResponse) -> bool:
     return bool(response.text or response.tool_calls)
+
+
+def _attach_usage_to_error(error: ProviderError, usage: Usage) -> None:
+    if usage.is_empty:
+        return
+    merged = _copy_usage(usage)
+    if error.usage is not None:
+        merged.add(error.usage)
+    error.usage = merged
+
+
+def _copy_usage(usage: Usage) -> Usage:
+    return replace(usage)
 
 
 def _raise_in_band_failure(
