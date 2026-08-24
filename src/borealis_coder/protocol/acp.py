@@ -441,13 +441,31 @@ class ACPServer:
             )
         elif event.type == "run.completed":
             result = data.get("result") or {}
+            emitted_messages: list[str] = []
             if result.get("incomplete") and result.get("error"):
+                emitted_messages.append(result["error"])
                 await self._update(
                     session_id,
                     {
                         "sessionUpdate": "agent_message",
                         "messageId": new_id("msg"),
                         "content": [{"type": "text", "text": result["error"]}],
+                    },
+                )
+            mutation_warning = (
+                "Workspace mutation tracking is incomplete; verification is required."
+            )
+            if result.get("mutation_tracking") == "incomplete" and not any(
+                "mutation tracking" in message.lower().replace("_", " ")
+                and "incomplete" in message.lower()
+                for message in emitted_messages
+            ):
+                await self._update(
+                    session_id,
+                    {
+                        "sessionUpdate": "agent_message",
+                        "messageId": new_id("msg"),
+                        "content": [{"type": "text", "text": mutation_warning}],
                     },
                 )
             await self._update(

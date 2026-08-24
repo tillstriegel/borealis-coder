@@ -172,6 +172,80 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updates[1]["state"], "idle")
         self.assertEqual(updates[1]["stopReason"], "max_turns")
 
+    async def test_incomplete_mutation_tracking_sends_warning_before_idle_state(self):
+        server = ACPServer()
+        fake = FakeConnection()
+        server.connection = cast(Any, fake)
+
+        await server._event_update(
+            "session_1",
+            cast(Any, None),
+            Event(
+                type="run.completed",
+                session_id="session_1",
+                data={
+                    "result": {
+                        "stop_reason": "cancelled",
+                        "incomplete": False,
+                        "mutation_tracking": "incomplete",
+                    }
+                },
+            ),
+        )
+
+        updates = [params["update"] for _, params in fake.notifications]
+        self.assertEqual(
+            [item["sessionUpdate"] for item in updates],
+            ["agent_message", "state_update"],
+        )
+        self.assertEqual(
+            updates[0]["content"],
+            [
+                {
+                    "type": "text",
+                    "text": (
+                        "Workspace mutation tracking is incomplete; "
+                        "verification is required."
+                    ),
+                }
+            ],
+        )
+        self.assertEqual(updates[1]["state"], "idle")
+        self.assertEqual(updates[1]["stopReason"], "cancelled")
+
+    async def test_mutation_warning_is_not_duplicated_in_max_turn_recovery(self):
+        server = ACPServer()
+        fake = FakeConnection()
+        server.connection = cast(Any, fake)
+        recovery = (
+            "Run incomplete: maximum turns reached. Workspace mutation tracking "
+            "is incomplete; verification is required."
+        )
+
+        await server._event_update(
+            "session_1",
+            cast(Any, None),
+            Event(
+                type="run.completed",
+                session_id="session_1",
+                data={
+                    "result": {
+                        "stop_reason": "max_turns",
+                        "incomplete": True,
+                        "error": recovery,
+                        "mutation_tracking": "incomplete",
+                    }
+                },
+            ),
+        )
+
+        updates = [params["update"] for _, params in fake.notifications]
+        self.assertEqual(
+            [item["sessionUpdate"] for item in updates],
+            ["agent_message", "state_update"],
+        )
+        self.assertEqual(updates[0]["content"], [{"type": "text", "text": recovery}])
+
     async def test_inactive_session_list_does_not_build_a_provider_runtime(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

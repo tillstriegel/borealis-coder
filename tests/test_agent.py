@@ -160,6 +160,37 @@ class RecoveringIncompleteProvider(Provider):
         )
 
 
+class InflightSteeringIncompleteProvider(Provider):
+    name = "inflight_steering_incomplete"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.saw_steering = False
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            self.first_started.set()
+            await self.release_first.wait()
+            return ModelResponse(
+                text="partial answer",
+                stop_reason="max_tokens",
+                usage=Usage(requests=1),
+            )
+        self.saw_steering = any(
+            message.role == Role.USER and message.content == "change direction"
+            for message in request.messages
+        )
+        return ModelResponse(
+            text="steering handled" if self.saw_steering else "steering missing",
+            stop_reason="end_turn",
+            usage=Usage(requests=1),
+        )
+
+
 class OneToolProvider(Provider):
     name = "one_tool"
 
@@ -356,6 +387,19 @@ class ConcurrentProvider(Provider):
                         "expected_sha256": None,
                     },
                 )
+            ],
+            usage=Usage(requests=1),
+        )
+
+
+class ParallelReadProvider(Provider):
+    name = "parallel_reads"
+
+    async def complete(self, request):
+        return ModelResponse(
+            tool_calls=[
+                ToolCall(id="fast-read", name="fast_read", arguments={}),
+                ToolCall(id="blocked-read", name="blocked_read", arguments={}),
             ],
             usage=Usage(requests=1),
         )
@@ -989,6 +1033,51 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_pre_final_incomplete_response_drains_inflight_steering(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "inflight", "max_turns": 2},
+            )
+            config.providers["inflight"] = ProviderConfig(
+                type="inflight_steering_incomplete",
+                model="inflight",
+                max_retries=0,
+            )
+            provider = InflightSteeringIncompleteProvider(config.providers["inflight"])
+            registry = ProviderRegistry()
+            registry.register(
+                "inflight_steering_incomplete",
+                lambda cfg, key: provider,
+            )
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                task = asyncio.create_task(runner.run("start"))
+                await asyncio.wait_for(provider.first_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                runner.steer(session_id, "change direction", message_id="inflight-message")
+                provider.release_first.set()
+                result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertEqual(result.text, "steering handled")
+                self.assertTrue(provider.saw_steering)
+                self.assertEqual(provider.calls, 2)
+                persisted = runner.sessions.messages(session_id)
+                self.assertEqual(
+                    [message.id for message in persisted].count("inflight-message"),
+                    1,
+                )
+            finally:
+                provider.release_first.set()
+                await runner.close()
+
     async def test_repeated_incomplete_response_exhausts_final_turn(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1127,6 +1216,101 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(asyncio.get_running_loop().time() - started, 0.75)
             self.assertEqual(result.stop_reason.value, "cancelled")
             await runner.close()
+
+    async def test_cancel_waits_for_all_parallel_read_finalizers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "parallel"})
+            config.providers["parallel"] = ProviderConfig(
+                type="parallel_reads",
+                model="parallel",
+                max_retries=0,
+            )
+            registry = ProviderRegistry()
+            registry.register("parallel_reads", lambda cfg, key: ParallelReadProvider(cfg, key))
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            tools_started = 0
+            all_tools_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def blocked_read(arguments, context):
+                nonlocal tools_started
+                del arguments, context
+                tools_started += 1
+                if tools_started == 2:
+                    all_tools_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            for name in ("fast_read", "blocked_read"):
+                runner.tools.register(
+                    FunctionTool(
+                        name=name,
+                        description="Test parallel cancellation finalization.",
+                        parameters=object_schema({}),
+                        function=blocked_read,
+                        concurrent=True,
+                    )
+                )
+
+            original_cancel_tool_call = runner.sessions.cancel_tool_call
+            blocked_finalizer_started = threading.Event()
+            fast_finalizer_finished = threading.Event()
+            release_finalizer = threading.Event()
+
+            def finalize_tool_call(session_id, call_id, **kwargs):
+                if call_id == "blocked-read":
+                    blocked_finalizer_started.set()
+                    release_finalizer.wait(timeout=3)
+                original_cancel_tool_call(session_id, call_id, **kwargs)
+                if call_id == "fast-read":
+                    fast_finalizer_finished.set()
+
+            history_at_completion: list[Role] = []
+
+            def capture_completion(event):
+                if event.type == "run.completed":
+                    history_at_completion.extend(
+                        message.role
+                        for message in runner.sessions.messages(event.session_id or "")
+                    )
+
+            runner.events.subscribe(capture_completion)
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "cancel_tool_call",
+                    side_effect=finalize_tool_call,
+                ):
+                    task = asyncio.create_task(runner.run("read in parallel"))
+                    await asyncio.wait_for(all_tools_started.wait(), timeout=1)
+                    session_id = next(iter(runner._cancel))
+                    self.assertTrue(runner.cancel(session_id))
+                    self.assertTrue(
+                        await asyncio.to_thread(blocked_finalizer_started.wait, 1)
+                    )
+                    self.assertTrue(await asyncio.to_thread(fast_finalizer_finished.wait, 1))
+                    self.assertFalse(task.done())
+                    self.assertEqual(runner.sessions.get_session(session_id).status, "running")
+                    release_finalizer.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(history_at_completion.count(Role.TOOL), 2)
+                self.assertEqual(
+                    [call["status"] for call in runner.sessions.tool_calls(session_id)],
+                    ["cancelled", "cancelled"],
+                )
+                self.assertEqual(runner.sessions.get_session(session_id).status, "idle")
+            finally:
+                release_finalizer.set()
+                never_complete.set()
+                await runner.close()
 
     async def test_max_time_is_an_end_to_end_deadline(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1898,6 +2082,94 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(len(tool_messages), 1)
                 self.assertEqual(tool_messages[0].content, "changed through shell")
+            finally:
+                release_snapshot.set()
+                await runner.close()
+
+    async def test_second_cancellation_marks_shell_reconciliation_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mutated_path = root / "shell-mutated.txt"
+            mutated_path.write_text("before")
+            config = make_config(root, agent={"provider": "shell_mutation"})
+            config.providers["shell_mutation"] = ProviderConfig(
+                type="shell_mutation_final_turn",
+                model="shell-mutation",
+                max_retries=0,
+            )
+            provider = ShellMutationFinalTurnProvider(config.providers["shell_mutation"])
+            registry = ProviderRegistry()
+            registry.register("shell_mutation_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+
+            def mutate_workspace(arguments, context):
+                del arguments, context
+                mutated_path.write_text("after")
+                return ToolResult("changed through shell")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="shell",
+                    description="Test interrupted shell reconciliation.",
+                    parameters=object_schema({"command": {"type": "string"}}),
+                    function=mutate_workspace,
+                    effect=Effect.EXECUTE,
+                ),
+                replace=True,
+            )
+            original_file_state = runner._workspace_file_state
+            after_snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            snapshot_calls = 0
+
+            def pause_after_snapshot(stop=None):
+                nonlocal snapshot_calls
+                del stop
+                snapshot_calls += 1
+                state = original_file_state()
+                if snapshot_calls == 2:
+                    after_snapshot_started.set()
+                    release_snapshot.wait(timeout=3)
+                return state
+
+            try:
+                with patch.object(runner, "_workspace_file_state", side_effect=pause_after_snapshot):
+                    task = asyncio.create_task(runner.run("change a file through shell"))
+                    self.assertTrue(
+                        await asyncio.to_thread(after_snapshot_started.wait, 1)
+                    )
+                    task.cancel()
+                    await asyncio.sleep(0.05)
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    release_snapshot.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(result.mutation_tracking, "incomplete")
+                verification = result.verification
+                self.assertIsNotNone(verification)
+                assert verification is not None
+                self.assertEqual(verification["roots"], ["."])
+                tool_call = runner.sessions.tool_calls(result.session_id)[0]
+                self.assertEqual(
+                    tool_call["metadata"]["workspace_change_tracking"],
+                    "incomplete",
+                )
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(
+                    tool_message.metadata["workspace_change_tracking"],
+                    "incomplete",
+                )
             finally:
                 release_snapshot.set()
                 await runner.close()

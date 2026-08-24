@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import sys
 import tempfile
@@ -530,6 +531,32 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             for _, kwargs in output_events:
                 self.assertIn(kwargs["stream"], {"stdout", "stderr"})
 
+    async def test_shell_cancellation_marks_an_unbounded_driver_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            context = make_context(root)
+            shell = build_builtin_registry().get("shell")
+            assert shell is not None
+            context.process.guarantees_bounded_lifecycle = False
+
+            with patch.object(
+                context.process,
+                "run",
+                new=AsyncMock(side_effect=asyncio.CancelledError),
+            ), self.assertRaises(asyncio.CancelledError):
+                await shell.execute(
+                    {
+                        "command": "ignored",
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "description": "cancel",
+                    },
+                    context,
+                )
+
+            self.assertEqual(context.mutation_tracking, "incomplete")
+            self.assertEqual(context.changed_roots, {root.resolve()})
+
     async def test_shell_redacts_secrets_split_across_output_chunks(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -750,6 +777,39 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.timed_out)
             self.assertIn("final", result.stdout)
             self.assertIn("final", "".join(chunks))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+    async def test_process_kills_background_group_before_returning(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            trigger = root / "trigger"
+            os.mkfifo(trigger)
+            driver = NativeProcessDriver(WorkspaceRoots(root), SafetyConfig(), SandboxConfig())
+            command = (
+                "(exec 3<> trigger; printf ready > child-ready; "
+                "IFS= read -r _ <&3; printf x > generated) >/dev/null 2>&1 & "
+                "while [ ! -f child-ready ]; do :; done"
+            )
+
+            result = await asyncio.wait_for(
+                driver.run(command, cwd=root, timeout=5, shell=True),
+                timeout=7,
+            )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(result.lifecycle_complete)
+            self.assertTrue((root / "child-ready").is_file())
+            try:
+                writer = os.open(trigger, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                self.assertEqual(error.errno, errno.ENXIO)
+                child_survived = False
+            else:
+                child_survived = True
+                os.write(writer, b"continue\n")
+                os.close(writer)
+            self.assertFalse(child_survived)
+            self.assertFalse((root / "generated").exists())
 
     async def test_verification_commands_pass_through_policy(self):
         with tempfile.TemporaryDirectory() as td:

@@ -8,6 +8,7 @@ import inspect
 import os
 import shutil
 import signal
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,26 @@ from .paths import WorkspaceRoots
 OutputSink = Callable[[str, str], Awaitable[None] | None]
 OUTPUT_TRUNCATION_MARKER = "\n… output truncated …\n"
 _OUTPUT_OBSERVER_DRAIN_SECONDS = 1.0
+_POSIX_PROCESS_SUPERVISOR = """
+import os
+import signal
+import subprocess
+import sys
+
+status_fd = int(sys.argv[1])
+shell = sys.argv[2] == "shell"
+command = sys.argv[3] if shell else sys.argv[3:]
+signal.signal(signal.SIGTERM, lambda *_: None)
+try:
+    completed = subprocess.run(command, shell=shell)
+    status = completed.returncode
+except OSError as error:
+    print(error, file=sys.stderr)
+    status = 127
+os.write(status_fd, f"{status}\\n".encode())
+while True:
+    signal.pause()
+"""
 
 
 class _BoundedText:
@@ -79,6 +100,7 @@ class ProcessResult:
     timed_out: bool = False
     stream_truncated: bool = False
     stream_complete: bool = True
+    lifecycle_complete: bool = True
 
     @property
     def ok(self) -> bool:
@@ -96,6 +118,8 @@ class ProcessResult:
 
 
 class ProcessDriver:
+    guarantees_bounded_lifecycle: bool = False
+
     async def run(
         self,
         command: str | list[str],
@@ -114,6 +138,7 @@ class NativeProcessDriver(ProcessDriver):
         self.roots = roots
         self.safety = safety
         self.sandbox = sandbox
+        self.guarantees_bounded_lifecycle = os.name == "posix"
 
     async def run(
         self,
@@ -133,11 +158,39 @@ class NativeProcessDriver(ProcessDriver):
         if os.name == "nt":
             creationflags = getattr(asyncio.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         started = monotonic_ms()
-        if shell:
+        status_task: asyncio.Task[int | None] | None = None
+        if os.name == "posix":
+            read_fd, write_fd = os.pipe()
+            arguments = (
+                ["shell", str(command)]
+                if shell
+                else ["exec", *(command if isinstance(command, list) else [command])]
+            )
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    _POSIX_PROCESS_SUPERVISOR,
+                    str(write_fd),
+                    *arguments,
+                    cwd=str(cwd),
+                    env=process_env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                    preexec_fn=preexec_fn,
+                    pass_fds=(write_fd,),
+                )
+            except BaseException:
+                os.close(read_fd)
+                raise
+            finally:
+                os.close(write_fd)
+            status_task = asyncio.create_task(_read_process_status(read_fd))
+        elif shell:
             process = await asyncio.create_subprocess_shell(
                 str(command), cwd=str(cwd), env=process_env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                start_new_session=os.name == "posix", preexec_fn=preexec_fn,
                 creationflags=creationflags,
             )
         else:
@@ -145,7 +198,6 @@ class NativeProcessDriver(ProcessDriver):
             process = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(cwd), env=process_env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                start_new_session=os.name == "posix", preexec_fn=preexec_fn,
                 creationflags=creationflags,
             )
         timed_out = False
@@ -240,32 +292,75 @@ class NativeProcessDriver(ProcessDriver):
             sink.append(final)
             queue_output(name, final)
 
-        tasks = [
+        io_tasks = [
             asyncio.create_task(pump(process.stdout, stdout, "stdout")),
             asyncio.create_task(pump(process.stderr, stderr, "stderr")),
-            asyncio.create_task(process.wait()),
         ]
+        process_task = asyncio.create_task(process.wait())
+        exit_code: int | None = None
+        lifecycle_complete = os.name == "posix"
+        abandon_io = False
         try:
-            _, pending = await asyncio.wait(tasks, timeout=max(1, timeout))
-            if pending:
+            completion_tasks: set[asyncio.Task[object]] = {process_task}
+            if status_task is not None:
+                completion_tasks.add(status_task)
+            done, _ = await asyncio.wait(
+                completion_tasks,
+                timeout=max(1, timeout),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if status_task is not None and status_task in done:
+                exit_code = status_task.result()
+                if exit_code is None:
+                    lifecycle_complete = False
+                    abandon_io = True
+                else:
+                    lifecycle_complete = await _kill_supervised_process_group(process)
+            elif process_task in done:
+                lifecycle_complete = False
+                abandon_io = True
+                exit_code = process.returncode
+            else:
                 timed_out = True
-                await _terminate_process(process)
-            await asyncio.gather(*tasks)
-            stream_complete = await finish_output(drain=True)
+                await _terminate_process(
+                    process,
+                    grace_seconds=0.2 if status_task is not None else 2.0,
+                )
+            if abandon_io:
+                for task in io_tasks:
+                    task.cancel()
+                await asyncio.gather(process_task, *io_tasks, return_exceptions=True)
+            else:
+                await asyncio.gather(process_task, *io_tasks)
+            stream_complete = await finish_output(drain=True) and not abandon_io
         except asyncio.CancelledError:
-            await _terminate_process(process)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await _terminate_process(
+                process,
+                grace_seconds=0.2 if status_task is not None else 2.0,
+            )
+            await asyncio.gather(process_task, *io_tasks, return_exceptions=True)
             await finish_output(drain=False)
             raise
+        finally:
+            if status_task is not None:
+                status_task.cancel()
+                await asyncio.gather(status_task, return_exceptions=True)
         return ProcessResult(
             command=command if isinstance(command, str) else " ".join(command),
-            exit_code=process.returncode if process.returncode is not None else -1,
+            exit_code=(
+                exit_code
+                if exit_code is not None
+                else process.returncode
+                if process.returncode is not None
+                else -1
+            ),
             stdout=stdout.render(),
             stderr=stderr.render(),
             duration_ms=monotonic_ms() - started,
             timed_out=timed_out,
             stream_truncated=emitted_truncation,
             stream_complete=stream_complete,
+            lifecycle_complete=lifecycle_complete,
         )
 
 
@@ -332,13 +427,19 @@ def build_process_driver(
     return NativeProcessDriver(roots, safety, sandbox)
 
 
-async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+async def _terminate_process(
+    process: asyncio.subprocess.Process,
+    *,
+    grace_seconds: float = 2.0,
+) -> None:
+    if process.returncode is not None:
+        return
     try:
         if os.name == "posix" and process.pid:
             os.killpg(process.pid, signal.SIGTERM)
         else:
             process.terminate()
-        await asyncio.wait_for(process.wait(), timeout=2)
+        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
     except (ProcessLookupError, TimeoutError):
         try:
             if os.name == "posix" and process.pid:
@@ -347,6 +448,52 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
                 process.kill()
         except ProcessLookupError:
             pass
+
+
+async def _kill_supervised_process_group(process: asyncio.subprocess.Process) -> bool:
+    """Kill a POSIX command group while its supervisor still owns the group ID."""
+
+    if process.returncode is not None:
+        return False
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return False
+    await process.wait()
+    return True
+
+
+async def _read_process_status(fd: int) -> int | None:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[int | None] = loop.create_future()
+    buffer = bytearray()
+    os.set_blocking(fd, False)
+
+    def read_ready() -> None:
+        try:
+            chunk = os.read(fd, 32)
+        except BlockingIOError:
+            return
+        if not chunk:
+            if not future.done():
+                future.set_result(None)
+            return
+        buffer.extend(chunk)
+        if b"\n" not in buffer:
+            return
+        try:
+            status = int(bytes(buffer).splitlines()[0])
+        except ValueError:
+            status = None
+        if not future.done():
+            future.set_result(status)
+
+    loop.add_reader(fd, read_ready)
+    try:
+        return await future
+    finally:
+        loop.remove_reader(fd)
+        os.close(fd)
 
 
 def _resource_limiter(config: SandboxConfig):  # type: ignore[no-untyped-def]

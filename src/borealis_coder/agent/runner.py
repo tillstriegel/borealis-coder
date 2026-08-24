@@ -515,6 +515,7 @@ class AgentRunner:
                 if usage_budget_error is not None:
                     raise usage_budget_error
                 if response_incomplete and not response.tool_calls:
+                    await self._drain_steering(session_id, run_id, messages)
                     continue
                 if not response.tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
@@ -1203,7 +1204,12 @@ class AgentRunner:
                 return await self._execute_one(call, context, cancel)
 
         if reads:
-            read_results = await asyncio.gather(*(run_read(call) for call in reads))
+            read_tasks = [asyncio.create_task(run_read(call)) for call in reads]
+            try:
+                read_results = await asyncio.gather(*read_tasks)
+            except BaseException:
+                await asyncio.gather(*read_tasks, return_exceptions=True)
+                raise
             results.update(
                 {call.id: result for call, result in zip(reads, read_results, strict=True)}
             )
@@ -1259,6 +1265,7 @@ class AgentRunner:
             )
             raise
         cancellation_message = self._tool_result_message(call, result)
+        workspace_reconciled = workspace_before is None
         try:
             if workspace_before is not None:
                 workspace_after = await self._finish_after_tool_result(
@@ -1269,6 +1276,9 @@ class AgentRunner:
                     required=False,
                 )
                 self._record_workspace_changes(workspace_before, workspace_after, context)
+                workspace_reconciled = True
+                if result.metadata.get("workspace_change_tracking") == "incomplete":
+                    self._mark_workspace_tracking_incomplete(context)
                 if context.mutation_tracking == "incomplete":
                     result.metadata["workspace_change_tracking"] = "incomplete"
             if cancel.is_set():
@@ -1297,6 +1307,8 @@ class AgentRunner:
                 cancel,
             )
         except asyncio.CancelledError:
+            if not workspace_reconciled:
+                self._mark_workspace_tracking_incomplete(context)
             result.metadata.setdefault("workspace_change_tracking", "incomplete")
             await asyncio.shield(
                 asyncio.to_thread(
@@ -1405,8 +1417,7 @@ class AgentRunner:
         context: ToolContext,
     ) -> None:
         if after is None:
-            context.mutation_tracking = "incomplete"
-            context.changed_roots.update(context.roots.roots)
+            self._mark_workspace_tracking_incomplete(context)
             return
         changed_paths = {
             path
@@ -1418,6 +1429,11 @@ class AgentRunner:
             root = entry[0]
             context.changed_files.add(self._display_workspace_path(path, root))
             context.changed_roots.add(root)
+
+    @staticmethod
+    def _mark_workspace_tracking_incomplete(context: ToolContext) -> None:
+        context.mutation_tracking = "incomplete"
+        context.changed_roots.update(context.roots.roots)
 
     @staticmethod
     async def _finish_after_tool_result(
