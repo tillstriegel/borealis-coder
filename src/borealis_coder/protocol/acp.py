@@ -408,6 +408,15 @@ class ACPServer:
             )
         elif event.type == "run.completed":
             result = data.get("result") or {}
+            if result.get("incomplete") and result.get("error"):
+                await self._update(
+                    session_id,
+                    {
+                        "sessionUpdate": "agent_message",
+                        "messageId": new_id("msg"),
+                        "content": [{"type": "text", "text": result["error"]}],
+                    },
+                )
             await self._update(
                 session_id,
                 {

@@ -324,6 +324,7 @@ class AgentResult:
     changed_files: list[str] = field(default_factory=list)
     verification: dict[str, Any] | None = None
     error: str | None = None
+    incomplete: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -336,6 +337,7 @@ class AgentResult:
             "changed_files": self.changed_files,
             "verification": self.verification,
             "error": self.error,
+            "incomplete": self.incomplete,
         }
 
 

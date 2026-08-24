@@ -65,7 +65,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `small_model` | `""` | Optional cheaper/faster model for delegated tasks and LLM compaction. |
 | `provider_fallbacks` | `[]` | Ordered provider route names tried after the primary route fails. |
 | `reasoning_effort` | `"medium"` | Adapter hint for providers/models that expose reasoning controls. |
-| `max_turns` | `60` | Maximum model turns per run. |
+| `max_turns` | `60` | Maximum primary model turns per run. The final turn has tools disabled so the model can finish cleanly. |
 | `max_input_tokens` | `180000` | Context budget used for compaction and hard checks. |
 | `compact_at_ratio` | `0.82` | Compact when estimated context reaches this fraction of the input budget. |
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |

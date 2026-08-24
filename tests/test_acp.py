@@ -48,6 +48,37 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update["messageId"], "message_1")
         self.assertEqual(update["content"], {"type": "text", "text": "Checked the plan."})
 
+    async def test_max_turns_sends_recovery_message_before_idle_state(self):
+        server = ACPServer()
+        fake = FakeConnection()
+        server.connection = cast(Any, fake)
+
+        recovery = (
+            "Run incomplete: maximum 60 model turns reached. "
+            "Session preserved; send 'continue' to resume."
+        )
+        await server._event_update(
+            "session_1",
+            cast(Any, None),
+            Event(
+                type="run.completed",
+                session_id="session_1",
+                data={
+                    "result": {
+                        "stop_reason": "max_turns",
+                        "incomplete": True,
+                        "error": recovery,
+                    }
+                },
+            ),
+        )
+
+        updates = [params["update"] for _, params in fake.notifications]
+        self.assertEqual([item["sessionUpdate"] for item in updates], ["agent_message", "state_update"])
+        self.assertEqual(updates[0]["content"], [{"type": "text", "text": recovery}])
+        self.assertEqual(updates[1]["state"], "idle")
+        self.assertEqual(updates[1]["stopReason"], "max_turns")
+
     async def test_inactive_session_list_does_not_build_a_provider_runtime(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

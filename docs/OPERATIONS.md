@@ -106,6 +106,7 @@ Before granting write authority to a new model or compatible API:
   `borealis auth login`. A single pre-output authentication failure is refreshed
   automatically when a refresh token is available.
 - **Context overflow:** lower initial context budgets, exclude generated files, reduce tool output, or resume after deterministic compaction.
+- **Maximum turns:** the final allowed turn runs without tools. If the run still cannot finish, Borealis preserves the session, verifies changed files when enabled, and reports that `continue` resumes the work.
 - **Stuck loop:** inspect repeated tool calls and project instructions; lower `max_repeated_calls` for high-risk automation.
 - **Verification failure:** use session history and Git diff; resume with the failing output as context.
 - **Bad mutation:** list checkpoints and restore with `borealis rollback CHECKPOINT_ID`.

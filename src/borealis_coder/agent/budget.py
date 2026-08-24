@@ -10,6 +10,13 @@ from ..models import Message, Usage
 from ..util import estimate_tokens, json_dumps, monotonic_ms
 
 
+def max_turns_recovery_message(max_turns: int) -> str:
+    return (
+        f"Run incomplete: maximum {max_turns} model turns reached. "
+        "Session preserved; send 'continue' to resume."
+    )
+
+
 @dataclass(slots=True)
 class Budget:
     config: AgentConfig
@@ -27,7 +34,7 @@ class Budget:
 
     def before_turn(self) -> None:
         if self.turns >= self.config.max_turns:
-            raise BudgetExceeded("turns", f"Maximum {self.config.max_turns} model turns reached")
+            raise BudgetExceeded("turns", max_turns_recovery_message(self.config.max_turns))
         if self.elapsed_seconds >= self.config.max_time_seconds:
             raise BudgetExceeded(
                 "time", f"Maximum {self.config.max_time_seconds}s run time reached"

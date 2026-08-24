@@ -33,6 +33,9 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 ### Fixed
 - Command menu text now follows the terminal foreground color, keeping slash
   commands readable in both light and dark color schemes.
+- The final configured model turn now runs without tools. Runs that still reach
+  the limit preserve resumable history, verify changed files when enabled, and
+  report explicit recovery guidance across terminal and ACP clients.
 - Assistant output is always terminated cleanly before the next prompt.
 - Final answers after one or more tool calls are no longer suppressed by text
   emitted during an earlier model exchange in the same user turn.

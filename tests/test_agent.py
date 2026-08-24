@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import build_runner
 from borealis_coder.config import ProviderConfig
@@ -24,6 +24,7 @@ from borealis_coder.providers.http import SSEEvent
 from borealis_coder.providers.mock import MockProvider
 from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.providers.registry import ProviderRegistry
+from borealis_coder.tools.verification import VerificationReport
 from tests.helpers import make_config
 
 
@@ -134,6 +135,114 @@ class OneToolProvider(Provider):
                     },
                 )
             ],
+            usage=Usage(requests=1),
+        )
+
+
+class FinalTurnProvider(Provider):
+    name = "final_turn"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.tool_counts: list[int] = []
+
+    async def complete(self, request):
+        self.tool_counts.append(len(request.tools))
+        if len(self.tool_counts) == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="write_file",
+                        arguments={
+                            "path": "completed.txt",
+                            "content": "done",
+                            "expected_sha256": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(text="Completed cleanly.", usage=Usage(requests=1))
+
+
+class DefiantFinalTurnProvider(Provider):
+    name = "defiant_final_turn"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.tool_counts: list[int] = []
+
+    async def complete(self, request):
+        self.calls += 1
+        self.tool_counts.append(len(request.tools))
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="write_file",
+                        arguments={
+                            "path": "durable.txt",
+                            "content": "durable",
+                            "expected_sha256": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        if self.calls == 2:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="write_file",
+                        arguments={
+                            "path": "must-not-run.txt",
+                            "content": "unexpected",
+                            "expected_sha256": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(text="Resumed to completion.", usage=Usage(requests=1))
+
+
+class LateSteeringProvider(Provider):
+    name = "late_steering"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.final_started = asyncio.Event()
+        self.release_final = asyncio.Event()
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="read_file",
+                        arguments={
+                            "path": "a.txt",
+                            "start_line": None,
+                            "end_line": None,
+                            "max_chars": None,
+                        },
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        if self.calls == 2:
+            self.final_started.set()
+            await self.release_final.wait()
+            return ModelResponse(text="Initial request complete.", usage=Usage(requests=1))
+        saw_steering = any(
+            message.role == Role.USER and message.content == "late direction"
+            for message in request.messages
+        )
+        return ModelResponse(
+            text="Late steering handled." if saw_steering else "Late steering missing.",
             usage=Usage(requests=1),
         )
 
@@ -926,6 +1035,134 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             try:
                 result = await runner.run("hello")
                 self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertIn("send 'continue' to resume", result.error or "")
+                assistant = runner.sessions.messages(result.session_id)[-1]
+                self.assertEqual(assistant.role, Role.ASSISTANT)
+                self.assertEqual(assistant.tool_calls, [])
+            finally:
+                await runner.close()
+
+    async def test_last_allowed_turn_disables_tools_and_can_finish_cleanly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "final", "max_turns": 2})
+            config.providers["final"] = ProviderConfig(
+                type="final_turn",
+                model="final",
+                max_retries=0,
+            )
+            provider = FinalTurnProvider(config.providers["final"])
+            registry = ProviderRegistry()
+            registry.register("final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("finish within the limit")
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertFalse(result.incomplete)
+                self.assertEqual(result.turns, 2)
+                self.assertGreater(provider.tool_counts[0], 0)
+                self.assertEqual(provider.tool_counts[1], 0)
+                self.assertEqual((root / "completed.txt").read_text(), "done")
+            finally:
+                await runner.close()
+
+    async def test_max_turns_verifies_mutations_and_resumes_without_dangling_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "defiant", "max_turns": 2, "auto_verify": True},
+            )
+            config.providers["defiant"] = ProviderConfig(
+                type="defiant_final_turn",
+                model="defiant",
+                max_retries=0,
+            )
+            provider = DefiantFinalTurnProvider(config.providers["defiant"])
+            registry = ProviderRegistry()
+            registry.register("defiant_final_turn", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    result = await runner.run("make a durable change")
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertEqual(result.verification, {"ok": True, "steps": []})
+                verify.assert_awaited_once()
+                self.assertEqual((root / "durable.txt").read_text(), "durable")
+                self.assertFalse((root / "must-not-run.txt").exists())
+                self.assertEqual(provider.tool_counts, [len(runner.tools.schemas()), 0])
+                persisted = runner.sessions.messages(result.session_id)
+                self.assertEqual(persisted[-1].role, Role.ASSISTANT)
+                self.assertEqual(persisted[-1].tool_calls, [])
+                self.assertEqual(
+                    runner.sessions.get_session(result.session_id).status,
+                    "idle",
+                )
+
+                resumed = await runner.run("continue", session_id=result.session_id)
+                self.assertEqual(resumed.stop_reason.value, "end_turn")
+                self.assertFalse(resumed.incomplete)
+                self.assertEqual(resumed.text, "Resumed to completion.")
+            finally:
+                await runner.close()
+
+    async def test_late_steering_is_durable_when_final_turn_is_already_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.txt").write_text("a")
+            config = make_config(root, agent={"provider": "late", "max_turns": 2})
+            config.providers["late"] = ProviderConfig(
+                type="late_steering",
+                model="late",
+                max_retries=0,
+            )
+            provider = LateSteeringProvider(config.providers["late"])
+            registry = ProviderRegistry()
+            registry.register("late_steering", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                task = asyncio.create_task(runner.run("start"))
+                await asyncio.wait_for(provider.final_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                runner.steer(session_id, "late direction", message_id="late-message")
+                provider.release_final.set()
+                result = await task
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                steering = [
+                    message
+                    for message in runner.sessions.messages(session_id)
+                    if message.id == "late-message"
+                ]
+                self.assertEqual(len(steering), 1)
+                self.assertTrue(steering[0].metadata["steering"])
+                self.assertEqual(runner.queued_prompts(session_id), 0)
+
+                resumed = await runner.run("continue", session_id=session_id)
+                self.assertEqual(resumed.stop_reason.value, "end_turn")
+                self.assertEqual(resumed.text, "Late steering handled.")
             finally:
                 await runner.close()
 

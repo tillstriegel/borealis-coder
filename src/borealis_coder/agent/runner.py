@@ -39,7 +39,7 @@ from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import ToolContext, ToolRegistry, VerificationPlanner
 from ..util import json_dumps, new_id, truncate_text
-from .budget import Budget, estimate_request_tokens
+from .budget import Budget, estimate_request_tokens, max_turns_recovery_message
 from .compaction import Summarizer, compact_messages_with_summary
 
 if TYPE_CHECKING:
@@ -54,6 +54,10 @@ class ProviderRoute:
 
 
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
+_FINAL_TURN_INSTRUCTION = """# Final model turn
+This is the last model turn available for this run. Tools are unavailable. Return the best
+final answer now. State what was completed and what remains.
+"""
 
 
 class AgentRunner:
@@ -303,8 +307,12 @@ class AgentRunner:
             while True:
                 self._check_cancel(cancel)
                 budget.before_turn()
-                schemas = self.tools.schemas()
-                estimated = estimate_request_tokens(system, messages, schemas)
+                final_turn = budget.turns == self.config.agent.max_turns
+                schemas = [] if final_turn else self.tools.schemas()
+                turn_system = (
+                    f"{system}\n\n{_FINAL_TURN_INSTRUCTION}" if final_turn else system
+                )
+                estimated = estimate_request_tokens(turn_system, messages, schemas)
                 threshold = int(
                     self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio
                 )
@@ -330,7 +338,7 @@ class AgentRunner:
                             estimated_tokens=estimated,
                             messages=len(messages),
                         )
-                        estimated = estimate_request_tokens(system, messages, schemas)
+                        estimated = estimate_request_tokens(turn_system, messages, schemas)
                 if estimated > self.config.agent.max_input_tokens:
                     raise BudgetExceeded(
                         "context",
@@ -339,7 +347,7 @@ class AgentRunner:
                     )
                 request = ProviderRequest(
                     model=self.providers[0].model,
-                    system=system,
+                    system=turn_system,
                     messages=messages,
                     tools=schemas,
                     max_output_tokens=self.config.agent.max_output_tokens,
@@ -428,7 +436,7 @@ class AgentRunner:
                     id=assistant_message_id,
                     role=Role.ASSISTANT,
                     content=response.text,
-                    tool_calls=response.tool_calls,
+                    tool_calls=[] if final_turn else response.tool_calls,
                     metadata=assistant_metadata,
                 )
                 messages.append(assistant)
@@ -441,7 +449,9 @@ class AgentRunner:
                     message_id=assistant.id,
                     text=response.text,
                     reasoning_summary=response.reasoning_summary,
-                    tool_calls=[call.to_dict() for call in response.tool_calls],
+                    tool_calls=(
+                        [] if final_turn else [call.to_dict() for call in response.tool_calls]
+                    ),
                     usage=response.usage.to_dict(),
                     stop_reason=response.stop_reason,
                 )
@@ -449,6 +459,11 @@ class AgentRunner:
                     final_text = response.text
                 if usage_budget_error is not None:
                     raise usage_budget_error
+                if final_turn and response.tool_calls:
+                    raise BudgetExceeded(
+                        "turns",
+                        max_turns_recovery_message(self.config.agent.max_turns),
+                    )
                 if not response.tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
                         continue
@@ -486,17 +501,7 @@ class AgentRunner:
                     await asyncio.to_thread(self.sessions.append_message, session_id, tool_message)
                 await self._drain_steering(session_id, run_id, messages)
             if context.changed_files and self.config.agent.auto_verify:
-                planner = VerificationPlanner(self.workspace)
-                await self.events.emit(
-                    "verification.started",
-                    session_id=session_id,
-                    run_id=run_id,
-                )
-                report = await planner.run(context)
-                verification = report.to_dict()
-                await self.events.emit(
-                    "verification.completed", session_id=session_id, run_id=run_id, **verification
-                )
+                verification = await self._verify_changes(context)
         except Cancelled as error:
             stop_reason = StopReason.CANCELLED
             error_message = str(error)
@@ -522,6 +527,41 @@ class AgentRunner:
                 "run.error", session_id=session_id, run_id=run_id, error=error_message
             )
         finally:
+            if (
+                stop_reason == StopReason.MAX_TURNS
+                and verification is None
+                and context.changed_files
+                and self.config.agent.auto_verify
+            ):
+                try:
+                    verification = await self._verify_changes(context)
+                except Cancelled as verification_error:
+                    stop_reason = StopReason.CANCELLED
+                    error_message = str(verification_error)
+                except asyncio.CancelledError:
+                    if deadline_expired.is_set():
+                        stop_reason = StopReason.BUDGET
+                        error_message = (
+                            f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+                        )
+                    else:
+                        stop_reason = StopReason.CANCELLED
+                        error_message = "Run cancelled"
+                except Exception as verification_error:
+                    verification = {
+                        "ok": False,
+                        "steps": [],
+                        "error": (
+                            f"{type(verification_error).__name__}: {verification_error}"
+                        ),
+                    }
+                    recovery_message = error_message or max_turns_recovery_message(
+                        self.config.agent.max_turns
+                    )
+                    error_message = (
+                        f"{recovery_message} Automatic verification could not run: "
+                        f"{verification['error']}"
+                    )
             self._cancel.pop(session_id, None)
             queue = self._steering.get(session_id)
             if queue is not None and queue.empty():
@@ -538,11 +578,29 @@ class AgentRunner:
             changed_files=sorted(context.changed_files),
             verification=verification,
             error=error_message,
+            incomplete=stop_reason == StopReason.MAX_TURNS,
         )
         await self.events.emit(
             "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
         )
         return result
+
+    async def _verify_changes(self, context: ToolContext) -> dict[str, Any]:
+        planner = VerificationPlanner(self.workspace)
+        await self.events.emit(
+            "verification.started",
+            session_id=context.session_id,
+            run_id=context.run_id,
+        )
+        report = await planner.run(context)
+        verification = report.to_dict()
+        await self.events.emit(
+            "verification.completed",
+            session_id=context.session_id,
+            run_id=context.run_id,
+            **verification,
+        )
+        return verification
 
     async def _drain_steering(self, session_id: str, run_id: str, messages: list[Message]) -> bool:
         queue = self._steering.get(session_id)
