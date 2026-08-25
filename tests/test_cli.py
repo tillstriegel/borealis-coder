@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -373,6 +374,52 @@ class CLITests(unittest.TestCase):
             self.assertEqual(json.loads(output)["events"]["events_before"], 0)
             self.assertFalse(data.exists())
             self.assertFalse((workspace / ".borealis").exists())
+
+    def test_maintenance_dry_run_does_not_migrate_an_existing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            data = root / "data"
+            workspace.mkdir()
+            data.mkdir()
+            config = load_config(
+                workspace,
+                overrides={"storage": {"directory": str(data)}},
+            )
+            connection = sqlite3.connect(config.database_path)
+            connection.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO sentinel VALUES ('unchanged')")
+            connection.commit()
+            connection.close()
+            before = config.database_path.read_bytes()
+            siblings_before = {path.name for path in data.iterdir()}
+
+            code, output, error = self.run_cli(
+                [
+                    "maintenance",
+                    "--workspace",
+                    str(workspace),
+                    "--dry-run",
+                    "--json",
+                ],
+                env={"BOREALIS_DATA_DIR": str(data)},
+            )
+
+            self.assertEqual(code, 0, error)
+            self.assertEqual(json.loads(output)["events"]["events_before"], 0)
+            self.assertEqual(config.database_path.read_bytes(), before)
+            self.assertEqual({path.name for path in data.iterdir()}, siblings_before)
+            connection = sqlite3.connect(config.database_path)
+            try:
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+            finally:
+                connection.close()
+            self.assertEqual(tables, {"sentinel"})
 
     def test_session_administration_does_not_build_a_provider_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -2264,6 +2264,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ],
             )
+            visible_text: list[str] = []
+            runner.events.subscribe(
+                lambda event: visible_text.append(str(event.data.get("text", "")))
+                if event.type in {"model.text_delta", "model.completed"}
+                else None
+            )
             try:
                 with patch(
                     "borealis_coder.agent.runner.VerificationPlanner.run",
@@ -2276,8 +2282,69 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Automatic verification failed", result.text)
                 self.assertIn("pytest -q tests/test_result.py", result.text)
                 self.assertIn("Exit code: 1", result.text)
+                self.assertNotIn("Everything succeeded", "".join(visible_text))
+                self.assertIn("Automatic verification failed", "".join(visible_text))
                 assert result.verification is not None
                 self.assertFalse(result.verification["checks_ok"])
+            finally:
+                await runner.close()
+
+    async def test_finalization_cannot_overstate_incomplete_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "mock", "auto_verify": True})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "good\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Candidate says everything is fully verified."),
+                ModelResponse(text="Everything is fully verified."),
+            )
+            report = VerificationReport(
+                ok=True,
+                steps=[
+                    {
+                        "name": "Detached check",
+                        "command": "pytest -q",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "passed",
+                        "stderr": "",
+                        "process_lifecycle_complete": False,
+                    }
+                ],
+            )
+            visible_text: list[str] = []
+            runner.events.subscribe(
+                lambda event: visible_text.append(str(event.data.get("text", "")))
+                if event.type in {"model.text_delta", "model.completed"}
+                else None
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=report,
+                ):
+                    result = await runner.run("report the final status accurately")
+
+                self.assertNotIn("fully verified", result.text)
+                self.assertNotIn("fully verified", "".join(visible_text))
+                self.assertEqual(result.text.splitlines()[0], "Checks passed.")
+                self.assertIn("Process lifecycle not guaranteed", result.text)
             finally:
                 await runner.close()
 
@@ -2351,6 +2418,80 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.verification["checks_ok"])
                 self.assertEqual(verify.await_count, 2)
                 self.assertEqual(result.turns, 5)
+            finally:
+                await runner.close()
+
+    async def test_failed_repair_tool_is_reverified_when_it_changed_the_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "mock", "auto_verify": True})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "bad\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Initial candidate."),
+                ModelResponse(tool_calls=[ToolCall(name="failing_mutator", arguments={})]),
+                ModelResponse(text="Repaired candidate."),
+                ModelResponse(text="Repair complete."),
+            )
+
+            def mutate_then_fail(arguments, context):
+                del arguments, context
+                (root / "result.txt").write_text("good\n", encoding="utf-8")
+                return ToolResult("tests failed after the edit", is_error=True)
+
+            runner.tools.register(
+                FunctionTool(
+                    name="failing_mutator",
+                    description="Change a file, then report a later command failure.",
+                    parameters=object_schema({}),
+                    function=mutate_then_fail,
+                    effect=Effect.WRITE,
+                )
+            )
+            reports = [
+                VerificationReport(
+                    ok=False,
+                    steps=[
+                        {
+                            "name": "Tests",
+                            "command": "pytest -q",
+                            "exit_code": 1,
+                            "duration_ms": 1,
+                            "timed_out": False,
+                            "stdout": "failed",
+                            "stderr": "",
+                            "process_lifecycle_complete": True,
+                        }
+                    ],
+                ),
+                VerificationReport(ok=True),
+            ]
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    side_effect=reports,
+                ) as verify:
+                    result = await runner.run("repair even if the combined command fails")
+
+                self.assertEqual((root / "result.txt").read_text(), "good\n")
+                self.assertEqual(verify.await_count, 2)
+                assert result.verification is not None
+                self.assertTrue(result.verification["checks_ok"])
+                self.assertEqual(result.text, "Repair complete.")
             finally:
                 await runner.close()
 

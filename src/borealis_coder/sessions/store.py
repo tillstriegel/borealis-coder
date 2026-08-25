@@ -382,27 +382,11 @@ class SessionStore:
     ) -> dict[str, Any]:
         """Prune old event rows without changing durable messages or tool records."""
 
-        clauses: list[str] = []
-        parameters: list[Any] = []
         with self._lock:
-            before = int(self._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
-            if before > max_count:
-                boundary = self._connection.execute(
-                    "SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1 OFFSET ?",
-                    (max_count - 1,),
-                ).fetchone()
-                if boundary is not None:
-                    clauses.append("sequence < ?")
-                    parameters.append(int(boundary[0]))
-            if max_age_seconds:
-                cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).isoformat()
-                clauses.append("created_at < ?")
-                parameters.append(cutoff)
-            where = " OR ".join(f"({clause})" for clause in clauses) or "0"
-            pruned = int(
-                self._connection.execute(
-                    f"SELECT COUNT(*) FROM events WHERE {where}", parameters
-                ).fetchone()[0]
+            before, pruned, where, parameters = self._event_prune_plan(
+                self._connection,
+                max_count=max_count,
+                max_age_seconds=max_age_seconds,
             )
             if not dry_run and pruned:
                 with self._connection:
@@ -415,6 +399,77 @@ class SessionStore:
             "pruned_events": pruned,
             "dry_run": dry_run,
         }
+
+    @classmethod
+    def preview_event_prune(
+        cls,
+        path: Path,
+        *,
+        max_count: int,
+        max_age_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """Report event retention through a read-only database connection."""
+
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            columns = (
+                {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(events)").fetchall()
+                }
+                if table is not None
+                else set()
+            )
+            if not {"sequence", "created_at"}.issubset(columns):
+                before = 0
+                pruned = 0
+            else:
+                before, pruned, _, _ = cls._event_prune_plan(
+                    connection,
+                    max_count=max_count,
+                    max_age_seconds=max_age_seconds,
+                )
+        finally:
+            connection.close()
+        return {
+            "events_before": before,
+            "events_after": before - pruned,
+            "pruned_events": pruned,
+            "dry_run": True,
+        }
+
+    @staticmethod
+    def _event_prune_plan(
+        connection: sqlite3.Connection,
+        *,
+        max_count: int,
+        max_age_seconds: int,
+    ) -> tuple[int, int, str, list[Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        before = int(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+        if before > max_count:
+            boundary = connection.execute(
+                "SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1 OFFSET ?",
+                (max_count - 1,),
+            ).fetchone()
+            if boundary is not None:
+                clauses.append("sequence < ?")
+                parameters.append(int(boundary[0]))
+        if max_age_seconds:
+            cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).isoformat()
+            clauses.append("created_at < ?")
+            parameters.append(cutoff)
+        where = " OR ".join(f"({clause})" for clause in clauses) or "0"
+        pruned = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM events WHERE {where}", parameters
+            ).fetchone()[0]
+        )
+        return before, pruned, where, parameters
 
     def _event_page(
         self,

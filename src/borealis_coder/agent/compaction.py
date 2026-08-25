@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 from collections.abc import Awaitable, Callable
@@ -64,7 +65,7 @@ def prune_provider_messages(
             call_details[call.id] = (call.name, call.arguments)
 
     copies: list[Message] = []
-    latest_reads: dict[tuple[str, str], int] = {}
+    latest_reads: dict[tuple[str, str, str], int] = {}
     latest_discovery: dict[str, int] = {}
     latest_mutation: dict[str, int] = {}
     for index, message in enumerate(messages):
@@ -76,7 +77,10 @@ def prune_provider_messages(
             if sha:
                 metadata.setdefault("sha256", sha)
             if path and sha and not message.is_error:
-                latest_reads[(path, sha)] = index
+                arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
+                latest_reads[(path, sha, _read_slice_identity(arguments, message.content))] = (
+                    index
+                )
         if message.role == Role.TOOL and not message.is_error:
             tool_name, arguments = call_details.get(
                 message.tool_call_id or "", (message.tool_name or "", {})
@@ -97,11 +101,13 @@ def prune_provider_messages(
         if message.tool_name == "read_file":
             path = str(message.metadata.get("path") or "")
             sha = str(message.metadata.get("sha256") or "")
+            arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
+            identity = (path, sha, _read_slice_identity(arguments, message.content))
             superseded = bool(
                 path
                 and sha
                 and (
-                    latest_reads.get((path, sha), index) > index
+                    latest_reads.get(identity, index) > index
                     or latest_mutation.get(path, -1) > index
                 )
             )
@@ -155,6 +161,18 @@ def _read_identity(content: str, metadata: dict[str, Any]) -> tuple[str, str]:
         match = re.search(r"(?m)^sha256: ([0-9a-f]{64})$", content)
         sha = match.group(1) if match else ""
     return path, sha
+
+
+def _read_slice_identity(arguments: dict[str, Any], content: str) -> str:
+    if arguments:
+        return json_dumps(
+            {
+                "start_line": arguments.get("start_line"),
+                "end_line": arguments.get("end_line"),
+                "max_chars": arguments.get("max_chars"),
+            }
+        )
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _mutation_paths(metadata: dict[str, Any], arguments: dict[str, Any]) -> list[str]:

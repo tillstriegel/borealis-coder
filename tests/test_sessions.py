@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from borealis_coder.errors import SessionError
 from borealis_coder.events import EventBus, JsonlTrace
@@ -313,6 +314,23 @@ class EventBusTests(unittest.IsolatedAsyncioTestCase):
                     )
             self.assertTrue(records)
             self.assertEqual(records[-1]["data"]["index"], 11)
+
+    async def test_trace_maintenance_streams_existing_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            trace = JsonlTrace(path, max_bytes=300, backup_count=2)
+            for index in range(8):
+                trace.append(Event(type="model.completed", data={"index": index}))
+
+            with patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("maintenance must stream trace files"),
+            ):
+                report = trace.maintenance(dry_run=True)
+
+            self.assertGreater(report["records_before"], 0)
+            self.assertGreater(report["records_after"], 0)
 
     async def test_persistence_failure_keeps_order_for_lossless_retry(self):
         durable: list[str] = []

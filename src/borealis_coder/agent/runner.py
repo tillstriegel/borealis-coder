@@ -408,6 +408,8 @@ class AgentRunner:
                 request = prepared.request
                 estimated = prepared.estimated_tokens
                 compacted = compacted or prepared.compacted
+                if prepared.compacted:
+                    messages = list(request.messages)
                 last_prune_signature = prepared.prune_signature
                 await self.events.emit(
                     "model.started",
@@ -419,6 +421,14 @@ class AgentRunner:
                     model=self.providers[0].model,
                 )
                 assistant_message_id = new_id("msg")
+                buffer_candidate_output = bool(
+                    verification_finalization_pending
+                    or (
+                        self.config.agent.auto_verify
+                        and (context.changed_roots or context.mutation_tracking == "incomplete")
+                        and verified_revision != mutation_revision
+                    )
+                )
                 try:
                     response, used_route = await self._complete_with_fallback(
                         request,
@@ -426,6 +436,7 @@ class AgentRunner:
                         run_id,
                         cancel,
                         assistant_message_id,
+                        emit_response_deltas=not buffer_candidate_output,
                     )
                 except ProviderContextOverflowError:
                     if compacted:
@@ -499,8 +510,10 @@ class AgentRunner:
                     run_id=run_id,
                     turn=budget.turns,
                     message_id=assistant.id,
-                    text=response.text,
-                    reasoning_summary=response.reasoning_summary,
+                    text="" if buffer_candidate_output else response.text,
+                    reasoning_summary=(
+                        "" if buffer_candidate_output else response.reasoning_summary
+                    ),
                     tool_calls=(
                         [] if tools_disabled else [call.to_dict() for call in response_tool_calls]
                     ),
@@ -546,6 +559,9 @@ class AgentRunner:
                         verified_revision=verified_revision,
                         repair_cycles=repair_cycles,
                         awaiting_repair=awaiting_repair,
+                        verification_finalization_pending=(
+                            verification_finalization_pending
+                        ),
                         stop_reason=stop_reason,
                         error_message=error_message,
                     )
@@ -559,6 +575,29 @@ class AgentRunner:
                     error_message = decision.error_message
                     if decision.continue_loop:
                         continue
+                    if buffer_candidate_output and final_text:
+                        await self.events.emit(
+                            "model.text_delta",
+                            session_id=session_id,
+                            run_id=run_id,
+                            message_id=assistant.id,
+                            text=final_text,
+                            provider=used_route.name,
+                            model=used_route.model,
+                        )
+                        await self.events.emit(
+                            "model.completed",
+                            session_id=session_id,
+                            run_id=run_id,
+                            turn=budget.turns,
+                            message_id=assistant.id,
+                            text=final_text,
+                            reasoning_summary="",
+                            tool_calls=[],
+                            usage={},
+                            stop_reason=response.stop_reason,
+                            authoritative_verification=True,
+                        )
                     break
                 batch_signature = hashlib.sha256(
                     json_dumps(
@@ -589,7 +628,7 @@ class AgentRunner:
                 if any(
                     (tool := self.tools.get(call.name)) is not None
                     and tool.effective_mutation_scope != MutationScope.NONE
-                    and not message.is_error
+                    and _tool_result_may_have_mutated(message)
                     for call, message in zip(response_tool_calls, tool_messages, strict=True)
                 ):
                     mutation_revision += 1
@@ -826,6 +865,7 @@ class AgentRunner:
         verified_revision: int,
         repair_cycles: int,
         awaiting_repair: bool,
+        verification_finalization_pending: bool,
         stop_reason: StopReason,
         error_message: str | None,
     ) -> CandidateVerificationDecision:
@@ -835,10 +875,16 @@ class AgentRunner:
             and verified_revision != mutation_revision
         )
         if not needs_verification:
-            if awaiting_repair:
-                final_text = _authoritative_verification_summary(
+            if awaiting_repair or verification_finalization_pending:
+                authoritative = _authoritative_verification_summary(
                     verification or {"checks_ok": False, "steps": []}, context
                 )
+                if verification_finalization_pending and _verification_is_guaranteed(
+                    verification, context
+                ):
+                    final_text = final_text.strip() or authoritative
+                else:
+                    final_text = authoritative
             return CandidateVerificationDecision(
                 verification,
                 final_text,
@@ -951,12 +997,21 @@ class AgentRunner:
                 **metrics.to_dict(),
             )
 
+        keep_recent = 12 if adaptive_cache else 18
+        provider_view_is_compacted = bool(
+            request_messages and request_messages[0].metadata.get("compacted")
+        )
+        enough_new_context = len(request_messages) > (keep_recent * 2) + 1
         compacted = False
-        if compaction_reason is not None:
+        if compaction_reason is not None and (
+            not provider_view_is_compacted
+            or enough_new_context
+            or estimated > self.config.agent.max_input_tokens
+        ):
             compacted_messages = await compact_messages_with_summary(
                 request_messages,
                 self._summarizer(usage_sink, cancel),
-                keep_recent=12 if adaptive_cache else 18,
+                keep_recent=keep_recent,
             )
             if compacted_messages != request_messages:
                 request_messages = compacted_messages
@@ -1037,6 +1092,8 @@ class AgentRunner:
         run_id: str,
         cancel: asyncio.Event,
         assistant_message_id: str,
+        *,
+        emit_response_deltas: bool = True,
     ) -> tuple[ModelResponse, ProviderRoute]:
         errors: list[str] = []
         failed_usage = Usage()
@@ -1096,7 +1153,7 @@ class AgentRunner:
                         saved_tokens=usage.application_cache_saved_tokens,
                         saved_cost_usd=usage.application_cache_saved_cost_usd,
                     )
-                    if response.reasoning_summary:
+                    if emit_response_deltas and response.reasoning_summary:
                         await self.events.emit(
                             "model.reasoning_delta",
                             session_id=session_id,
@@ -1106,7 +1163,7 @@ class AgentRunner:
                             provider=route.name,
                             model=route.model,
                         )
-                    if response.text:
+                    if emit_response_deltas and response.text:
                         await self.events.emit(
                             "model.text_delta",
                             session_id=session_id,
@@ -1135,6 +1192,7 @@ class AgentRunner:
                     run_id,
                     cancel,
                     assistant_message_id,
+                    emit_response_deltas=emit_response_deltas,
                 )
                 if self.config.cache.response_cache_enabled:
                     response.usage.application_cache_misses += cache_misses
@@ -1310,6 +1368,8 @@ class AgentRunner:
         run_id: str,
         cancel: asyncio.Event,
         assistant_message_id: str,
+        *,
+        emit_response_deltas: bool = True,
     ) -> ModelResponse:
         attempts = max(0, route.provider.config.max_retries) + 1
         delay = max(0.0, route.provider.config.initial_backoff_seconds)
@@ -1327,7 +1387,7 @@ class AgentRunner:
                     stream = route.provider.stream(request).__aiter__()
 
                     async def emit_reasoning(text: str) -> None:
-                        if not text:
+                        if not emit_response_deltas or not text:
                             return
                         await self.events.emit(
                             "model.reasoning_delta",
@@ -1371,15 +1431,16 @@ class AgentRunner:
                             if item.type == "text_delta" and item.text:
                                 await commit_reasoning()
                                 actionable_emitted = True
-                                await self.events.emit(
-                                    "model.text_delta",
-                                    session_id=session_id,
-                                    run_id=run_id,
-                                    message_id=assistant_message_id,
-                                    text=item.text,
-                                    provider=route.name,
-                                    model=route.model,
-                                )
+                                if emit_response_deltas:
+                                    await self.events.emit(
+                                        "model.text_delta",
+                                        session_id=session_id,
+                                        run_id=run_id,
+                                        message_id=assistant_message_id,
+                                        text=item.text,
+                                        provider=route.name,
+                                        model=route.model,
+                                    )
                             elif item.type == "tool_call_delta":
                                 await commit_reasoning()
                                 actionable_emitted = True
@@ -2087,6 +2148,30 @@ def _authoritative_verification_summary(
     if mutation_tracking != "complete":
         summary += f"\nMutation tracking: {mutation_tracking}."
     return summary
+
+
+def _verification_is_guaranteed(
+    verification: dict[str, Any] | None,
+    context: ToolContext,
+) -> bool:
+    if verification is None:
+        return False
+    return bool(
+        verification.get("checks_ok", verification.get("ok", False))
+        and verification.get(
+            "process_lifecycle_guaranteed",
+            verification.get("process_lifecycle_complete", False),
+        )
+        and verification.get("mutation_tracking", context.mutation_tracking) == "complete"
+    )
+
+
+def _tool_result_may_have_mutated(message: Message) -> bool:
+    return bool(
+        not message.is_error
+        or message.metadata.get("changed_files")
+        or message.metadata.get("workspace_change_tracking") == "incomplete"
+    )
 
 
 def _is_cacheable_response(response: ModelResponse) -> bool:

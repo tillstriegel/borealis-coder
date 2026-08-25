@@ -469,6 +469,114 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    def test_partial_reads_of_the_same_revision_are_retained(self):
+        sha = "a" * 64
+        messages: list[Message] = []
+        for call_id, start, end, body in (
+            ("first", 1, 10, "FIRST_SLICE"),
+            ("second", 20, 30, "SECOND_SLICE"),
+            ("first-repeat", 1, 10, "FIRST_SLICE"),
+        ):
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(
+                            id=call_id,
+                            name="read_file",
+                            arguments={
+                                "path": "src/example.py",
+                                "start_line": start,
+                                "end_line": end,
+                                "max_chars": None,
+                            },
+                        )
+                    ],
+                )
+            )
+            messages.append(
+                Message(
+                    role=Role.TOOL,
+                    tool_name="read_file",
+                    tool_call_id=call_id,
+                    content=f"path: src/example.py\nsha256: {sha}\n\n{body}",
+                )
+            )
+
+        pruned, metrics = prune_provider_messages(messages)
+
+        provider_text = "\n".join(message.content for message in pruned)
+        self.assertEqual(metrics.superseded_reads_removed, 1)
+        self.assertIn("SECOND_SLICE", provider_text)
+        self.assertEqual(provider_text.count("FIRST_SLICE"), 1)
+
+    async def test_provider_compaction_is_reused_across_later_turns(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.txt").write_text("current", encoding="utf-8")
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            summary_calls = 0
+            normal_calls = 0
+
+            def handle(request, _call_number):
+                nonlocal normal_calls, summary_calls
+                if request.metadata.get("purpose") == "compaction_summary":
+                    summary_calls += 1
+                    return ModelResponse(text="Reusable provider summary.")
+                normal_calls += 1
+                if normal_calls == 1:
+                    return ModelResponse(
+                        tool_calls=[
+                            ToolCall(
+                                name="read_file",
+                                arguments={
+                                    "path": "a.txt",
+                                    "start_line": None,
+                                    "end_line": None,
+                                    "max_chars": None,
+                                },
+                            )
+                        ]
+                    )
+                return ModelResponse(text="Done.")
+
+            provider.handler = handle
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(12):
+                call = ToolCall(
+                    id=f"call-{index}", name="shell", arguments={"command": "status"}
+                )
+                runner.sessions.append_message(
+                    session.id, Message(role=Role.ASSISTANT, tool_calls=[call])
+                )
+                runner.sessions.append_message(
+                    session.id,
+                    Message(
+                        role=Role.TOOL,
+                        tool_name="shell",
+                        tool_call_id=call.id,
+                        content=f"successful status output {index} " * 20,
+                    ),
+                )
+            try:
+                result = await runner.run("continue", session_id=session.id)
+
+                self.assertEqual(result.text, "Done.")
+                self.assertEqual(normal_calls, 2)
+                self.assertEqual(summary_calls, 1)
+                self.assertEqual(len(runner.sessions.messages(session.id)), 28)
+            finally:
+                await runner.close()
+
     async def test_compaction_llm_summary_preserves_tool_output(self):
         tool_output = "FAILED tests/test_x.py::test_y - AssertionError: expected 4 got 5"
         messages = [

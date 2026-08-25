@@ -552,15 +552,21 @@ def _maintenance(args: argparse.Namespace) -> int:
         workspace, explicit_path=args.config, ensure_storage=not args.dry_run
     )
     if config.database_path.is_file():
-        store = SessionStore(config.database_path)
-        try:
-            events = store.prune_events(
+        if args.dry_run:
+            events = SessionStore.preview_event_prune(
+                config.database_path,
                 max_count=config.storage.event_retention_max_count,
                 max_age_seconds=config.storage.event_retention_max_age_seconds,
-                dry_run=args.dry_run,
             )
-        finally:
-            store.close()
+        else:
+            store = SessionStore(config.database_path)
+            try:
+                events = store.prune_events(
+                    max_count=config.storage.event_retention_max_count,
+                    max_age_seconds=config.storage.event_retention_max_age_seconds,
+                )
+            finally:
+                store.close()
     else:
         events = {
             "events_before": 0,

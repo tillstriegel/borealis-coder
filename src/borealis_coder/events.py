@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import threading
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -74,28 +75,30 @@ class JsonlTrace:
         with self._lock:
             existing = self._existing_trace_paths()
             before_bytes = sum(path.stat().st_size for path in existing)
-            records: list[str] = []
-            invalid_records = 0
-            for path in existing:
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    try:
-                        json.loads(line)
-                    except json.JSONDecodeError:
-                        invalid_records += 1
-                        continue
-                    records.append(line + "\n")
             capacity = self.max_bytes * (self.backup_count + 1)
-            kept_reversed: list[str] = []
+            kept: deque[tuple[str, int]] = deque()
+            valid_records = 0
+            invalid_records = 0
             kept_bytes = 0
-            for record in reversed(records):
-                size = len(record.encode("utf-8"))
-                if kept_reversed and kept_bytes + size > capacity:
-                    break
-                kept_reversed.append(record)
-                kept_bytes += size
-            kept = list(reversed(kept_reversed))
+            for path in existing:
+                with path.open(encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        line = line.rstrip("\r\n")
+                        try:
+                            json.loads(line)
+                        except json.JSONDecodeError:
+                            invalid_records += 1
+                            continue
+                        record = line + "\n"
+                        size = len(record.encode("utf-8"))
+                        valid_records += 1
+                        kept.append((record, size))
+                        kept_bytes += size
+                        while len(kept) > 1 and kept_bytes > capacity:
+                            _, removed_size = kept.popleft()
+                            kept_bytes -= removed_size
             report = {
-                "records_before": len(records) + invalid_records,
+                "records_before": valid_records + invalid_records,
                 "records_after": len(kept),
                 "invalid_records_removed": invalid_records,
                 "bytes_before": before_bytes,
@@ -106,8 +109,7 @@ class JsonlTrace:
             chunks: list[list[str]] = []
             current: list[str] = []
             current_bytes = 0
-            for record in reversed(kept):
-                size = len(record.encode("utf-8"))
+            for record, size in reversed(kept):
                 if current and current_bytes + size > self.max_bytes:
                     chunks.append(list(reversed(current)))
                     current = []
