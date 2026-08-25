@@ -124,7 +124,8 @@ storage and privacy exposure.
 JSONL traces rotate automatically by configured bytes and backup count. Complete checkpoints are
 pruned oldest first after a new checkpoint, within count, total-byte, and optional age limits; the
 newest complete recovery point is preserved. Interrupted or malformed checkpoint directories are
-not deleted automatically.
+not deleted automatically. Independent trace writers serialize rotation, and an in-progress
+multi-file patch keeps its checkpoint outside retention pruning until commit or rollback finishes.
 
 Preview or apply existing-history maintenance explicitly:
 

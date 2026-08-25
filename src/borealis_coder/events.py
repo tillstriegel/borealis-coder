@@ -9,7 +9,7 @@ import json
 import os
 import threading
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +26,51 @@ _BUFFERED_EVENT_TYPES = frozenset(
 _EVENT_BATCH_SIZE = 64
 
 
+@contextlib.contextmanager
+def _exclusive_file_lock(path: Path, *, create: bool = True) -> Iterator[None]:
+    """Serialize trace changes made by independent processes."""
+
+    lock_path = Path(f"{path}.lock")
+    if create:
+        ensure_private_directory(lock_path.parent)
+    elif not lock_path.is_file():
+        yield
+        return
+    try:
+        fd = os.open(
+            lock_path,
+            os.O_RDWR | (os.O_CREAT if create else 0),
+            0o600,
+        )
+    except FileNotFoundError:
+        yield
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 class JsonlTrace:
-    """Append-only local trace with process-local serialization."""
+    """Append-only local trace with cross-process serialization."""
 
     def __init__(
         self,
@@ -56,7 +99,7 @@ class JsonlTrace:
         ]
         if not records:
             return
-        with self._lock:
+        with self._lock, _exclusive_file_lock(self.path):
             for record in records:
                 current_size = self.path.stat().st_size if self.path.exists() else 0
                 if current_size and current_size + len(record.encode("utf-8")) > self.max_bytes:
@@ -67,12 +110,13 @@ class JsonlTrace:
                     handle.flush()
 
     def reset(self) -> None:
-        atomic_write_text(self.path, "", mode=0o600)
+        with self._lock, _exclusive_file_lock(self.path):
+            self._reset_unlocked()
 
     def maintenance(self, *, dry_run: bool = False) -> dict[str, int]:
         """Repack existing trace files into bounded, valid JSONL segments."""
 
-        with self._lock:
+        with self._lock, _exclusive_file_lock(self.path, create=not dry_run):
             existing = self._existing_trace_paths()
             before_bytes = sum(path.stat().st_size for path in existing)
             capacity = self.max_bytes * (self.backup_count + 1)
@@ -133,7 +177,7 @@ class JsonlTrace:
 
     def _rotate(self) -> None:
         if self.backup_count == 0:
-            self.reset()
+            self._reset_unlocked()
             return
         oldest = self._backup_path(self.backup_count)
         if oldest.exists():
@@ -145,6 +189,9 @@ class JsonlTrace:
         if self.path.exists():
             os.replace(self.path, self._backup_path(1))
         ensure_private_file(self.path)
+
+    def _reset_unlocked(self) -> None:
+        atomic_write_text(self.path, "", mode=0o600)
 
     def _backup_path(self, index: int) -> Path:
         return Path(f"{self.path}.{index}")

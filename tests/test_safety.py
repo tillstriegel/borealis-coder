@@ -140,6 +140,29 @@ class PathTests(unittest.TestCase):
             self.assertTrue(malformed.is_dir())
             manager.restore(checkpoint.id)
 
+    def test_checkpoint_pruning_skips_active_checkpoint_until_release(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "state.txt"
+            source.write_text("first", encoding="utf-8")
+            manager = CheckpointManager(
+                WorkspaceRoots(root), retention_max_count=1
+            )
+            active = manager.create([source], label="active", active=True)
+            assert active is not None
+            source.write_text("second", encoding="utf-8")
+            newest = manager.create([source], label="newest")
+            assert newest is not None
+
+            self.assertTrue((manager.directory / active.id).is_dir())
+            manager.prune()
+            self.assertTrue((manager.directory / active.id).is_dir())
+
+            manager.release(active.id)
+
+            self.assertFalse((manager.directory / active.id).exists())
+            self.assertTrue((manager.directory / newest.id).is_dir())
+
     def test_checkpoint_retention_respects_age_and_preserves_newest(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

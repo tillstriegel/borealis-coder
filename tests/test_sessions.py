@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -286,6 +287,53 @@ class EventBusTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(records)
             self.assertTrue(all(record["type"] == "model.completed" for record in records))
             self.assertEqual(records[-1]["data"]["index"], 7)
+
+    async def test_independent_trace_writers_rotate_without_racing(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            traces = [
+                JsonlTrace(path, max_bytes=300, backup_count=3)
+                for _ in range(4)
+            ]
+            barrier = threading.Barrier(len(traces))
+            errors: list[Exception] = []
+
+            def write_events(writer: int, trace: JsonlTrace) -> None:
+                try:
+                    barrier.wait()
+                    for index in range(20):
+                        trace.append(
+                            Event(
+                                type="model.completed",
+                                data={
+                                    "writer": writer,
+                                    "index": index,
+                                    "payload": "x" * 80,
+                                },
+                            )
+                        )
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [
+                threading.Thread(target=write_events, args=(index, trace))
+                for index, trace in enumerate(traces)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            records = []
+            for item in [Path(f"{path}.{index}") for index in range(3, 0, -1)] + [path]:
+                if item.is_file():
+                    records.extend(
+                        json.loads(line)
+                        for line in item.read_text(encoding="utf-8").splitlines()
+                    )
+            self.assertTrue(records)
+            self.assertTrue(all(record["type"] == "model.completed" for record in records))
 
     async def test_trace_maintenance_prunes_backups_above_current_limit(self):
         with tempfile.TemporaryDirectory() as td:

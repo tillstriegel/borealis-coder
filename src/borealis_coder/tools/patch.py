@@ -109,7 +109,11 @@ class ApplyPatchTool(Tool):
 
         # All hunks are validated before any file is changed. The checkpoint then
         # provides rollback if an unexpected filesystem error occurs during commit.
-        checkpoint = context.checkpoints.create(targets, label=f"apply_patch ({len(patches)} files)")
+        checkpoint = context.checkpoints.create(
+            targets,
+            label=f"apply_patch ({len(patches)} files)",
+            active=True,
+        )
         outcomes: list[str] = []
         try:
             for _, target, operation, content in planned:
@@ -126,7 +130,10 @@ class ApplyPatchTool(Tool):
         except Exception:
             if checkpoint is not None:
                 context.checkpoints.restore(checkpoint.id)
+                context.checkpoints.release(checkpoint.id)
             raise
+        if checkpoint is not None:
+            context.checkpoints.release(checkpoint.id)
         return ToolResult("\n".join(outcomes), metadata={
             "files": [context.roots.display(item) for item in targets],
             "checkpoint_id": checkpoint.id if checkpoint else None,

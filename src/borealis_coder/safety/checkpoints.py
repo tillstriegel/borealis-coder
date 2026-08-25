@@ -21,6 +21,8 @@ from ..util import (
 )
 from .paths import WorkspaceRoots
 
+_ACTIVE_MARKER = ".active"
+
 
 @dataclass(slots=True)
 class Checkpoint:
@@ -52,7 +54,9 @@ class CheckpointManager:
         if create_directory:
             ensure_private_directory(self.directory)
 
-    def create(self, paths: list[Path], *, label: str) -> Checkpoint | None:
+    def create(
+        self, paths: list[Path], *, label: str, active: bool = False
+    ) -> Checkpoint | None:
         if not self.enabled:
             return None
         unique = sorted({path.resolve(strict=False) for path in paths}, key=str)
@@ -96,12 +100,24 @@ class CheckpointManager:
             files.append(entry)
         checkpoint = Checkpoint(checkpoint_id, utc_now(), label, files)
         target.mkdir(parents=True, exist_ok=True)
+        if active:
+            atomic_write_text(target / _ACTIVE_MARKER, "active\n")
         atomic_write_text(target / "manifest.json", json.dumps({
             "id": checkpoint.id, "created_at": checkpoint.created_at,
             "label": checkpoint.label, "files": checkpoint.files,
         }, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         self.prune()
         return checkpoint
+
+    def release(self, checkpoint_id: str) -> None:
+        """Make an active checkpoint eligible for retention pruning."""
+
+        target = self._checkpoint_directory(checkpoint_id)
+        manifest = target / "manifest.json"
+        if not manifest.is_file():
+            raise ToolError(f"Unknown checkpoint: {checkpoint_id}")
+        (target / _ACTIVE_MARKER).unlink(missing_ok=True)
+        self.prune()
 
     def list(self) -> list[Checkpoint]:
         result: list[Checkpoint] = []
@@ -116,11 +132,7 @@ class CheckpointManager:
         return sorted(result, key=lambda item: item.created_at, reverse=True)
 
     def restore(self, checkpoint_id: str) -> Checkpoint:
-        target = (self.directory / checkpoint_id).resolve(strict=False)
-        try:
-            target.relative_to(self.directory.resolve())
-        except ValueError as error:
-            raise ToolError(f"Invalid checkpoint ID: {checkpoint_id}") from error
+        target = self._checkpoint_directory(checkpoint_id)
         manifest_path = target / "manifest.json"
         if not manifest_path.is_file():
             raise ToolError(f"Unknown checkpoint: {checkpoint_id}")
@@ -207,6 +219,8 @@ class CheckpointManager:
         for directory in self.directory.iterdir():
             if not directory.is_dir() or directory.is_symlink():
                 continue
+            if (directory / _ACTIVE_MARKER).exists():
+                continue
             manifest = directory / "manifest.json"
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -225,6 +239,14 @@ class CheckpointManager:
                 continue
             records.append((checkpoint, directory, size, created_at))
         return records
+
+    def _checkpoint_directory(self, checkpoint_id: str) -> Path:
+        target = (self.directory / checkpoint_id).resolve(strict=False)
+        try:
+            target.relative_to(self.directory.resolve())
+        except ValueError as error:
+            raise ToolError(f"Invalid checkpoint ID: {checkpoint_id}") from error
+        return target
 
     @staticmethod
     def _complete_directory_size(directory: Path, checkpoint: Checkpoint) -> int | None:
