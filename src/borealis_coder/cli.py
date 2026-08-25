@@ -351,6 +351,7 @@ async def _launch_interactive(
         stream_text=args.stream,
         show_tool_output=args.show_tool_output,
         history_enabled=args.history,
+        terminal_approvals=True,
     )
     return await shell.run()
 

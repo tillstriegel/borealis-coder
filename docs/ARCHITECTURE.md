@@ -50,8 +50,8 @@ responses separated by tool calls. The completed model response remains the
 source of truth when stream deltas are incomplete. Human text, tool progress,
 verification, and the next prompt are finalized in deterministic order.
 
-The shell adds readline history when available, slash commands, runtime route and
-policy changes, multiline input, and turn cancellation. It does not create a
+The shell adds prompt-toolkit input and history on interactive terminals, slash
+commands, runtime route and policy changes, multiline input, and turn cancellation. It does not create a
 second conversation implementation; all messages, tools, usage, and terminal
 state still pass through `AgentRunner` and `SessionStore`.
 

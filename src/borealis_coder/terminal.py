@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .models import Event
+from .terminal_input import read_history_entries, write_history_entries
 from .util import json_dumps, truncate_text
 
 _PROMPT_GLYPH = "❯"  # noqa: RUF001 - intentional terminal prompt glyph
@@ -115,7 +116,7 @@ class AuroraUI:
         self._box_field("GUARDRAIL", safety, width)
         self._box_field("SESSION", session, width)
         print(self.paint(bottom, self._MUTED), file=self.stream)
-        hint = " /help commands   // literal slash   Ctrl+C cancel turn"
+        hint = " type follow-ups while working   /help commands   Ctrl+C cancel turn"
         print(self.subdued(_middle_truncate(hint, width)), file=self.stream)
 
     def panel(
@@ -1001,7 +1002,8 @@ class ReadlineHistory:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.is_file():
                 with contextlib.suppress(OSError):
-                    readline.read_history_file(str(self.path))
+                    for entry in read_history_entries(self.path):
+                        readline.add_history(entry)
             readline.set_history_length(self.max_entries)
         self._previous_completer = readline.get_completer()
         self._previous_delimiters = readline.get_completer_delims()
@@ -1024,9 +1026,12 @@ class ReadlineHistory:
             return
         try:
             if self.enabled:
-                readline.write_history_file(str(self.path))
-                if os.name != "nt":
-                    os.chmod(self.path, 0o600)
+                entries = [
+                    entry
+                    for index in range(1, readline.get_current_history_length() + 1)
+                    if (entry := readline.get_history_item(index)) is not None
+                ]
+                write_history_entries(self.path, entries[-self.max_entries :])
         except OSError:
             pass
         finally:

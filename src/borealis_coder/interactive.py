@@ -1,4 +1,4 @@
-"""Persistent, dependency-free interactive shell for Borealis Coder."""
+"""Persistent interactive shell for Borealis Coder."""
 
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from prompt_toolkit.document import Document
+from prompt_toolkit.patch_stdout import patch_stdout
+
 from . import __version__
 from .agent import AgentRunner, build_runner
 from .config import Config
@@ -20,9 +23,11 @@ from .errors import BorealisError, ConfigurationError, SessionError
 from .models import AgentResult, Event, Role
 from .safety import ApprovalRequest
 from .terminal import AuroraUI, ConsoleRenderer, ReadlineHistory
+from .terminal_input import TerminalInput, TerminalInputInterrupted
 from .util import truncate_text
 
 ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
+
 
 _COMMAND_OPTIONS = (
     ("/help", "Show every command and keyboard control"),
@@ -66,6 +71,7 @@ class InteractiveCLI:
         stream_text: bool = True,
         show_tool_output: bool = False,
         history_enabled: bool = True,
+        terminal_approvals: bool = False,
     ) -> None:
         self.workspace = workspace.resolve()
         self.config = config
@@ -74,6 +80,7 @@ class InteractiveCLI:
         self.resume_last = resume_last
         self.initial_prompt = initial_prompt.strip()
         self.history_enabled = history_enabled
+        self.terminal_approvals = terminal_approvals
         self.renderer = ConsoleRenderer(
             stream_text=stream_text,
             interactive=True,
@@ -85,6 +92,11 @@ class InteractiveCLI:
         self._active_session_id: str | None = None
         self._active_task: asyncio.Task[AgentResult] | None = None
         self._interrupt_count = 0
+        self._pending_follow_ups: list[str] = []
+        self._approval_requests: asyncio.Queue[
+            tuple[ApprovalRequest, asyncio.Future[str]]
+        ] = asyncio.Queue()
+        self._input: TerminalInput | None = None
 
     @property
     def ui(self) -> AuroraUI:
@@ -95,61 +107,276 @@ class InteractiveCLI:
         await self._select_initial_session()
         self._print_banner()
         history_file = self.config.storage_dir / "cli-history"
+        if not self._concurrent_input():
+            try:
+                return await self._run_serial(history_file)
+            finally:
+                if self.runner is not None:
+                    await self.runner.close()
+                    self.runner = None
+        original_status_stream = self.renderer._status_stream
         try:
-            with ReadlineHistory(
-                history_file,
-                enabled=self.history_enabled,
-                completions=_COMMANDS,
-                completion_descriptions=_COMMAND_DESCRIPTIONS,
-            ):
-                if self.initial_prompt:
-                    await self._submit(self.initial_prompt)
-                while True:
-                    try:
-                        line = _terminal_input(self._prompt_label())
-                    except EOFError:
-                        print()
-                        self.ui.notice("info", "Aurora shell closed", "session saved")
-                        break
-                    except KeyboardInterrupt:
-                        print()
-                        self.ui.notice("warning", "Aurora shell interrupted", "session saved")
-                        return 130
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("//"):
-                        await self._submit(line[1:])
-                        continue
-                    if line.startswith("/"):
-                        try:
-                            should_exit, prompt = await self._command(line)
-                        except (BorealisError, ConfigurationError, OSError, ValueError) as error:
-                            self.ui.notice("error", "Command failed", str(error))
-                            continue
-                        if prompt:
-                            await self._submit(prompt)
-                        if should_exit:
-                            self.ui.notice("info", "Aurora shell closed", "session saved")
-                            break
-                        continue
-                    await self._submit(line)
+            with patch_stdout(raw=True):
+                self.renderer._status_stream = sys.stdout
+                self._input = TerminalInput(
+                    history_file,
+                    history_enabled=self.history_enabled,
+                    completions=_COMMANDS,
+                    completion_descriptions=_COMMAND_DESCRIPTIONS,
+                )
+                return await self._run_concurrent()
         finally:
+            self.renderer._status_stream = original_status_stream
+            if self._input is not None:
+                self._input.close()
+                self._input = None
             if self.runner is not None:
                 await self.runner.close()
                 self.runner = None
+
+    async def _run_concurrent(self) -> int:
+        """Keep agent work, editable input, and approvals responsive together."""
+
+        submission: asyncio.Task[None] | None = None
+        input_task: asyncio.Task[str] | None = None
+        input_role = "command"
+        draft: Document | None = None
+        draft_role = "command"
+        approval_task: asyncio.Task[tuple[ApprovalRequest, asyncio.Future[str]]] | None = None
+        pending_approval: tuple[ApprovalRequest, asyncio.Future[str]] | None = None
+        input_closed = False
+        try:
+            if self.initial_prompt:
+                submission = asyncio.create_task(self._submit(self.initial_prompt))
+            while True:
+                if pending_approval is not None and pending_approval[1].done():
+                    pending_approval = None
+                    if input_task is not None and input_role == "approval":
+                        await _cancel_task(input_task)
+                        input_task = None
+                if submission is None and self._pending_follow_ups:
+                    prompt = self._pending_follow_ups.pop(0)
+                    submission = asyncio.create_task(self._submit(prompt))
+                if input_task is None and not input_closed:
+                    if pending_approval is not None:
+                        input_role = "approval"
+                        prompt = self._approval_prompt()
+                    elif submission is not None:
+                        input_role = "follow_up"
+                        prompt = self._input_prompt(True)
+                    elif draft is not None and draft_role == "follow_up":
+                        input_role = "next_turn"
+                        prompt = self._input_prompt(False)
+                    else:
+                        input_role = "command"
+                        prompt = self._input_prompt(False)
+                    input_task = asyncio.create_task(
+                        self._require_input().read(
+                            prompt,
+                            default=(
+                                draft
+                                if input_role != "approval" and draft is not None
+                                else ""
+                            ),
+                        )
+                    )
+                    if input_role != "approval":
+                        draft = None
+                        draft_role = "command"
+                if (
+                    approval_task is None
+                    and pending_approval is None
+                    and self.terminal_approvals
+                ):
+                    approval_task = asyncio.create_task(self._approval_requests.get())
+
+                waiting: set[asyncio.Future[Any]] = set()
+                for task in (submission, input_task, approval_task):
+                    if task is not None:
+                        waiting.add(task)
+                if pending_approval is not None:
+                    waiting.add(pending_approval[1])
+                if not waiting:
+                    break
+                done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+
+                if submission is not None and submission in done:
+                    await submission
+                    submission = None
+                    if (
+                        input_task is not None
+                        and not input_task.done()
+                        and input_role == "follow_up"
+                    ):
+                        current = self._require_input().current_document
+                        if current.text:
+                            draft = current
+                            draft_role = "follow_up"
+                        await _cancel_task(input_task)
+                        input_task = None
+                    if input_closed and not self._pending_follow_ups:
+                        self.ui.notice("info", "Aurora shell closed", "session saved")
+                        break
+
+                if input_task is not None and input_task in done:
+                    completed_role = input_role
+                    try:
+                        line = input_task.result().strip()
+                    except EOFError:
+                        print()
+                        input_closed = True
+                        if pending_approval is not None:
+                            self._resolve_approval(pending_approval[1], "no")
+                            pending_approval = None
+                        if submission is None:
+                            self.ui.notice("info", "Aurora shell closed", "session saved")
+                            break
+                        self.ui.notice("info", "Input closed", "waiting for the active turn")
+                    except TerminalInputInterrupted:
+                        print()
+                        if completed_role == "approval" and pending_approval is not None:
+                            self._resolve_approval(pending_approval[1], "no")
+                            pending_approval = None
+                        elif submission is not None:
+                            self._cancel_active_turn()
+                        else:
+                            self.ui.notice(
+                                "warning", "Aurora shell interrupted", "session saved"
+                            )
+                            return 130
+                    else:
+                        if completed_role == "approval":
+                            if pending_approval is not None and self._answer_approval(
+                                line, pending_approval[1]
+                            ):
+                                pending_approval = None
+                        elif line and completed_role in {"follow_up", "next_turn"}:
+                            self._queue_follow_up(_unescape_prompt(line))
+                        elif line.startswith("//"):
+                            submission = asyncio.create_task(self._submit(_unescape_prompt(line)))
+                        elif line.startswith("/"):
+                            try:
+                                should_exit, prompt = await self._command(line)
+                            except (
+                                BorealisError,
+                                ConfigurationError,
+                                OSError,
+                                ValueError,
+                            ) as error:
+                                self.ui.notice("error", "Command failed", str(error))
+                            else:
+                                if prompt:
+                                    submission = asyncio.create_task(self._submit(prompt))
+                                if should_exit:
+                                    self.ui.notice(
+                                        "info", "Aurora shell closed", "session saved"
+                                    )
+                                    break
+                        elif line:
+                            submission = asyncio.create_task(self._submit(line))
+                    input_task = None
+
+                if approval_task is not None and approval_task in done:
+                    request = approval_task.result()
+                    approval_task = None
+                    if request[1].done():
+                        continue
+                    if input_closed:
+                        self._resolve_approval(request[1], "no")
+                        continue
+                    if input_task is not None:
+                        if input_role != "approval":
+                            draft = self._require_input().current_document
+                            draft_role = input_role
+                        await _cancel_task(input_task)
+                        input_task = None
+                    pending_approval = request
+                    self._show_approval(request[0])
+        finally:
+            cleanup_tasks: list[asyncio.Task[Any]] = []
+            for task in (input_task, approval_task, submission):
+                if task is not None:
+                    cleanup_tasks.append(task)
+            for task in cleanup_tasks:
+                if not task.done():
+                    task.cancel()
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            if approval_task is not None and approval_task.done() and not approval_task.cancelled():
+                with contextlib.suppress(Exception):
+                    _, future = approval_task.result()
+                    self._resolve_approval(future, "no")
+            pending_requests: list[tuple[ApprovalRequest, asyncio.Future[str]]] = []
+            while not self._approval_requests.empty():
+                pending_requests.append(self._approval_requests.get_nowait())
+            for _, future in pending_requests:
+                self._resolve_approval(future, "no")
+            if pending_approval is not None:
+                self._resolve_approval(pending_approval[1], "no")
+        return 0
+
+    async def _run_serial(self, history_file: Path) -> int:
+        """Preserve deterministic line-by-line behavior for redirected stdin."""
+
+        with ReadlineHistory(
+            history_file,
+            enabled=self.history_enabled,
+            completions=_COMMANDS,
+            completion_descriptions=_COMMAND_DESCRIPTIONS,
+        ):
+            if self.initial_prompt:
+                await self._submit(self.initial_prompt)
+            while True:
+                try:
+                    line = _terminal_input("").strip()
+                except EOFError:
+                    print()
+                    self.ui.notice("info", "Aurora shell closed", "session saved")
+                    break
+                except KeyboardInterrupt:
+                    print()
+                    self.ui.notice("warning", "Aurora shell interrupted", "session saved")
+                    return 130
+                if not line:
+                    continue
+                if line.startswith("//"):
+                    await self._submit(_unescape_prompt(line))
+                    continue
+                if line.startswith("/"):
+                    try:
+                        should_exit, prompt = await self._command(line)
+                    except (BorealisError, ConfigurationError, OSError, ValueError) as error:
+                        self.ui.notice("error", "Command failed", str(error))
+                        continue
+                    if prompt:
+                        await self._submit(prompt)
+                    if should_exit:
+                        self.ui.notice("info", "Aurora shell closed", "session saved")
+                        break
+                    continue
+                await self._submit(line)
         return 0
 
     async def _new_runner(self, config: Config) -> AgentRunner:
+        approval_callback = (
+            self._request_terminal_approval
+            if self.terminal_approvals and self._concurrent_input()
+            else self.approval_callback
+        )
         runner = await build_runner(
             self.workspace,
             config=config,
-            approval_callback=self.approval_callback,
+            approval_callback=approval_callback,
             interactive=True,
         )
-        runner.events.subscribe(self.renderer.handle)
+        runner.events.subscribe(self._render_event)
         runner.events.subscribe(self._observe)
         return runner
+
+    async def _render_event(self, event: Event) -> None:
+        """Render every event; prompt-toolkit keeps the input line stable."""
+
+        await self.renderer.handle(event)
 
     async def _select_initial_session(self) -> None:
         runner = self._require_runner()
@@ -185,6 +412,95 @@ class InteractiveCLI:
         short = self.session_id[-8:] if self.session_id else "new"
         return self.ui.prompt(short)
 
+    def _concurrent_input(self) -> bool:
+        return _is_tty(sys.stdin) and _is_tty(self.renderer.status_stream)
+
+    def _input_prompt(self, active: bool) -> str:
+        if not _is_tty(sys.stdin):
+            return ""
+        if active:
+            return self.ui.inline_prompt("follow-up · Enter to steer")
+        return self._prompt_label()
+
+    def _approval_prompt(self) -> str:
+        return self.ui.inline_prompt("approval · y once · a for session · n reject")
+
+    def _require_input(self) -> TerminalInput:
+        if self._input is None:
+            raise RuntimeError("Concurrent terminal input is not active")
+        return self._input
+
+    def _queue_follow_up(self, prompt: str) -> None:
+        prompt = prompt.strip()
+        if not prompt:
+            return
+        self._pending_follow_ups.append(prompt)
+        self._flush_follow_ups()
+        runner = self._require_runner()
+        queued = len(self._pending_follow_ups)
+        if self._active_session_id:
+            queued += runner.queued_prompts(self._active_session_id)
+        self.ui.notice(
+            "info",
+            "Follow-up queued",
+            f"{queued} pending · will steer before the next model turn",
+        )
+
+    def _flush_follow_ups(self) -> None:
+        runner = self._require_runner()
+        session_id = self._active_session_id
+        if not session_id or not runner.accepts_steering(session_id):
+            return
+        while self._pending_follow_ups:
+            prompt = self._pending_follow_ups[0]
+            try:
+                runner.steer(session_id, prompt, metadata={"interactive": True})
+            except SessionError:
+                return
+            self._pending_follow_ups.pop(0)
+
+    async def _request_terminal_approval(self, request: ApprovalRequest) -> str:
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._approval_requests.put_nowait((request, future))
+        return await future
+
+    def _show_approval(self, request: ApprovalRequest) -> None:
+        self.renderer.finish_turn()
+        self.ui.panel(
+            "Approval required",
+            [
+                ("tool", request.tool_name),
+                ("risk", request.decision.risk),
+                ("reason", request.decision.reason),
+                ("request", request.arguments_preview),
+            ],
+            tone="warning",
+        )
+        self.ui.notice("info", "Reply y once · a for session · n to reject")
+
+    @staticmethod
+    def _resolve_approval(future: asyncio.Future[str], answer: str) -> bool:
+        if future.done():
+            return False
+        future.set_result(answer)
+        return True
+
+    def _answer_approval(self, line: str, future: asyncio.Future[str]) -> bool:
+        if future.done():
+            return True
+        answer = line.strip().lower()
+        if answer in {"y", "yes"}:
+            self._resolve_approval(future, "allow_once")
+            return True
+        if answer in {"a", "always"}:
+            self._resolve_approval(future, "allow_always")
+            return True
+        if answer in {"n", "no", ""}:
+            self._resolve_approval(future, "no")
+            return True
+        self.ui.notice("warning", "Expected y, a, or n", "approval is still waiting")
+        return False
+
     async def _submit(self, prompt: str) -> None:
         prompt = prompt.strip()
         if not prompt:
@@ -197,6 +513,12 @@ class InteractiveCLI:
         progress_task = asyncio.create_task(self._report_progress(task))
         self._active_task = task
         previous_handler = self._install_turn_interrupt_handler()
+        if self._concurrent_input():
+            self.ui.notice(
+                "info",
+                "Follow-up input ready",
+                "type while Borealis works · Enter queues · Ctrl+C cancels",
+            )
         try:
             result = await task
         except asyncio.CancelledError:
@@ -213,7 +535,12 @@ class InteractiveCLI:
                 await progress_task
             self._restore_interrupt_handler(previous_handler)
             self._active_task = None
+            active_session_id = self._active_session_id
             self._active_session_id = None
+            if active_session_id:
+                reclaimed = runner.reclaim_steering(active_session_id)
+                if reclaimed:
+                    self._pending_follow_ups[0:0] = reclaimed
             self.renderer.finish_turn()
         self.session_id = result.session_id
         if result.text and not self.renderer.has_rendered(result.text):
@@ -229,12 +556,18 @@ class InteractiveCLI:
         frame = 0
         next_heartbeat_at = started + 10.0
         while not task.done():
-            await asyncio.sleep(0.12 if self.renderer.live_activity else 1.0)
+            live_activity = self.renderer.live_activity and not (
+                self._input is not None and self._input.reading
+            )
+            await asyncio.sleep(0.12 if live_activity else 1.0)
             if task.done():
                 return
             now = loop.time()
             elapsed = now - started
-            if self.renderer.live_activity:
+            live_activity = self.renderer.live_activity and not (
+                self._input is not None and self._input.reading
+            )
+            if live_activity:
                 self.renderer.pulse(elapsed, frame)
                 frame += 1
                 continue
@@ -643,13 +976,14 @@ class InteractiveCLI:
         self.ui.notice(
             "info",
             "Controls",
-            "Ctrl+C cancels a turn · // sends a prompt beginning with /",
+            "type during a turn to steer · Ctrl+C cancels · // sends a literal slash",
         )
 
     async def _observe(self, event: Event) -> None:
         if event.type == "run.started" and event.session_id:
             self._active_session_id = event.session_id
             self.session_id = event.session_id
+            self._flush_follow_ups()
 
     def _primary_route(self):  # type: ignore[no-untyped-def]
         return self._require_runner().providers[0]
@@ -721,6 +1055,16 @@ def _turn_footer(result: AgentResult) -> str:
     if result.verification is not None:
         parts.append("verified" if result.verification.get("ok") else "verification failed")
     return " · ".join(parts)
+
+
+async def _cancel_task(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def _unescape_prompt(prompt: str) -> str:
+    return prompt[1:] if prompt.startswith("//") else prompt
 
 
 def _optional_positive_int(args: list[str], *, default: int) -> int:

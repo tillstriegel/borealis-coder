@@ -580,6 +580,22 @@ class EmptyIncompleteProvider(Provider):
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reclaim_steering_returns_unconsumed_prompts_in_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            session_id = "sess_reclaim"
+            steering: asyncio.Queue[tuple[str, str | None, dict[str, object]]] = asyncio.Queue()
+            steering.put_nowait(("first", "msg_first", {"interactive": True}))
+            steering.put_nowait(("second", None, {"interactive": True}))
+            runner._steering[session_id] = steering  # type: ignore[assignment]
+            try:
+                self.assertEqual(runner.reclaim_steering(session_id), ["first", "second"])
+                self.assertEqual(runner.queued_prompts(session_id), 0)
+                self.assertEqual(runner.reclaim_steering(session_id), [])
+            finally:
+                await runner.close()
+
     async def test_event_persistence_failure_cannot_return_a_successful_run(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
