@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from borealis_coder.config import SafetyConfig
 from borealis_coder.errors import PathViolation, ToolError
@@ -121,6 +122,37 @@ class PathTests(unittest.TestCase):
             report = manager.prune()
             self.assertGreaterEqual(report["pruned_count"], 1)
             self.assertEqual(manager.list()[0].id, newest.id)
+
+    def test_checkpoint_creation_preserves_newest_when_timestamps_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "state.txt"
+            source.write_text("first", encoding="utf-8")
+            manager = CheckpointManager(
+                WorkspaceRoots(root), retention_max_count=1
+            )
+            created_at = "2026-08-25T12:00:00.000+00:00"
+
+            with (
+                patch(
+                    "borealis_coder.safety.checkpoints.utc_now",
+                    return_value=created_at,
+                ),
+                patch(
+                    "borealis_coder.safety.checkpoints.time.time_ns",
+                    side_effect=[1, 2],
+                ),
+            ):
+                first = manager.create([source], label="first")
+                source.write_text("second", encoding="utf-8")
+                newest = manager.create([source], label="newest")
+            assert first is not None and newest is not None
+
+            self.assertFalse((manager.directory / first.id).exists())
+            self.assertTrue((manager.directory / newest.id).is_dir())
+            source.write_text("changed", encoding="utf-8")
+            manager.restore(newest.id)
+            self.assertEqual(source.read_text(encoding="utf-8"), "second")
 
     def test_checkpoint_pruning_ignores_malformed_directories(self):
         with tempfile.TemporaryDirectory() as td:

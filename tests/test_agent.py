@@ -2485,6 +2485,68 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_successful_finalization_is_bound_to_executed_checks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "mock", "auto_verify": True})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "good\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Candidate says every check passed."),
+                ModelResponse(text="All tests, lint, and type checks passed."),
+            )
+            report = VerificationReport(
+                ok=True,
+                steps=[
+                    {
+                        "name": "Focused test",
+                        "command": "pytest -q tests/test_result.py",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "passed",
+                        "stderr": "",
+                        "process_lifecycle_complete": True,
+                    }
+                ],
+            )
+            visible_text: list[str] = []
+            runner.events.subscribe(
+                lambda event: visible_text.append(str(event.data.get("text", "")))
+                if event.type in {"model.text_delta", "model.completed"}
+                else None
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=report,
+                ):
+                    result = await runner.run("run the focused check")
+
+                self.assertNotIn("All tests", result.text)
+                self.assertNotIn("All tests", "".join(visible_text))
+                self.assertIn("Executed checks:", result.text)
+                self.assertIn(
+                    "Focused test: pytest -q tests/test_result.py",
+                    result.text,
+                )
+            finally:
+                await runner.close()
+
     async def test_cost_stop_cannot_publish_unverified_finalizer_claim(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2625,7 +2687,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 ) as verify:
                     result = await runner.run("repair until verified")
 
-                self.assertEqual(result.text, "Checks passed after the repair.")
+                self.assertEqual(
+                    result.text,
+                    "No automatic verification commands were executed.",
+                )
                 self.assertEqual((root / "result.txt").read_text(), "good\n")
                 assert result.verification is not None
                 self.assertTrue(result.verification["checks_ok"])
@@ -2704,7 +2769,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(verify.await_count, 2)
                 assert result.verification is not None
                 self.assertTrue(result.verification["checks_ok"])
-                self.assertEqual(result.text, "Repair complete.")
+                self.assertEqual(
+                    result.text,
+                    "No automatic verification commands were executed.",
+                )
             finally:
                 await runner.close()
 

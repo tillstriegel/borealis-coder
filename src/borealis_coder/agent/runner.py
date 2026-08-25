@@ -946,12 +946,7 @@ class AgentRunner:
                 authoritative = _authoritative_verification_summary(
                     verification or {"checks_ok": False, "steps": []}, context
                 )
-                if verification_finalization_pending and _verification_is_guaranteed(
-                    verification, context
-                ):
-                    final_text = final_text.strip() or authoritative
-                else:
-                    final_text = authoritative
+                final_text = authoritative
             return CandidateVerificationDecision(
                 verification,
                 final_text,
@@ -2202,7 +2197,19 @@ def _authoritative_verification_summary(
         )
     )
     if checks_ok:
-        summary = "Checks passed."
+        executed = [
+            step
+            for step in verification.get("steps", [])
+            if str(step.get("command", "")).strip()
+        ]
+        if executed:
+            summary = "Checks passed.\nExecuted checks:"
+            for step in executed:
+                name = str(step.get("name", "Check")).strip() or "Check"
+                command = truncate_text(str(step["command"]).strip(), 500)
+                summary += f"\n- {name}: {command}"
+        else:
+            summary = "No automatic verification commands were executed."
     else:
         summary = "Automatic verification failed."
         failed = next(

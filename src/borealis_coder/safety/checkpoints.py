@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ class Checkpoint:
     created_at: str
     label: str
     files: list[dict[str, Any]]
+    creation_order: str = ""
 
 
 class CheckpointManager:
@@ -98,15 +100,22 @@ class CheckpointManager:
                 atomic_write_bytes(blob, data)
                 entry.update({"blob": f"files/{blob_name}", "sha256": sha256_bytes(data), "mode": resolved.stat().st_mode})
             files.append(entry)
-        checkpoint = Checkpoint(checkpoint_id, utc_now(), label, files)
+        checkpoint = Checkpoint(
+            checkpoint_id,
+            utc_now(),
+            label,
+            files,
+            f"{time.time_ns():020d}:{checkpoint_id}",
+        )
         target.mkdir(parents=True, exist_ok=True)
         if active:
             atomic_write_text(target / _ACTIVE_MARKER, "active\n")
         atomic_write_text(target / "manifest.json", json.dumps({
             "id": checkpoint.id, "created_at": checkpoint.created_at,
             "label": checkpoint.label, "files": checkpoint.files,
+            "creation_order": checkpoint.creation_order,
         }, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        self.prune()
+        self.prune(preserve_id=checkpoint.id)
         return checkpoint
 
     def release(self, checkpoint_id: str) -> None:
@@ -126,10 +135,17 @@ class CheckpointManager:
         for manifest in self.directory.glob("*/manifest.json"):
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
-                result.append(Checkpoint(data["id"], data["created_at"], data.get("label", ""), data.get("files", [])))
+                result.append(Checkpoint(
+                    data["id"], data["created_at"], data.get("label", ""),
+                    data.get("files", []), str(data.get("creation_order", "")),
+                ))
             except (OSError, KeyError, json.JSONDecodeError):
                 continue
-        return sorted(result, key=lambda item: item.created_at, reverse=True)
+        return sorted(
+            result,
+            key=lambda item: (item.created_at, item.creation_order, item.id),
+            reverse=True,
+        )
 
     def restore(self, checkpoint_id: str) -> Checkpoint:
         target = self._checkpoint_directory(checkpoint_id)
@@ -137,7 +153,10 @@ class CheckpointManager:
         if not manifest_path.is_file():
             raise ToolError(f"Unknown checkpoint: {checkpoint_id}")
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        checkpoint = Checkpoint(data["id"], data["created_at"], data.get("label", ""), data.get("files", []))
+        checkpoint = Checkpoint(
+            data["id"], data["created_at"], data.get("label", ""),
+            data.get("files", []), str(data.get("creation_order", "")),
+        )
         validated: list[tuple[dict[str, Any], Path, bytes | None]] = []
         for entry in checkpoint.files:
             path = self._entry_path(entry)
@@ -169,7 +188,9 @@ class CheckpointManager:
                     path.unlink()
         return checkpoint
 
-    def prune(self, *, dry_run: bool = False) -> dict[str, Any]:
+    def prune(
+        self, *, dry_run: bool = False, preserve_id: str | None = None
+    ) -> dict[str, Any]:
         """Prune complete checkpoints oldest first while preserving the newest."""
 
         records = self._complete_records()
@@ -182,7 +203,25 @@ class CheckpointManager:
                 "checkpoint_ids": [],
                 "dry_run": dry_run,
             }
-        records.sort(key=lambda item: item[0].created_at, reverse=True)
+        records.sort(
+            key=lambda item: (
+                item[0].created_at,
+                item[0].creation_order,
+                item[0].id,
+            ),
+            reverse=True,
+        )
+        if preserve_id is not None:
+            preserved = next(
+                (
+                    index
+                    for index, (checkpoint, _, _, _) in enumerate(records)
+                    if checkpoint.id == preserve_id
+                ),
+                None,
+            )
+            if preserved is not None:
+                records.insert(0, records.pop(preserved))
         total_bytes = sum(size for _, _, size, _ in records)
         remaining_count = len(records)
         remaining_bytes = total_bytes
@@ -225,7 +264,8 @@ class CheckpointManager:
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
                 checkpoint = Checkpoint(
-                    data["id"], data["created_at"], data.get("label", ""), data["files"]
+                    data["id"], data["created_at"], data.get("label", ""),
+                    data["files"], str(data.get("creation_order", "")),
                 )
                 if checkpoint.id != directory.name or not isinstance(checkpoint.files, list):
                     continue
