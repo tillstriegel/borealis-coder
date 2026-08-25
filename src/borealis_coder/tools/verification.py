@@ -36,12 +36,17 @@ class VerificationReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
+            "checks_ok": self.ok,
             "steps": self.steps,
             "process_lifecycle_complete": self.lifecycle_complete,
+            "process_lifecycle_guaranteed": self.lifecycle_complete,
         }
 
     def render(self) -> str:
-        rows = [f"verification_ok={str(self.ok).lower()}"]
+        rows = [
+            f"checks_ok={str(self.ok).lower()}",
+            f"process_lifecycle_guaranteed={str(self.lifecycle_complete).lower()}",
+        ]
         for step in self.steps:
             rows.append(f"\n## {step['name']}\ncommand: {step['command']}\nexit_code: {step['exit_code']}\nduration_ms: {step['duration_ms']}")
             if step.get("stdout"):

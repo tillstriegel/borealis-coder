@@ -95,6 +95,122 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.is_error)
         self.assertEqual((self.root/"a.txt").read_text(), "a\n")
 
+    async def test_apply_patch_bare_header_and_multiple_hunks(self):
+        (self.root / "a.txt").write_text("alpha\nbeta\ngamma\ndelta\n", encoding="utf-8")
+        patch = """*** Begin Patch
+*** Update File: a.txt
+@@
+ alpha
+-beta
++BETA
+@@
+ gamma
+-delta
++DELTA
+*** End Patch"""
+
+        result = await self.call("apply_patch", {"patch": patch})
+
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual(
+            (self.root / "a.txt").read_text(encoding="utf-8"),
+            "alpha\nBETA\ngamma\nDELTA\n",
+        )
+
+    async def test_apply_patch_bare_header_rejects_ambiguous_or_missing_context(self):
+        (self.root / "a.txt").write_text("same\nvalue\nsame\nvalue\n", encoding="utf-8")
+        ambiguous = """*** Begin Patch
+*** Update File: a.txt
+@@
+ same
+-value
++changed
+*** End Patch"""
+        missing = """*** Begin Patch
+*** Update File: a.txt
+@@
+-absent
++changed
+*** End Patch"""
+
+        ambiguous_result = await self.call("apply_patch", {"patch": ambiguous})
+        missing_result = await self.call("apply_patch", {"patch": missing})
+
+        self.assertTrue(ambiguous_result.is_error)
+        self.assertIn("ambiguous", ambiguous_result.output)
+        self.assertTrue(missing_result.is_error)
+        self.assertIn("not found", missing_result.output)
+        self.assertEqual(
+            (self.root / "a.txt").read_text(encoding="utf-8"),
+            "same\nvalue\nsame\nvalue\n",
+        )
+
+    async def test_apply_patch_rejects_overlapping_numbered_hunks(self):
+        (self.root / "a.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+        patch = """*** Begin Patch
+*** Update File: a.txt
+@@ -1,2 +1,2 @@
+ one
+-two
++TWO
+@@ -2,2 +2,2 @@
+ two
+-three
++THREE
+*** End Patch"""
+
+        result = await self.call("apply_patch", {"patch": patch})
+
+        self.assertTrue(result.is_error)
+        self.assertIn("Overlapping or reordered", result.output)
+        self.assertEqual((self.root / "a.txt").read_text(), "one\ntwo\nthree\n")
+
+    async def test_apply_patch_bare_header_multi_file_failure_is_atomic(self):
+        (self.root / "a.txt").write_text("a\n", encoding="utf-8")
+        (self.root / "b.txt").write_text("b\n", encoding="utf-8")
+        patch = """*** Begin Patch
+*** Update File: a.txt
+@@
+-a
++A
+*** Update File: b.txt
+@@
+-missing
++B
+*** End Patch"""
+
+        result = await self.call("apply_patch", {"patch": patch})
+
+        self.assertTrue(result.is_error)
+        self.assertEqual((self.root / "a.txt").read_text(), "a\n")
+        self.assertEqual(len(self.context.checkpoints.list()), 0)
+
+    async def test_apply_patch_envelope_add_delete_and_no_trailing_newline(self):
+        (self.root / "old.txt").write_text("old", encoding="utf-8")
+        patch = """*** Begin Patch
+*** Update File: old.txt
+@@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+*** Add File: added.txt
++added
+*** End Patch"""
+
+        result = await self.call("apply_patch", {"patch": patch})
+
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual((self.root / "old.txt").read_bytes(), b"new")
+        self.assertEqual((self.root / "added.txt").read_text(), "added\n")
+
+        delete = """*** Begin Patch
+*** Delete File: added.txt
+*** End Patch"""
+        deleted = await self.call("apply_patch", {"patch": delete})
+        self.assertFalse(deleted.is_error, deleted.output)
+        self.assertFalse((self.root / "added.txt").exists())
+
     async def test_grep_glob_and_list(self):
         (self.root/"src").mkdir()
         for name in ("a.py", "b.py", "c.py"):

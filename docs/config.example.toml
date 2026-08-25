@@ -18,6 +18,7 @@ parallel_reads = 8
 max_repeated_calls = 3
 auto_verify = true
 auto_verify_max_seconds = 900
+auto_verify_max_repair_cycles = 1
 deterministic_compaction = true
 
 [safety]
@@ -34,6 +35,9 @@ max_process_output_chars = 40000
 env_allowlist = ["PATH", "HOME", "USER", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "TERM", "CI", "NO_COLOR"]
 checkpoints = true
 checkpoint_max_bytes = 25000000
+checkpoint_retention_max_count = 50
+checkpoint_retention_max_bytes = 250000000
+checkpoint_retention_max_age_seconds = 0
 approval_cache = "session"
 protected_paths = [".git", ".git/**", ".borealis/checkpoints", ".borealis/checkpoints/**"]
 
@@ -51,6 +55,7 @@ repo_map_chars = 28000
 max_file_bytes = 2000000
 max_search_results = 200
 tool_output_chars = 24000
+compact_tool_output_tokens = 40000
 include_git_status = true
 instruction_names = ["AGENTS.md", "BOREALIS.md", "CLAUDE.md"]
 skill_dirs = [".agents/skills", ".borealis/skills"]
@@ -60,6 +65,11 @@ ignored_dirs = [".git", ".borealis", ".venv", "venv", "node_modules", "dist", "b
 directory = "~/.local/share/borealis"
 database = "sessions.sqlite3"
 trace_jsonl = true
+persist_event_deltas = false
+trace_max_bytes = 10000000
+trace_backup_count = 3
+event_retention_max_count = 250000
+event_retention_max_age_seconds = 0
 retain_raw_provider_responses = false
 
 [cache]

@@ -633,6 +633,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 provider_registry=registry,
             )
             original_create_task = asyncio.create_task
+            live_reasoning: list[str] = []
+            runner.events.subscribe(
+                lambda event: live_reasoning.append(str(event.data.get("text") or ""))
+                if event.type == "model.reasoning_delta"
+                else None
+            )
             try:
                 session = runner.sessions.create_session(
                     workspace=root,
@@ -653,13 +659,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertEqual(response.text, "abc")
                 self.assertEqual(response.reasoning_summary, "Checked the stream.")
-                await runner.events.flush()
-                reasoning = [
-                    event.data["text"]
-                    for _, event in runner.sessions.events(session.id)
-                    if event.type == "model.reasoning_delta"
-                ]
-                self.assertEqual(reasoning, ["Checked the stream."])
+                self.assertEqual(live_reasoning, ["Checked the stream."])
                 self.assertEqual(create_task.call_count, 2)
             finally:
                 await runner.close()
@@ -690,6 +690,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     provider_registry=registry,
                 )
             try:
+                live_reasoning: list[str] = []
+                runner.events.subscribe(
+                    lambda event: live_reasoning.append(
+                        str(event.data.get("text") or "")
+                    )
+                    if event.type == "model.reasoning_delta"
+                    else None
+                )
                 session = runner.sessions.create_session(
                     workspace=root,
                     provider="split_secret_reasoning",
@@ -707,13 +715,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     asyncio.Event(),
                     "msg_1",
                 )
-                await runner.events.flush()
-                reasoning = [
-                    str(event.data.get("text") or "")
-                    for _, event in runner.sessions.events(session.id)
-                    if event.type == "model.reasoning_delta"
-                ]
-                self.assertEqual("".join(reasoning), "Checked [REDACTED] safely.")
+                self.assertEqual(
+                    "".join(live_reasoning), "Checked [REDACTED] safely."
+                )
             finally:
                 await runner.close()
 
@@ -744,6 +748,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 provider_registry=registry,
             )
             try:
+                live_reasoning: list[str] = []
+                runner.events.subscribe(
+                    lambda event: live_reasoning.append(
+                        str(event.data.get("text") or "")
+                    )
+                    if event.type == "model.reasoning_delta"
+                    else None
+                )
                 session = runner.sessions.create_session(
                     workspace=root,
                     provider="summary_only_retry",
@@ -765,12 +777,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.usage.requests, 2)
                 events = [event for _, event in runner.sessions.events(session.id)]
                 self.assertTrue(any(event.type == "model.retrying" for event in events))
-                reasoning = [
-                    str(event.data.get("text") or "")
-                    for event in events
-                    if event.type == "model.reasoning_delta"
-                ]
-                self.assertEqual(reasoning, ["Checked ", "the retry."])
+                self.assertEqual(live_reasoning, ["Checked ", "the retry."])
             finally:
                 await runner.close()
 
@@ -899,6 +906,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 provider_registry=registry,
             )
             try:
+                live_reasoning: dict[str, list[str]] = {}
+                runner.events.subscribe(
+                    lambda event: live_reasoning.setdefault(
+                        event.session_id or "", []
+                    ).append(str(event.data.get("text") or ""))
+                    if event.type == "model.reasoning_delta"
+                    else None
+                )
                 first = await runner.run("same exact unsafe request")
                 second = await runner.run("same exact unsafe request")
                 assert provider is not None
@@ -914,15 +929,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     all_event_text = " ".join(str(event.data) for event in events)
                     self.assertNotIn("sk-", all_event_text)
 
-                cached_events = [
-                    event for _, event in runner.sessions.events(second.session_id)
-                ]
-                cached_reasoning = [
-                    str(event.data.get("text") or "")
-                    for event in cached_events
-                    if event.type == "model.reasoning_delta"
-                ]
-                self.assertEqual(cached_reasoning, ["Unsafe [REDACTED]"])
+                self.assertEqual(
+                    live_reasoning[second.session_id], ["Unsafe [REDACTED]"]
+                )
             finally:
                 await runner.close()
 
@@ -949,6 +958,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 provider_registry=registry,
             )
             try:
+                live_reasoning: dict[str, list[str]] = {}
+                runner.events.subscribe(
+                    lambda event: live_reasoning.setdefault(
+                        event.session_id or "", []
+                    ).append(str(event.data.get("text") or ""))
+                    if event.type == "model.reasoning_delta"
+                    else None
+                )
                 first = await runner.run("same exact request")
                 second = await runner.run("same exact request")
                 assert provider is not None
@@ -958,11 +975,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(second.usage.application_cache_saved_tokens, 23)
                 self.assertEqual(second.usage.cost_usd, 0.0)
                 for result in (first, second):
-                    reasoning = "".join(
-                        str(event.data.get("text") or "")
-                        for _, event in runner.sessions.events(result.session_id)
-                        if event.type == "model.reasoning_delta"
-                    )
+                    reasoning = "".join(live_reasoning[result.session_id])
                     self.assertEqual(reasoning, "Checked cacheability.")
                 first_messages = runner.sessions.messages(first.session_id)
                 second_messages = runner.sessions.messages(second.session_id)
@@ -1383,12 +1396,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(second.session_id, first.session_id)
                 self.assertTrue((root / "borealis-demo.txt").is_file())
                 self.assertGreaterEqual(len(messages), 5)
-                self.assertTrue(
-                    any(
-                        event.type == "model.text_delta"
-                        for _, event in runner.sessions.events(first.session_id)
-                    )
-                )
+                durable_events = [
+                    event.type
+                    for _, event in runner.sessions.events(first.session_id)
+                ]
+                self.assertNotIn("model.text_delta", durable_events)
+                self.assertIn("model.completed", durable_events)
             finally:
                 await runner.close()
 
@@ -1863,14 +1876,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     result = await task
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertTrue(result.incomplete)
-                self.assertEqual(
-                    result.verification,
-                    {
-                        "ok": True,
-                        "process_lifecycle_complete": True,
-                        "steps": [],
-                    },
-                )
+                assert result.verification is not None
+                self.assertTrue(result.verification["checks_ok"])
+                self.assertTrue(result.verification["process_lifecycle_guaranteed"])
+                self.assertEqual(result.verification["steps"], [])
                 verify.assert_awaited_once()
                 self.assertEqual((root / "durable.txt").read_text(), "durable")
                 self.assertFalse((root / "must-not-run.txt").exists())
@@ -1997,10 +2006,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(verification_cancelled.is_set())
                 self.assertEqual(result.stop_reason.value, "max_turns")
-                self.assertEqual(
-                    result.verification,
-                    {"ok": False, "steps": [], "error": "Run cancelled"},
-                )
+                assert result.verification is not None
+                self.assertFalse(result.verification["checks_ok"])
+                self.assertEqual(result.verification["steps"], [])
+                self.assertEqual(result.verification["error"], "Run cancelled")
                 self.assertIn("Automatic verification was interrupted", result.error or "")
             finally:
                 await runner.close()
@@ -2056,13 +2065,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.incomplete)
                 self.assertIn("maximum 2 model turns reached", result.error or "")
                 self.assertIn("Maximum 1s run time reached", result.error or "")
+                assert result.verification is not None
+                self.assertFalse(result.verification["checks_ok"])
+                self.assertEqual(result.verification["steps"], [])
                 self.assertEqual(
-                    result.verification,
-                    {
-                        "ok": False,
-                        "steps": [],
-                        "error": "Maximum 1s run time reached",
-                    },
+                    result.verification["error"], "Maximum 1s run time reached"
                 )
                 persisted = runner.sessions.messages(session_id)
                 self.assertEqual(
@@ -2148,14 +2155,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.incomplete)
                 self.assertIn("maximum 2 model turns reached", result.error or "")
                 self.assertIn("exceeded $1.00", result.error or "")
-                self.assertEqual(
-                    result.verification,
-                    {
-                        "ok": True,
-                        "process_lifecycle_complete": True,
-                        "steps": [],
-                    },
-                )
+                assert result.verification is not None
+                self.assertTrue(result.verification["checks_ok"])
+                self.assertTrue(result.verification["process_lifecycle_guaranteed"])
+                self.assertEqual(result.verification["steps"], [])
                 verify.assert_awaited_once()
             finally:
                 await runner.close()
@@ -2214,6 +2217,252 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                         "process_lifecycle_complete"
                     ]
                 )
+            finally:
+                await runner.close()
+
+    async def test_candidate_success_claim_is_replaced_when_verification_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "mock",
+                    "auto_verify": True,
+                    "auto_verify_max_repair_cycles": 0,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "bad\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Everything succeeded and all tests pass."),
+            )
+            failure = VerificationReport(
+                ok=False,
+                steps=[
+                    {
+                        "name": "Focused tests",
+                        "command": "pytest -q tests/test_result.py",
+                        "exit_code": 1,
+                        "duration_ms": 10,
+                        "timed_out": False,
+                        "stdout": "FAILED test_result - expected good, got bad",
+                        "stderr": "",
+                        "process_lifecycle_complete": True,
+                    }
+                ],
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=failure,
+                ):
+                    result = await runner.run("make the result pass")
+
+                self.assertNotIn("Everything succeeded", result.text)
+                self.assertIn("Automatic verification failed", result.text)
+                self.assertIn("pytest -q tests/test_result.py", result.text)
+                self.assertIn("Exit code: 1", result.text)
+                assert result.verification is not None
+                self.assertFalse(result.verification["checks_ok"])
+            finally:
+                await runner.close()
+
+    async def test_verification_failure_can_be_repaired_and_reverified(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "mock", "auto_verify": True})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "bad\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Candidate success."),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="replace_in_file",
+                            arguments={
+                                "path": "result.txt",
+                                "old_text": "bad",
+                                "new_text": "good",
+                                "expected_occurrences": 1,
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Repaired candidate."),
+                ModelResponse(text="Checks passed after the repair."),
+            )
+            reports = [
+                VerificationReport(
+                    ok=False,
+                    steps=[
+                        {
+                            "name": "Tests",
+                            "command": "pytest -q",
+                            "exit_code": 1,
+                            "duration_ms": 1,
+                            "timed_out": False,
+                            "stdout": "failed",
+                            "stderr": "",
+                            "process_lifecycle_complete": True,
+                        }
+                    ],
+                ),
+                VerificationReport(ok=True),
+            ]
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    side_effect=reports,
+                ) as verify:
+                    result = await runner.run("repair until verified")
+
+                self.assertEqual(result.text, "Checks passed after the repair.")
+                self.assertEqual((root / "result.txt").read_text(), "good\n")
+                assert result.verification is not None
+                self.assertTrue(result.verification["checks_ok"])
+                self.assertEqual(verify.await_count, 2)
+                self.assertEqual(result.turns, 5)
+            finally:
+                await runner.close()
+
+    async def test_turn_exhaustion_uses_authoritative_verification_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "mock", "auto_verify": True, "max_turns": 2},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "bad\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="All checks passed."),
+            )
+            failure = VerificationReport(
+                ok=False,
+                steps=[
+                    {
+                        "name": "Tests",
+                        "command": "pytest -q",
+                        "exit_code": 2,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "collection failed",
+                        "stderr": "",
+                        "process_lifecycle_complete": True,
+                    }
+                ],
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=failure,
+                ):
+                    result = await runner.run("finish at the budget boundary")
+
+                self.assertEqual(result.stop_reason.value, "max_turns")
+                self.assertTrue(result.incomplete)
+                self.assertNotIn("All checks passed", result.text)
+                self.assertIn("Exit code: 2", result.text)
+            finally:
+                await runner.close()
+
+    async def test_checks_pass_without_claiming_missing_lifecycle_guarantee(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "mock", "auto_verify": True, "max_turns": 2},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "good\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Verified successfully."),
+            )
+            report = VerificationReport(
+                ok=True,
+                steps=[
+                    {
+                        "name": "Detached check",
+                        "command": "pytest -q",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "passed",
+                        "stderr": "",
+                        "process_lifecycle_complete": False,
+                    }
+                ],
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=report,
+                ):
+                    result = await runner.run("report lifecycle accurately")
+
+                self.assertEqual(result.text.splitlines()[0], "Checks passed.")
+                self.assertIn("Process lifecycle not guaranteed", result.text)
+                assert result.verification is not None
+                self.assertTrue(result.verification["checks_ok"])
+                self.assertFalse(result.verification["process_lifecycle_guaranteed"])
+                self.assertEqual(result.mutation_tracking, "incomplete")
             finally:
                 await runner.close()
 
@@ -2389,14 +2638,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertEqual(result.changed_files, [".", "verify-generated.txt"])
-                self.assertEqual(
-                    result.verification,
-                    {
-                        "ok": True,
-                        "process_lifecycle_complete": True,
-                        "steps": [],
-                    },
-                )
+                assert result.verification is not None
+                self.assertTrue(result.verification["checks_ok"])
+                self.assertTrue(result.verification["process_lifecycle_guaranteed"])
+                self.assertEqual(result.verification["steps"], [])
             finally:
                 await runner.close()
 

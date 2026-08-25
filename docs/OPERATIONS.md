@@ -108,10 +108,34 @@ Before granting write authority to a new model or compatible API:
 - **Context overflow:** lower initial context budgets, exclude generated files, reduce tool output, or resume after deterministic compaction.
 - **Maximum turns:** the final allowed turn runs without tools. If the run still cannot finish, Borealis preserves the session, verifies changed files when enabled, and reports that `continue` resumes the work.
 - **Stuck loop:** inspect repeated tool calls and project instructions; lower `max_repeated_calls` for high-risk automation.
-- **Verification failure:** use session history and Git diff; resume with the failing output as context.
+- **Verification failure:** automatic checks are authoritative. Borealis feeds a bounded failure excerpt back for one repair cycle by default; if no model turn remains, the harness replaces the candidate claim with the command, exit code, and useful output excerpt.
 - **Bad mutation:** list checkpoints and restore with `borealis rollback CHECKPOINT_ID`.
 - **MCP failure:** remove/disable the server or narrow `allowed_tools`; core tools remain available.
 - **Corrupt session database:** preserve the file, inspect SQLite integrity, and restore/export from backup. Do not silently replace it.
+
+## Retention maintenance
+
+Live streaming does not depend on SQLite delta persistence. By default, Borealis durably stores
+assembled model completions and lifecycle, policy, tool, verification, and error events, while
+streaming text/reasoning/tool-call deltas remain live-only. Set
+`storage.persist_event_deltas = true` only when full delta replay is required; it increases local
+storage and privacy exposure.
+
+JSONL traces rotate automatically by configured bytes and backup count. Complete checkpoints are
+pruned oldest first after a new checkpoint, within count, total-byte, and optional age limits; the
+newest complete recovery point is preserved. Interrupted or malformed checkpoint directories are
+not deleted automatically.
+
+Preview or apply existing-history maintenance explicitly:
+
+```bash
+borealis maintenance --dry-run --json
+borealis maintenance
+```
+
+Configuration loading never performs migration cleanup. Review dry-run output before applying
+retention in environments where event history, prompts, source excerpts, or traces have audit or
+privacy requirements.
 
 ## Release artifacts
 

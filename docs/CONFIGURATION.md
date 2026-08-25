@@ -75,6 +75,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `max_repeated_calls` | `3` | Repeated identical call threshold for stuck detection. |
 | `auto_verify` | `true` | Run project verification after mutations. |
 | `auto_verify_max_seconds` | `900` | Verification time budget. |
+| `auto_verify_max_repair_cycles` | `1` | Maximum automatic repair-and-reverify cycles after a failed authoritative check. |
 | `deterministic_compaction` | `true` | Use local structured compaction rather than another model call. |
 
 ## `[safety]`
@@ -94,6 +95,9 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `env_allowlist` | minimal host variables | Environment names inherited by subprocesses. |
 | `checkpoints` | `true` | Snapshot files before mutation. |
 | `checkpoint_max_bytes` | `25000000` | Maximum bytes captured in one checkpoint. |
+| `checkpoint_retention_max_count` | `50` | Maximum complete checkpoints retained after creating a new checkpoint. |
+| `checkpoint_retention_max_bytes` | `250000000` | Maximum total bytes across complete checkpoints; the newest recovery point is always preserved. |
+| `checkpoint_retention_max_age_seconds` | `0` | Optional maximum checkpoint age; `0` disables age pruning. |
 | `approval_cache` | `"session"` | Cache matching approvals for the active session. |
 | `protected_paths` | `.git`, checkpoint store | Glob patterns that file mutation tools may never write, delete, or patch. |
 
@@ -117,6 +121,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `max_file_bytes` | `2000000` | Largest file eligible for text inspection. |
 | `max_search_results` | `200` | Search result ceiling. |
 | `tool_output_chars` | `24000` | Model-facing tool-output ceiling. |
+| `compact_tool_output_tokens` | `40000` | Trigger provider-facing compaction when tool output reaches this estimated-token volume. |
 | `include_git_status` | `true` | Include compact Git status in the initial prompt. |
 | `instruction_names` | `AGENTS.md`, `BOREALIS.md`, `CLAUDE.md` | Hierarchical instruction filenames. |
 | `skill_dirs` | `.agents/skills`, `.borealis/skills` | Skill discovery paths. |
@@ -131,7 +136,16 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `directory` | `~/.local/share/borealis` | Persistent data root. |
 | `database` | `sessions.sqlite3` | SQLite filename. |
 | `trace_jsonl` | `true` | Append redacted lifecycle events to JSONL. |
+| `persist_event_deltas` | `false` | Persist streaming text/reasoning/tool-call deltas to SQLite. Live observers always receive them; assembled `model.completed` events remain durable. |
+| `trace_max_bytes` | `10000000` | Maximum active JSONL trace segment size. Rotation occurs between complete records. |
+| `trace_backup_count` | `3` | Number of rotated JSONL trace segments to keep. |
+| `event_retention_max_count` | `250000` | SQLite event-row target used by the explicit maintenance command. |
+| `event_retention_max_age_seconds` | `0` | Optional SQLite event age target used by maintenance; `0` disables it. |
 | `retain_raw_provider_responses` | `false` | Reserved opt-in for adapter debugging; normalized persistence remains the default. |
+
+Retention settings do not delete existing history when configuration is loaded. Trace rotation
+applies on append, checkpoint retention applies after a complete new checkpoint is written, and
+`borealis maintenance --dry-run` previews cleanup of existing events, traces, and checkpoints.
 
 ## `[telemetry]`
 

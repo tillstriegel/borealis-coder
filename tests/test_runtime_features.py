@@ -17,6 +17,7 @@ from borealis_coder.agent import (
     compact_messages,
     compact_messages_with_summary,
     estimate_request_tokens,
+    prune_provider_messages,
 )
 from borealis_coder.config import ProviderConfig, SafetyConfig, SandboxConfig
 from borealis_coder.errors import BudgetExceeded, Cancelled
@@ -281,6 +282,192 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             compacted[-2].metadata["continuation_state"],
             continuation,
         )
+
+    def test_provider_context_pruning_reduces_long_session_replay_without_losing_state(self):
+        old_content = "OLD_FILE_STATE\n" * 2_000
+        intermediate_content = "INTERMEDIATE_FILE_STATE\n" * 2_000
+        current_content = "CURRENT_FILE_STATE\n" * 2_000
+        messages: list[Message] = [
+            Message(role=Role.USER, content="Keep the API compatible and run all tests."),
+        ]
+
+        def tool_exchange(
+            call_id: str,
+            name: str,
+            arguments: dict[str, object],
+            content: str,
+            *,
+            metadata: dict[str, object] | None = None,
+            is_error: bool = False,
+        ) -> None:
+            messages.extend(
+                [
+                    Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)],
+                    ),
+                    Message(
+                        role=Role.TOOL,
+                        tool_call_id=call_id,
+                        tool_name=name,
+                        content=content,
+                        metadata=metadata or {},
+                        is_error=is_error,
+                    ),
+                ]
+            )
+
+        old_sha = "1" * 64
+        intermediate_sha = "2" * 64
+        current_sha = "3" * 64
+        tool_exchange(
+            "read-old-1",
+            "read_file",
+            {"path": "src/large.py"},
+            f"path: src/large.py\nsha256: {old_sha}\n\n{old_content}",
+        )
+        tool_exchange(
+            "read-old-2",
+            "read_file",
+            {"path": "src/large.py"},
+            f"path: src/large.py\nsha256: {old_sha}\n\n{old_content}",
+        )
+        tool_exchange(
+            "edit-1",
+            "replace_in_file",
+            {"path": "src/large.py"},
+            "Replaced 1 occurrence",
+            metadata={"path": "src/large.py", "sha256": intermediate_sha},
+        )
+        tool_exchange(
+            "read-intermediate",
+            "read_file",
+            {"path": "src/large.py"},
+            f"path: src/large.py\nsha256: {intermediate_sha}\n\n{intermediate_content}",
+        )
+        for index in range(2):
+            tool_exchange(
+                f"search-{index}",
+                "grep",
+                {"pattern": "public_api", "path": "src"},
+                "src/large.py:42: public_api\n" * 200,
+            )
+        tool_exchange(
+            "verify-1",
+            "verify",
+            {"command": "pytest -q"},
+            "checks_ok=true\nprocess_lifecycle_guaranteed=true",
+        )
+        messages.append(Message(role=Role.USER, content="Do not change the CLI contract."))
+        messages.append(
+            Message(role=Role.ASSISTANT, content="Decision: preserve the CLI contract.")
+        )
+        tool_exchange(
+            "edit-2",
+            "replace_in_file",
+            {"path": "src/large.py"},
+            "Replaced 1 occurrence",
+            metadata={"path": "src/large.py", "sha256": current_sha},
+        )
+        for index in range(2):
+            tool_exchange(
+                f"read-current-{index}",
+                "read_file",
+                {"path": "src/large.py"},
+                f"path: src/large.py\nsha256: {current_sha}\n\n{current_content}",
+            )
+            tool_exchange(
+                f"status-{index}",
+                "git_status",
+                {},
+                "M src/large.py\n",
+            )
+        tool_exchange(
+            "verify-2",
+            "verify",
+            {"command": "pytest -q"},
+            "checks_ok=true\nprocess_lifecycle_guaranteed=true",
+        )
+        tool_exchange(
+            "failed-tests",
+            "shell",
+            {"command": "pytest"},
+            "FAILED test_current_state - AssertionError: expected current decision",
+            is_error=True,
+        )
+        messages.append(Message(role=Role.USER, content="Also preserve the recent decision."))
+
+        pruned, metrics = prune_provider_messages(messages)
+
+        self.assertLess(metrics.tokens_after, metrics.tokens_before * 0.6)
+        self.assertEqual(metrics.superseded_reads_removed, 4)
+        self.assertEqual(metrics.repeated_outputs_removed, 2)
+        self.assertLess(
+            metrics.tool_output_tokens_retained, metrics.tool_output_tokens_before
+        )
+        provider_text = "\n".join(message.content for message in pruned)
+        self.assertIn("CURRENT_FILE_STATE", provider_text)
+        self.assertIn("AssertionError", provider_text)
+        self.assertIn("Keep the API compatible", provider_text)
+        self.assertIn("Do not change the CLI contract", provider_text)
+        self.assertIn("Decision: preserve the CLI contract", provider_text)
+        self.assertIn("preserve the recent decision", provider_text)
+        self.assertNotIn("OLD_FILE_STATE", provider_text)
+        self.assertNotIn("INTERMEDIATE_FILE_STATE", provider_text)
+        self.assertIn("OLD_FILE_STATE", messages[2].content)
+        latest_read = next(
+            message
+            for message in reversed(pruned)
+            if message.tool_name == "read_file"
+        )
+        self.assertEqual(latest_read.metadata["path"], "src/large.py")
+        self.assertEqual(latest_read.metadata["sha256"], current_sha)
+
+    async def test_tool_output_volume_triggers_compaction_metrics(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(12):
+                call = ToolCall(
+                    id=f"call-{index}", name="shell", arguments={"command": "status"}
+                )
+                runner.sessions.append_message(
+                    session.id, Message(role=Role.ASSISTANT, tool_calls=[call])
+                )
+                runner.sessions.append_message(
+                    session.id,
+                    Message(
+                        role=Role.TOOL,
+                        tool_name="shell",
+                        tool_call_id=call.id,
+                        content=f"successful status output {index} " * 20,
+                    ),
+                )
+            compacted_events = []
+            runner.events.subscribe(
+                lambda event: compacted_events.append(event)
+                if event.type == "context.compacted"
+                else None
+            )
+            try:
+                result = await runner.run("continue with the current requirements", session_id=session.id)
+
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertEqual(len(compacted_events), 1)
+                metrics = compacted_events[0].data
+                self.assertEqual(metrics["compaction_reason"], "tool_output_volume")
+                self.assertGreater(metrics["tokens_before"], metrics["tokens_after"])
+                self.assertGreater(metrics["tool_output_tokens_retained"], 0)
+                self.assertEqual(len(runner.sessions.messages(session.id)), 26)
+            finally:
+                await runner.close()
 
     async def test_compaction_llm_summary_preserves_tool_output(self):
         tool_output = "FAILED tests/test_x.py::test_y - AssertionError: expected 4 got 5"
@@ -1009,18 +1196,23 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 WorkspaceRoots(root), SafetyConfig(), SandboxConfig()
             )
             detached_pid = None
-            started = asyncio.get_running_loop().time()
 
             try:
-                with self.assertRaises(TimeoutError):
-                    await asyncio.wait_for(
-                        driver.run(
-                            [sys.executable, "-c", parent_code],
-                            cwd=root,
-                            timeout=5,
-                        ),
-                        timeout=0.3,
+                task = asyncio.create_task(
+                    driver.run(
+                        [sys.executable, "-c", parent_code],
+                        cwd=root,
+                        timeout=5,
                     )
+                )
+                deadline = asyncio.get_running_loop().time() + 2
+                while not pid_path.exists() and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.01)
+                self.assertTrue(pid_path.exists(), "detached child did not start")
+                started = asyncio.get_running_loop().time()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
                 elapsed = asyncio.get_running_loop().time() - started
                 detached_pid = int(pid_path.read_text())
 

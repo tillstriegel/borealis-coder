@@ -181,7 +181,7 @@ Workspace plugins are disabled unless `BOREALIS_ENABLE_WORKSPACE_PLUGINS=1`. Whe
 
 ## Persistence and privacy
 
-By default Borealis stores normalized messages, events, tool lifecycle, usage, and redacted JSONL traces under the configured data directory. Provider-supplied reasoning summaries are model-output events and may be sensitive. The default exact-response cache can also retain them for its configured lifetime. Encrypted reasoning continuation state remains opaque. Repository snippets and other model outputs may also be sensitive.
+By default Borealis stores normalized messages, assembled model events, lifecycle/policy/tool/verification/error events, usage, and redacted rotating JSONL traces under the configured data directory. Streaming text, reasoning, and tool-call deltas remain live-only unless `storage.persist_event_deltas` is enabled. Provider-supplied reasoning summaries are model-output events and may be sensitive. The default exact-response cache can also retain them for its configured lifetime. Encrypted reasoning continuation state remains opaque. Repository snippets and other model outputs may also be sensitive.
 
 For restricted environments:
 
@@ -190,6 +190,7 @@ For restricted environments:
 - disable `cache.response_cache_enabled` when exact-response reuse is unnecessary
 - keep `storage.retain_raw_provider_responses = false`
 - delete or export sessions according to retention policy
+- preview retained-data cleanup with `borealis maintenance --dry-run` before applying it
 - encrypt the storage volume at the operating-system level
 
 The core does not implement application-level database encryption.

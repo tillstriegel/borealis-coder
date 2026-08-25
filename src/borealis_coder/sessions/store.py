@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -371,6 +372,49 @@ class SessionStore:
             after_sequence=after_sequence,
             limit=limit,
         )
+
+    def prune_events(
+        self,
+        *,
+        max_count: int,
+        max_age_seconds: int = 0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Prune old event rows without changing durable messages or tool records."""
+
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        with self._lock:
+            before = int(self._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            if before > max_count:
+                boundary = self._connection.execute(
+                    "SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1 OFFSET ?",
+                    (max_count - 1,),
+                ).fetchone()
+                if boundary is not None:
+                    clauses.append("sequence < ?")
+                    parameters.append(int(boundary[0]))
+            if max_age_seconds:
+                cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).isoformat()
+                clauses.append("created_at < ?")
+                parameters.append(cutoff)
+            where = " OR ".join(f"({clause})" for clause in clauses) or "0"
+            pruned = int(
+                self._connection.execute(
+                    f"SELECT COUNT(*) FROM events WHERE {where}", parameters
+                ).fetchone()[0]
+            )
+            if not dry_run and pruned:
+                with self._connection:
+                    self._connection.execute(
+                        f"DELETE FROM events WHERE {where}", parameters
+                    )
+        return {
+            "events_before": before,
+            "events_after": before - pruned,
+            "pruned_events": pruned,
+            "dry_run": dry_run,
+        }
 
     def _event_page(
         self,

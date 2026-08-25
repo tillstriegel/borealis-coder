@@ -112,6 +112,7 @@ BOREALIS_PROVIDER=mock borealis run --non-interactive OFFLINE_WRITE_DEMO
 | `borealis config` | Print the merged configuration with secret-bearing fields redacted. |
 | `borealis sessions` | List, inspect, export, or delete durable sessions. |
 | `borealis rollback` | List or restore pre-mutation checkpoints. |
+| `borealis maintenance` | Preview or apply event, trace, and checkpoint retention. |
 | `borealis acp` | Serve Agent Client Protocol v2 over stdio. |
 | `borealis eval` | Run deterministic offline acceptance checks. |
 

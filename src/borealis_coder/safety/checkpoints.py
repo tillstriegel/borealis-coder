@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +31,26 @@ class Checkpoint:
 
 
 class CheckpointManager:
-    def __init__(self, roots: WorkspaceRoots, *, enabled: bool = True, max_bytes: int = 25_000_000) -> None:
+    def __init__(
+        self,
+        roots: WorkspaceRoots,
+        *,
+        enabled: bool = True,
+        max_bytes: int = 25_000_000,
+        retention_max_count: int = 50,
+        retention_max_bytes: int = 250_000_000,
+        retention_max_age_seconds: int = 0,
+        create_directory: bool = True,
+    ) -> None:
         self.roots = roots
         self.enabled = enabled
         self.max_bytes = max_bytes
+        self.retention_max_count = retention_max_count
+        self.retention_max_bytes = retention_max_bytes
+        self.retention_max_age_seconds = retention_max_age_seconds
         self.directory = roots.primary / ".borealis" / "checkpoints"
-        ensure_private_directory(self.directory)
+        if create_directory:
+            ensure_private_directory(self.directory)
 
     def create(self, paths: list[Path], *, label: str) -> Checkpoint | None:
         if not self.enabled:
@@ -84,10 +100,13 @@ class CheckpointManager:
             "id": checkpoint.id, "created_at": checkpoint.created_at,
             "label": checkpoint.label, "files": checkpoint.files,
         }, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        self.prune()
         return checkpoint
 
     def list(self) -> list[Checkpoint]:
         result: list[Checkpoint] = []
+        if not self.directory.is_dir():
+            return result
         for manifest in self.directory.glob("*/manifest.json"):
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -137,6 +156,104 @@ class CheckpointManager:
                 if path.is_file() or path.is_symlink():
                     path.unlink()
         return checkpoint
+
+    def prune(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """Prune complete checkpoints oldest first while preserving the newest."""
+
+        records = self._complete_records()
+        if not records:
+            return {
+                "complete_checkpoints": 0,
+                "bytes_before": 0,
+                "pruned_count": 0,
+                "pruned_bytes": 0,
+                "checkpoint_ids": [],
+                "dry_run": dry_run,
+            }
+        records.sort(key=lambda item: item[0].created_at, reverse=True)
+        total_bytes = sum(size for _, _, size, _ in records)
+        remaining_count = len(records)
+        remaining_bytes = total_bytes
+        now = datetime.now(UTC)
+        selected: list[tuple[Checkpoint, Path, int, datetime]] = []
+        for checkpoint, directory, size, created_at in reversed(records[1:]):
+            too_old = bool(
+                self.retention_max_age_seconds
+                and (now - created_at).total_seconds() > self.retention_max_age_seconds
+            )
+            over_count = remaining_count > self.retention_max_count
+            over_bytes = remaining_bytes > self.retention_max_bytes
+            if not (too_old or over_count or over_bytes):
+                continue
+            selected.append((checkpoint, directory, size, created_at))
+            remaining_count -= 1
+            remaining_bytes -= size
+        if not dry_run:
+            for _, directory, _, _ in selected:
+                shutil.rmtree(directory)
+        return {
+            "complete_checkpoints": len(records),
+            "bytes_before": total_bytes,
+            "pruned_count": len(selected),
+            "pruned_bytes": sum(size for _, _, size, _ in selected),
+            "checkpoint_ids": [checkpoint.id for checkpoint, _, _, _ in selected],
+            "dry_run": dry_run,
+        }
+
+    def _complete_records(self) -> list[tuple[Checkpoint, Path, int, datetime]]:
+        records: list[tuple[Checkpoint, Path, int, datetime]] = []
+        if not self.directory.is_dir():
+            return records
+        for directory in self.directory.iterdir():
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            manifest = directory / "manifest.json"
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                checkpoint = Checkpoint(
+                    data["id"], data["created_at"], data.get("label", ""), data["files"]
+                )
+                if checkpoint.id != directory.name or not isinstance(checkpoint.files, list):
+                    continue
+                created_at = datetime.fromisoformat(checkpoint.created_at.replace("Z", "+00:00"))
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=UTC)
+                size = self._complete_directory_size(directory, checkpoint)
+                if size is None:
+                    continue
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            records.append((checkpoint, directory, size, created_at))
+        return records
+
+    @staticmethod
+    def _complete_directory_size(directory: Path, checkpoint: Checkpoint) -> int | None:
+        for entry in checkpoint.files:
+            if not isinstance(entry, dict):
+                return None
+            if entry.get("existed"):
+                blob_value = entry.get("blob")
+                if not isinstance(blob_value, str):
+                    return None
+                blob = (directory / blob_value).resolve(strict=False)
+                try:
+                    blob.relative_to(directory.resolve())
+                except ValueError:
+                    return None
+                if not blob.is_file() or blob.is_symlink():
+                    return None
+                try:
+                    if sha256_bytes(blob.read_bytes()) != entry.get("sha256"):
+                        return None
+                except OSError:
+                    return None
+        total = 0
+        for path in directory.rglob("*"):
+            if path.is_symlink() or (not path.is_file() and not path.is_dir()):
+                return None
+            if path.is_file():
+                total += path.stat().st_size
+        return total
 
     def _entry_path(self, entry: dict[str, Any]) -> Path:
         if "root" not in entry or "relative_path" not in entry:

@@ -21,7 +21,7 @@ class HunkLine:
 
 @dataclass(slots=True)
 class Hunk:
-    old_start: int
+    old_start: int | None
     old_count: int
     new_start: int
     new_count: int
@@ -39,7 +39,11 @@ class FilePatch:
 
 class ApplyPatchTool(Tool):
     name = "apply_patch"
-    description = "Apply an exact unified diff or *** Begin Patch envelope with context validation and rollback checkpoints."
+    description = (
+        "Apply an exact unified diff or *** Begin Patch envelope atomically. "
+        "Envelope updates accept numbered headers or bare @@ headers, for example: "
+        "*** Begin Patch\\n*** Update File: a.txt\\n@@\\n-old\\n+new\\n*** End Patch"
+    )
     effect = Effect.WRITE
     mutation_scope = MutationScope.TRACKED
     default_risk = "medium"
@@ -86,6 +90,11 @@ class ApplyPatchTool(Tool):
                 raise PatchError(
                     f"File exceeds {context.config.context.max_file_bytes} byte edit limit: {display}"
                 )
+            if item.delete and not item.hunks:
+                # The apply_patch envelope's Delete File directive names the
+                # complete target; unified deletions still validate their hunks.
+                planned.append((item, target, "delete", None))
+                continue
             updated = apply_hunks(original, item.hunks, display)
             if item.delete:
                 if updated != "":
@@ -162,20 +171,70 @@ def _parse_apply_patch(text: str) -> list[FilePatch]:
         if line.startswith("*** Update File: "):
             path = line[len("*** Update File: ") :].strip()
             index += 1
-            body: list[str] = [f"--- a/{path}\n", f"+++ b/{path}\n"]
+            body: list[str] = []
             while index < len(lines) and not lines[index].startswith("*** "):
                 body.append(lines[index])
                 index += 1
-            parsed = _parse_unified("".join(body))
-            if len(parsed) != 1:
-                raise PatchError(f"Could not parse update for {path}")
-            result.append(parsed[0])
+            result.append(FilePatch(path, path, hunks=_parse_update_hunks(body, path)))
             continue
         if not line.strip():
             index += 1
             continue
         raise PatchError(f"Unexpected apply_patch directive: {line}")
     return result
+
+
+def _parse_update_hunks(lines: list[str], path: str) -> list[Hunk]:
+    """Parse apply_patch update hunks, including context-located bare headers."""
+
+    numbered = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    hunks: list[Hunk] = []
+    index = 0
+    while index < len(lines):
+        header = lines[index].rstrip("\n")
+        match = numbered.match(lines[index])
+        if match:
+            hunk = Hunk(
+                int(match.group(1)),
+                int(match.group(2) or 1),
+                int(match.group(3)),
+                int(match.group(4) or 1),
+            )
+        elif header == "@@" or (header.startswith("@@ ") and header.endswith(" @@")):
+            hunk = Hunk(None, 0, 0, 0)
+        else:
+            detail = header or "<blank line>"
+            raise PatchError(
+                f"Expected hunk header in {path}, got {detail!r}. "
+                "Use '@@ -old,count +new,count @@' or bare '@@'."
+            )
+        index += 1
+        while index < len(lines) and not lines[index].startswith("@@"):
+            value = lines[index]
+            if value.startswith("\\ No newline"):
+                if not hunk.lines:
+                    raise PatchError(f"No-newline marker has no preceding hunk line in {path}")
+                hunk.lines[-1].text = hunk.lines[-1].text.removesuffix("\n")
+                index += 1
+                continue
+            if not value or value[0] not in " +-":
+                raise PatchError(f"Invalid hunk line in {path}: {value.rstrip()}")
+            hunk.lines.append(HunkLine(value[0], value[1:]))
+            index += 1
+        if hunk.old_start is None:
+            hunk.old_count = sum(line.kind in " -" for line in hunk.lines)
+            hunk.new_count = sum(line.kind in " +" for line in hunk.lines)
+            if not hunk.old_count:
+                raise PatchError(
+                    f"Bare '@@' hunk in {path} needs at least one context or removal line"
+                )
+        hunks.append(hunk)
+    if not hunks:
+        raise PatchError(
+            f"Update for {path} contains no hunks. "
+            "Use '@@ -old,count +new,count @@' or bare '@@'."
+        )
+    return hunks
 
 
 def _parse_unified(text: str) -> list[FilePatch]:
@@ -220,7 +279,11 @@ def _parse_unified(text: str) -> list[FilePatch]:
             match = header.match(lines[index])
             if not match:
                 if lines[index].strip():
-                    raise PatchError(f"Expected hunk header, got: {lines[index].rstrip()}")
+                    raise PatchError(
+                        "Expected numbered hunk header '@@ -old,count +new,count @@', "
+                        f"got: {lines[index].rstrip()}. Bare '@@' is accepted only "
+                        "inside a *** Begin Patch / *** Update File block."
+                    )
                 index += 1
                 continue
             hunk = Hunk(
@@ -231,6 +294,9 @@ def _parse_unified(text: str) -> list[FilePatch]:
             while index < len(lines) and not lines[index].startswith(("@@ ", "--- ")):
                 value = lines[index]
                 if value.startswith("\\ No newline"):
+                    if not hunk.lines:
+                        raise PatchError("No-newline marker has no preceding hunk line")
+                    hunk.lines[-1].text = hunk.lines[-1].text.removesuffix("\n")
                     index += 1
                     continue
                 if not value or value[0] not in " +-":
@@ -247,9 +313,28 @@ def apply_hunks(original: str, hunks: list[Hunk], display: str) -> str:
     output: list[str] = []
     cursor = 0
     for hunk in hunks:
-        start = max(0, hunk.old_start - 1)
+        if hunk.old_start is None:
+            expected = [line.text for line in hunk.lines if line.kind in " -"]
+            matches = [
+                index
+                for index in range(cursor, len(source) - len(expected) + 1)
+                if source[index : index + len(expected)] == expected
+            ]
+            if not matches:
+                raise PatchError(
+                    f"Bare '@@' hunk context was not found in {display}; no changes made"
+                )
+            if len(matches) != 1:
+                raise PatchError(
+                    f"Bare '@@' hunk context is ambiguous in {display}: "
+                    f"found {len(matches)} exact matches; add more context or use a numbered header"
+                )
+            start = matches[0]
+        else:
+            start = max(0, hunk.old_start - 1)
         if start < cursor or start > len(source):
-            raise PatchError(f"Invalid hunk position in {display}: old line {hunk.old_start}")
+            label = "located context" if hunk.old_start is None else f"old line {hunk.old_start}"
+            raise PatchError(f"Overlapping or reordered hunk in {display}: {label}")
         output.extend(source[cursor:start])
         source_index = start
         old_seen = new_seen = 0
