@@ -22,7 +22,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
-dependencies = []
+dependencies = ["prompt-toolkit>=3.0.53,<4"]
 
 [project.optional-dependencies]
 dev = [

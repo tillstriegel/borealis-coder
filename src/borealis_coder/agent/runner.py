@@ -157,6 +157,20 @@ class AgentRunner:
         queue = self._steering.get(session_id)
         return queue.qsize() if queue else 0
 
+    def reclaim_steering(self, session_id: str) -> list[str]:
+        """Return steering prompts that an ended run did not consume."""
+
+        if self.accepts_steering(session_id):
+            raise SessionError(f"Session {session_id} is still accepting steering")
+        queue = self._steering.pop(session_id, None)
+        if queue is None:
+            return []
+        prompts: list[str] = []
+        while not queue.empty():
+            prompt, _, _ = queue.get_nowait()
+            prompts.append(prompt)
+        return prompts
+
     async def run(
         self,
         prompt: str,

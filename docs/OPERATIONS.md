@@ -10,7 +10,7 @@
 - User-scoped SQLite storage
 - Provider key in shell environment
 - Persistent interactive shell started with `borealis`
-- Owner-only local prompt history when readline is available
+- Owner-only local prompt history for interactive terminals
 
 Start a normal local session with:
 

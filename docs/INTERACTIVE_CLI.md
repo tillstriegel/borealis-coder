@@ -85,10 +85,10 @@ including follow-ups entered while a tool is running. If a line arrives exactly
 as the active turn finishes, the shell preserves it as the next user turn rather
 than dropping it.
 
-While the follow-up prompt is active, Borealis renders status updates above the
-input line and restores the text already entered. It pauses the animated activity
-pulse and buffers token-by-token model output until the current response is
-complete, so terminal refreshes cannot erase or split the input buffer.
+While the follow-up prompt is active, prompt-toolkit keeps the editable input line,
+cursor position, and wrapped text stable while Borealis streams model and tool output
+above it. Borealis pauses the animated activity pulse during input and coalesces rapid
+terminal writes, so refreshes cannot erase or split the input buffer.
 
 Slash-prefixed input typed while a turn is active is treated as steering text,
 not as an interactive command. Wait for the normal session prompt to run `/help`,
@@ -174,8 +174,8 @@ normally.
 ## History and privacy
 
 The durable model conversation is stored in the configured SQLite session store.
-Readline prompt history is separate and optional. When supported by the platform,
-it is written to `cli-history` under the Borealis storage directory and changed
+Prompt history is separate and optional. On interactive terminals, prompt-toolkit
+writes it to `cli-history` under the Borealis storage directory and changes
 to mode `0600` on Unix.
 
 Disable local prompt history for sensitive terminals:

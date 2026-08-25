@@ -14,7 +14,7 @@ lint:
 	$(PYTHON) -m ruff check src tests scripts
 
 typecheck:
-	$(PYTHON) -m pyright
+	$(PYTHON) -m pyright --pythonpath $(PYTHON)
 
 validate:
 	PYTHONPATH=src $(PYTHON) scripts/validate_release.py

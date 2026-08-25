@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -11,17 +12,41 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
+
 from borealis_coder import cli, interactive, terminal
 from borealis_coder.config import load_config
 from borealis_coder.models import AgentResult, Event, StopReason, Usage
 from borealis_coder.safety import ApprovalRequest, PolicyAction, PolicyDecision
 from borealis_coder.safety.checkpoints import CheckpointManager
 from borealis_coder.safety.paths import WorkspaceRoots
+from borealis_coder.terminal_input import TerminalInput
 
 
 class TTYBuffer(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class ControlledInput:
+    def __init__(self) -> None:
+        self.requests: asyncio.Queue[tuple[str, str, asyncio.Future[str]]] = asyncio.Queue()
+        self.reading = False
+        self.current_text = ""
+
+    async def read(self, prompt: str, *, default: str = "") -> str:
+        self.reading = True
+        self.current_text = default
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self.requests.put_nowait((prompt, default, future))
+        try:
+            return await future
+        finally:
+            self.reading = False
+
+    def close(self) -> None:
+        return None
 
 
 class CLITests(unittest.TestCase):
@@ -1101,22 +1126,27 @@ class CLITests(unittest.TestCase):
             with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()):
                 self.assertFalse(shell._concurrent_input())
 
-    def test_terminal_input_worker_restores_active_readline_prompt_after_output(self) -> None:
-        worker = interactive._TerminalInputWorker()
-        worker._readline = SimpleNamespace(get_line_buffer=Mock(return_value="typed text"))
-        worker._active_prompt = "\001\033[90m\002follow-up> \001\033[0m\002"
-        worker._reading.set()
-        stream = TTYBuffer()
+    def test_terminal_input_preserves_cursor_position_when_editing(self) -> None:
+        async def exercise() -> str:
+            with tempfile.TemporaryDirectory() as td, create_pipe_input() as pipe:
+                worker = TerminalInput(
+                    Path(td) / "history",
+                    history_enabled=False,
+                    completions=(),
+                    completion_descriptions={},
+                    input=pipe,
+                    output=DummyOutput(),
+                )
+                task = __import__("asyncio").create_task(
+                    worker.read("\001\033[90m\002follow-up> \001\033[0m\002", default="abc")
+                )
+                await __import__("asyncio").sleep(0)
+                pipe.send_text("\x1b[DX\n")
+                return await task
 
-        with worker.render_above_prompt(stream):
-            print("model update", file=stream)
+        self.assertEqual(__import__("asyncio").run(exercise()), "abXc")
 
-        self.assertEqual(
-            stream.getvalue(),
-            "\r\033[2Kmodel update\n\033[90mfollow-up> \033[0mtyped text",
-        )
-
-    def test_interactive_buffers_stream_deltas_while_follow_up_prompt_is_active(
+    def test_interactive_renders_all_stream_events_while_follow_up_prompt_is_active(
         self,
     ) -> None:
         async def exercise() -> str:
@@ -1139,24 +1169,26 @@ class CLITests(unittest.TestCase):
                 shell.renderer._text_stream = stream
                 shell.renderer._status_stream = stream
                 shell.renderer.ui.color = False
-                shell._input._readline = SimpleNamespace(
-                    get_line_buffer=Mock(return_value="draft")
-                )
-                shell._input._active_prompt = "follow-up> "
-                shell._input._reading.set()
+                shell.renderer.show_tool_output = True
+                shell._input = cast(Any, SimpleNamespace(reading=True))
 
                 await shell._render_event(
-                    Event(type="model.text_delta", data={"text": "stable answer"})
+                    Event(type="model.text_delta", data={"text": "first-middle-last"})
                 )
-                self.assertEqual(stream.getvalue(), "")
                 await shell._render_event(
-                    Event(type="model.completed", data={"text": "stable answer"})
+                    Event(
+                        type="tool.output",
+                        data={"tool": "shell", "tool_call_id": "call", "text": "tool-output"},
+                    )
+                )
+                await shell._render_event(
+                    Event(type="model.completed", data={"text": "first-middle-last"})
                 )
                 return terminal._strip_ansi(stream.getvalue())
 
         output = __import__("asyncio").run(exercise())
-        self.assertEqual(output.count("stable answer"), 1)
-        self.assertFalse(output.rstrip().endswith("\r\033[2K"))
+        self.assertEqual(output.count("first-middle-last"), 1)
+        self.assertEqual(output.count("tool-output"), 1)
 
     def test_interactive_pauses_live_pulse_while_follow_up_prompt_is_active(
         self,
@@ -1188,7 +1220,7 @@ class CLITests(unittest.TestCase):
                 shell.renderer._status_stream = TTYBuffer()
                 shell.renderer.ui.color = True
                 shell.renderer._activity_phase = "working"
-                shell._input._reading.set()
+                shell._input = cast(Any, SimpleNamespace(reading=True))
                 shell.renderer.pulse = Mock()  # type: ignore[method-assign]
 
                 with patch(
@@ -1205,8 +1237,11 @@ class CLITests(unittest.TestCase):
         class InputWorker:
             def __init__(self) -> None:
                 self.calls = 0
+                self.reading = False
+                self.current_text = ""
 
-            async def read(self, _prompt: str) -> str:
+            async def read(self, _prompt: str, *, default: str = "") -> str:
+                del default
                 self.calls += 1
                 if self.calls == 1:
                     await __import__("asyncio").sleep(0.01)
@@ -1233,7 +1268,7 @@ class CLITests(unittest.TestCase):
                     initial_prompt="first task",
                     history_enabled=False,
                 )
-                shell._input = cast(Any, InputWorker())
+                input_worker = InputWorker()
                 shell.renderer._status_stream = io.StringIO()
                 runner = SimpleNamespace(close=AsyncMock())
                 shell.runner = cast(Any, runner)
@@ -1248,6 +1283,10 @@ class CLITests(unittest.TestCase):
                     patch.object(shell, "_select_initial_session", AsyncMock()),
                     patch.object(shell, "_print_banner"),
                     patch.object(shell, "_concurrent_input", return_value=True),
+                    patch(
+                        "borealis_coder.interactive.TerminalInput",
+                        return_value=input_worker,
+                    ),
                 ):
                     self.assertEqual(await shell.run(), 0)
 
@@ -1288,6 +1327,241 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(await response, "allow_always")
 
         __import__("asyncio").run(exercise())
+
+    def test_existing_follow_up_cannot_answer_a_new_approval(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    initial_prompt="first task",
+                    history_enabled=False,
+                    terminal_approvals=True,
+                )
+                input_worker = ControlledInput()
+                shell._input = cast(Any, input_worker)
+                runner = SimpleNamespace(
+                    accepts_steering=Mock(return_value=True),
+                    queued_prompts=Mock(return_value=1),
+                    steer=Mock(),
+                )
+                shell.runner = cast(Any, runner)
+                release_submission = asyncio.Event()
+
+                async def submit(_prompt: str) -> None:
+                    shell._active_session_id = "sess_test"
+                    await release_submission.wait()
+
+                shell._submit = submit  # type: ignore[method-assign]
+                loop_task = asyncio.create_task(shell._run_concurrent())
+                _, _, follow_up = await input_worker.requests.get()
+                request = ApprovalRequest(
+                    tool_name="shell",
+                    description="run",
+                    decision=PolicyDecision(PolicyAction.ASK, "reason", "high"),
+                    arguments_preview="echo hi",
+                )
+                approval: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                shell._approval_requests.put_nowait((request, approval))
+                follow_up.set_result("a")
+
+                approval_prompt, default, approval_input = await input_worker.requests.get()
+                self.assertIn("approval", approval_prompt)
+                self.assertEqual(default, "")
+                self.assertFalse(approval.done())
+                runner.steer.assert_called_once_with(
+                    "sess_test", "a", metadata={"interactive": True}
+                )
+                approval_input.set_result("n")
+                self.assertEqual(await approval, "no")
+
+                _, _, final_input = await input_worker.requests.get()
+                release_submission.set()
+                final_input.set_exception(EOFError())
+                self.assertEqual(await loop_task, 0)
+
+        asyncio.run(exercise())
+
+    def test_approval_interrupt_preserves_draft_for_the_follow_up_prompt(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    initial_prompt="first task",
+                    history_enabled=False,
+                    terminal_approvals=True,
+                )
+                input_worker = ControlledInput()
+                shell._input = cast(Any, input_worker)
+                shell.runner = cast(
+                    Any,
+                    SimpleNamespace(
+                        accepts_steering=Mock(return_value=False),
+                        queued_prompts=Mock(return_value=0),
+                    ),
+                )
+                release_submission = asyncio.Event()
+
+                async def submit(_prompt: str) -> None:
+                    await release_submission.wait()
+
+                shell._submit = submit  # type: ignore[method-assign]
+                loop_task = asyncio.create_task(shell._run_concurrent())
+
+                await input_worker.requests.get()
+                input_worker.current_text = "keep this draft"
+                request = ApprovalRequest(
+                    tool_name="write_file",
+                    description="write",
+                    decision=PolicyDecision(PolicyAction.ASK, "reason", "high"),
+                    arguments_preview="file.txt",
+                )
+                approval: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                shell._approval_requests.put_nowait((request, approval))
+
+                _, approval_default, approval_input = await input_worker.requests.get()
+                self.assertEqual(approval_default, "")
+                approval_input.set_result("n")
+                self.assertEqual(await approval, "no")
+                _, restored_default, restored_input = await input_worker.requests.get()
+                self.assertEqual(restored_default, "keep this draft")
+                restored_input.set_exception(EOFError())
+                release_submission.set()
+                self.assertEqual(await loop_task, 0)
+
+        asyncio.run(exercise())
+
+    def test_eof_rejects_approval_requested_later_in_the_active_turn(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    initial_prompt="first task",
+                    history_enabled=False,
+                    terminal_approvals=True,
+                )
+                input_worker = ControlledInput()
+                shell._input = cast(Any, input_worker)
+                shell.runner = cast(Any, SimpleNamespace())
+                release_submission = asyncio.Event()
+
+                async def submit(_prompt: str) -> None:
+                    await release_submission.wait()
+
+                shell._submit = submit  # type: ignore[method-assign]
+                loop_task = asyncio.create_task(shell._run_concurrent())
+                _, _, terminal_input = await input_worker.requests.get()
+                terminal_input.set_exception(EOFError())
+                await asyncio.sleep(0)
+
+                request = ApprovalRequest(
+                    tool_name="shell",
+                    description="run",
+                    decision=PolicyDecision(PolicyAction.ASK, "reason", "high"),
+                    arguments_preview="echo hi",
+                )
+                approval: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                shell._approval_requests.put_nowait((request, approval))
+                self.assertEqual(await asyncio.wait_for(approval, timeout=1), "no")
+                release_submission.set()
+                self.assertEqual(await asyncio.wait_for(loop_task, timeout=1), 0)
+
+        asyncio.run(exercise())
+
+    def test_stale_approval_answer_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(
+                root,
+                overrides={
+                    "agent": {"provider": "mock"},
+                    "storage": {"directory": str(root / "data")},
+                },
+            )
+            shell = cli.InteractiveCLI(
+                workspace=root,
+                config=config,
+                approval_callback=None,
+                history_enabled=False,
+            )
+
+            async def exercise() -> None:
+                future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                future.cancel()
+                self.assertTrue(shell._answer_approval("a", future))
+                self.assertTrue(future.cancelled())
+
+            asyncio.run(exercise())
+
+    def test_unconsumed_steering_is_requeued_after_a_turn(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    history_enabled=False,
+                )
+                shell.session_id = "sess_test"
+                result = AgentResult(
+                    session_id="sess_test",
+                    run_id="run_test",
+                    text="done",
+                    stop_reason=StopReason.END_TURN,
+                    usage=Usage(),
+                    turns=1,
+                )
+                runner = SimpleNamespace(
+                    run=AsyncMock(return_value=result),
+                    reclaim_steering=Mock(return_value=["late direction"]),
+                )
+                shell.runner = cast(Any, runner)
+                shell.renderer._status_stream = io.StringIO()
+                shell.renderer._text_stream = io.StringIO()
+
+                await shell._submit("first task")
+
+                runner.reclaim_steering.assert_called_once_with("sess_test")
+                self.assertEqual(shell._pending_follow_ups, ["late direction"])
+
+        asyncio.run(exercise())
 
     def test_interactive_prompt_keyboard_interrupt_exits_130(self) -> None:
         with tempfile.TemporaryDirectory() as td:
