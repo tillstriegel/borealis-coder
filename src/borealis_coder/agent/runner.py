@@ -368,6 +368,38 @@ class AgentRunner:
         verification_finalization_pending = False
         compacted = False
         last_prune_signature: tuple[int, ...] | None = None
+
+        async def publish_authoritative_result(text: str) -> None:
+            if not text:
+                return
+            message = Message(
+                role=Role.ASSISTANT,
+                content=text,
+                metadata={"authoritative_verification": True},
+            )
+            messages.append(message)
+            await asyncio.to_thread(self.sessions.append_message, session_id, message)
+            await self.events.emit(
+                "model.text_delta",
+                session_id=session_id,
+                run_id=run_id,
+                message_id=message.id,
+                text=text,
+            )
+            await self.events.emit(
+                "model.completed",
+                session_id=session_id,
+                run_id=run_id,
+                turn=budget.turns,
+                message_id=message.id,
+                text=text,
+                reasoning_summary="",
+                tool_calls=[],
+                usage={},
+                stop_reason=stop_reason.value,
+                authoritative_verification=True,
+            )
+
         try:
             prompt_context = await asyncio.to_thread(self.context_builder.build, query=prompt)
             session_usage = await asyncio.to_thread(self.sessions.usage, session_id)
@@ -423,6 +455,7 @@ class AgentRunner:
                 assistant_message_id = new_id("msg")
                 buffer_candidate_output = bool(
                     verification_finalization_pending
+                    or awaiting_repair
                     or (
                         self.config.agent.auto_verify
                         and (context.changed_roots or context.mutation_tracking == "incomplete")
@@ -495,6 +528,12 @@ class AgentRunner:
                         # Persist only provider-selected continuation items, never
                         # the full raw response.
                         assistant_metadata["continuation_state"] = continuation
+                if buffer_candidate_output:
+                    assistant_metadata["internal"] = (
+                        "verification_finalizer"
+                        if verification_finalization_pending
+                        else "verification_candidate"
+                    )
                 assistant = Message(
                     id=assistant_message_id,
                     role=Role.ASSISTANT,
@@ -524,7 +563,6 @@ class AgentRunner:
                     final_text = response.text
                 final_response_incomplete = final_turn and response_incomplete
                 if final_turn and (response_tool_calls or final_response_incomplete):
-                    await self._drain_steering(session_id, run_id, messages)
                     recovery_message = max_turns_recovery_message(
                         self.config.agent.max_turns
                     )
@@ -575,29 +613,6 @@ class AgentRunner:
                     error_message = decision.error_message
                     if decision.continue_loop:
                         continue
-                    if buffer_candidate_output and final_text:
-                        await self.events.emit(
-                            "model.text_delta",
-                            session_id=session_id,
-                            run_id=run_id,
-                            message_id=assistant.id,
-                            text=final_text,
-                            provider=used_route.name,
-                            model=used_route.model,
-                        )
-                        await self.events.emit(
-                            "model.completed",
-                            session_id=session_id,
-                            run_id=run_id,
-                            turn=budget.turns,
-                            message_id=assistant.id,
-                            text=final_text,
-                            reasoning_summary="",
-                            tool_calls=[],
-                            usage={},
-                            stop_reason=response.stop_reason,
-                            authoritative_verification=True,
-                        )
                     break
                 batch_signature = hashlib.sha256(
                     json_dumps(
@@ -733,36 +748,66 @@ class AgentRunner:
                         f"{recovery_message} Automatic verification could not run: "
                         f"{verification['error']}"
                     )
+        try:
+            if (
+                verification is None
+                and (
+                    context.mutation_tracking == "incomplete"
+                    or (self.config.agent.auto_verify and context.changed_roots)
+                )
+            ):
+                verification = {
+                    "ok": False,
+                    "checks_ok": False,
+                    "process_lifecycle_complete": False,
+                    "process_lifecycle_guaranteed": False,
+                    "mutation_tracking": context.mutation_tracking,
+                    "steps": [],
+                    "error": (
+                        "Automatic verification did not complete; success is not confirmed."
+                    ),
+                    "roots": [
+                        context.roots.display(root)
+                        for root in sorted(
+                            context.changed_roots, key=lambda item: item.as_posix()
+                        )
+                    ],
+                }
+                if context.changed_roots:
+                    final_text = _authoritative_verification_summary(verification, context)
+            if verification is not None and (
+                context.changed_roots or context.mutation_tracking == "incomplete"
+            ):
+                if stop_reason != StopReason.END_TURN or not _verification_is_guaranteed(
+                    verification, context
+                ):
+                    final_text = _authoritative_verification_summary(verification, context)
+                terminal_feedback = Message(
+                    role=Role.USER,
+                    content=_verification_feedback(
+                        verification,
+                        repair=False,
+                        terminal=True,
+                    ),
+                    metadata={"internal": "verification_result_terminal"},
+                )
+                messages.append(terminal_feedback)
+                await asyncio.to_thread(
+                    self.sessions.append_message,
+                    session_id,
+                    terminal_feedback,
+                )
+                await publish_authoritative_result(final_text)
+            if stop_reason == StopReason.MAX_TURNS:
+                await self._drain_steering(session_id, run_id, messages)
+        finally:
             if stop_reason == StopReason.MAX_TURNS:
                 self._accepting_steering.discard(session_id)
-                await self._drain_steering(session_id, run_id, messages)
             self._cancel.pop(session_id, None)
             queue = self._steering.get(session_id)
             if queue is not None and queue.empty():
                 self._steering.pop(session_id, None)
             await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
-        if (
-            verification is None
-            and (
-                context.mutation_tracking == "incomplete"
-                or (self.config.agent.auto_verify and context.changed_roots)
-            )
-        ):
-            verification = {
-                "ok": False,
-                "checks_ok": False,
-                "process_lifecycle_complete": False,
-                "process_lifecycle_guaranteed": False,
-                "mutation_tracking": context.mutation_tracking,
-                "steps": [],
-                "error": "Automatic verification did not complete; success is not confirmed.",
-                "roots": [
-                    context.roots.display(root)
-                    for root in sorted(context.changed_roots, key=lambda item: item.as_posix())
-                ],
-            }
-            if context.changed_roots:
-                final_text = _authoritative_verification_summary(verification, context)
         usage = budget.usage or Usage()
         result = AgentResult(
             session_id=session_id,
@@ -2087,12 +2132,24 @@ def _title(prompt: str) -> str:
     return truncate_text(value, 80, marker="…") or "New coding session"
 
 
-def _verification_feedback(verification: dict[str, Any], *, repair: bool) -> str:
-    action = (
-        "Repair the failure, then return a candidate final answer so verification can run again."
-        if repair
-        else "Return the final answer now and report this result accurately."
-    )
+def _verification_feedback(
+    verification: dict[str, Any],
+    *,
+    repair: bool,
+    terminal: bool = False,
+) -> str:
+    if terminal:
+        action = (
+            "The prior run ended after this result. Treat it as authoritative when the "
+            "session resumes."
+        )
+    elif repair:
+        action = (
+            "Repair the failure, then return a candidate final answer so verification can "
+            "run again."
+        )
+    else:
+        action = "Return the final answer now and report this result accurately."
     return (
         "<automatic_verification_result>\n"
         + _authoritative_verification_summary(verification, None)

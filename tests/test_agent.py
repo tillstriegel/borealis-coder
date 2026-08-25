@@ -2286,6 +2286,26 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Automatic verification failed", "".join(visible_text))
                 assert result.verification is not None
                 self.assertFalse(result.verification["checks_ok"])
+                persisted = runner.sessions.messages(result.session_id)
+                candidate = next(
+                    message
+                    for message in persisted
+                    if message.content == "Everything succeeded and all tests pass."
+                )
+                self.assertEqual(candidate.metadata["internal"], "verification_candidate")
+                authoritative = next(
+                    message
+                    for message in persisted
+                    if message.metadata.get("authoritative_verification")
+                )
+                self.assertEqual(authoritative.content, result.text)
+                terminal_feedback = next(
+                    message
+                    for message in persisted
+                    if message.metadata.get("internal") == "verification_result_terminal"
+                )
+                self.assertIn("pytest -q tests/test_result.py", terminal_feedback.content)
+                self.assertIn("expected good, got bad", terminal_feedback.content)
             finally:
                 await runner.close()
 
@@ -2345,6 +2365,103 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("fully verified", "".join(visible_text))
                 self.assertEqual(result.text.splitlines()[0], "Checks passed.")
                 self.assertIn("Process lifecycle not guaranteed", result.text)
+                persisted = runner.sessions.messages(result.session_id)
+                hidden_outputs = {
+                    message.content: message.metadata.get("internal")
+                    for message in persisted
+                    if "fully verified" in message.content
+                }
+                self.assertEqual(
+                    hidden_outputs,
+                    {
+                        "Candidate says everything is fully verified.": (
+                            "verification_candidate"
+                        ),
+                        "Everything is fully verified.": "verification_finalizer",
+                    },
+                )
+                authoritative = next(
+                    message
+                    for message in persisted
+                    if message.metadata.get("authoritative_verification")
+                )
+                self.assertEqual(authoritative.content, result.text)
+            finally:
+                await runner.close()
+
+    async def test_cost_stop_cannot_publish_unverified_finalizer_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "mock",
+                    "auto_verify": True,
+                    "max_cost_usd": 0.5,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "good\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Candidate says everything is fully verified."),
+                ModelResponse(
+                    text="Everything is fully verified.",
+                    usage=Usage(requests=1, cost_usd=1.0),
+                ),
+            )
+            report = VerificationReport(
+                ok=True,
+                steps=[
+                    {
+                        "name": "Detached check",
+                        "command": "pytest -q",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "passed",
+                        "stderr": "",
+                        "process_lifecycle_complete": False,
+                    }
+                ],
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=report,
+                ):
+                    result = await runner.run("report the final status accurately")
+
+                self.assertEqual(result.stop_reason.value, "budget")
+                self.assertNotIn("fully verified", result.text)
+                self.assertEqual(result.text.splitlines()[0], "Checks passed.")
+                self.assertIn("Process lifecycle not guaranteed", result.text)
+                persisted = runner.sessions.messages(result.session_id)
+                finalizer = next(
+                    message
+                    for message in persisted
+                    if message.content == "Everything is fully verified."
+                )
+                self.assertEqual(finalizer.metadata["internal"], "verification_finalizer")
+                authoritative = next(
+                    message
+                    for message in persisted
+                    if message.metadata.get("authoritative_verification")
+                )
+                self.assertEqual(authoritative.content, result.text)
             finally:
                 await runner.close()
 

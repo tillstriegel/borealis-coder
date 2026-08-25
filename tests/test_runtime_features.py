@@ -510,6 +510,44 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SECOND_SLICE", provider_text)
         self.assertEqual(provider_text.count("FIRST_SLICE"), 1)
 
+    def test_failed_shell_with_changed_files_invalidates_stale_reads(self):
+        sha = "a" * 64
+        read_call = ToolCall(
+            id="read-before-mutation",
+            name="read_file",
+            arguments={"path": "a.txt"},
+        )
+        shell_call = ToolCall(
+            id="mutating-shell",
+            name="shell",
+            arguments={"command": "sed -i '' s/old/new/ a.txt; pytest -q"},
+        )
+        messages = [
+            Message(role=Role.ASSISTANT, tool_calls=[read_call]),
+            Message(
+                role=Role.TOOL,
+                tool_name="read_file",
+                tool_call_id=read_call.id,
+                content=f"path: a.txt\nsha256: {sha}\n\nOLD_FILE_STATE",
+            ),
+            Message(role=Role.ASSISTANT, tool_calls=[shell_call]),
+            Message(
+                role=Role.TOOL,
+                tool_name="shell",
+                tool_call_id=shell_call.id,
+                content="FAILED test_current_state",
+                is_error=True,
+                metadata={"changed_files": ["a.txt"]},
+            ),
+        ]
+
+        pruned, metrics = prune_provider_messages(messages)
+
+        provider_text = "\n".join(message.content for message in pruned)
+        self.assertEqual(metrics.superseded_reads_removed, 1)
+        self.assertNotIn("OLD_FILE_STATE", provider_text)
+        self.assertIn("FAILED test_current_state", provider_text)
+
     async def test_provider_compaction_is_reused_across_later_turns(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

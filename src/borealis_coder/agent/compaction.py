@@ -81,14 +81,17 @@ def prune_provider_messages(
                 latest_reads[(path, sha, _read_slice_identity(arguments, message.content))] = (
                     index
                 )
-        if message.role == Role.TOOL and not message.is_error:
+        if message.role == Role.TOOL:
             tool_name, arguments = call_details.get(
                 message.tool_call_id or "", (message.tool_name or "", {})
             )
-            if tool_name in _DISCOVERY_TOOLS:
+            if not message.is_error and tool_name in _DISCOVERY_TOOLS:
                 signature = f"{tool_name}:{json_dumps(arguments)}"
                 latest_discovery[signature] = index
-            if tool_name in _PATH_MUTATION_TOOLS or metadata.get("changed_files"):
+            mutation_succeeded = (
+                not message.is_error and tool_name in _PATH_MUTATION_TOOLS
+            )
+            if mutation_succeeded or metadata.get("changed_files"):
                 for path in _mutation_paths(metadata, arguments):
                     latest_mutation[path] = index
         copies.append(replace(message, metadata=metadata))
