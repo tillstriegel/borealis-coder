@@ -32,7 +32,7 @@
 
 ## Packaging
 
-- [ ] Wheel builds without downloading runtime dependencies.
+- [ ] Wheel declares only the reviewed runtime dependencies and installs them in a clean environment.
 - [ ] Source distribution builds.
 - [ ] Wheel installs into a clean target/virtual environment.
 - [ ] Installed `borealis --version`, `borealis eval`, and imports pass.

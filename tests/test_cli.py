@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -22,7 +23,12 @@ from borealis_coder.models import AgentResult, Event, StopReason, Usage
 from borealis_coder.safety import ApprovalRequest, PolicyAction, PolicyDecision
 from borealis_coder.safety.checkpoints import CheckpointManager
 from borealis_coder.safety.paths import WorkspaceRoots
-from borealis_coder.terminal_input import TerminalInput, TerminalInputInterrupted
+from borealis_coder.terminal_input import (
+    CompatibleFileHistory,
+    TerminalInput,
+    TerminalInputInterrupted,
+    read_history_entries,
+)
 
 
 class TTYBuffer(io.StringIO):
@@ -1179,7 +1185,10 @@ class CLITests(unittest.TestCase):
         async def exercise() -> list[str]:
             with tempfile.TemporaryDirectory() as td, create_pipe_input() as pipe:
                 history_file = Path(td) / "history"
-                history_file.write_text("old first\nold second\n", encoding="utf-8")
+                history_file.write_text(
+                    "_HiStOrY_V2_\nold\\040first\npath\\134name\n",
+                    encoding="utf-8",
+                )
                 terminal_input = TerminalInput(
                     history_file,
                     history_enabled=True,
@@ -1191,7 +1200,7 @@ class CLITests(unittest.TestCase):
                 initial = [
                     value async for value in terminal_input._session.history.load()
                 ]
-                self.assertEqual(initial, ["old second", "old first"])
+                self.assertEqual(initial, [r"path\name", "old first"])
                 terminal_input._session.history.append_string("new prompt")
                 replacement = TerminalInput(
                     history_file,
@@ -1205,8 +1214,60 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(
             asyncio.run(exercise()),
-            ["new prompt", "old second", "old first"],
+            ["new prompt", r"path\name", "old first"],
         )
+
+    def test_readline_history_preserves_shared_prompt_toolkit_file(self) -> None:
+        class FakeReadline:
+            __doc__ = "GNU readline"
+
+            def __init__(self) -> None:
+                self.history: list[str] = []
+                self.completer: Any = None
+                self.delimiters = " \t\n"
+
+            def add_history(self, entry: str) -> None:
+                self.history.append(entry)
+
+            def get_current_history_length(self) -> int:
+                return len(self.history)
+
+            def get_history_item(self, index: int) -> str | None:
+                return self.history[index - 1] if 0 < index <= len(self.history) else None
+
+            def set_history_length(self, _length: int) -> None:
+                return None
+
+            def get_completer(self) -> Any:
+                return self.completer
+
+            def set_completer(self, completer: Any) -> None:
+                self.completer = completer
+
+            def get_completer_delims(self) -> str:
+                return self.delimiters
+
+            def set_completer_delims(self, delimiters: str) -> None:
+                self.delimiters = delimiters
+
+            def parse_and_bind(self, _binding: str) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as td:
+            history_file = Path(td) / "history"
+            CompatibleFileHistory(history_file).store_string("interactive prompt")
+            fake_readline = FakeReadline()
+            with (
+                patch.dict(sys.modules, {"readline": fake_readline}),
+                terminal.ReadlineHistory(history_file),
+            ):
+                fake_readline.add_history("serial prompt")
+
+            self.assertEqual(
+                read_history_entries(history_file),
+                ["interactive prompt", "serial prompt"],
+            )
+            self.assertNotIn("_HiStOrY_V2_", history_file.read_text(encoding="utf-8"))
 
     def test_interactive_renders_all_stream_events_while_follow_up_prompt_is_active(
         self,

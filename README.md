@@ -2,7 +2,7 @@
 
 **Borealis Coder is a provider-portable, policy-first, resumable AI coding harness for autonomous repository work.** It combines a compact asynchronous agent runtime with deterministic editing tools, durable SQLite sessions, context-efficient repository discovery, checkpoints, verification, MCP extensions, and an ACP v2 editor bridge.
 
-The project is deliberately dependency-light: the runtime uses only the Python standard library on Python 3.11–3.13. Provider SDKs are not required. This keeps the execution boundary inspectable and makes the harness practical for local tools, CI workers, containers, and embedded applications.
+The project is deliberately dependency-light: the runtime uses the Python standard library plus prompt-toolkit for stable interactive terminal input on Python 3.11–3.13. Provider SDKs are not required. This keeps the execution boundary inspectable and makes the harness practical for local tools, CI workers, containers, and embedded applications.
 
 > **Release status:** `0.1.3` is a production-oriented beta/release candidate. The offline acceptance suite, unit/integration tests, wheel build, and clean-install checks are part of the release process. Live provider behavior still depends on the selected API, model, account, and network environment. Use Docker or another operating-system sandbox for untrusted repositories or models; the native driver is resource-bounded process execution, not a kernel security boundary.
 
