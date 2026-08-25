@@ -1053,7 +1053,19 @@ def _turn_footer(result: AgentResult) -> str:
     if result.incomplete:
         parts.append("incomplete · session preserved")
     if result.verification is not None:
-        parts.append("verified" if result.verification.get("ok") else "verification failed")
+        checks_ok = result.verification.get(
+            "checks_ok", result.verification.get("ok", False)
+        )
+        lifecycle = result.verification.get(
+            "process_lifecycle_guaranteed",
+            result.verification.get("process_lifecycle_complete", False),
+        )
+        if checks_ok and lifecycle:
+            parts.append("checks passed · process lifecycle guaranteed")
+        elif checks_ok:
+            parts.append("checks passed · process lifecycle not guaranteed")
+        else:
+            parts.append("verification failed")
     return " · ".join(parts)
 
 

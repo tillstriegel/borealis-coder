@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from borealis_coder.errors import SessionError
 from borealis_coder.events import EventBus, JsonlTrace
@@ -57,6 +60,39 @@ class SessionStoreTests(unittest.TestCase):
         exported = self.store.export(self.session.id)
         self.assertEqual(len(exported["events"]), 10_005)
         self.assertEqual(exported["events"][-1]["sequence"], 10_005)
+
+    def test_event_maintenance_dry_run_changes_nothing(self):
+        self.store.append_events(
+            Event(type="run.started", session_id=self.session.id) for _ in range(5)
+        )
+
+        report = self.store.prune_events(max_count=2, dry_run=True)
+
+        self.assertEqual(report["pruned_events"], 3)
+        self.assertEqual(len(self.store.events(self.session.id)), 5)
+        applied = self.store.prune_events(max_count=2)
+        self.assertEqual(applied["events_after"], 2)
+        self.assertEqual(len(self.store.events(self.session.id)), 2)
+
+    def test_event_maintenance_respects_age_without_pruning_recent_rows(self):
+        self.store.append_events(
+            [
+                Event(
+                    type="run.started",
+                    session_id=self.session.id,
+                    created_at="2000-01-01T00:00:00+00:00",
+                ),
+                Event(type="run.completed", session_id=self.session.id),
+            ]
+        )
+
+        report = self.store.prune_events(max_count=100, max_age_seconds=60)
+
+        self.assertEqual(report["pruned_events"], 1)
+        self.assertEqual(
+            [event.type for _, event in self.store.events(self.session.id)],
+            ["run.completed"],
+        )
 
     def test_message_upsert_preserves_order_and_tool_ids_are_session_scoped(self):
         first = Message(role=Role.USER, content="first")
@@ -180,7 +216,7 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class EventBusTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stream_events_are_live_immediately_and_persisted_in_one_batch(self):
+    async def test_stream_deltas_are_live_but_only_assembled_event_is_durable_by_default(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             store = SessionStore(root / "sessions.sqlite3")
@@ -213,16 +249,136 @@ class EventBusTests(unittest.IsolatedAsyncioTestCase):
                 "model.completed",
                 session_id=session.id,
                 run_id="run_1",
+                text="0123456789",
             )
-            self.assertEqual(batches, [11])
-            persisted = [event.type for _, event in store.events(session.id)]
-            self.assertEqual(
-                persisted,
-                ["model.text_delta"] * 10 + ["model.completed"],
-            )
+            self.assertEqual(batches, [1])
+            persisted = [event for _, event in store.events(session.id)]
+            self.assertEqual([event.type for event in persisted], ["model.completed"])
+            self.assertEqual(persisted[0].data["text"], "0123456789")
             self.assertEqual(len(trace_path.read_text().splitlines()), 11)
             await bus.flush()
             store.close()
+
+    async def test_verbose_delta_persistence_can_be_enabled(self):
+        persisted: list[str] = []
+        bus = EventBus(
+            persist=lambda events: persisted.extend(event.type for event in events),
+            persist_deltas=True,
+        )
+
+        await bus.emit("model.text_delta", text="part")
+        await bus.emit("model.completed", text="part")
+
+        self.assertEqual(persisted, ["model.text_delta", "model.completed"])
+
+    async def test_trace_rotation_preserves_valid_jsonl_records(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            trace = JsonlTrace(path, max_bytes=300, backup_count=2)
+            for index in range(8):
+                trace.append(Event(type="model.completed", data={"index": index}))
+
+            files = [Path(f"{path}.2"), Path(f"{path}.1"), path]
+            records = []
+            for item in files:
+                if item.is_file():
+                    for line in item.read_text(encoding="utf-8").splitlines():
+                        records.append(json.loads(line))
+            self.assertTrue(records)
+            self.assertTrue(all(record["type"] == "model.completed" for record in records))
+            self.assertEqual(records[-1]["data"]["index"], 7)
+
+    async def test_independent_trace_writers_rotate_without_racing(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            traces = [
+                JsonlTrace(path, max_bytes=300, backup_count=3)
+                for _ in range(4)
+            ]
+            barrier = threading.Barrier(len(traces))
+            errors: list[Exception] = []
+
+            def write_events(writer: int, trace: JsonlTrace) -> None:
+                try:
+                    barrier.wait()
+                    for index in range(20):
+                        trace.append(
+                            Event(
+                                type="model.completed",
+                                data={
+                                    "writer": writer,
+                                    "index": index,
+                                    "payload": "x" * 80,
+                                },
+                            )
+                        )
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [
+                threading.Thread(target=write_events, args=(index, trace))
+                for index, trace in enumerate(traces)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            records = []
+            for item in [Path(f"{path}.{index}") for index in range(3, 0, -1)] + [path]:
+                if item.is_file():
+                    records.extend(
+                        json.loads(line)
+                        for line in item.read_text(encoding="utf-8").splitlines()
+                    )
+            self.assertTrue(records)
+            self.assertTrue(all(record["type"] == "model.completed" for record in records))
+
+    async def test_trace_maintenance_prunes_backups_above_current_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            trace = JsonlTrace(path, max_bytes=240, backup_count=3)
+            for index in range(12):
+                trace.append(Event(type="model.completed", data={"index": index}))
+            self.assertTrue(Path(f"{path}.2").is_file())
+
+            reduced = JsonlTrace(
+                path, max_bytes=240, backup_count=1, create=False
+            )
+            preview = reduced.maintenance(dry_run=True)
+            self.assertGreater(preview["records_before"], preview["records_after"])
+            self.assertTrue(Path(f"{path}.2").is_file())
+
+            reduced.maintenance()
+
+            self.assertFalse(Path(f"{path}.2").exists())
+            records = []
+            for item in (Path(f"{path}.1"), path):
+                if item.is_file():
+                    records.extend(
+                        json.loads(line)
+                        for line in item.read_text(encoding="utf-8").splitlines()
+                    )
+            self.assertTrue(records)
+            self.assertEqual(records[-1]["data"]["index"], 11)
+
+    async def test_trace_maintenance_streams_existing_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "events.jsonl"
+            trace = JsonlTrace(path, max_bytes=300, backup_count=2)
+            for index in range(8):
+                trace.append(Event(type="model.completed", data={"index": index}))
+
+            with patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("maintenance must stream trace files"),
+            ):
+                report = trace.maintenance(dry_run=True)
+
+            self.assertGreater(report["records_before"], 0)
+            self.assertGreater(report["records_after"], 0)
 
     async def test_persistence_failure_keeps_order_for_lossless_retry(self):
         durable: list[str] = []

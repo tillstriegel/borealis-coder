@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from borealis_coder.config import SafetyConfig
 from borealis_coder.errors import PathViolation, ToolError
@@ -94,6 +96,128 @@ class PathTests(unittest.TestCase):
             roots.allow_outside = True
             manager.restore(checkpoint.id)
             self.assertEqual(file_path.read_text(encoding="utf-8"), "before")
+
+    def test_checkpoint_retention_respects_count_and_preserves_newest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "state.txt"
+            source.write_text("one", encoding="utf-8")
+            manager = CheckpointManager(
+                WorkspaceRoots(root), retention_max_count=2, retention_max_bytes=10_000_000
+            )
+            first = manager.create([source], label="first")
+            source.write_text("two", encoding="utf-8")
+            second = manager.create([source], label="second")
+            source.write_text("three", encoding="utf-8")
+            newest = manager.create([source], label="newest")
+            assert first is not None and second is not None and newest is not None
+
+            self.assertEqual([item.id for item in manager.list()], [newest.id, second.id])
+            source.write_text("changed", encoding="utf-8")
+            manager.restore(newest.id)
+            self.assertEqual(source.read_text(encoding="utf-8"), "three")
+
+            records = manager._complete_records()
+            manager.retention_max_bytes = max(size for _, _, size, _ in records)
+            report = manager.prune()
+            self.assertGreaterEqual(report["pruned_count"], 1)
+            self.assertEqual(manager.list()[0].id, newest.id)
+
+    def test_checkpoint_creation_preserves_newest_when_timestamps_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "state.txt"
+            source.write_text("first", encoding="utf-8")
+            manager = CheckpointManager(
+                WorkspaceRoots(root), retention_max_count=1
+            )
+            created_at = "2026-08-25T12:00:00.000+00:00"
+
+            with (
+                patch(
+                    "borealis_coder.safety.checkpoints.utc_now",
+                    return_value=created_at,
+                ),
+                patch(
+                    "borealis_coder.safety.checkpoints.time.time_ns",
+                    side_effect=[1, 2],
+                ),
+            ):
+                first = manager.create([source], label="first")
+                source.write_text("second", encoding="utf-8")
+                newest = manager.create([source], label="newest")
+            assert first is not None and newest is not None
+
+            self.assertFalse((manager.directory / first.id).exists())
+            self.assertTrue((manager.directory / newest.id).is_dir())
+            source.write_text("changed", encoding="utf-8")
+            manager.restore(newest.id)
+            self.assertEqual(source.read_text(encoding="utf-8"), "second")
+
+    def test_checkpoint_pruning_ignores_malformed_directories(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manager = CheckpointManager(WorkspaceRoots(root), retention_max_count=1)
+            malformed = manager.directory / "interrupted"
+            malformed.mkdir()
+            (malformed / "manifest.json").write_text("not json", encoding="utf-8")
+            source = root / "state.txt"
+            source.write_text("value", encoding="utf-8")
+            checkpoint = manager.create([source], label="valid")
+            assert checkpoint is not None
+
+            report = manager.prune()
+
+            self.assertEqual(report["complete_checkpoints"], 1)
+            self.assertTrue(malformed.is_dir())
+            manager.restore(checkpoint.id)
+
+    def test_checkpoint_pruning_skips_active_checkpoint_until_release(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "state.txt"
+            source.write_text("first", encoding="utf-8")
+            manager = CheckpointManager(
+                WorkspaceRoots(root), retention_max_count=1
+            )
+            active = manager.create([source], label="active", active=True)
+            assert active is not None
+            source.write_text("second", encoding="utf-8")
+            newest = manager.create([source], label="newest")
+            assert newest is not None
+
+            self.assertTrue((manager.directory / active.id).is_dir())
+            manager.prune()
+            self.assertTrue((manager.directory / active.id).is_dir())
+
+            manager.release(active.id)
+
+            self.assertFalse((manager.directory / active.id).exists())
+            self.assertTrue((manager.directory / newest.id).is_dir())
+
+    def test_checkpoint_retention_respects_age_and_preserves_newest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "state.txt"
+            source.write_text("old", encoding="utf-8")
+            manager = CheckpointManager(
+                WorkspaceRoots(root), retention_max_age_seconds=60
+            )
+            old = manager.create([source], label="old")
+            assert old is not None
+            manifest_path = manager.directory / old.id / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["created_at"] = "2000-01-01T00:00:00+00:00"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            source.write_text("new", encoding="utf-8")
+            newest = manager.create([source], label="newest")
+            assert newest is not None
+
+            self.assertFalse((manager.directory / old.id).exists())
+            self.assertTrue((manager.directory / newest.id).is_dir())
+            source.write_text("changed", encoding="utf-8")
+            manager.restore(newest.id)
+            self.assertEqual(source.read_text(encoding="utf-8"), "new")
 
 
 class PolicyTests(unittest.IsolatedAsyncioTestCase):

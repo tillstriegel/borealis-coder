@@ -338,9 +338,20 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(
                     any(item["messageId"] in assistant_ids for item in full_agent_updates)
                 )
+                internal_ids = {
+                    item.id for item in persisted if item.metadata.get("internal")
+                }
+                authoritative_ids = {
+                    item.id
+                    for item in persisted
+                    if item.metadata.get("authoritative_verification")
+                }
+                self.assertTrue(internal_ids)
+                self.assertTrue(authoritative_ids)
                 listed = await server.handle("session/list", {"cwd": str(root)})
                 self.assertTrue(any(item["sessionId"] == session_id for item in listed["sessions"]))
                 await server.handle("session/close", {"sessionId": session_id})
+                fake.notifications.clear()
                 await server.handle(
                     "session/resume",
                     {
@@ -350,6 +361,15 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
                         "replayFrom": {"type": "start"},
                     },
                 )
+                replayed_ids = {
+                    params["update"]["messageId"]
+                    for method, params in fake.notifications
+                    if method == "session/update"
+                    and params["update"]["sessionUpdate"]
+                    in {"user_message", "agent_message"}
+                }
+                self.assertTrue(authoritative_ids.issubset(replayed_ids))
+                self.assertTrue(internal_ids.isdisjoint(replayed_ids))
                 await server.handle("session/close", {"sessionId": session_id})
                 await server.handle("session/delete", {"sessionId": session_id})
                 listed = await server.handle("session/list", {"cwd": str(root)})

@@ -2,17 +2,195 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
+import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from typing import Any
 
 from ..errors import BudgetExceeded, Cancelled
 from ..models import Message, Role
-from ..util import truncate_text
+from ..util import estimate_tokens, json_dumps, truncate_text
 
 # Summarizer receives the rendered transcript of the older messages and returns
 # the replacement summary text. May return an awaitable. Implementations should
 # be exception-free; any failure falls back to deterministic truncation.
 Summarizer = Callable[[str], str | Awaitable[str]]
+_DISCOVERY_TOOLS = frozenset(
+    {
+        "git_log",
+        "git_status",
+        "glob_files",
+        "grep",
+        "list_directory",
+        "read_instructions",
+        "read_skill",
+        "repo_map",
+    }
+)
+_PATH_MUTATION_TOOLS = frozenset(
+    {"apply_patch", "delete_file", "replace_in_file", "write_file"}
+)
+
+
+@dataclass(slots=True)
+class ContextPruneMetrics:
+    tokens_before: int
+    tokens_after: int
+    superseded_reads_removed: int
+    repeated_outputs_removed: int
+    tool_output_tokens_before: int
+    tool_output_tokens_retained: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "tokens_before": self.tokens_before,
+            "tokens_after": self.tokens_after,
+            "superseded_reads_removed": self.superseded_reads_removed,
+            "repeated_outputs_removed": self.repeated_outputs_removed,
+            "tool_output_tokens_before": self.tool_output_tokens_before,
+            "tool_output_tokens_retained": self.tool_output_tokens_retained,
+        }
+
+
+def prune_provider_messages(
+    messages: list[Message],
+) -> tuple[list[Message], ContextPruneMetrics]:
+    """Return a deterministic provider-only view without changing durable history."""
+
+    call_details: dict[str, tuple[str, dict[str, Any]]] = {}
+    for message in messages:
+        for call in message.tool_calls:
+            call_details[call.id] = (call.name, call.arguments)
+
+    copies: list[Message] = []
+    latest_reads: dict[tuple[str, str, str], int] = {}
+    latest_discovery: dict[str, int] = {}
+    latest_mutation: dict[str, int] = {}
+    for index, message in enumerate(messages):
+        metadata = dict(message.metadata)
+        if message.role == Role.TOOL and message.tool_name == "read_file":
+            path, sha = _read_identity(message.content, metadata)
+            if path:
+                metadata.setdefault("path", path)
+            if sha:
+                metadata.setdefault("sha256", sha)
+            if path and sha and not message.is_error:
+                arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
+                latest_reads[(path, sha, _read_slice_identity(arguments, message.content))] = (
+                    index
+                )
+        if message.role == Role.TOOL:
+            tool_name, arguments = call_details.get(
+                message.tool_call_id or "", (message.tool_name or "", {})
+            )
+            if not message.is_error and tool_name in _DISCOVERY_TOOLS:
+                signature = f"{tool_name}:{json_dumps(arguments)}"
+                latest_discovery[signature] = index
+            mutation_succeeded = (
+                not message.is_error and tool_name in _PATH_MUTATION_TOOLS
+            )
+            if mutation_succeeded or metadata.get("changed_files"):
+                for path in _mutation_paths(metadata, arguments):
+                    latest_mutation[path] = index
+        copies.append(replace(message, metadata=metadata))
+
+    superseded_reads = 0
+    repeated_outputs = 0
+    for index, message in enumerate(copies):
+        if message.role != Role.TOOL or message.is_error:
+            continue
+        if message.tool_name == "read_file":
+            path = str(message.metadata.get("path") or "")
+            sha = str(message.metadata.get("sha256") or "")
+            arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
+            identity = (path, sha, _read_slice_identity(arguments, message.content))
+            superseded = bool(
+                path
+                and sha
+                and (
+                    latest_reads.get(identity, index) > index
+                    or latest_mutation.get(path, -1) > index
+                )
+            )
+            if superseded:
+                copies[index] = replace(
+                    message,
+                    content=f"[superseded read: path={path} sha256={sha}]",
+                    metadata={**message.metadata, "provider_compacted": "superseded_read"},
+                )
+                superseded_reads += 1
+            continue
+        tool_name, arguments = call_details.get(
+            message.tool_call_id or "", (message.tool_name or "", {})
+        )
+        if tool_name not in _DISCOVERY_TOOLS:
+            continue
+        signature = f"{tool_name}:{json_dumps(arguments)}"
+        if latest_discovery.get(signature, index) > index:
+            copies[index] = replace(
+                message,
+                content=f"[superseded successful {tool_name} output]",
+                metadata={**message.metadata, "provider_compacted": "repeated_output"},
+            )
+            repeated_outputs += 1
+
+    tool_before = sum(
+        estimate_tokens(message.content) for message in messages if message.role == Role.TOOL
+    )
+    tool_after = sum(
+        estimate_tokens(message.content) for message in copies if message.role == Role.TOOL
+    )
+    before = sum(_message_tokens(message) for message in messages)
+    after = sum(_message_tokens(message) for message in copies)
+    return copies, ContextPruneMetrics(
+        tokens_before=before,
+        tokens_after=after,
+        superseded_reads_removed=superseded_reads,
+        repeated_outputs_removed=repeated_outputs,
+        tool_output_tokens_before=tool_before,
+        tool_output_tokens_retained=tool_after,
+    )
+
+
+def _read_identity(content: str, metadata: dict[str, Any]) -> tuple[str, str]:
+    path = str(metadata.get("path") or "")
+    sha = str(metadata.get("sha256") or "")
+    if not path:
+        match = re.search(r"(?m)^path: (.+)$", content)
+        path = match.group(1).strip() if match else ""
+    if not sha:
+        match = re.search(r"(?m)^sha256: ([0-9a-f]{64})$", content)
+        sha = match.group(1) if match else ""
+    return path, sha
+
+
+def _read_slice_identity(arguments: dict[str, Any], content: str) -> str:
+    if arguments:
+        return json_dumps(
+            {
+                "start_line": arguments.get("start_line"),
+                "end_line": arguments.get("end_line"),
+                "max_chars": arguments.get("max_chars"),
+            }
+        )
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _mutation_paths(metadata: dict[str, Any], arguments: dict[str, Any]) -> list[str]:
+    paths = metadata.get("files") or metadata.get("changed_files")
+    if isinstance(paths, list):
+        return [str(path) for path in paths if path]
+    path = metadata.get("path") or arguments.get("path")
+    return [str(path)] if path else []
+
+
+def _message_tokens(message: Message) -> int:
+    tokens = estimate_tokens(message.content) + 12
+    if message.tool_calls:
+        tokens += estimate_tokens(json_dumps([call.to_dict() for call in message.tool_calls]))
+    return tokens
 
 
 def _frame_llm_summary(summary: str, limit: int) -> str:

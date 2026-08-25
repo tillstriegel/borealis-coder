@@ -144,6 +144,7 @@ class ConfigTests(unittest.TestCase):
             ("sandbox", "process_file_size_bytes", 0),
             ("context", "max_search_results", 0),
             ("context", "tool_output_chars", -1),
+            ("context", "compact_tool_output_tokens", 0),
         )
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

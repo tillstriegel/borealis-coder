@@ -55,11 +55,19 @@ async def build_runner(
     routes: list[ProviderRoute] = []
     try:
         trace = (
-            JsonlTrace(config.storage_dir / "traces" / "events.jsonl")
+            JsonlTrace(
+                config.storage_dir / "traces" / "events.jsonl",
+                max_bytes=config.storage.trace_max_bytes,
+                backup_count=config.storage.trace_backup_count,
+            )
             if config.storage.trace_jsonl
             else None
         )
-        events = EventBus(trace=trace, persist=sessions.append_events)
+        events = EventBus(
+            trace=trace,
+            persist=sessions.append_events,
+            persist_deltas=config.storage.persist_event_deltas,
+        )
         context_builder = ContextBuilder(workspace, config)
         tools = build_builtin_registry()
         load_entrypoint_tools(tools)
@@ -82,6 +90,9 @@ async def build_runner(
             roots,
             enabled=config.safety.checkpoints,
             max_bytes=config.safety.checkpoint_max_bytes,
+            retention_max_count=config.safety.checkpoint_retention_max_count,
+            retention_max_bytes=config.safety.checkpoint_retention_max_bytes,
+            retention_max_age_seconds=config.safety.checkpoint_retention_max_age_seconds,
         )
         tool_context = ToolContext(
             workspace=workspace,

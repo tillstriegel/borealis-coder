@@ -527,6 +527,8 @@ class ACPServer:
 
     async def _replay(self, session_id: str, runner: AgentRunner) -> None:
         for message in await asyncio.to_thread(runner.sessions.messages, session_id):
+            if message.metadata.get("internal"):
+                continue
             if message.role.value == "user":
                 kind = "user_message"
             elif message.role.value == "assistant":

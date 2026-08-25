@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from prompt_toolkit.output import DummyOutput
 
 from borealis_coder import cli, interactive, terminal
 from borealis_coder.config import load_config
+from borealis_coder.events import JsonlTrace
 from borealis_coder.models import AgentResult, Event, StopReason, Usage
 from borealis_coder.safety import ApprovalRequest, PolicyAction, PolicyDecision
 from borealis_coder.safety.checkpoints import CheckpointManager
@@ -264,6 +266,160 @@ class CLITests(unittest.TestCase):
             self.assertTrue(payload["incomplete"])
             self.assertIn("send 'continue' to resume", payload["error"])
             self.assertFalse((workspace / "borealis-demo.txt").exists())
+
+    def test_interactive_footer_uses_authoritative_lifecycle_wording(self) -> None:
+        result = AgentResult(
+            session_id="session",
+            run_id="run",
+            text="I verified everything.",
+            stop_reason=StopReason.END_TURN,
+            usage=Usage(),
+            turns=2,
+            verification={
+                "ok": True,
+                "checks_ok": True,
+                "process_lifecycle_complete": False,
+                "process_lifecycle_guaranteed": False,
+                "mutation_tracking": "incomplete",
+                "steps": [],
+            },
+            mutation_tracking="incomplete",
+        )
+
+        footer = interactive._turn_footer(result)
+
+        self.assertIn("checks passed · process lifecycle not guaranteed", footer)
+        self.assertNotIn("verified", footer)
+
+    def test_maintenance_dry_run_does_not_change_existing_history(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            data = root / "data"
+            workspace.mkdir()
+            env = {
+                "BOREALIS_DATA_DIR": str(data),
+                "BOREALIS_CFG__STORAGE__EVENT_RETENTION_MAX_COUNT": "1",
+                "BOREALIS_CFG__STORAGE__TRACE_MAX_BYTES": "200",
+                "BOREALIS_CFG__SAFETY__CHECKPOINT_RETENTION_MAX_COUNT": "1",
+            }
+            config = load_config(
+                workspace,
+                overrides={"storage": {"directory": str(data)}},
+            )
+            from borealis_coder.sessions import SessionStore
+
+            store = SessionStore(config.database_path)
+            session = store.create_session(
+                workspace=workspace, provider="mock", model="deterministic"
+            )
+            store.append_events(
+                Event(type="run.started", session_id=session.id) for _ in range(3)
+            )
+            store.close()
+            trace_path = data / "traces" / "events.jsonl"
+            trace = JsonlTrace(trace_path)
+            for index in range(3):
+                trace.append(Event(type="run.started", data={"index": index}))
+            source = workspace / "state.txt"
+            source.write_text("state", encoding="utf-8")
+            manager = CheckpointManager(WorkspaceRoots(workspace))
+            for index in range(3):
+                manager.create([source], label=str(index))
+            trace_before = trace_path.read_bytes()
+            checkpoints_before = [item.id for item in manager.list()]
+
+            code, output, error = self.run_cli(
+                [
+                    "maintenance",
+                    "--workspace",
+                    str(workspace),
+                    "--dry-run",
+                    "--json",
+                ],
+                env=env,
+            )
+
+            self.assertEqual(code, 0, error)
+            report = json.loads(output)
+            self.assertGreater(report["events"]["pruned_events"], 0)
+            self.assertGreater(report["checkpoints"]["pruned_count"], 0)
+            reopened = SessionStore(config.database_path)
+            try:
+                self.assertEqual(len(reopened.events(session.id)), 3)
+            finally:
+                reopened.close()
+            self.assertEqual(trace_path.read_bytes(), trace_before)
+            self.assertEqual([item.id for item in manager.list()], checkpoints_before)
+
+    def test_maintenance_dry_run_does_not_create_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            data = root / "data"
+            workspace.mkdir()
+
+            code, output, error = self.run_cli(
+                [
+                    "maintenance",
+                    "--workspace",
+                    str(workspace),
+                    "--dry-run",
+                    "--json",
+                ],
+                env={"BOREALIS_DATA_DIR": str(data)},
+            )
+
+            self.assertEqual(code, 0, error)
+            self.assertEqual(json.loads(output)["events"]["events_before"], 0)
+            self.assertFalse(data.exists())
+            self.assertFalse((workspace / ".borealis").exists())
+
+    def test_maintenance_dry_run_does_not_migrate_an_existing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            data = root / "data"
+            workspace.mkdir()
+            data.mkdir()
+            config = load_config(
+                workspace,
+                overrides={"storage": {"directory": str(data)}},
+            )
+            connection = sqlite3.connect(config.database_path)
+            connection.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO sentinel VALUES ('unchanged')")
+            connection.commit()
+            connection.close()
+            before = config.database_path.read_bytes()
+            siblings_before = {path.name for path in data.iterdir()}
+
+            code, output, error = self.run_cli(
+                [
+                    "maintenance",
+                    "--workspace",
+                    str(workspace),
+                    "--dry-run",
+                    "--json",
+                ],
+                env={"BOREALIS_DATA_DIR": str(data)},
+            )
+
+            self.assertEqual(code, 0, error)
+            self.assertEqual(json.loads(output)["events"]["events_before"], 0)
+            self.assertEqual(config.database_path.read_bytes(), before)
+            self.assertEqual({path.name for path in data.iterdir()}, siblings_before)
+            connection = sqlite3.connect(config.database_path)
+            try:
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+            finally:
+                connection.close()
+            self.assertEqual(tables, {"sentinel"})
 
     def test_session_administration_does_not_build_a_provider_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -660,7 +816,8 @@ class CLITests(unittest.TestCase):
         self.assertIn("changed=1", footer)
         self.assertIn("mutation_tracking=incomplete", footer)
         self.assertIn("incomplete=true", footer)
-        self.assertIn("verified=False", footer)
+        self.assertIn("checks_ok=False", footer)
+        self.assertIn("process_lifecycle_guaranteed=False", footer)
         self.assertIn("error=boom", footer)
         self.assertIn("incomplete · session preserved", interactive._turn_footer(result))
         self.assertIn("mutation tracking incomplete", interactive._turn_footer(result))

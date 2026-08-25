@@ -20,6 +20,7 @@ from .auth import (
 from .config import SAMPLE_CONFIG, Config, load_config
 from .diagnostics import run_diagnostics
 from .errors import BorealisError, ConfigurationError
+from .events import JsonlTrace
 from .interactive import InteractiveCLI
 from .protocol import ACPServer
 from .safety import ApprovalRequest, CheckpointManager, WorkspaceRoots
@@ -144,6 +145,14 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--workspace", type=Path, default=Path.cwd())
     rollback.add_argument("--config", type=Path)
 
+    maintenance = sub.add_parser(
+        "maintenance", help="Prune retained events, traces, and checkpoints"
+    )
+    maintenance.add_argument("--workspace", type=Path, default=Path.cwd())
+    maintenance.add_argument("--config", type=Path)
+    maintenance.add_argument("--dry-run", action="store_true")
+    maintenance.add_argument("--json", action="store_true")
+
     sub.add_parser("acp", help="Serve ACP v2 over stdio")
 
     evaluate = sub.add_parser("eval", help="Run deterministic offline acceptance checks")
@@ -204,6 +213,7 @@ _TOP_LEVEL_COMMANDS = {
     "config",
     "sessions",
     "rollback",
+    "maintenance",
     "acp",
     "eval",
 }
@@ -264,6 +274,8 @@ async def _main(args: argparse.Namespace) -> int:
         return await _sessions(args)
     if args.command == "rollback":
         return _rollback(args)
+    if args.command == "maintenance":
+        return _maintenance(args)
     if args.command == "acp":
         await ACPServer().serve()
         return 0
@@ -300,7 +312,12 @@ async def _run(args: argparse.Namespace) -> int:
     return (
         0
         if result.stop_reason.value == "end_turn"
-        and not (result.verification and not result.verification.get("ok", True))
+        and not (
+            result.verification
+            and not result.verification.get(
+                "checks_ok", result.verification.get("ok", True)
+            )
+        )
         else 1
     )
 
@@ -529,6 +546,64 @@ def _rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+def _maintenance(args: argparse.Namespace) -> int:
+    workspace = args.workspace.expanduser().resolve()
+    config = load_config(
+        workspace, explicit_path=args.config, ensure_storage=not args.dry_run
+    )
+    if config.database_path.is_file():
+        if args.dry_run:
+            events = SessionStore.preview_event_prune(
+                config.database_path,
+                max_count=config.storage.event_retention_max_count,
+                max_age_seconds=config.storage.event_retention_max_age_seconds,
+            )
+        else:
+            store = SessionStore(config.database_path)
+            try:
+                events = store.prune_events(
+                    max_count=config.storage.event_retention_max_count,
+                    max_age_seconds=config.storage.event_retention_max_age_seconds,
+                )
+            finally:
+                store.close()
+    else:
+        events = {
+            "events_before": 0,
+            "events_after": 0,
+            "pruned_events": 0,
+            "dry_run": args.dry_run,
+        }
+    traces = JsonlTrace(
+        config.storage_dir / "traces" / "events.jsonl",
+        max_bytes=config.storage.trace_max_bytes,
+        backup_count=config.storage.trace_backup_count,
+        create=False,
+    ).maintenance(dry_run=args.dry_run)
+    roots = WorkspaceRoots(workspace, allow_outside=config.safety.allow_outside_workspace)
+    checkpoints = CheckpointManager(
+        roots,
+        enabled=True,
+        max_bytes=config.safety.checkpoint_max_bytes,
+        retention_max_count=config.safety.checkpoint_retention_max_count,
+        retention_max_bytes=config.safety.checkpoint_retention_max_bytes,
+        retention_max_age_seconds=config.safety.checkpoint_retention_max_age_seconds,
+        create_directory=False,
+    ).prune(dry_run=args.dry_run)
+    report = {"events": events, "traces": traces, "checkpoints": checkpoints}
+    if args.json:
+        print(json_dumps(report, pretty=True))
+    else:
+        prefix = "would prune" if args.dry_run else "pruned"
+        print(f"events: {prefix} {events['pruned_events']}")
+        print(
+            f"traces: {prefix} "
+            f"{traces['records_before'] - traces['records_after']} record(s)"
+        )
+        print(f"checkpoints: {prefix} {checkpoints['pruned_count']}")
+    return 0
+
+
 async def _eval(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="borealis-eval-") as temp:
         workspace = Path(temp)
@@ -637,7 +712,23 @@ def _result_footer(result) -> str:  # type: ignore[no-untyped-def]
         parts.append(f"response_cache_hits={result.usage.application_cache_hits}")
         parts.append(f"tokens_avoided={result.usage.application_cache_saved_tokens}")
     if result.verification is not None:
-        parts.append(f"verified={result.verification.get('ok')}")
+        parts.append(
+            "checks_ok="
+            + str(
+                result.verification.get(
+                    "checks_ok", result.verification.get("ok", False)
+                )
+            )
+        )
+        parts.append(
+            "process_lifecycle_guaranteed="
+            + str(
+                result.verification.get(
+                    "process_lifecycle_guaranteed",
+                    result.verification.get("process_lifecycle_complete", False),
+                )
+            )
+        )
     if result.error:
         parts.append(f"error={result.error}")
     return " · ".join(parts)

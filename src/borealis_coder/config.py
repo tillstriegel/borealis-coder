@@ -46,6 +46,7 @@ class AgentConfig:
     max_repeated_calls: int = 3
     auto_verify: bool = True
     auto_verify_max_seconds: int = 900
+    auto_verify_max_repair_cycles: int = 1
     deterministic_compaction: bool = True
 
 
@@ -78,6 +79,9 @@ class SafetyConfig:
     )
     checkpoints: bool = True
     checkpoint_max_bytes: int = 25_000_000
+    checkpoint_retention_max_count: int = 50
+    checkpoint_retention_max_bytes: int = 250_000_000
+    checkpoint_retention_max_age_seconds: int = 0
     approval_cache: str = "session"
     protected_paths: list[str] = field(
         default_factory=lambda: [
@@ -106,6 +110,7 @@ class ContextConfig:
     max_file_bytes: int = 2_000_000
     max_search_results: int = 200
     tool_output_chars: int = 24_000
+    compact_tool_output_tokens: int = 40_000
     include_git_status: bool = True
     instruction_names: list[str] = field(
         default_factory=lambda: ["AGENTS.md", "BOREALIS.md", "CLAUDE.md"]
@@ -134,6 +139,11 @@ class StorageConfig:
     directory: str = "~/.local/share/borealis"
     database: str = "sessions.sqlite3"
     trace_jsonl: bool = True
+    persist_event_deltas: bool = False
+    trace_max_bytes: int = 10_000_000
+    trace_backup_count: int = 3
+    event_retention_max_count: int = 250_000
+    event_retention_max_age_seconds: int = 0
     retain_raw_provider_responses: bool = False
 
 
@@ -414,6 +424,7 @@ def load_config(
     *,
     explicit_path: Path | None = None,
     overrides: dict[str, Any] | None = None,
+    ensure_storage: bool = True,
 ) -> Config:
     workspace = workspace.resolve()
     merged: dict[str, Any] = dict(DEFAULTS)
@@ -470,7 +481,8 @@ def load_config(
         source_files=sources,
     )
     validate_config(config)
-    ensure_private_directory(config.storage_dir)
+    if ensure_storage:
+        ensure_private_directory(config.storage_dir)
     return config
 
 
@@ -547,6 +559,16 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("safety.approval must be never, on-risk, or always")
     if config.safety.max_process_output_chars < 1:
         raise ConfigurationError("safety.max_process_output_chars must be positive")
+    if config.agent.auto_verify_max_repair_cycles < 0:
+        raise ConfigurationError("agent.auto_verify_max_repair_cycles cannot be negative")
+    if config.safety.checkpoint_max_bytes < 1:
+        raise ConfigurationError("safety.checkpoint_max_bytes must be positive")
+    if config.safety.checkpoint_retention_max_count < 1:
+        raise ConfigurationError("safety.checkpoint_retention_max_count must be positive")
+    if config.safety.checkpoint_retention_max_bytes < 1:
+        raise ConfigurationError("safety.checkpoint_retention_max_bytes must be positive")
+    if config.safety.checkpoint_retention_max_age_seconds < 0:
+        raise ConfigurationError("safety.checkpoint_retention_max_age_seconds cannot be negative")
     if config.sandbox.driver not in {"native", "docker"}:
         raise ConfigurationError("sandbox.driver must be native or docker")
     if config.sandbox.process_cpu_seconds < 1:
@@ -557,6 +579,16 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("context.max_search_results must be positive")
     if config.context.tool_output_chars < 1:
         raise ConfigurationError("context.tool_output_chars must be positive")
+    if config.context.compact_tool_output_tokens < 1:
+        raise ConfigurationError("context.compact_tool_output_tokens must be positive")
+    if config.storage.trace_max_bytes < 1:
+        raise ConfigurationError("storage.trace_max_bytes must be positive")
+    if config.storage.trace_backup_count < 0:
+        raise ConfigurationError("storage.trace_backup_count cannot be negative")
+    if config.storage.event_retention_max_count < 1:
+        raise ConfigurationError("storage.event_retention_max_count must be positive")
+    if config.storage.event_retention_max_age_seconds < 0:
+        raise ConfigurationError("storage.event_retention_max_age_seconds cannot be negative")
     if config.cache.anthropic_ttl not in {"5m", "1h"}:
         raise ConfigurationError("cache.anthropic_ttl must be 5m or 1h")
     if config.cache.response_cache_ttl_seconds < 0:
