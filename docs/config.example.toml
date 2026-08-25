@@ -20,6 +20,14 @@ auto_verify = true
 auto_verify_max_seconds = 900
 auto_verify_max_repair_cycles = 1
 deterministic_compaction = true
+compaction_version = 2
+compaction_target_ratio = 0.70
+compaction_safety_margin_tokens = 2048
+compaction_provider_framing_tokens = 512
+compaction_max_overflow_retries = 2
+compaction_summarizer_input_tokens = 32000
+compaction_summarizer_total_input_tokens = 96000
+compaction_shadow_v2 = false
 
 [safety]
 mode = "workspace-write"

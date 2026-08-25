@@ -1,0 +1,82 @@
+# Compaction v2
+
+Compaction v2 creates a bounded provider view. It does not edit the durable session history.
+
+## Design requirements
+
+- Durable messages are append-only. Compaction artifacts use a separate SQLite table.
+- Every compacted summary is escaped and framed as untrusted quoted history.
+- A synthetic summary is system context. It is never a current user message.
+- An assistant tool call and all matching tool results form one atomic bundle.
+- Malformed call and result relationships stop request preparation.
+- Current objectives, recent user constraints, pending work, blockers, changed files, and verification evidence have priority.
+- A successful compaction must fit the calculated target in tokens and bytes.
+- Cancellation, provider errors, usage, and cost keep their normal accounting behavior.
+- Each artifact records the exact summary, source IDs and hash, configuration fingerprint, retained IDs, usage, and parent artifact.
+- An invalid or failed model summary falls back to the deterministic artifact.
+
+## Provider view
+
+The durable messages remain unchanged. Request preparation first validates and groups them as:
+
+- user request;
+- assistant tool call with all results;
+- steering message;
+- verification result;
+- terminal assistant response.
+
+The deterministic artifact contains these sections in a stable order:
+
+1. Current objective
+2. User constraints
+3. Completed work
+4. Files changed
+5. Important decisions
+6. Latest verification
+7. Open failures and blockers
+8. Pending work
+9. Historical excerpts
+
+Borealis records an unavailable marker when durable structured evidence does not support a section. It does not infer decisions from prose.
+
+## Context budget
+
+`ContextBudget` starts with the configured model input limit. It reserves output tokens, system and tool-schema tokens, provider framing, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input.
+
+After a provider overflow, Borealis increases the safety margin and retries with a smaller provider-message target. `compaction_max_overflow_retries` is a strict upper bound. The reduction order is historical excerpts, retained bundles, and diagnostic output. The final fallback preserves mandatory state and the latest actionable bundle or returns a context-budget error before another provider call.
+
+## Durable reuse
+
+An artifact is reusable only when its source-content hash, strategy, prompt version, model selection, configuration fingerprint, and retained provider messages match. The artifact stores the exact summary, retained provider payload, and compacted-context hash. Resume checks it before it calls an LLM summarizer. A new artifact records the previous artifact as its parent when the old source range is an exact prefix. Only the new transcript suffix is sent to the summarizer.
+
+LLM compaction uses a strict JSON schema and bounded chunks. Output must retain all critical source fields and may contain only source-backed values. Empty, malformed, invented, over-budget, cancelled, or overflowing summaries use the deterministic artifact. Usage from completed or failed summary requests is recorded before an error is propagated.
+
+## Evaluation and release gates
+
+Run the fixed offline corpus:
+
+```sh
+PYTHONPATH=src python scripts/evaluate_compaction.py
+```
+
+The corpus covers multi-file work, requirement changes, repeated failures, large output, cancellation and resume, continuation metadata, steering, hostile content, repeated compaction, and provider overflow. It reports critical-fact recall, false completion claims, boundary escapes, tool ordering, token reduction, target compliance, latency, cost, resume determinism, and full-history versus compacted completion scores. The offline score uses source-backed task facts; callers can supply a model or human-backed scorer for deeper quality evaluation.
+
+The release gates are:
+
+- 100% recall of marked critical facts;
+- zero boundary escapes;
+- zero invalid tool sequences;
+- every successful size case below target;
+- no second LLM charge for an unchanged resume;
+- no completion-quality regression greater than five percentage points when a completion scorer is supplied.
+
+## Rollout
+
+`agent.compaction_version = 2` enables v2. A compatibility v1 path remains available for one release and uses the same secure framing.
+
+1. Set `compaction_version = 1` and `compaction_shadow_v2 = true` to emit safe v2 comparison metrics while v1 remains active.
+2. Set `compaction_version = 2` with `deterministic_compaction = true` to enable deterministic v2 and durable reuse.
+3. Set `deterministic_compaction = false` only after the evaluation gates pass for the configured summarizer provider.
+4. Remove v1 after the compatibility release.
+
+`context.compacted` and `context.compaction_shadow` events contain sizes, counts, strategy, artifact version, reuse state, overflow retry count, fallback reason, usage, and latency. They do not contain summary text.

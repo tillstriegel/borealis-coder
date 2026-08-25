@@ -29,6 +29,7 @@ from ..errors import (
 from ..events import EventBus
 from ..models import (
     AgentResult,
+    CompactionArtifact,
     ContinuationState,
     Message,
     ModelResponse,
@@ -44,12 +45,19 @@ from ..safety import ApprovalManager
 from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import MutationScope, ToolContext, ToolRegistry, VerificationPlanner
-from ..util import estimate_tokens, json_dumps, new_id, truncate_text
-from .budget import Budget, estimate_request_tokens, max_turns_recovery_message
+from ..util import estimate_tokens, json_dumps, monotonic_ms, new_id, truncate_text
+from .budget import Budget, ContextBudget, estimate_request_tokens, max_turns_recovery_message
 from .compaction import (
+    COMPACTION_RESPONSE_SCHEMA,
+    CompactionError,
+    CompactionEvidence,
+    CompactionSizeError,
     Summarizer,
+    compact_messages,
+    compact_messages_v1,
     compact_messages_with_summary,
     prune_provider_messages,
+    validate_tool_call_order,
 )
 
 if TYPE_CHECKING:
@@ -82,6 +90,7 @@ class PreparedProviderRequest:
     estimated_tokens: int
     compacted: bool
     prune_signature: tuple[int, ...] | None
+    compaction_metadata: dict[str, Any] | None = None
 
 
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
@@ -368,6 +377,7 @@ class AgentRunner:
         awaiting_repair = False
         verification_finalization_pending = False
         compacted = False
+        provider_overflow_retries = 0
         last_prune_signature: tuple[int, ...] | None = None
 
         async def publish_authoritative_result(text: str) -> None:
@@ -437,12 +447,11 @@ class AgentRunner:
                     session_id=session_id,
                     run_id=run_id,
                     last_prune_signature=last_prune_signature,
+                    overflow_retry_count=provider_overflow_retries,
                 )
                 request = prepared.request
                 estimated = prepared.estimated_tokens
                 compacted = compacted or prepared.compacted
-                if prepared.compacted:
-                    messages = list(request.messages)
                 last_prune_signature = prepared.prune_signature
                 await self.events.emit(
                     "model.started",
@@ -472,21 +481,28 @@ class AgentRunner:
                         assistant_message_id,
                         emit_response_deltas=not buffer_candidate_output,
                     )
-                except ProviderContextOverflowError:
-                    if compacted:
+                except ProviderContextOverflowError as error:
+                    if error.usage is not None:
+                        await usage_sink(error.usage)
+                    if (
+                        provider_overflow_retries
+                        >= self.config.agent.compaction_max_overflow_retries
+                    ):
                         raise
-                    messages = await compact_messages_with_summary(
-                        messages, self._summarizer(usage_sink, cancel), keep_recent=12
-                    )
-                    compacted = True
+                    provider_overflow_retries += 1
                     await self.events.emit(
-                        "context.compacted",
+                        "context.overflow_retry",
                         session_id=session_id,
                         run_id=run_id,
                         provider_overflow=True,
-                        messages=len(messages),
+                        provider_overflow_retry_count=provider_overflow_retries,
+                        fallback_reason="provider_context_overflow",
                     )
                     continue
+                except ProviderError as error:
+                    if error.usage is not None:
+                        await usage_sink(error.usage)
+                    raise
                 await asyncio.to_thread(self.sessions.add_usage, session_id, response.usage)
                 usage_budget_error: BudgetExceeded | None = None
                 try:
@@ -1010,6 +1026,7 @@ class AgentRunner:
         session_id: str,
         run_id: str,
         last_prune_signature: tuple[int, ...] | None,
+        overflow_retry_count: int = 0,
     ) -> PreparedProviderRequest:
         turn_system = prompt_context.text
         turn_system_blocks = prompt_context.system_blocks
@@ -1027,13 +1044,21 @@ class AgentRunner:
             ]
 
         request_messages, metrics = prune_provider_messages(messages)
+        validate_tool_call_order(request_messages)
         raw_estimated = estimate_request_tokens(turn_system, messages, schemas)
         estimated = estimate_request_tokens(turn_system, request_messages, schemas)
-        threshold = int(
-            self.config.agent.max_input_tokens * self.config.agent.compact_at_ratio
+        context_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=turn_system,
+            tools=schemas,
+            messages=request_messages,
+            provider=self.providers[0].provider.name,
+            overflow_retry_count=overflow_retry_count,
         )
         compaction_reason: str | None = None
-        if raw_estimated >= threshold:
+        if overflow_retry_count:
+            compaction_reason = "provider_context_overflow"
+        elif context_budget.estimated_total(request_messages) >= context_budget.trigger_tokens:
             compaction_reason = "estimated_tokens"
         elif (
             metrics.tool_output_tokens_before
@@ -1060,43 +1085,370 @@ class AgentRunner:
             )
 
         keep_recent = 12 if adaptive_cache else 18
-        provider_view_is_compacted = bool(
-            request_messages and request_messages[0].metadata.get("compacted")
-        )
-        enough_new_context = len(request_messages) > (keep_recent * 2) + 1
         compacted = False
-        if compaction_reason is not None and (
-            not provider_view_is_compacted
-            or enough_new_context
-            or estimated > self.config.agent.max_input_tokens
-        ):
-            compacted_messages = await compact_messages_with_summary(
-                request_messages,
-                self._summarizer(usage_sink, cancel),
-                keep_recent=keep_recent,
+        compaction_metadata: dict[str, Any] | None = None
+        if compaction_reason is not None:
+            summary_usage = Usage()
+            summary_started_ms = monotonic_ms()
+            provider_message_target = context_budget.message_target_tokens
+            if compaction_reason == "tool_output_volume":
+                provider_message_target = min(
+                    provider_message_target,
+                    max(1_024, int(metrics.tokens_before * 0.85)),
+                )
+            elif compaction_reason == "provider_context_overflow":
+                provider_message_target = min(
+                    provider_message_target,
+                    max(
+                        1_024,
+                        int(metrics.tokens_before * (0.70**overflow_retry_count)),
+                    ),
+                )
+            intended_strategy = (
+                "deterministic"
+                if self.config.agent.deterministic_compaction
+                or self.config.agent.compaction_version == 1
+                else "llm"
             )
+            artifact_version = self.config.agent.compaction_version
+            fingerprint = self._compaction_config_fingerprint(
+                context_budget,
+                intended_strategy,
+                artifact_version,
+            )
+            incremental_parent = await asyncio.to_thread(
+                self.sessions.latest_compaction_artifact,
+                session_id,
+                config_fingerprint=fingerprint,
+                strategy=intended_strategy,
+            )
+            if incremental_parent is None and intended_strategy == "llm":
+                incremental_parent = await asyncio.to_thread(
+                    self.sessions.latest_compaction_artifact,
+                    session_id,
+                    config_fingerprint=fingerprint,
+                    strategy="deterministic",
+                )
+            current_source_ids = [message.id for message in request_messages]
+            parent_is_prefix = bool(
+                incremental_parent is not None
+                and current_source_ids[: len(incremental_parent.source_message_ids)]
+                == incremental_parent.source_message_ids
+            )
+            compaction_kwargs = {
+                "keep_recent": keep_recent,
+                "summary_tokens": provider_message_target,
+                "summary_bytes": provider_message_target * 4,
+                "summarizer_input_tokens": (
+                    self.config.agent.compaction_summarizer_input_tokens
+                ),
+                "summarizer_total_input_tokens": (
+                    self.config.agent.compaction_summarizer_total_input_tokens
+                ),
+                "target_tokens": provider_message_target,
+                "force": compaction_reason in {
+                    "tool_output_volume",
+                    "provider_context_overflow",
+                },
+                "base_evidence": (
+                    CompactionEvidence.from_dict(
+                        incremental_parent.metadata.get("authoritative_evidence")
+                        or incremental_parent.metadata.get("evidence")
+                    )
+                    if parent_is_prefix and incremental_parent is not None
+                    else None
+                ),
+                "base_source_message_ids": (
+                    incremental_parent.source_message_ids
+                    if parent_is_prefix and incremental_parent is not None
+                    else None
+                ),
+            }
+            try:
+                if self.config.agent.compaction_version == 1:
+                    if self.config.agent.compaction_shadow_v2:
+                        try:
+                            shadow = compact_messages(
+                                request_messages,
+                                keep_recent=keep_recent,
+                                summary_tokens=provider_message_target,
+                                summary_bytes=provider_message_target * 4,
+                                target_tokens=provider_message_target,
+                                force=bool(compaction_kwargs["force"]),
+                            )
+                            shadow_metadata = shadow[0].metadata
+                            shadow_evidence = CompactionEvidence.from_dict(
+                                shadow_metadata.get("authoritative_evidence")
+                                or shadow_metadata.get("evidence")
+                            )
+                            critical_fact_count = sum(
+                                len(getattr(shadow_evidence, field))
+                                for field in (
+                                    "current_objective",
+                                    "user_constraints",
+                                    "files_changed",
+                                    "latest_verification",
+                                    "open_failures_and_blockers",
+                                    "pending_work",
+                                )
+                            )
+                            await self.events.emit(
+                                "context.compaction_shadow",
+                                session_id=session_id,
+                                run_id=run_id,
+                                artifact_version=2,
+                                strategy=shadow_metadata.get("strategy"),
+                                source_bundle_count=shadow_metadata.get(
+                                    "source_bundles", 0
+                                ),
+                                retained_bundle_count=shadow_metadata.get(
+                                    "retained_bundles", 0
+                                ),
+                                compacted_bundle_count=shadow_metadata.get(
+                                    "compacted_bundles", 0
+                                ),
+                                critical_fact_count=critical_fact_count,
+                                estimated_tokens_before=metrics.tokens_before,
+                                estimated_tokens_after=estimate_request_tokens(
+                                    "", shadow, []
+                                ),
+                                target_tokens=context_budget.target_tokens,
+                                below_target=(
+                                    estimate_request_tokens("", shadow, [])
+                                    <= provider_message_target
+                                ),
+                            )
+                        except CompactionError as shadow_error:
+                            await self.events.emit(
+                                "context.compaction_shadow",
+                                session_id=session_id,
+                                run_id=run_id,
+                                artifact_version=2,
+                                fallback_reason=type(shadow_error).__name__,
+                            )
+                    deterministic_messages = compact_messages_v1(
+                        request_messages,
+                        keep_recent=keep_recent,
+                    )
+                else:
+                    deterministic_messages = await compact_messages_with_summary(
+                        request_messages,
+                        None,
+                        **compaction_kwargs,
+                    )
+            except CompactionSizeError as error:
+                raise BudgetExceeded("context", str(error)) from error
+            compacted_messages = deterministic_messages
+            if deterministic_messages != request_messages:
+                deterministic_artifact = deterministic_messages[0]
+                durable_by_id = {message.id: message for message in messages}
+                durable_source = [
+                    durable_by_id[str(message_id)]
+                    for message_id in deterministic_artifact.metadata[
+                        "source_message_ids"
+                    ]
+                    if str(message_id) in durable_by_id
+                ]
+                if len(durable_source) != len(
+                    deterministic_artifact.metadata["source_message_ids"]
+                ):
+                    raise CompactionError(
+                        "Compaction source IDs do not resolve to durable messages"
+                    )
+                durable_source_hash = hashlib.sha256(
+                    json_dumps([message.to_dict() for message in durable_source]).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                deterministic_artifact = replace(
+                    deterministic_artifact,
+                    metadata={
+                        **deterministic_artifact.metadata,
+                        "source_hash": durable_source_hash,
+                    },
+                )
+                deterministic_messages = [
+                    deterministic_artifact,
+                    *deterministic_messages[1:],
+                ]
+                compacted_messages = deterministic_messages
+                reusable = await asyncio.to_thread(
+                    self.sessions.reusable_compaction_artifact,
+                    session_id,
+                    source_hash=str(deterministic_artifact.metadata["source_hash"]),
+                    config_fingerprint=fingerprint,
+                    strategy=intended_strategy,
+                )
+                if reusable is None and intended_strategy == "llm":
+                    reusable = await asyncio.to_thread(
+                        self.sessions.reusable_compaction_artifact,
+                        session_id,
+                        source_hash=str(deterministic_artifact.metadata["source_hash"]),
+                        config_fingerprint=fingerprint,
+                        strategy="deterministic",
+                    )
+                if reusable is not None and reusable.metadata.get(
+                    "provider_messages"
+                ) != [message.to_dict() for message in deterministic_messages[1:]]:
+                    reusable = None
+                if reusable is not None:
+                    compacted_messages = [
+                        replace(
+                            deterministic_artifact,
+                            content=reusable.summary_text,
+                            metadata={
+                                **deterministic_artifact.metadata,
+                                "strategy": reusable.strategy,
+                                "artifact_id": reusable.id,
+                                "artifact_reused": True,
+                                "fallback_reason": reusable.metadata.get(
+                                    "fallback_reason"
+                                ),
+                                "requested_strategy": reusable.metadata.get(
+                                    "requested_strategy", reusable.strategy
+                                ),
+                                "evidence": reusable.metadata.get(
+                                    "evidence",
+                                    deterministic_artifact.metadata.get("evidence", {}),
+                                ),
+                            },
+                        ),
+                        *deterministic_messages[1:],
+                    ]
+                elif intended_strategy == "llm":
+                    transcript_message_ids: set[str] | None = None
+                    source_ids = [
+                        str(item)
+                        for item in deterministic_artifact.metadata[
+                            "source_message_ids"
+                        ]
+                    ]
+                    if (
+                        incremental_parent is not None
+                        and source_ids[: len(incremental_parent.source_message_ids)]
+                        == incremental_parent.source_message_ids
+                    ):
+                        transcript_message_ids = set(
+                            source_ids[len(incremental_parent.source_message_ids) :]
+                        )
+                    compacted_messages = await compact_messages_with_summary(
+                        request_messages,
+                        self._summarizer(usage_sink, cancel, summary_usage),
+                        transcript_message_ids=transcript_message_ids,
+                        **compaction_kwargs,
+                    )
+                    if compacted_messages != request_messages:
+                        compacted_messages = [
+                            replace(
+                                compacted_messages[0],
+                                metadata={
+                                    **compacted_messages[0].metadata,
+                                    "source_hash": durable_source_hash,
+                                },
+                            ),
+                            *compacted_messages[1:],
+                        ]
             if compacted_messages != request_messages:
-                request_messages = compacted_messages
+                artifact_messages = [
+                    message
+                    for message in compacted_messages
+                    if message.role == Role.SYSTEM and message.metadata.get("compacted")
+                ]
+                if len(artifact_messages) != 1:
+                    raise CompactionError(
+                        "Compaction must produce exactly one synthetic system artifact"
+                    )
+                artifact_message = artifact_messages[0]
+                retained_messages = [
+                    message for message in compacted_messages if message is not artifact_message
+                ]
+                validate_tool_call_order(retained_messages)
+                artifact_message, reused = await self._record_or_reuse_compaction_artifact(
+                    session_id=session_id,
+                    source_messages=request_messages,
+                    artifact_message=artifact_message,
+                    retained_messages=retained_messages,
+                    context_budget=context_budget,
+                    summary_usage=summary_usage,
+                )
+                turn_system = f"{turn_system}\n\n{artifact_message.content}"
+                turn_system_blocks = [
+                    *turn_system_blocks,
+                    {"text": artifact_message.content, "cacheable": False},
+                ]
+                request_messages = retained_messages
                 compacted = True
                 tool_tokens = sum(
                     estimate_tokens(message.content)
                     for message in request_messages
                     if message.role == Role.TOOL
                 )
+                estimated = estimate_request_tokens(turn_system, request_messages, schemas)
+                if estimated > context_budget.target_tokens:
+                    raise CompactionError(
+                        f"Compacted request size {estimated} exceeds calculated target "
+                        f"{context_budget.target_tokens}"
+                    )
+                tokens_after = estimated
+                conversation_tokens_after = estimate_request_tokens(
+                    artifact_message.content, request_messages, []
+                )
+                reduction = (
+                    max(0.0, 1.0 - (tokens_after / raw_estimated))
+                    if raw_estimated
+                    else 0.0
+                )
+                compaction_metadata = {
+                    "strategy": artifact_message.metadata.get("strategy"),
+                    "artifact_version": artifact_message.metadata.get(
+                        "artifact_version", 2
+                    ),
+                    "source_bundle_count": artifact_message.metadata.get(
+                        "source_bundles", 0
+                    ),
+                    "retained_bundle_count": artifact_message.metadata.get(
+                        "retained_bundles", 0
+                    ),
+                    "compacted_bundle_count": artifact_message.metadata.get(
+                        "compacted_bundles", 0
+                    ),
+                    "estimated_tokens_before": raw_estimated,
+                    "target_tokens": context_budget.target_tokens,
+                    "estimated_tokens_after": tokens_after,
+                    "reduction_percentage": round(reduction * 100, 2),
+                    "provider_overflow_retry_count": overflow_retry_count,
+                    "artifact_reused": reused,
+                    "fallback_reason": (
+                        artifact_message.metadata.get("fallback_reason")
+                        or (
+                            "provider_context_overflow"
+                            if compaction_reason == "provider_context_overflow"
+                            else None
+                        )
+                    ),
+                    "summarization_usage": summary_usage.to_dict(),
+                    "summarization_latency_ms": monotonic_ms() - summary_started_ms,
+                }
                 await self.events.emit(
                     "context.compacted",
                     session_id=session_id,
                     run_id=run_id,
                     compaction_reason=compaction_reason,
                     tokens_before=metrics.tokens_before,
-                    tokens_after=estimate_request_tokens("", request_messages, []),
+                    tokens_after=conversation_tokens_after,
                     superseded_reads_removed=metrics.superseded_reads_removed,
                     tool_output_tokens_retained=tool_tokens,
-                    estimated_tokens_before=raw_estimated,
                     messages=len(request_messages),
+                    **compaction_metadata,
                 )
-                estimated = estimate_request_tokens(turn_system, request_messages, schemas)
-        if estimated > self.config.agent.max_input_tokens:
+        if (
+            estimated
+            + context_budget.reserved_output_tokens
+            + context_budget.safety_margin_tokens
+            + context_budget.provider_framing_tokens
+            + context_budget.continuation_state_tokens
+            > context_budget.input_limit
+        ):
             raise BudgetExceeded(
                 "context",
                 f"Estimated request size {estimated} exceeds "
@@ -1120,7 +1472,170 @@ class AgentRunner:
                 "system_blocks": turn_system_blocks,
             },
         )
-        return PreparedProviderRequest(request, estimated, compacted, prune_signature)
+        return PreparedProviderRequest(
+            request, estimated, compacted, prune_signature, compaction_metadata
+        )
+
+    async def _record_or_reuse_compaction_artifact(
+        self,
+        *,
+        session_id: str,
+        source_messages: list[Message],
+        artifact_message: Message,
+        retained_messages: list[Message],
+        context_budget: ContextBudget,
+        summary_usage: Usage,
+    ) -> tuple[Message, bool]:
+        """Reuse an exact immutable artifact or persist the exact new provider context."""
+
+        strategy = str(artifact_message.metadata.get("strategy") or "deterministic")
+        requested_strategy = str(
+            artifact_message.metadata.get("requested_strategy") or strategy
+        )
+        artifact_version = int(artifact_message.metadata.get("artifact_version", 2))
+        config_fingerprint = self._compaction_config_fingerprint(
+            context_budget, requested_strategy, artifact_version
+        )
+        source_hash = str(artifact_message.metadata["source_hash"])
+        reusable = await asyncio.to_thread(
+            self.sessions.reusable_compaction_artifact,
+            session_id,
+            source_hash=source_hash,
+            config_fingerprint=config_fingerprint,
+            strategy=strategy,
+        )
+        if reusable is not None:
+            return (
+                replace(
+                    artifact_message,
+                    content=reusable.summary_text,
+                    metadata={
+                        **artifact_message.metadata,
+                        "artifact_id": reusable.id,
+                        "artifact_reused": True,
+                    },
+                ),
+                True,
+            )
+
+        source_ids = [str(item) for item in artifact_message.metadata["source_message_ids"]]
+        source_id_set = set(source_ids)
+        source = [message for message in source_messages if message.id in source_id_set]
+        sequenced = await asyncio.to_thread(self.sessions.sequenced_messages, session_id)
+        sequence_by_id = {message.id: sequence for sequence, message in sequenced}
+        sequences = [sequence_by_id[item] for item in source_ids if item in sequence_by_id]
+        parent = await asyncio.to_thread(
+            self.sessions.latest_compaction_artifact,
+            session_id,
+            config_fingerprint=config_fingerprint,
+            strategy=strategy,
+        )
+        parent_id: str | None = None
+        if parent is not None and source_ids[: len(parent.source_message_ids)] == parent.source_message_ids:
+            parent_id = parent.id
+        artifact = CompactionArtifact(
+            session_id=session_id,
+            version=artifact_version,
+            strategy=strategy,
+            source_message_ids=source_ids,
+            source_hash=source_hash,
+            summary_text=artifact_message.content,
+            provider=(
+                self.providers[0].name if requested_strategy == "llm" else None
+            ),
+            model=(
+                self.config.agent.small_model or self.providers[0].model
+                if requested_strategy == "llm"
+                else None
+            ),
+            config_fingerprint=config_fingerprint,
+            estimated_tokens_before=estimate_request_tokens("", source, []),
+            estimated_tokens_after=estimate_tokens(artifact_message.content) + 12,
+            usage=summary_usage,
+            source_start_sequence=min(sequences) if sequences else None,
+            source_end_sequence=max(sequences) if sequences else None,
+            parent_artifact_id=parent_id,
+            metadata={
+                "source_bundle_count": artifact_message.metadata.get("source_bundles", 0),
+                "retained_bundle_count": artifact_message.metadata.get(
+                    "retained_bundles", 0
+                ),
+                "compacted_bundle_count": artifact_message.metadata.get(
+                    "compacted_bundles", 0
+                ),
+                "retained_message_ids": [message.id for message in retained_messages],
+                "provider_messages": [
+                    message.to_dict() for message in retained_messages
+                ],
+                "compacted_context_hash": hashlib.sha256(
+                    json_dumps(
+                        {
+                            "summary_text": artifact_message.content,
+                            "messages": [
+                                message.to_dict() for message in retained_messages
+                            ],
+                        }
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "evidence": artifact_message.metadata.get("evidence", {}),
+                "authoritative_evidence": artifact_message.metadata.get(
+                    "authoritative_evidence",
+                    artifact_message.metadata.get("evidence", {}),
+                ),
+                "fallback_reason": artifact_message.metadata.get("fallback_reason"),
+                "requested_strategy": requested_strategy,
+                "context_budget": asdict(context_budget),
+            },
+        )
+        await asyncio.to_thread(self.sessions.append_compaction_artifact, artifact)
+        return (
+            replace(
+                artifact_message,
+                metadata={
+                    **artifact_message.metadata,
+                    "artifact_id": artifact.id,
+                    "artifact_reused": False,
+                },
+            ),
+            False,
+        )
+
+    def _compaction_config_fingerprint(
+        self,
+        context_budget: ContextBudget,
+        strategy: str,
+        artifact_version: int = 2,
+    ) -> str:
+        fingerprint_payload = {
+            "artifact_version": artifact_version,
+            "strategy": strategy,
+            "prompt_version": 2,
+            "target_tokens": context_budget.target_tokens,
+            "summary_model": (
+                self.config.agent.small_model or self.providers[0].model
+                if strategy == "llm"
+                else None
+            ),
+            "config": {
+                "compaction_target_ratio": self.config.agent.compaction_target_ratio,
+                "compaction_safety_margin_tokens": (
+                    context_budget.safety_margin_tokens
+                ),
+                "compaction_provider_framing_tokens": (
+                    context_budget.provider_framing_tokens
+                ),
+                "compaction_summarizer_input_tokens": (
+                    self.config.agent.compaction_summarizer_input_tokens
+                ),
+                "compaction_summarizer_total_input_tokens": (
+                    self.config.agent.compaction_summarizer_total_input_tokens
+                ),
+                "max_output_tokens": self.config.agent.max_output_tokens,
+            },
+        }
+        return hashlib.sha256(
+            json_dumps(fingerprint_payload).encode("utf-8")
+        ).hexdigest()
 
     async def _drain_steering(self, session_id: str, run_id: str, messages: list[Message]) -> bool:
         queue = self._steering.get(session_id)
@@ -1361,6 +1876,7 @@ class AgentRunner:
         self,
         usage_sink: Callable[[Usage], Awaitable[None]],
         cancel: asyncio.Event,
+        usage_collector: Usage | None = None,
     ) -> Summarizer | None:
         """Build an LLM-backed compaction summarizer from the primary route.
 
@@ -1384,6 +1900,7 @@ class AgentRunner:
                 ),
                 messages=[Message(role=Role.USER, content=transcript)],
                 max_output_tokens=min(4_000, self.config.agent.max_output_tokens),
+                response_schema=COMPACTION_RESPONSE_SCHEMA,
                 metadata={"purpose": "compaction_summary"},
             )
             request_task = asyncio.create_task(route.provider.complete(request))
@@ -1397,6 +1914,12 @@ class AgentRunner:
                     request_task.cancel()
                     raise Cancelled("Run cancelled")
                 response = await request_task
+            except ProviderError as error:
+                if error.usage is not None:
+                    if usage_collector is not None:
+                        usage_collector.add(error.usage)
+                    await usage_sink(error.usage)
+                raise
             finally:
                 cancel_task.cancel()
                 if not request_task.done():
@@ -1406,6 +1929,8 @@ class AgentRunner:
                     cancel_task,
                     return_exceptions=True,
                 )
+            if usage_collector is not None:
+                usage_collector.add(response.usage)
             await usage_sink(response.usage)
             if cancel.is_set():
                 raise Cancelled("Run cancelled")
@@ -1721,6 +2246,12 @@ class AgentRunner:
             ):
                 self._mark_workspace_tracking_incomplete(context)
                 result.metadata["workspace_change_tracking"] = "incomplete"
+            # A cancelled await can finish the database write before control reaches
+            # the recovery handler. Freeze the durable payload before that write so
+            # an idempotent recovery call cannot turn into an overwrite.
+            cancellation_message = replace(
+                cancellation_message, metadata=dict(result.metadata)
+            )
             if cancel.is_set():
                 await self._finish_after_tool_result(
                     asyncio.to_thread(

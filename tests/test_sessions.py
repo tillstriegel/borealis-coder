@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from borealis_coder.errors import SessionError
 from borealis_coder.events import EventBus, JsonlTrace
-from borealis_coder.models import Event, Message, Role, Usage
+from borealis_coder.models import CompactionArtifact, Event, Message, Role, Usage
 from borealis_coder.sessions import SessionStore
 
 
@@ -94,15 +94,16 @@ class SessionStoreTests(unittest.TestCase):
             ["run.completed"],
         )
 
-    def test_message_upsert_preserves_order_and_tool_ids_are_session_scoped(self):
+    def test_messages_are_append_only_and_tool_ids_are_session_scoped(self):
         first = Message(role=Role.USER, content="first")
         second = Message(role=Role.ASSISTANT, content="second")
         self.store.append_message(self.session.id, first)
         self.store.append_message(self.session.id, second)
         first.content = "updated"
-        self.store.append_message(self.session.id, first)
+        with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+            self.store.append_message(self.session.id, first)
         self.assertEqual(
-            [item.content for item in self.store.messages(self.session.id)], ["updated", "second"]
+            [item.content for item in self.store.messages(self.session.id)], ["first", "second"]
         )
 
         other = self.store.create_session(
@@ -117,6 +118,37 @@ class SessionStoreTests(unittest.TestCase):
         self.store.complete_tool_call(other.id, "same", output="b", is_error=False)
         self.assertEqual(self.store.tool_calls(self.session.id)[0]["output"], "a")
         self.assertEqual(self.store.tool_calls(other.id)[0]["output"], "b")
+
+    def test_tool_completion_cannot_overwrite_a_durable_result_message(self):
+        self.store.start_tool_call(
+            self.session.id, "run", "call", "read_file", {"path": "a"}
+        )
+        result = Message(
+            id="result",
+            role=Role.TOOL,
+            content="original",
+            tool_call_id="call",
+            tool_name="read_file",
+        )
+        self.store.complete_tool_call(
+            self.session.id,
+            "call",
+            output="original",
+            is_error=False,
+            message=result,
+        )
+        result.content = "overwritten"
+
+        with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+            self.store.complete_tool_call(
+                self.session.id,
+                "call",
+                output="overwritten",
+                is_error=False,
+                message=result,
+            )
+
+        self.assertEqual(self.store.messages(self.session.id)[0].content, "original")
 
     def test_v1_tool_call_schema_migrates(self):
         self.store.close()
@@ -158,7 +190,7 @@ class SessionStoreTests(unittest.TestCase):
             version = legacy._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='version'"
             ).fetchone()[0]
-            self.assertEqual(version, "3")
+            self.assertEqual(version, "4")
         finally:
             legacy.close()
         self.store = SessionStore(self.root / "sessions.sqlite3")
@@ -174,6 +206,43 @@ class SessionStoreTests(unittest.TestCase):
         self.store.set_value(self.session.id, "plan", {"x": 1})
         self.assertEqual(self.store.get_value(self.session.id, "plan"), {"x": 1})
         self.assertEqual(self.store.get_value(self.session.id, "missing", 9), 9)
+
+    def test_compaction_artifacts_are_immutable_reusable_and_exported(self):
+        artifact = CompactionArtifact(
+            id="cmp-test",
+            session_id=self.session.id,
+            version=2,
+            strategy="deterministic",
+            source_message_ids=["m1", "m2"],
+            source_hash="source-hash",
+            summary_text="exact compacted context",
+            config_fingerprint="config-hash",
+            estimated_tokens_before=100,
+            estimated_tokens_after=25,
+            usage=Usage(input_tokens=5, output_tokens=2, requests=1, cost_usd=0.01),
+            parent_artifact_id="cmp-parent",
+            metadata={"retained_message_ids": ["m3"]},
+        )
+
+        self.store.append_compaction_artifact(artifact)
+
+        latest = self.store.latest_compaction_artifact(self.session.id)
+        reusable = self.store.reusable_compaction_artifact(
+            self.session.id,
+            source_hash="source-hash",
+            config_fingerprint="config-hash",
+            strategy="deterministic",
+        )
+        assert latest is not None and reusable is not None
+        self.assertEqual(latest.summary_text, "exact compacted context")
+        self.assertEqual(reusable.id, artifact.id)
+        self.assertEqual(reusable.usage.cost_usd, 0.01)
+        self.assertEqual(
+            self.store.export(self.session.id)["compaction_artifacts"][0]["id"],
+            artifact.id,
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.append_compaction_artifact(artifact)
 
     def test_response_cache_is_bounded_and_tracks_usage(self):
         original = Usage(input_tokens=10, output_tokens=2, requests=1, cost_usd=0.25)

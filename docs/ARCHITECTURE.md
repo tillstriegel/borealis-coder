@@ -132,7 +132,7 @@ The safety subsystem is deliberately independent from prompts and providers.
 - optional Git status
 - bounded tool results
 
-The in-memory compactor summarizes structural facts, completed work, pending work, changed files, recent errors, and recent turns. The SQLite message log remains complete for replay and audit.
+The compactor builds validated turn bundles and a structured, untrusted historical artifact. It must meet a calculated provider target. Immutable versioned artifacts support exact resume reuse and incremental suffix compaction. The SQLite message log remains append-only and complete for replay and audit. See [COMPACTION.md](COMPACTION.md).
 
 ### `sessions/`
 

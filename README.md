@@ -343,7 +343,7 @@ Borealis builds model context incrementally:
 - It discovers project skills in `.agents/skills` and `.borealis/skills`, but injects only compact descriptions until a skill is explicitly loaded.
 - It extracts symbols for common programming languages and ranks files against the task query.
 - It gives the model search/read tools instead of front-loading the entire repository.
-- It deterministically compacts older turns near the configured context threshold while retaining durable full history in SQLite.
+- It compacts validated turn bundles to a calculated provider target while retaining append-only full history and reusable versioned artifacts in SQLite. See [Compaction v2](docs/COMPACTION.md).
 - It keeps a deterministic system-context prefix for provider prompt caching and appends Git status and request-ranked context afterward.
 - It reports provider cache reads, writes, hit rate, and savings, and can reuse short-lived exact text-only responses without replaying tools. Validated provider continuation state is retained so cached responses remain resumable.
 - Typing `/` at the interactive prompt opens a compact command selector with descriptions; continue typing to narrow it and use Tab to complete.

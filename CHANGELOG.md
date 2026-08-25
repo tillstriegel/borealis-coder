@@ -2,6 +2,17 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+- Compaction v2 with atomic conversation bundles, structured deterministic state,
+  provider-aware target budgets, durable incremental artifacts, bounded LLM
+  summarization, overflow recovery, safe observability, and a fixed release-gate corpus.
+
+### Security
+- Compacted user, assistant, and tool history is escaped through one untrusted-data
+  boundary implementation. Durable messages are append-only across every write path.
+
 ## [0.1.3] - 2026-08-21
 
 ### Added

@@ -354,3 +354,72 @@ class SessionInfo:
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class CompactionArtifact:
+    """Immutable provider-context artifact derived from durable session messages."""
+
+    session_id: str
+    version: int
+    strategy: str
+    source_message_ids: list[str]
+    source_hash: str
+    summary_text: str
+    config_fingerprint: str
+    estimated_tokens_before: int
+    estimated_tokens_after: int
+    id: str = field(default_factory=lambda: new_id("cmp"))
+    source_start_sequence: int | None = None
+    source_end_sequence: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    usage: Usage = field(default_factory=Usage)
+    created_at: str = field(default_factory=utc_now)
+    parent_artifact_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "version": self.version,
+            "strategy": self.strategy,
+            "source_message_ids": self.source_message_ids,
+            "source_hash": self.source_hash,
+            "summary_text": self.summary_text,
+            "provider": self.provider,
+            "model": self.model,
+            "config_fingerprint": self.config_fingerprint,
+            "estimated_tokens_before": self.estimated_tokens_before,
+            "estimated_tokens_after": self.estimated_tokens_after,
+            "usage": self.usage.to_dict(),
+            "created_at": self.created_at,
+            "parent_artifact_id": self.parent_artifact_id,
+            "source_start_sequence": self.source_start_sequence,
+            "source_end_sequence": self.source_end_sequence,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> CompactionArtifact:
+        return cls(
+            id=str(value["id"]),
+            session_id=str(value["session_id"]),
+            version=int(value["version"]),
+            strategy=str(value["strategy"]),
+            source_message_ids=[str(item) for item in value.get("source_message_ids", [])],
+            source_hash=str(value["source_hash"]),
+            summary_text=str(value["summary_text"]),
+            provider=value.get("provider"),
+            model=value.get("model"),
+            config_fingerprint=str(value["config_fingerprint"]),
+            estimated_tokens_before=int(value.get("estimated_tokens_before", 0)),
+            estimated_tokens_after=int(value.get("estimated_tokens_after", 0)),
+            usage=Usage.from_dict(value.get("usage")),
+            created_at=str(value.get("created_at") or utc_now()),
+            parent_artifact_id=value.get("parent_artifact_id"),
+            source_start_sequence=value.get("source_start_sequence"),
+            source_end_sequence=value.get("source_end_sequence"),
+            metadata=dict(value.get("metadata") or {}),
+        )
