@@ -1101,6 +1101,106 @@ class CLITests(unittest.TestCase):
             with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()):
                 self.assertFalse(shell._concurrent_input())
 
+    def test_terminal_input_worker_restores_active_readline_prompt_after_output(self) -> None:
+        worker = interactive._TerminalInputWorker()
+        worker._readline = SimpleNamespace(get_line_buffer=Mock(return_value="typed text"))
+        worker._active_prompt = "\001\033[90m\002follow-up> \001\033[0m\002"
+        worker._reading.set()
+        stream = TTYBuffer()
+
+        with worker.render_above_prompt(stream):
+            print("model update", file=stream)
+
+        self.assertEqual(
+            stream.getvalue(),
+            "\r\033[2Kmodel update\n\033[90mfollow-up> \033[0mtyped text",
+        )
+
+    def test_interactive_buffers_stream_deltas_while_follow_up_prompt_is_active(
+        self,
+    ) -> None:
+        async def exercise() -> str:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    history_enabled=False,
+                )
+                stream = TTYBuffer()
+                shell.renderer._text_stream = stream
+                shell.renderer._status_stream = stream
+                shell.renderer.ui.color = False
+                shell._input._readline = SimpleNamespace(
+                    get_line_buffer=Mock(return_value="draft")
+                )
+                shell._input._active_prompt = "follow-up> "
+                shell._input._reading.set()
+
+                await shell._render_event(
+                    Event(type="model.text_delta", data={"text": "stable answer"})
+                )
+                self.assertEqual(stream.getvalue(), "")
+                await shell._render_event(
+                    Event(type="model.completed", data={"text": "stable answer"})
+                )
+                return terminal._strip_ansi(stream.getvalue())
+
+        output = __import__("asyncio").run(exercise())
+        self.assertEqual(output.count("stable answer"), 1)
+        self.assertFalse(output.rstrip().endswith("\r\033[2K"))
+
+    def test_interactive_pauses_live_pulse_while_follow_up_prompt_is_active(
+        self,
+    ) -> None:
+        class RunningTask:
+            def __init__(self) -> None:
+                self.done_calls = 0
+
+            def done(self) -> bool:
+                self.done_calls += 1
+                return self.done_calls >= 3
+
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    history_enabled=False,
+                )
+                shell.renderer._status_stream = TTYBuffer()
+                shell.renderer.ui.color = True
+                shell.renderer._activity_phase = "working"
+                shell._input._reading.set()
+                shell.renderer.pulse = Mock()  # type: ignore[method-assign]
+
+                with patch(
+                    "borealis_coder.interactive.asyncio.sleep", new=AsyncMock()
+                ) as sleep:
+                    await shell._report_progress(cast(Any, RunningTask()))
+
+                sleep.assert_awaited_once_with(1.0)
+                shell.renderer.pulse.assert_not_called()
+
+        __import__("asyncio").run(exercise())
+
     def test_interactive_follow_up_entered_at_turn_boundary_starts_next_turn(self) -> None:
         class InputWorker:
             def __init__(self) -> None:

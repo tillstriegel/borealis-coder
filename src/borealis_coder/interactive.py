@@ -40,6 +40,38 @@ class _TerminalInputWorker:
             tuple[str, concurrent.futures.Future[str]] | None
         ] = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._reading = threading.Event()
+        self._active_prompt = ""
+        self._readline: Any | None = None
+        with contextlib.suppress(ImportError):
+            import readline  # type: ignore[import-not-found]
+
+            self._readline = readline
+
+    @property
+    def reading(self) -> bool:
+        return self._reading.is_set()
+
+    @contextlib.contextmanager
+    def render_above_prompt(self, stream: Any):  # type: ignore[no-untyped-def]
+        """Temporarily clear and then restore an active readline prompt."""
+
+        get_line_buffer = getattr(self._readline, "get_line_buffer", None)
+        if not self.reading or not _is_tty(stream) or not callable(get_line_buffer):
+            yield
+            return
+        print("\r\033[2K", end="", file=stream, flush=True)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                prompt = self._active_prompt.replace("\001", "").replace("\002", "")
+                print(
+                    f"{prompt}{get_line_buffer()}",
+                    end="",
+                    file=stream,
+                    flush=True,
+                )
 
     async def read(self, prompt: str) -> str:
         if self._thread is None:
@@ -50,6 +82,8 @@ class _TerminalInputWorker:
             )
             self._thread.start()
         future: concurrent.futures.Future[str] = concurrent.futures.Future()
+        self._active_prompt = prompt
+        self._reading.set()
         self._requests.put((prompt, future))
         return await asyncio.wrap_future(future)
 
@@ -76,6 +110,9 @@ class _TerminalInputWorker:
             else:
                 if not future.done():
                     future.set_result(value)
+            finally:
+                self._reading.clear()
+                self._active_prompt = ""
 
 
 _COMMAND_OPTIONS = (
@@ -349,9 +386,31 @@ class InteractiveCLI:
             approval_callback=approval_callback,
             interactive=True,
         )
-        runner.events.subscribe(self.renderer.handle)
+        runner.events.subscribe(self._render_event)
         runner.events.subscribe(self._observe)
         return runner
+
+    async def _render_event(self, event: Event) -> None:
+        """Render agent output without overwriting an active input buffer."""
+
+        buffer_stream = self._input.reading and event.type in {
+            "model.reasoning_delta",
+            "model.text_delta",
+            "model.completed",
+        }
+        if self._input.reading and event.type == "tool.output":
+            return
+        stream_text = self.renderer.stream_text
+        if buffer_stream:
+            self.renderer.stream_text = False
+        try:
+            if buffer_stream and event.type != "model.completed":
+                await self.renderer.handle(event)
+            else:
+                with self._input.render_above_prompt(self.renderer.status_stream):
+                    await self.renderer.handle(event)
+        finally:
+            self.renderer.stream_text = stream_text
 
     async def _select_initial_session(self) -> None:
         runner = self._require_runner()
@@ -432,18 +491,19 @@ class InteractiveCLI:
         return await future
 
     def _show_approval(self, request: ApprovalRequest) -> None:
-        self.renderer.finish_turn()
-        self.ui.panel(
-            "Approval required",
-            [
-                ("tool", request.tool_name),
-                ("risk", request.decision.risk),
-                ("reason", request.decision.reason),
-                ("request", request.arguments_preview),
-            ],
-            tone="warning",
-        )
-        self.ui.notice("info", "Reply y once · a for session · n to reject")
+        with self._input.render_above_prompt(self.renderer.status_stream):
+            self.renderer.finish_turn()
+            self.ui.panel(
+                "Approval required",
+                [
+                    ("tool", request.tool_name),
+                    ("risk", request.decision.risk),
+                    ("reason", request.decision.reason),
+                    ("request", request.arguments_preview),
+                ],
+                tone="warning",
+            )
+            self.ui.notice("info", "Reply y once · a for session · n to reject")
 
     def _answer_approval(self, line: str, future: asyncio.Future[str]) -> bool:
         answer = line.strip().lower()
@@ -464,7 +524,8 @@ class InteractiveCLI:
         if not prompt:
             return
         runner = self._require_runner()
-        self.renderer.reset_turn()
+        with self._input.render_above_prompt(self.renderer.status_stream):
+            self.renderer.reset_turn()
         self._active_session_id = self.session_id
         self._interrupt_count = 0
         task = asyncio.create_task(runner.run(prompt, session_id=self.session_id))
@@ -480,12 +541,14 @@ class InteractiveCLI:
         try:
             result = await task
         except asyncio.CancelledError:
-            self.renderer.finish_turn()
-            self.ui.notice("warning", "Turn cancelled", "session state preserved")
+            with self._input.render_above_prompt(self.renderer.status_stream):
+                self.renderer.finish_turn()
+                self.ui.notice("warning", "Turn cancelled", "session state preserved")
             return
         except (BorealisError, ConfigurationError, OSError, ValueError) as error:
-            self.renderer.finish_turn()
-            self.ui.notice("error", "Turn failed", str(error))
+            with self._input.render_above_prompt(self.renderer.status_stream):
+                self.renderer.finish_turn()
+                self.ui.notice("error", "Turn failed", str(error))
             return
         finally:
             progress_task.cancel()
@@ -494,13 +557,15 @@ class InteractiveCLI:
             self._restore_interrupt_handler(previous_handler)
             self._active_task = None
             self._active_session_id = None
-            self.renderer.finish_turn()
+            with self._input.render_above_prompt(self.renderer.status_stream):
+                self.renderer.finish_turn()
         self.session_id = result.session_id
-        if result.text and not self.renderer.has_rendered(result.text):
-            print(result.text)
-        self.ui.turn_footer(_turn_footer(result))
-        if result.error and result.stop_reason.value != "cancelled":
-            self.ui.notice("error", result.stop_reason.value, result.error)
+        with self._input.render_above_prompt(self.renderer.status_stream):
+            if result.text and not self.renderer.has_rendered(result.text):
+                print(result.text)
+            self.ui.turn_footer(_turn_footer(result))
+            if result.error and result.stop_reason.value != "cancelled":
+                self.ui.notice("error", result.stop_reason.value, result.error)
 
     async def _report_progress(self, task: asyncio.Task[AgentResult]) -> None:
         loop = asyncio.get_running_loop()
@@ -509,13 +574,16 @@ class InteractiveCLI:
         frame = 0
         next_heartbeat_at = started + 10.0
         while not task.done():
-            await asyncio.sleep(0.12 if self.renderer.live_activity else 1.0)
+            live_activity = self.renderer.live_activity and not self._input.reading
+            await asyncio.sleep(0.12 if live_activity else 1.0)
             if task.done():
                 return
             now = loop.time()
             elapsed = now - started
-            if self.renderer.live_activity:
-                self.renderer.pulse(elapsed, frame)
+            live_activity = self.renderer.live_activity and not self._input.reading
+            if live_activity:
+                with self._input.render_above_prompt(self.renderer.status_stream):
+                    self.renderer.pulse(elapsed, frame)
                 frame += 1
                 continue
             current_generation = self.renderer.activity_generation
@@ -523,7 +591,8 @@ class InteractiveCLI:
                 generation = current_generation
                 next_heartbeat_at = now + 10.0
             elif now >= next_heartbeat_at:
-                self.renderer.heartbeat(max(1, int(elapsed)))
+                with self._input.render_above_prompt(self.renderer.status_stream):
+                    self.renderer.heartbeat(max(1, int(elapsed)))
                 next_heartbeat_at = now + 10.0
 
     async def _command(self, line: str) -> tuple[bool, str | None]:
@@ -966,14 +1035,16 @@ class InteractiveCLI:
         if task is None or task.done():
             return
         self._interrupt_count += 1
-        self.renderer.finish_turn()
+        with self._input.render_above_prompt(self.renderer.status_stream):
+            self.renderer.finish_turn()
         runner = self._require_runner()
         cancelled = bool(
             self._active_session_id and runner.cancel(self._active_session_id)
         )
         if not cancelled or self._interrupt_count > 1:
             task.cancel()
-        self.ui.notice("warning", "Cancelling current turn", "press Ctrl+C again to force")
+        with self._input.render_above_prompt(self.renderer.status_stream):
+            self.ui.notice("warning", "Cancelling current turn", "press Ctrl+C again to force")
 
 
 def _turn_footer(result: AgentResult) -> str:

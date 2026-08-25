@@ -85,6 +85,11 @@ including follow-ups entered while a tool is running. If a line arrives exactly
 as the active turn finishes, the shell preserves it as the next user turn rather
 than dropping it.
 
+While the follow-up prompt is active, Borealis renders status updates above the
+input line and restores the text already entered. It pauses the animated activity
+pulse and buffers token-by-token model output until the current response is
+complete, so terminal refreshes cannot erase or split the input buffer.
+
 Slash-prefixed input typed while a turn is active is treated as steering text,
 not as an interactive command. Wait for the normal session prompt to run `/help`,
 `/status`, `/exit`, or another shell command. Redirected stdin remains serial and
