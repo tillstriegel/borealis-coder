@@ -12,6 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from prompt_toolkit.document import Document
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from . import __version__
@@ -22,7 +23,7 @@ from .errors import BorealisError, ConfigurationError, SessionError
 from .models import AgentResult, Event, Role
 from .safety import ApprovalRequest
 from .terminal import AuroraUI, ConsoleRenderer, ReadlineHistory
-from .terminal_input import TerminalInput
+from .terminal_input import TerminalInput, TerminalInputInterrupted
 from .util import truncate_text
 
 ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
@@ -139,7 +140,8 @@ class InteractiveCLI:
         submission: asyncio.Task[None] | None = None
         input_task: asyncio.Task[str] | None = None
         input_role = "command"
-        draft = ""
+        draft: Document | None = None
+        draft_role = "command"
         approval_task: asyncio.Task[tuple[ApprovalRequest, asyncio.Future[str]]] | None = None
         pending_approval: tuple[ApprovalRequest, asyncio.Future[str]] | None = None
         input_closed = False
@@ -162,17 +164,25 @@ class InteractiveCLI:
                     elif submission is not None:
                         input_role = "follow_up"
                         prompt = self._input_prompt(True)
+                    elif draft is not None and draft_role == "follow_up":
+                        input_role = "next_turn"
+                        prompt = self._input_prompt(False)
                     else:
                         input_role = "command"
                         prompt = self._input_prompt(False)
                     input_task = asyncio.create_task(
                         self._require_input().read(
                             prompt,
-                            default=draft if input_role != "approval" else "",
+                            default=(
+                                draft
+                                if input_role != "approval" and draft is not None
+                                else ""
+                            ),
                         )
                     )
                     if input_role != "approval":
-                        draft = ""
+                        draft = None
+                        draft_role = "command"
                 if (
                     approval_task is None
                     and pending_approval is None
@@ -193,6 +203,17 @@ class InteractiveCLI:
                 if submission is not None and submission in done:
                     await submission
                     submission = None
+                    if (
+                        input_task is not None
+                        and not input_task.done()
+                        and input_role == "follow_up"
+                    ):
+                        current = self._require_input().current_document
+                        if current.text:
+                            draft = current
+                            draft_role = "follow_up"
+                        await _cancel_task(input_task)
+                        input_task = None
                     if input_closed and not self._pending_follow_ups:
                         self.ui.notice("info", "Aurora shell closed", "session saved")
                         break
@@ -211,7 +232,7 @@ class InteractiveCLI:
                             self.ui.notice("info", "Aurora shell closed", "session saved")
                             break
                         self.ui.notice("info", "Input closed", "waiting for the active turn")
-                    except KeyboardInterrupt:
+                    except TerminalInputInterrupted:
                         print()
                         if completed_role == "approval" and pending_approval is not None:
                             self._resolve_approval(pending_approval[1], "no")
@@ -229,10 +250,10 @@ class InteractiveCLI:
                                 line, pending_approval[1]
                             ):
                                 pending_approval = None
-                        elif line and completed_role == "follow_up":
-                            self._queue_follow_up(line)
+                        elif line and completed_role in {"follow_up", "next_turn"}:
+                            self._queue_follow_up(_unescape_prompt(line))
                         elif line.startswith("//"):
-                            submission = asyncio.create_task(self._submit(line[1:]))
+                            submission = asyncio.create_task(self._submit(_unescape_prompt(line)))
                         elif line.startswith("/"):
                             try:
                                 should_exit, prompt = await self._command(line)
@@ -265,7 +286,8 @@ class InteractiveCLI:
                         continue
                     if input_task is not None:
                         if input_role != "approval":
-                            draft = self._require_input().current_text
+                            draft = self._require_input().current_document
+                            draft_role = input_role
                         await _cancel_task(input_task)
                         input_task = None
                     pending_approval = request
@@ -318,7 +340,7 @@ class InteractiveCLI:
                 if not line:
                     continue
                 if line.startswith("//"):
-                    await self._submit(line[1:])
+                    await self._submit(_unescape_prompt(line))
                     continue
                 if line.startswith("/"):
                     try:
@@ -1039,6 +1061,10 @@ async def _cancel_task(task: asyncio.Task[Any]) -> None:
     if not task.done():
         task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+def _unescape_prompt(prompt: str) -> str:
+    return prompt[1:] if prompt.startswith("//") else prompt
 
 
 def _optional_positive_int(args: list[str], *, default: int) -> int:
