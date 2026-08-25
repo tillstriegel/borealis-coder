@@ -115,7 +115,7 @@ class AuroraUI:
         self._box_field("GUARDRAIL", safety, width)
         self._box_field("SESSION", session, width)
         print(self.paint(bottom, self._MUTED), file=self.stream)
-        hint = " /help commands   // literal slash   Ctrl+C cancel turn"
+        hint = " type follow-ups while working   /help commands   Ctrl+C cancel turn"
         print(self.subdued(_middle_truncate(hint, width)), file=self.stream)
 
     def panel(

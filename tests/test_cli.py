@@ -1004,6 +1004,191 @@ class CLITests(unittest.TestCase):
             self.assertTrue(task.cancelled)
             self.assertEqual(output.getvalue().count("Cancelling current turn"), 2)
 
+    def test_interactive_follow_up_is_queued_until_the_session_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(
+                root,
+                overrides={
+                    "agent": {"provider": "mock"},
+                    "storage": {"directory": str(root / "data")},
+                },
+            )
+            shell = cli.InteractiveCLI(
+                workspace=root,
+                config=config,
+                approval_callback=None,
+                history_enabled=False,
+            )
+            runner = SimpleNamespace(
+                accepts_steering=Mock(side_effect=lambda session_id: session_id == "sess_test"),
+                queued_prompts=Mock(return_value=1),
+                steer=Mock(),
+            )
+            shell.runner = cast(Any, runner)
+            shell.renderer._status_stream = io.StringIO()
+
+            shell._queue_follow_up("change direction")
+            self.assertEqual(shell._pending_follow_ups, ["change direction"])
+            runner.steer.assert_not_called()
+
+            __import__("asyncio").run(
+                shell._observe(Event(type="run.started", session_id="sess_test"))
+            )
+            runner.steer.assert_called_once_with(
+                "sess_test",
+                "change direction",
+                metadata={"interactive": True},
+            )
+            self.assertEqual(shell._pending_follow_ups, [])
+
+    def test_interactive_active_turn_follow_up_steers_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(
+                root,
+                overrides={
+                    "agent": {"provider": "mock"},
+                    "storage": {"directory": str(root / "data")},
+                },
+            )
+            shell = cli.InteractiveCLI(
+                workspace=root,
+                config=config,
+                approval_callback=None,
+                history_enabled=False,
+            )
+            runner = SimpleNamespace(
+                accepts_steering=Mock(return_value=True),
+                queued_prompts=Mock(return_value=1),
+                steer=Mock(),
+            )
+            shell.runner = cast(Any, runner)
+            shell._active_session_id = "sess_test"
+            output = io.StringIO()
+            shell.renderer._status_stream = output
+
+            shell._queue_follow_up("change direction")
+
+            runner.steer.assert_called_once_with(
+                "sess_test",
+                "change direction",
+                metadata={"interactive": True},
+            )
+            self.assertEqual(shell._pending_follow_ups, [])
+            self.assertIn("1 pending", output.getvalue())
+
+    def test_interactive_uses_status_terminal_for_concurrent_input(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = load_config(
+                root,
+                overrides={
+                    "agent": {"provider": "mock"},
+                    "storage": {"directory": str(root / "data")},
+                },
+            )
+            shell = cli.InteractiveCLI(
+                workspace=root,
+                config=config,
+                approval_callback=None,
+                history_enabled=False,
+            )
+            shell.renderer._status_stream = TTYBuffer()
+            with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()):
+                self.assertTrue(shell._concurrent_input())
+            shell.renderer._status_stream = io.StringIO()
+            with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()):
+                self.assertFalse(shell._concurrent_input())
+
+    def test_interactive_follow_up_entered_at_turn_boundary_starts_next_turn(self) -> None:
+        class InputWorker:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def read(self, _prompt: str) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    await __import__("asyncio").sleep(0.01)
+                    return "next task"
+                raise EOFError
+
+            def close(self) -> None:
+                return None
+
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    initial_prompt="first task",
+                    history_enabled=False,
+                )
+                shell._input = cast(Any, InputWorker())
+                shell.renderer._status_stream = io.StringIO()
+                runner = SimpleNamespace(close=AsyncMock())
+                shell.runner = cast(Any, runner)
+                submitted: list[str] = []
+
+                async def submit(prompt: str) -> None:
+                    submitted.append(prompt)
+
+                shell._submit = submit  # type: ignore[method-assign]
+                with (
+                    patch.object(shell, "_new_runner", AsyncMock(return_value=runner)),
+                    patch.object(shell, "_select_initial_session", AsyncMock()),
+                    patch.object(shell, "_print_banner"),
+                    patch.object(shell, "_concurrent_input", return_value=True),
+                ):
+                    self.assertEqual(await shell.run(), 0)
+
+                self.assertEqual(submitted, ["first task", "next task"])
+
+        __import__("asyncio").run(exercise())
+
+    def test_interactive_terminal_approval_uses_the_shared_input_loop(self) -> None:
+        async def exercise() -> None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                config = load_config(
+                    root,
+                    overrides={
+                        "agent": {"provider": "mock"},
+                        "storage": {"directory": str(root / "data")},
+                    },
+                )
+                shell = cli.InteractiveCLI(
+                    workspace=root,
+                    config=config,
+                    approval_callback=None,
+                    history_enabled=False,
+                    terminal_approvals=True,
+                )
+                request = ApprovalRequest(
+                    tool_name="shell",
+                    description="run",
+                    decision=PolicyDecision(PolicyAction.ASK, "reason", "high"),
+                    arguments_preview="echo hi",
+                )
+                response = __import__("asyncio").create_task(
+                    shell._request_terminal_approval(request)
+                )
+                queued_request, future = await shell._approval_requests.get()
+                self.assertIs(queued_request, request)
+                self.assertTrue(shell._answer_approval("a", future))
+                self.assertEqual(await response, "allow_always")
+
+        __import__("asyncio").run(exercise())
+
     def test_interactive_prompt_keyboard_interrupt_exits_130(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
