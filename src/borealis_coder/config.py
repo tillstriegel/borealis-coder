@@ -48,6 +48,14 @@ class AgentConfig:
     auto_verify_max_seconds: int = 900
     auto_verify_max_repair_cycles: int = 1
     deterministic_compaction: bool = True
+    compaction_version: int = 2
+    compaction_target_ratio: float = 0.70
+    compaction_safety_margin_tokens: int = 2_048
+    compaction_provider_framing_tokens: int = 512
+    compaction_max_overflow_retries: int = 2
+    compaction_summarizer_input_tokens: int = 32_000
+    compaction_summarizer_total_input_tokens: int = 96_000
+    compaction_shadow_v2: bool = False
 
 
 @dataclass(slots=True)
@@ -553,6 +561,30 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("agent.max_time_seconds must be positive")
     if not 0.5 <= config.agent.compact_at_ratio < 1.0:
         raise ConfigurationError("agent.compact_at_ratio must be between 0.5 and 1.0")
+    if config.agent.compaction_version not in {1, 2}:
+        raise ConfigurationError("agent.compaction_version must be 1 or 2")
+    if not 0.1 <= config.agent.compaction_target_ratio < 1.0:
+        raise ConfigurationError(
+            "agent.compaction_target_ratio must be between 0.1 and 1.0"
+        )
+    if config.agent.compaction_safety_margin_tokens < 0:
+        raise ConfigurationError("agent.compaction_safety_margin_tokens cannot be negative")
+    if config.agent.compaction_provider_framing_tokens < 0:
+        raise ConfigurationError("agent.compaction_provider_framing_tokens cannot be negative")
+    if config.agent.compaction_max_overflow_retries < 0:
+        raise ConfigurationError("agent.compaction_max_overflow_retries cannot be negative")
+    if config.agent.compaction_summarizer_input_tokens < 1_024:
+        raise ConfigurationError(
+            "agent.compaction_summarizer_input_tokens must be at least 1024"
+        )
+    if (
+        config.agent.compaction_summarizer_total_input_tokens
+        < config.agent.compaction_summarizer_input_tokens
+    ):
+        raise ConfigurationError(
+            "agent.compaction_summarizer_total_input_tokens must be at least the "
+            "per-request summarizer input limit"
+        )
     if config.safety.mode not in {"plan", "workspace-write", "full"}:
         raise ConfigurationError("safety.mode must be plan, workspace-write, or full")
     if config.safety.approval not in {"never", "on-risk", "always"}:

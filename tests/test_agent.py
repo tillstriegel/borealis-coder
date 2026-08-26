@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from borealis_coder.agent import AgentRunner, build_runner
+from borealis_coder.agent import AgentRunner, build_runner, validate_tool_call_order
 from borealis_coder.config import ProviderConfig
 from borealis_coder.errors import (
     ConfigurationError,
@@ -21,6 +21,7 @@ from borealis_coder.errors import (
 from borealis_coder.models import (
     ContinuationState,
     Effect,
+    Message,
     ModelResponse,
     ProviderRequest,
     Role,
@@ -232,6 +233,38 @@ class OneToolProvider(Provider):
             tool_calls=[
                 ToolCall(
                     id="same_call",
+                    name="read_file",
+                    arguments={
+                        "path": "a.txt",
+                        "start_line": None,
+                        "end_line": None,
+                        "max_chars": None,
+                    },
+                )
+            ],
+            usage=Usage(requests=1),
+        )
+
+
+class RepeatedToolProvider(Provider):
+    name = "repeated_tool"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.complete_after_stuck = False
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.complete_after_stuck:
+            return ModelResponse(
+                text="Recovered after abandoned call.",
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            tool_calls=[
+                ToolCall(
+                    id=f"repeated-{self.calls}",
                     name="read_file",
                     arguments={
                         "path": "a.txt",
@@ -1308,6 +1341,190 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_same_batch_duplicate_mutating_tool_ids_are_rejected_before_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            executions = 0
+
+            def mutate(arguments, context):
+                nonlocal executions
+                del arguments, context
+                executions += 1
+                return ToolResult("mutated")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="duplicate_mutator",
+                    description="Count executions for duplicate ID regression coverage.",
+                    parameters=object_schema({}),
+                    function=mutate,
+                    effect=Effect.WRITE,
+                )
+            )
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="duplicate", name="duplicate_mutator", arguments={}),
+                        ToolCall(id="duplicate", name="duplicate_mutator", arguments={}),
+                    ],
+                    usage=Usage(input_tokens=7, output_tokens=3, requests=1),
+                )
+            )
+            try:
+                result = await runner.run("reject duplicate calls")
+                messages = runner.sessions.messages(result.session_id)
+
+                self.assertEqual(result.stop_reason.value, "error")
+                self.assertIn("duplicate tool-call ID", result.error or "")
+                self.assertEqual(executions, 0)
+                self.assertEqual(runner.sessions.tool_calls(result.session_id), [])
+                self.assertFalse(
+                    any(message.role == Role.ASSISTANT and message.tool_calls for message in messages)
+                )
+                self.assertEqual(runner.sessions.usage(result.session_id).total_tokens, 10)
+                self.assertEqual(runner.sessions.usage(result.session_id).requests, 1)
+            finally:
+                await runner.close()
+
+    async def test_blank_mutating_tool_id_is_rejected_before_persistence_and_can_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            executions = 0
+
+            def mutate(arguments, context):
+                nonlocal executions
+                del arguments, context
+                executions += 1
+                return ToolResult("mutated")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="blank_id_mutator",
+                    description="Count executions for blank ID regression coverage.",
+                    parameters=object_schema({}),
+                    function=mutate,
+                    effect=Effect.WRITE,
+                )
+            )
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id=" \t ", name="blank_id_mutator", arguments={})
+                    ],
+                    usage=Usage(requests=1),
+                ),
+                ModelResponse(text="resumed safely", usage=Usage(requests=1)),
+            )
+            try:
+                rejected = await runner.run("reject the blank call")
+                before_resume = runner.sessions.messages(rejected.session_id)
+
+                self.assertEqual(rejected.stop_reason.value, "error")
+                self.assertIn("empty tool-call ID", rejected.error or "")
+                self.assertEqual(executions, 0)
+                self.assertEqual(runner.sessions.tool_calls(rejected.session_id), [])
+                self.assertFalse(
+                    any(
+                        message.role == Role.ASSISTANT and message.tool_calls
+                        for message in before_resume
+                    )
+                )
+                validate_tool_call_order(before_resume)
+
+                resumed = await runner.run("continue", session_id=rejected.session_id)
+                durable = runner.sessions.messages(rejected.session_id)
+
+                self.assertEqual(resumed.text, "resumed safely")
+                self.assertEqual(executions, 0)
+                validate_tool_call_order(durable)
+            finally:
+                await runner.close()
+
+    async def test_cross_turn_duplicate_mutating_tool_id_preserves_first_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            executions: list[str] = []
+
+            def mutate(arguments, context):
+                del context
+                value = str(arguments["value"])
+                executions.append(value)
+                return ToolResult(f"mutated {value}", metadata={"value": value})
+
+            runner.tools.register(
+                FunctionTool(
+                    name="duplicate_mutator",
+                    description="Record the mutation value for duplicate ID regression coverage.",
+                    parameters=object_schema({"value": {"type": "string"}}, required=["value"]),
+                    function=mutate,
+                    effect=Effect.WRITE,
+                )
+            )
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="reused-call",
+                            name="duplicate_mutator",
+                            arguments={"value": "original"},
+                        )
+                    ],
+                    usage=Usage(requests=1),
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="reused-call",
+                            name="duplicate_mutator",
+                            arguments={"value": "replacement"},
+                        )
+                    ],
+                    usage=Usage(requests=1),
+                ),
+            )
+            try:
+                result = await runner.run("reject a reused call ID")
+                ledger = runner.sessions.tool_calls(result.session_id)
+                messages = runner.sessions.messages(result.session_id)
+
+                self.assertEqual(result.stop_reason.value, "error")
+                self.assertEqual(executions, ["original"])
+                self.assertEqual(len(ledger), 1)
+                self.assertEqual(ledger[0]["arguments"], {"value": "original"})
+                self.assertEqual(ledger[0]["output"], "mutated original")
+                self.assertEqual(ledger[0]["status"], "completed")
+                assistant_calls = [
+                    message
+                    for message in messages
+                    if message.role == Role.ASSISTANT and message.tool_calls
+                ]
+                self.assertEqual(len(assistant_calls), 1)
+                self.assertEqual(assistant_calls[0].tool_calls[0].arguments["value"], "original")
+                self.assertEqual(runner.sessions.usage(result.session_id).requests, 2)
+            finally:
+                await runner.close()
+
     async def test_pre_final_incomplete_response_drains_inflight_steering(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1533,6 +1750,92 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.stop_reason.value, "cancelled")
             await runner.close()
 
+    async def test_cancelled_serial_batch_records_unstarted_results_before_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            first_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def blocked_tool(arguments, context):
+                del arguments, context
+                first_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            async def unstarted_tool(arguments, context):
+                del arguments, context
+                self.fail("The second serial tool must not start after cancellation")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="blocked_serial",
+                    description="Block until the run is cancelled.",
+                    parameters=object_schema({}),
+                    function=blocked_tool,
+                )
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="unstarted_serial",
+                    description="Remain pending behind the blocked tool.",
+                    parameters=object_schema({}),
+                    function=unstarted_tool,
+                )
+            )
+
+            def respond(_request: ProviderRequest, call: int) -> ModelResponse:
+                if call == 1:
+                    return ModelResponse(
+                        tool_calls=[
+                            ToolCall(id="blocked-call", name="blocked_serial", arguments={}),
+                            ToolCall(
+                                id="unstarted-call",
+                                name="unstarted_serial",
+                                arguments={},
+                            ),
+                        ],
+                        usage=Usage(requests=1),
+                    )
+                return ModelResponse(text="resumed", usage=Usage(requests=1))
+
+            provider.handler = respond
+            try:
+                task = asyncio.create_task(runner.run("run serial tools"))
+                await asyncio.wait_for(first_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                self.assertTrue(runner.cancel(session_id))
+                cancelled = await asyncio.wait_for(task, timeout=2)
+
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(session_id)
+                    if message.role == Role.TOOL
+                ]
+                self.assertEqual(
+                    [message.tool_call_id for message in tool_messages],
+                    ["blocked-call", "unstarted-call"],
+                )
+                self.assertTrue(tool_messages[1].metadata["not_started"])
+                self.assertEqual(
+                    [item["status"] for item in runner.sessions.tool_calls(session_id)],
+                    ["cancelled", "cancelled"],
+                )
+
+                resumed = await runner.run("resume", session_id=session_id)
+            finally:
+                never_complete.set()
+                await runner.close()
+
+        self.assertEqual(cancelled.stop_reason.value, "cancelled")
+        self.assertEqual(resumed.text, "resumed")
+
     async def test_cancel_waits_for_all_parallel_read_finalizers(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1710,6 +2013,131 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 fast_persisted.set()
                 await runner.close()
 
+    async def test_cancellation_after_tool_completion_keeps_ledger_and_message_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[ToolCall(id="race-call", name="race_tool", arguments={})],
+                    usage=Usage(requests=1),
+                )
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="race_tool",
+                    description="Return a stable result for cancellation reconciliation.",
+                    parameters=object_schema({}),
+                    function=lambda arguments, context: ToolResult(
+                        "stable result",
+                        metadata={"stable": True},
+                    ),
+                )
+            )
+            original_complete = runner.sessions.complete_tool_call
+            durable_written = threading.Event()
+            release_first_completion = threading.Event()
+            completion_calls = 0
+            completion_lock = threading.Lock()
+
+            def pause_after_first_completion(session_id, call_id, **kwargs):
+                nonlocal completion_calls
+                original_complete(session_id, call_id, **kwargs)
+                with completion_lock:
+                    completion_calls += 1
+                    current_call = completion_calls
+                if current_call == 1:
+                    durable_written.set()
+                    release_first_completion.wait(timeout=3)
+
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "complete_tool_call",
+                    side_effect=pause_after_first_completion,
+                ):
+                    task = asyncio.create_task(runner.run("exercise the completion race"))
+                    self.assertTrue(await asyncio.to_thread(durable_written.wait, 1))
+                    task.cancel()
+                    await asyncio.sleep(0.05)
+                    task.cancel()
+                    release_first_completion.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                ledger = runner.sessions.tool_calls(result.session_id)[0]
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(ledger["status"], "completed")
+                self.assertEqual(ledger["output"], tool_message.content)
+                self.assertEqual(ledger["is_error"], tool_message.is_error)
+                self.assertEqual(ledger["metadata"], tool_message.metadata)
+                self.assertTrue(ledger["metadata"]["stable"])
+                self.assertGreaterEqual(completion_calls, 2)
+            finally:
+                release_first_completion.set()
+                await runner.close()
+
+    async def test_stale_runtime_cancellation_preserves_terminal_tool_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            call = ToolCall(id="stale-cancel", name="read_file", arguments={})
+            stable = Message(
+                role=Role.TOOL,
+                content="durable success",
+                tool_call_id=call.id,
+                tool_name=call.name,
+                metadata={"stable": True},
+            )
+            runner.sessions.start_tool_call(
+                session.id, "run", call.id, call.name, call.arguments
+            )
+            runner.sessions.complete_tool_call(
+                session.id,
+                call.id,
+                output=stable.content,
+                is_error=False,
+                metadata=stable.metadata,
+                message=stable,
+            )
+
+            try:
+                runner._cancel_tool_call_if_running(
+                    session.id,
+                    call.id,
+                    reason="Run cancelled",
+                    message=Message(
+                        role=Role.TOOL,
+                        content="Run cancelled",
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        is_error=True,
+                        metadata={"cancelled": True},
+                    ),
+                )
+                ledger = runner.sessions.tool_calls(session.id)[0]
+                durable = runner.sessions.messages(session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual(ledger["status"], "completed")
+        self.assertEqual(ledger["output"], stable.content)
+        self.assertEqual(ledger["metadata"], stable.metadata)
+        self.assertEqual(durable, [stable])
+
     async def test_max_time_is_an_end_to_end_deadline(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1778,6 +2206,143 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 assistant = runner.sessions.messages(result.session_id)[-1]
                 self.assertEqual(assistant.role, Role.ASSISTANT)
                 self.assertEqual(assistant.tool_calls, [])
+            finally:
+                await runner.close()
+
+    async def test_resume_repairs_tool_call_abandoned_by_stuck_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.txt").write_text("a")
+            config = make_config(
+                root,
+                agent={
+                    "provider": "repeated",
+                    "max_turns": 10,
+                    "max_repeated_calls": 1,
+                },
+            )
+            config.providers["repeated"] = ProviderConfig(
+                type="repeated_tool",
+                model="repeated",
+                max_retries=0,
+            )
+            provider = RepeatedToolProvider(config.providers["repeated"])
+            registry = ProviderRegistry()
+            registry.register("repeated_tool", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                first = await runner.run("inspect repeatedly")
+                self.assertEqual(first.stop_reason.value, "stuck")
+                before_resume = runner.sessions.messages(first.session_id)
+                self.assertEqual(before_resume[-1].role, Role.ASSISTANT)
+                self.assertEqual(before_resume[-1].tool_calls[0].id, "repeated-2")
+
+                provider.complete_after_stuck = True
+                resumed = await runner.run("continue", session_id=first.session_id)
+
+                self.assertEqual(resumed.text, "Recovered after abandoned call.")
+                after_resume = runner.sessions.messages(first.session_id)
+                abandoned_index = next(
+                    index
+                    for index, message in enumerate(after_resume)
+                    if any(call.id == "repeated-2" for call in message.tool_calls)
+                )
+                repair = after_resume[abandoned_index + 1]
+                self.assertEqual(repair.role, Role.TOOL)
+                self.assertEqual(repair.tool_call_id, "repeated-2")
+                self.assertTrue(repair.is_error)
+                self.assertTrue(repair.metadata["cancelled"])
+                self.assertTrue(repair.metadata["not_started"])
+                self.assertTrue(repair.metadata["abandoned"])
+                self.assertNotIn(
+                    "repeated-2",
+                    {
+                        call["tool_call_id"]
+                        for call in runner.sessions.tool_calls(first.session_id)
+                    },
+                )
+                self.assertEqual(after_resume[abandoned_index + 2].content, "continue")
+            finally:
+                await runner.close()
+
+    async def test_resume_recovers_unknown_mutation_outcome_and_verifies(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "mock", "auto_verify": True},
+            )
+            crashed_runner = await build_runner(root, config=config, interactive=False)
+            session = crashed_runner.sessions.create_session(
+                workspace=root,
+                provider="mock",
+                model="deterministic",
+            )
+            call = ToolCall(
+                id="crashed-write",
+                name="write_file",
+                arguments={
+                    "path": "result.txt",
+                    "content": "mutated before crash\n",
+                    "expected_sha256": None,
+                },
+            )
+            original = Message(
+                id="original-assistant",
+                role=Role.ASSISTANT,
+                tool_calls=[call],
+            )
+            crashed_runner.sessions.append_message(session.id, original)
+            crashed_runner.sessions.start_tool_call(
+                session.id,
+                "crashed-run",
+                call.id,
+                call.name,
+                call.arguments,
+            )
+            (root / "result.txt").write_text("mutated before crash\n", encoding="utf-8")
+            await crashed_runner.close()
+
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(text="Resume candidate."),
+                ModelResponse(text="Resume finalizer."),
+            )
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    resumed = await runner.run("resume", session_id=session.id)
+
+                messages = runner.sessions.messages(session.id)
+                self.assertEqual(messages[0], original)
+                repair = messages[1]
+                self.assertEqual(repair.role, Role.TOOL)
+                self.assertEqual(repair.tool_call_id, call.id)
+                self.assertTrue(repair.is_error)
+                self.assertTrue(repair.metadata["unknown_outcome"])
+                self.assertTrue(repair.metadata["execution_started"])
+                self.assertEqual(
+                    repair.metadata["workspace_change_tracking"],
+                    "incomplete",
+                )
+                self.assertNotIn("cancelled", repair.metadata)
+                ledger = runner.sessions.tool_calls(session.id)[0]
+                self.assertEqual(ledger["status"], "error")
+                self.assertEqual(ledger["output"], repair.content)
+                self.assertEqual(ledger["metadata"], repair.metadata)
+                self.assertEqual(resumed.mutation_tracking, "incomplete")
+                self.assertEqual(verify.await_count, 1)
             finally:
                 await runner.close()
 
@@ -3441,6 +4006,69 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 never_complete.set()
                 await runner.close()
+
+    async def test_tool_result_wins_simultaneous_cancellation_and_is_persisted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            committed_path = root / "committed.txt"
+            committed_path.write_text("before", encoding="utf-8")
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="committed-call", name="commit_then_cancel", arguments={})
+                    ],
+                    usage=Usage(requests=1),
+                )
+            )
+
+            async def commit_then_cancel(call, context):
+                del call
+                committed_path.write_text("committed", encoding="utf-8")
+                self.assertTrue(runner.cancel(context.session_id))
+                return ToolResult("committed result", metadata={"committed": True})
+
+            runner.tools.register(
+                FunctionTool(
+                    name="commit_then_cancel",
+                    description="Commit a mutation and cancel the active run.",
+                    parameters=object_schema({}),
+                    function=lambda arguments, context: ToolResult("not called"),
+                    effect=Effect.EXECUTE,
+                )
+            )
+            try:
+                with patch.object(
+                    runner.tools,
+                    "execute",
+                    side_effect=commit_then_cancel,
+                ):
+                    result = await runner.run("commit and cancel")
+                ledger = runner.sessions.tool_calls(result.session_id)
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                ]
+            finally:
+                await runner.close()
+
+        self.assertEqual(result.stop_reason.value, "cancelled")
+        self.assertEqual(result.changed_files, ["committed.txt"])
+        self.assertEqual(result.mutation_tracking, "complete")
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["status"], "completed")
+        self.assertEqual(ledger[0]["output"], "committed result")
+        self.assertTrue(ledger[0]["metadata"]["committed"])
+        self.assertEqual(len(tool_messages), 1)
+        self.assertEqual(tool_messages[0].content, "committed result")
+        self.assertEqual(tool_messages[0].metadata, ledger[0]["metadata"])
 
     async def test_cancelled_shell_exposes_incomplete_mutation_tracking(self):
         with tempfile.TemporaryDirectory() as td:

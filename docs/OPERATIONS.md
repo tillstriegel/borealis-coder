@@ -106,6 +106,7 @@ Before granting write authority to a new model or compatible API:
   `borealis auth login`. A single pre-output authentication failure is refreshed
   automatically when a refresh token is available.
 - **Context overflow:** lower initial context budgets, exclude generated files, reduce tool output, or resume after deterministic compaction.
+- **Compaction release gate:** run `PYTHONPATH=src python scripts/evaluate_compaction.py` for the offline structural gate. Before enabling LLM compaction, rerun it with both `--summarizer module:function` and `--completion-scorer module:function`; require every case to use the LLM strategy, reuse its durable artifact with zero second-call cost, and report `release_gate_passed: true`.
 - **Maximum turns:** the final allowed turn runs without tools. If the run still cannot finish, Borealis preserves the session, verifies changed files when enabled, and reports that `continue` resumes the work.
 - **Stuck loop:** inspect repeated tool calls and project instructions; lower `max_repeated_calls` for high-risk automation.
 - **Verification failure:** automatic checks are authoritative. Borealis feeds a bounded failure excerpt back for one repair cycle by default; if no model turn remains, the harness replaces the candidate claim with the command, exit code, and useful output excerpt.

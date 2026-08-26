@@ -161,6 +161,34 @@ class ConfigTests(unittest.TestCase):
                         },
                     )
 
+    def test_compaction_v2_limits_are_validated(self):
+        cases = (
+            ("compaction_version", 3),
+            ("compaction_target_ratio", 1.0),
+            ("compaction_safety_margin_tokens", -1),
+            ("compaction_provider_framing_tokens", -1),
+            ("compaction_max_overflow_retries", -1),
+            ("compaction_summarizer_input_tokens", 1_000),
+            ("compaction_summarizer_total_input_tokens", 1_000),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for field, value in cases:
+                overrides = {field: value}
+                if field == "compaction_summarizer_total_input_tokens":
+                    overrides["compaction_summarizer_input_tokens"] = 2_000
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(ConfigurationError, field),
+                ):
+                    load_config(
+                        root,
+                        overrides={
+                            "agent": overrides,
+                            "storage": {"directory": str(root / "data")},
+                        },
+                    )
+
     def test_provider_extra_body_secrets_are_redacted(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

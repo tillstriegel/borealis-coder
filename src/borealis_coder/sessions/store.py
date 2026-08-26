@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import SessionError
-from ..models import Event, Message, SessionInfo, Usage
+from ..models import CompactionArtifact, Event, Message, SessionInfo, Usage
 from ..util import ensure_private_directory, ensure_private_file, json_dumps, new_id, utc_now
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _EVENT_EXPORT_PAGE_SIZE = 1_000
 
 
@@ -132,6 +132,31 @@ class SessionStore:
                 value_json TEXT NOT NULL,
                 PRIMARY KEY(session_id, key)
             );
+            CREATE TABLE IF NOT EXISTS compaction_artifacts (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                artifact_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL,
+                strategy TEXT NOT NULL,
+                source_start_sequence INTEGER,
+                source_end_sequence INTEGER,
+                source_message_ids_json TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                summary_text TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                config_fingerprint TEXT NOT NULL,
+                estimated_tokens_before INTEGER NOT NULL,
+                estimated_tokens_after INTEGER NOT NULL,
+                usage_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                parent_artifact_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_compaction_artifacts_session
+                ON compaction_artifacts(session_id, sequence DESC);
+            CREATE INDEX IF NOT EXISTS idx_compaction_artifacts_reuse
+                ON compaction_artifacts(session_id, source_hash, config_fingerprint, strategy);
             """
         )
         current = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
@@ -150,6 +175,9 @@ class SessionStore:
                 version = 2
             if version < 3:
                 self._migrate_cache_v3()
+                version = 3
+            if version < 4:
+                self._migrate_compaction_v4()
             conn.execute(
                 "UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),)
             )
@@ -200,6 +228,37 @@ class SessionStore:
         for name, declaration in additions.items():
             if name not in columns:
                 self._connection.execute(f"ALTER TABLE usage ADD COLUMN {name} {declaration}")
+
+    def _migrate_compaction_v4(self) -> None:
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS compaction_artifacts (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                artifact_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL,
+                strategy TEXT NOT NULL,
+                source_start_sequence INTEGER,
+                source_end_sequence INTEGER,
+                source_message_ids_json TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                summary_text TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                config_fingerprint TEXT NOT NULL,
+                estimated_tokens_before INTEGER NOT NULL,
+                estimated_tokens_after INTEGER NOT NULL,
+                usage_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                parent_artifact_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_compaction_artifacts_session
+                ON compaction_artifacts(session_id, sequence DESC);
+            CREATE INDEX IF NOT EXISTS idx_compaction_artifacts_reuse
+                ON compaction_artifacts(session_id, source_hash, config_fingerprint, strategy);
+            """
+        )
 
     def create_session(
         self,
@@ -295,42 +354,11 @@ class SessionStore:
 
     def append_message(self, session_id: str, message: Message) -> None:
         with self._lock, self._connection:
-            self._connection.execute(
-                """INSERT INTO messages(session_id,message_id,role,payload_json,created_at)
-                VALUES(?,?,?,?,?)
-                ON CONFLICT(session_id,message_id) DO UPDATE SET
-                    role=excluded.role,
-                    payload_json=excluded.payload_json,
-                    created_at=excluded.created_at""",
-                (
-                    session_id,
-                    message.id,
-                    message.role.value,
-                    json_dumps(message.to_dict()),
-                    message.created_at,
-                ),
-            )
-            self._connection.execute(
-                "UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id)
-            )
+            self._append_message_locked(session_id, message)
 
     def replace_messages(self, session_id: str, messages: Iterable[Message]) -> None:
-        with self._lock, self._connection:
-            self._connection.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
-            for message in messages:
-                self._connection.execute(
-                    "INSERT INTO messages(session_id,message_id,role,payload_json,created_at) VALUES(?,?,?,?,?)",
-                    (
-                        session_id,
-                        message.id,
-                        message.role.value,
-                        json_dumps(message.to_dict()),
-                        message.created_at,
-                    ),
-                )
-            self._connection.execute(
-                "UPDATE sessions SET updated_at=? WHERE id=?", (utc_now(), session_id)
-            )
+        del session_id, messages
+        raise SessionError("Durable messages are append-only and cannot be replaced")
 
     def messages(self, session_id: str) -> list[Message]:
         self.get_session(session_id)
@@ -340,6 +368,89 @@ class SessionStore:
                 (session_id,),
             ).fetchall()
         return [Message.from_dict(json.loads(row[0])) for row in rows]
+
+    def sequenced_messages(self, session_id: str) -> list[tuple[int, Message]]:
+        self.get_session(session_id)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sequence,payload_json FROM messages WHERE session_id=? ORDER BY sequence",
+                (session_id,),
+            ).fetchall()
+        return [(int(row[0]), Message.from_dict(json.loads(row[1]))) for row in rows]
+
+    def append_compaction_artifact(self, artifact: CompactionArtifact) -> None:
+        """Persist an immutable artifact separately from durable messages."""
+
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO compaction_artifacts(
+                    artifact_id,session_id,version,strategy,source_start_sequence,
+                    source_end_sequence,source_message_ids_json,source_hash,summary_text,
+                    provider,model,config_fingerprint,estimated_tokens_before,
+                    estimated_tokens_after,usage_json,created_at,parent_artifact_id,metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    artifact.id,
+                    artifact.session_id,
+                    artifact.version,
+                    artifact.strategy,
+                    artifact.source_start_sequence,
+                    artifact.source_end_sequence,
+                    json_dumps(artifact.source_message_ids),
+                    artifact.source_hash,
+                    artifact.summary_text,
+                    artifact.provider,
+                    artifact.model,
+                    artifact.config_fingerprint,
+                    artifact.estimated_tokens_before,
+                    artifact.estimated_tokens_after,
+                    json_dumps(artifact.usage.to_dict()),
+                    artifact.created_at,
+                    artifact.parent_artifact_id,
+                    json_dumps(artifact.metadata),
+                ),
+            )
+            self._connection.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?",
+                (utc_now(), artifact.session_id),
+            )
+
+    def latest_compaction_artifact(
+        self,
+        session_id: str,
+        *,
+        config_fingerprint: str | None = None,
+        strategy: str | None = None,
+    ) -> CompactionArtifact | None:
+        query = "SELECT * FROM compaction_artifacts WHERE session_id=?"
+        parameters: list[Any] = [session_id]
+        if config_fingerprint is not None:
+            query += " AND config_fingerprint=?"
+            parameters.append(config_fingerprint)
+        if strategy is not None:
+            query += " AND strategy=?"
+            parameters.append(strategy)
+        query += " ORDER BY sequence DESC LIMIT 1"
+        with self._lock:
+            row = self._connection.execute(query, parameters).fetchone()
+        return _compaction_artifact(row) if row is not None else None
+
+    def reusable_compaction_artifact(
+        self,
+        session_id: str,
+        *,
+        source_hash: str,
+        config_fingerprint: str,
+        strategy: str,
+    ) -> CompactionArtifact | None:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT * FROM compaction_artifacts
+                WHERE session_id=? AND source_hash=? AND config_fingerprint=? AND strategy=?
+                ORDER BY sequence DESC LIMIT 1""",
+                (session_id, source_hash, config_fingerprint, strategy),
+            ).fetchone()
+        return _compaction_artifact(row) if row is not None else None
 
     def append_event(self, event: Event) -> None:
         self.append_events([event])
@@ -535,22 +646,35 @@ class SessionStore:
     def start_tool_call(
         self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any]
     ) -> None:
+        if not call_id.strip():
+            raise SessionError("Tool call ID must be non-empty")
+        arguments_json = json_dumps(arguments)
+        normalized_arguments = json.loads(arguments_json)
         with self._lock, self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """INSERT INTO tool_calls(
                     session_id,tool_call_id,run_id,tool_name,arguments_json,status,started_at
                 ) VALUES(?,?,?,?,?,'running',?)
-                ON CONFLICT(session_id,tool_call_id) DO UPDATE SET
-                    run_id=excluded.run_id,
-                    tool_name=excluded.tool_name,
-                    arguments_json=excluded.arguments_json,
-                    output=NULL,
-                    is_error=NULL,
-                    status='running',
-                    started_at=excluded.started_at,
-                    completed_at=NULL,
-                    metadata_json='{}'""",
-                (session_id, call_id, run_id, name, json_dumps(arguments), utc_now()),
+                ON CONFLICT(session_id,tool_call_id) DO NOTHING""",
+                (session_id, call_id, run_id, name, arguments_json, utc_now()),
+            )
+            if cursor.rowcount:
+                return
+            existing = self._connection.execute(
+                """SELECT run_id,tool_name,arguments_json,status
+                FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
+                (session_id, call_id),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["status"] == "running"
+                and existing["run_id"] == run_id
+                and existing["tool_name"] == name
+                and json.loads(existing["arguments_json"]) == normalized_arguments
+            ):
+                return
+            raise SessionError(
+                f"Tool call {call_id!r} already exists and cannot be overwritten"
             )
 
     def complete_tool_call(
@@ -563,21 +687,43 @@ class SessionStore:
         metadata: dict[str, Any] | None = None,
         message: Message | None = None,
     ) -> None:
+        status = "error" if is_error else "completed"
+        metadata_json = json_dumps(metadata or {})
         with self._lock, self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """UPDATE tool_calls SET
                     output=?,is_error=?,status=?,completed_at=?,metadata_json=?
-                WHERE session_id=? AND tool_call_id=?""",
+                WHERE session_id=? AND tool_call_id=? AND status='running'""",
                 (
                     output,
                     int(is_error),
-                    "error" if is_error else "completed",
+                    status,
                     utc_now(),
-                    json_dumps(metadata or {}),
+                    metadata_json,
                     session_id,
                     call_id,
                 ),
             )
+            if cursor.rowcount == 0:
+                existing = self._connection.execute(
+                    """SELECT output,is_error,status,metadata_json
+                    FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
+                    (session_id, call_id),
+                ).fetchone()
+                if existing is None:
+                    raise SessionError(f"Tool call {call_id!r} does not exist")
+                if not (
+                    existing["output"] == output
+                    and existing["is_error"] == int(is_error)
+                    and existing["status"] == status
+                    and existing["metadata_json"] == metadata_json
+                ):
+                    raise SessionError(
+                        f"Tool call {call_id!r} is terminal and cannot be overwritten"
+                    )
+                if message is not None:
+                    self._append_message_locked(session_id, message)
+                return
             if message is not None:
                 self._append_message_locked(session_id, message)
 
@@ -589,29 +735,59 @@ class SessionStore:
         reason: str = "cancelled",
         message: Message | None = None,
     ) -> None:
+        metadata_json = json_dumps({"cancelled": True})
         with self._lock, self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """UPDATE tool_calls SET
                     output=?,is_error=1,status='cancelled',completed_at=?,metadata_json=?
-                WHERE session_id=? AND tool_call_id=?""",
-                (reason, utc_now(), json_dumps({"cancelled": True}), session_id, call_id),
+                WHERE session_id=? AND tool_call_id=? AND status='running'""",
+                (reason, utc_now(), metadata_json, session_id, call_id),
             )
+            if cursor.rowcount == 0:
+                existing = self._connection.execute(
+                    """SELECT output,is_error,status,metadata_json
+                    FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
+                    (session_id, call_id),
+                ).fetchone()
+                if existing is None:
+                    raise SessionError(f"Tool call {call_id!r} does not exist")
+                if not (
+                    existing["output"] == reason
+                    and existing["is_error"] == 1
+                    and existing["status"] == "cancelled"
+                    and existing["metadata_json"] == metadata_json
+                ):
+                    raise SessionError(
+                        f"Tool call {call_id!r} is terminal and cannot be overwritten"
+                    )
             if message is not None:
                 self._append_message_locked(session_id, message)
 
     def _append_message_locked(self, session_id: str, message: Message) -> None:
+        payload = json_dumps(message.to_dict())
+        existing = self._connection.execute(
+            "SELECT role,payload_json,created_at FROM messages "
+            "WHERE session_id=? AND message_id=?",
+            (session_id, message.id),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["role"] != message.role.value
+                or existing["payload_json"] != payload
+                or existing["created_at"] != message.created_at
+            ):
+                raise SessionError(
+                    f"Durable message {message.id} already exists and cannot be overwritten"
+                )
+            return
         self._connection.execute(
-            """INSERT INTO messages(session_id,message_id,role,payload_json,created_at)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(session_id,message_id) DO UPDATE SET
-                role=excluded.role,
-                payload_json=excluded.payload_json,
-                created_at=excluded.created_at""",
+            "INSERT INTO messages(session_id,message_id,role,payload_json,created_at) "
+            "VALUES(?,?,?,?,?)",
             (
                 session_id,
                 message.id,
                 message.role.value,
-                json_dumps(message.to_dict()),
+                payload,
                 message.created_at,
             ),
         )
@@ -645,8 +821,12 @@ class SessionStore:
 
     def add_usage(self, session_id: str, usage: Usage) -> Usage:
         with self._lock, self._connection:
-            self._connection.execute(
-                """UPDATE usage SET
+            self._add_usage_locked(session_id, usage)
+        return self.usage(session_id)
+
+    def _add_usage_locked(self, session_id: str, usage: Usage) -> None:
+        cursor = self._connection.execute(
+            """UPDATE usage SET
                 input_tokens=input_tokens+?, output_tokens=output_tokens+?,
                 cached_input_tokens=cached_input_tokens+?, cache_write_tokens=cache_write_tokens+?,
                 reasoning_tokens=reasoning_tokens+?, requests=requests+?, cost_usd=cost_usd+?,
@@ -656,23 +836,105 @@ class SessionStore:
                 application_cache_saved_tokens=application_cache_saved_tokens+?,
                 application_cache_saved_cost_usd=application_cache_saved_cost_usd+?
                 WHERE session_id=?""",
-                (
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cached_input_tokens,
-                    usage.cache_write_tokens,
-                    usage.reasoning_tokens,
-                    usage.requests,
-                    usage.cost_usd,
-                    usage.cache_savings_usd,
-                    usage.application_cache_hits,
-                    usage.application_cache_misses,
-                    usage.application_cache_saved_tokens,
-                    usage.application_cache_saved_cost_usd,
-                    session_id,
-                ),
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens,
+                usage.cache_write_tokens,
+                usage.reasoning_tokens,
+                usage.requests,
+                usage.cost_usd,
+                usage.cache_savings_usd,
+                usage.application_cache_hits,
+                usage.application_cache_misses,
+                usage.application_cache_saved_tokens,
+                usage.application_cache_saved_cost_usd,
+                session_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise SessionError(f"Unknown session: {session_id}")
+
+    def put_pending_compaction_summary(
+        self,
+        session_id: str,
+        key: str,
+        value: dict[str, Any],
+    ) -> bool:
+        """Persist a provider summary and return whether this caller owns it."""
+
+        pending = {**value, "usage_settled": False}
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """INSERT INTO key_values(session_id,key,value_json) VALUES(?,?,?)
+                ON CONFLICT(session_id,key) DO NOTHING""",
+                (session_id, key, json_dumps(pending)),
             )
-        return self.usage(session_id)
+            if cursor.rowcount:
+                return True
+            row = self._connection.execute(
+                "SELECT value_json FROM key_values WHERE session_id=? AND key=?",
+                (session_id, key),
+            ).fetchone()
+            existing = json.loads(row["value_json"]) if row is not None else None
+            if not isinstance(existing, dict):
+                raise SessionError(f"Compaction summary {key!r} has invalid durable state")
+            # The cache key identifies the request, not the nondeterministic response.
+            # An identical or different provider response is still a losing write.
+            return False
+
+    def get_compaction_summary(
+        self,
+        session_id: str,
+        key: str,
+    ) -> dict[str, Any] | None:
+        value = self.get_value(session_id, key)
+        return value if isinstance(value, dict) else None
+
+    def settle_compaction_summary_usage(
+        self,
+        session_id: str,
+        key: str,
+    ) -> tuple[dict[str, Any], Usage, bool]:
+        """Atomically charge pending summary usage exactly once."""
+
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT value_json FROM key_values WHERE session_id=? AND key=?",
+                (session_id, key),
+            ).fetchone()
+            if row is None:
+                raise SessionError(f"Compaction summary {key!r} does not exist")
+            value = json.loads(row["value_json"])
+            if not isinstance(value, dict):
+                raise SessionError(f"Compaction summary {key!r} has invalid durable state")
+            usage = Usage.from_dict(value.get("usage"))
+            if value.get("usage_settled") is True:
+                return value, usage, False
+            original_json = row["value_json"]
+            value["usage_settled"] = True
+            cursor = self._connection.execute(
+                """UPDATE key_values SET value_json=?
+                WHERE session_id=? AND key=? AND value_json=?""",
+                (json_dumps(value), session_id, key, original_json),
+            )
+            if cursor.rowcount == 0:
+                current = self._connection.execute(
+                    "SELECT value_json FROM key_values WHERE session_id=? AND key=?",
+                    (session_id, key),
+                ).fetchone()
+                current_value = (
+                    json.loads(current["value_json"]) if current is not None else None
+                )
+                if isinstance(current_value, dict) and current_value.get(
+                    "usage_settled"
+                ) is True:
+                    return current_value, Usage.from_dict(current_value.get("usage")), False
+                raise SessionError(
+                    f"Compaction summary {key!r} changed during usage settlement"
+                )
+            self._add_usage_locked(session_id, usage)
+            return value, usage, True
 
     def usage(self, session_id: str) -> Usage:
         with self._lock:
@@ -793,6 +1055,9 @@ class SessionStore:
                 "metadata": session.metadata,
             },
             "messages": [item.to_dict() for item in self.messages(session_id)],
+            "compaction_artifacts": [
+                artifact.to_dict() for artifact in self.compaction_artifacts(session_id)
+            ],
             "tool_calls": self.tool_calls(session_id),
             "usage": self.usage(session_id).to_dict(),
             "events": [
@@ -800,6 +1065,15 @@ class SessionStore:
                 for sequence, event in self._export_events(session_id)
             ],
         }
+
+    def compaction_artifacts(self, session_id: str) -> list[CompactionArtifact]:
+        self.get_session(session_id)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM compaction_artifacts WHERE session_id=? ORDER BY sequence",
+                (session_id,),
+            ).fetchall()
+        return [_compaction_artifact(row) for row in rows]
 
 
 def _session_info(row: sqlite3.Row) -> SessionInfo:
@@ -812,5 +1086,28 @@ def _session_info(row: sqlite3.Row) -> SessionInfo:
         status=row["status"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        metadata=json.loads(row["metadata_json"] or "{}"),
+    )
+
+
+def _compaction_artifact(row: sqlite3.Row) -> CompactionArtifact:
+    return CompactionArtifact(
+        id=row["artifact_id"],
+        session_id=row["session_id"],
+        version=int(row["version"]),
+        strategy=row["strategy"],
+        source_start_sequence=row["source_start_sequence"],
+        source_end_sequence=row["source_end_sequence"],
+        source_message_ids=list(json.loads(row["source_message_ids_json"] or "[]")),
+        source_hash=row["source_hash"],
+        summary_text=row["summary_text"],
+        provider=row["provider"],
+        model=row["model"],
+        config_fingerprint=row["config_fingerprint"],
+        estimated_tokens_before=int(row["estimated_tokens_before"]),
+        estimated_tokens_after=int(row["estimated_tokens_after"]),
+        usage=Usage.from_dict(json.loads(row["usage_json"] or "{}")),
+        created_at=row["created_at"],
+        parent_artifact_id=row["parent_artifact_id"],
         metadata=json.loads(row["metadata_json"] or "{}"),
     )

@@ -20,7 +20,7 @@
 | Repository-aware context | Full repository dumps waste tokens and obscure relevant code. | Git-aware discovery, ignore rules, symbol extraction, ranked repo map, focused search/read. | Context ranking tests and benchmark script. |
 | Hierarchical instructions | Repository and directory rules materially affect correctness. | `AGENTS.md`, `BOREALIS.md`, `CLAUDE.md` discovery from root to active path. | Instruction tests. |
 | Lazy skills | Rich procedural guidance should be available without polluting every prompt. | Skill discovery, compact descriptors, explicit `read_skill`. | Skill tests and example. |
-| Context compaction | Long sessions exceed model windows. | Deterministic structured compaction near a configurable token ratio; full history remains durable. | Compaction test. |
+| Context compaction | Long sessions exceed model windows. | Validated turn bundles, target-based structured artifacts, append-only history, durable reuse, and bounded overflow recovery. | Compaction v2 adversarial tests and fixed evaluation corpus. |
 | Durable sessions and replay | Work must survive process/client restarts and support audits. | SQLite/WAL sessions, messages, events, tool calls, usage, KV, JSON export. | Session CRUD/export tests; ACP replay. |
 | Budgets and stuck detection | Autonomous loops need hard operational limits. | Turn, input, output, time, cost, and repetition limits. | Unit paths and offline acceptance. |
 | Git integration | Diffs and status are the most useful evidence of repository mutation. | Status, diff, log, gated commit and push tools. | Tool registry and policy tests. |

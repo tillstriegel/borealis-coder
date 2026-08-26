@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from borealis_coder.errors import SessionError
 from borealis_coder.events import EventBus, JsonlTrace
-from borealis_coder.models import Event, Message, Role, Usage
+from borealis_coder.models import CompactionArtifact, Event, Message, Role, ToolCall, Usage
 from borealis_coder.sessions import SessionStore
 
 
@@ -49,6 +49,37 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(exported["events"][0]["type"], "test")
         self.assertEqual(exported["usage"]["total_tokens"], 7)
         self.assertEqual(exported["tool_calls"][0]["status"], "completed")
+
+    def test_pending_compaction_summary_reports_single_owner(self):
+        value = {
+            "version": 2,
+            "text": "winner",
+            "usage": Usage(input_tokens=3, requests=1).to_dict(),
+        }
+
+        self.assertTrue(
+            self.store.put_pending_compaction_summary(
+                self.session.id, "compaction_summary:key", value
+            )
+        )
+        self.assertFalse(
+            self.store.put_pending_compaction_summary(
+                self.session.id, "compaction_summary:key", value
+            )
+        )
+        self.assertFalse(
+            self.store.put_pending_compaction_summary(
+                self.session.id,
+                "compaction_summary:key",
+                {**value, "text": "loser"},
+            )
+        )
+        cached = self.store.get_compaction_summary(
+            self.session.id, "compaction_summary:key"
+        )
+        assert cached is not None
+        self.assertEqual(cached["text"], "winner")
+        self.assertFalse(cached["usage_settled"])
 
     def test_export_contains_more_than_one_event_query_page(self):
         self.store.append_events(
@@ -94,15 +125,16 @@ class SessionStoreTests(unittest.TestCase):
             ["run.completed"],
         )
 
-    def test_message_upsert_preserves_order_and_tool_ids_are_session_scoped(self):
+    def test_messages_are_append_only_and_tool_ids_are_session_scoped(self):
         first = Message(role=Role.USER, content="first")
         second = Message(role=Role.ASSISTANT, content="second")
         self.store.append_message(self.session.id, first)
         self.store.append_message(self.session.id, second)
         first.content = "updated"
-        self.store.append_message(self.session.id, first)
+        with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+            self.store.append_message(self.session.id, first)
         self.assertEqual(
-            [item.content for item in self.store.messages(self.session.id)], ["updated", "second"]
+            [item.content for item in self.store.messages(self.session.id)], ["first", "second"]
         )
 
         other = self.store.create_session(
@@ -117,6 +149,332 @@ class SessionStoreTests(unittest.TestCase):
         self.store.complete_tool_call(other.id, "same", output="b", is_error=False)
         self.assertEqual(self.store.tool_calls(self.session.id)[0]["output"], "a")
         self.assertEqual(self.store.tool_calls(other.id)[0]["output"], "b")
+
+    def test_tool_completion_cannot_overwrite_a_durable_result_message(self):
+        self.store.start_tool_call(
+            self.session.id, "run", "call", "read_file", {"path": "a"}
+        )
+        result = Message(
+            id="result",
+            role=Role.TOOL,
+            content="original",
+            tool_call_id="call",
+            tool_name="read_file",
+        )
+        self.store.complete_tool_call(
+            self.session.id,
+            "call",
+            output="original",
+            is_error=False,
+            message=result,
+        )
+        result.content = "overwritten"
+
+        with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+            self.store.complete_tool_call(
+                self.session.id,
+                "call",
+                output="overwritten",
+                is_error=False,
+                message=result,
+            )
+
+        self.assertEqual(self.store.messages(self.session.id)[0].content, "original")
+
+    def test_running_tool_call_start_is_exactly_idempotent(self):
+        self.store.start_tool_call(
+            self.session.id,
+            "run",
+            "call",
+            "read_file",
+            {"path": "a", "start": 1},
+        )
+        original = self.store.tool_calls(self.session.id)[0]
+
+        self.store.start_tool_call(
+            self.session.id,
+            "run",
+            "call",
+            "read_file",
+            {"start": 1, "path": "a"},
+        )
+
+        self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+        for run_id, name, arguments in (
+            ("other-run", "read_file", {"path": "a", "start": 1}),
+            ("run", "write_file", {"path": "a", "start": 1}),
+            ("run", "read_file", {"path": "b", "start": 1}),
+        ):
+            with self.subTest(run_id=run_id, name=name, arguments=arguments):
+                with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+                    self.store.start_tool_call(
+                        self.session.id,
+                        run_id,
+                        "call",
+                        name,
+                        arguments,
+                    )
+                self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+
+    def test_empty_tool_call_ids_are_rejected_without_ledger_mutation(self):
+        for call_id in ("", "   ", "\t\n"):
+            with self.subTest(call_id=repr(call_id)), self.assertRaisesRegex(
+                SessionError,
+                "must be non-empty",
+            ):
+                self.store.start_tool_call(
+                    self.session.id,
+                    "run",
+                    call_id,
+                    "read_file",
+                    {"path": "a"},
+                )
+
+        self.assertEqual(self.store.tool_calls(self.session.id), [])
+
+    def test_terminal_tool_completion_accepts_only_exact_replay(self):
+        self.store.start_tool_call(
+            self.session.id,
+            "run",
+            "call",
+            "read_file",
+            {"path": "a"},
+        )
+        message = Message(
+            id="result",
+            role=Role.TOOL,
+            content="original",
+            tool_call_id="call",
+            tool_name="read_file",
+            metadata={"stable": True},
+        )
+        self.store.complete_tool_call(
+            self.session.id,
+            "call",
+            output="original",
+            is_error=False,
+            metadata={"stable": True},
+            message=message,
+        )
+        original = self.store.tool_calls(self.session.id)[0]
+
+        self.store.complete_tool_call(
+            self.session.id,
+            "call",
+            output="original",
+            is_error=False,
+            metadata={"stable": True},
+            message=message,
+        )
+
+        self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+        self.assertEqual(len(self.store.messages(self.session.id)), 1)
+        for output, is_error, metadata in (
+            ("replacement", False, {"stable": True}),
+            ("original", True, {"stable": True}),
+            ("original", False, {"stable": False}),
+        ):
+            with self.subTest(output=output, is_error=is_error, metadata=metadata):
+                with self.assertRaisesRegex(SessionError, "terminal"):
+                    self.store.complete_tool_call(
+                        self.session.id,
+                        "call",
+                        output=output,
+                        is_error=is_error,
+                        metadata=metadata,
+                        message=message,
+                    )
+                self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+
+    def test_concurrent_cancellation_wins_over_stale_completion(self):
+        call = ToolCall(id="raced-call", name="read_file", arguments={"path": "a"})
+        assistant = Message(role=Role.ASSISTANT, tool_calls=[call])
+        self.store.append_message(self.session.id, assistant)
+        self.store.start_tool_call(
+            self.session.id, "run", call.id, call.name, call.arguments
+        )
+        completion_store = SessionStore(self.store.path)
+        update_started = threading.Event()
+        release_update = threading.Event()
+        completion_errors: list[BaseException] = []
+
+        class PausingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __enter__(self):
+                self.connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.connection.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, statement, parameters=()):
+                if (
+                    "UPDATE tool_calls SET" in statement
+                    and "status=?" in statement
+                ):
+                    update_started.set()
+                    release_update.wait(timeout=3)
+                return self.connection.execute(statement, parameters)
+
+        completion_message = Message(
+            role=Role.TOOL,
+            content="stale success",
+            tool_call_id=call.id,
+            tool_name=call.name,
+        )
+
+        def complete() -> None:
+            try:
+                completion_store.complete_tool_call(
+                    self.session.id,
+                    call.id,
+                    output=completion_message.content,
+                    is_error=False,
+                    message=completion_message,
+                )
+            except BaseException as error:
+                completion_errors.append(error)
+
+        original_connection = completion_store._connection
+        try:
+            with patch.object(
+                completion_store,
+                "_connection",
+                PausingConnection(original_connection),
+            ):
+                thread = threading.Thread(target=complete)
+                thread.start()
+                self.assertTrue(update_started.wait(timeout=1))
+                cancellation_message = Message(
+                    role=Role.TOOL,
+                    content="cancel won",
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    is_error=True,
+                    metadata={"cancelled": True},
+                )
+                self.store.cancel_tool_call(
+                    self.session.id,
+                    call.id,
+                    reason=cancellation_message.content,
+                    message=cancellation_message,
+                )
+                release_update.set()
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+        finally:
+            release_update.set()
+            completion_store.close()
+
+        self.assertEqual(len(completion_errors), 1)
+        self.assertIsInstance(completion_errors[0], SessionError)
+        ledger = self.store.tool_calls(self.session.id)[0]
+        self.assertEqual(ledger["status"], "cancelled")
+        self.assertEqual(ledger["output"], "cancel won")
+        messages = self.store.messages(self.session.id)
+        self.assertEqual(messages, [assistant, cancellation_message])
+
+    def test_tool_cancellation_accepts_only_exact_cancelled_replay(self):
+        with self.assertRaisesRegex(SessionError, "does not exist"):
+            self.store.cancel_tool_call(self.session.id, "missing")
+
+        self.store.start_tool_call(
+            self.session.id, "run", "cancelled-call", "read_file", {"path": "a"}
+        )
+        message = Message(
+            id="cancelled-result",
+            role=Role.TOOL,
+            content="stopped",
+            tool_call_id="cancelled-call",
+            tool_name="read_file",
+            is_error=True,
+            metadata={"cancelled": True},
+        )
+        self.store.cancel_tool_call(
+            self.session.id, "cancelled-call", reason="stopped", message=message
+        )
+        cancelled = self.store.tool_calls(self.session.id)[0]
+        self.store.cancel_tool_call(
+            self.session.id, "cancelled-call", reason="stopped", message=message
+        )
+        self.assertEqual(self.store.tool_calls(self.session.id)[0], cancelled)
+        self.assertEqual(self.store.messages(self.session.id), [message])
+
+        for status in ("completed", "error"):
+            call_id = f"terminal-{status}"
+            self.store.start_tool_call(
+                self.session.id, "run", call_id, "read_file", {"path": status}
+            )
+            self.store.complete_tool_call(
+                self.session.id,
+                call_id,
+                output=f"{status} result",
+                is_error=status == "error",
+                metadata={"stable": True},
+            )
+            original = next(
+                row
+                for row in self.store.tool_calls(self.session.id)
+                if row["tool_call_id"] == call_id
+            )
+            with self.assertRaisesRegex(SessionError, "terminal"):
+                self.store.cancel_tool_call(
+                    self.session.id, call_id, reason="stale cancellation"
+                )
+            current = next(
+                row
+                for row in self.store.tool_calls(self.session.id)
+                if row["tool_call_id"] == call_id
+            )
+            self.assertEqual(current, original)
+
+    def test_terminal_tool_calls_cannot_be_restarted_or_overwritten(self):
+        for status in ("completed", "error", "cancelled"):
+            with self.subTest(status=status):
+                call_id = f"call-{status}"
+                self.store.start_tool_call(
+                    self.session.id,
+                    "original-run",
+                    call_id,
+                    "read_file",
+                    {"path": "original"},
+                )
+                if status == "cancelled":
+                    self.store.cancel_tool_call(self.session.id, call_id)
+                else:
+                    self.store.complete_tool_call(
+                        self.session.id,
+                        call_id,
+                        output="original output",
+                        is_error=status == "error",
+                        metadata={"original": True},
+                    )
+                original = next(
+                    row
+                    for row in self.store.tool_calls(self.session.id)
+                    if row["tool_call_id"] == call_id
+                )
+
+                with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+                    self.store.start_tool_call(
+                        self.session.id,
+                        "new-run",
+                        call_id,
+                        "write_file",
+                        {"path": "replacement"},
+                    )
+
+                current = next(
+                    row
+                    for row in self.store.tool_calls(self.session.id)
+                    if row["tool_call_id"] == call_id
+                )
+                self.assertEqual(current, original)
 
     def test_v1_tool_call_schema_migrates(self):
         self.store.close()
@@ -158,7 +516,7 @@ class SessionStoreTests(unittest.TestCase):
             version = legacy._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='version'"
             ).fetchone()[0]
-            self.assertEqual(version, "3")
+            self.assertEqual(version, "4")
         finally:
             legacy.close()
         self.store = SessionStore(self.root / "sessions.sqlite3")
@@ -174,6 +532,43 @@ class SessionStoreTests(unittest.TestCase):
         self.store.set_value(self.session.id, "plan", {"x": 1})
         self.assertEqual(self.store.get_value(self.session.id, "plan"), {"x": 1})
         self.assertEqual(self.store.get_value(self.session.id, "missing", 9), 9)
+
+    def test_compaction_artifacts_are_immutable_reusable_and_exported(self):
+        artifact = CompactionArtifact(
+            id="cmp-test",
+            session_id=self.session.id,
+            version=2,
+            strategy="deterministic",
+            source_message_ids=["m1", "m2"],
+            source_hash="source-hash",
+            summary_text="exact compacted context",
+            config_fingerprint="config-hash",
+            estimated_tokens_before=100,
+            estimated_tokens_after=25,
+            usage=Usage(input_tokens=5, output_tokens=2, requests=1, cost_usd=0.01),
+            parent_artifact_id="cmp-parent",
+            metadata={"retained_message_ids": ["m3"]},
+        )
+
+        self.store.append_compaction_artifact(artifact)
+
+        latest = self.store.latest_compaction_artifact(self.session.id)
+        reusable = self.store.reusable_compaction_artifact(
+            self.session.id,
+            source_hash="source-hash",
+            config_fingerprint="config-hash",
+            strategy="deterministic",
+        )
+        assert latest is not None and reusable is not None
+        self.assertEqual(latest.summary_text, "exact compacted context")
+        self.assertEqual(reusable.id, artifact.id)
+        self.assertEqual(reusable.usage.cost_usd, 0.01)
+        self.assertEqual(
+            self.store.export(self.session.id)["compaction_artifacts"][0]["id"],
+            artifact.id,
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.append_compaction_artifact(artifact)
 
     def test_response_cache_is_bounded_and_tracks_usage(self):
         original = Usage(input_tokens=10, output_tokens=2, requests=1, cost_usd=0.25)

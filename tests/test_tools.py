@@ -60,6 +60,78 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         self.context.checkpoints.restore(checkpoint)
         self.assertEqual((self.root/"a.txt").read_text(), "one\n")
 
+    async def test_file_mutations_reject_changes_made_during_checkpoint(self):
+        original_create = self.context.checkpoints.create
+
+        async def raced_call(name, arguments, path, external_content):
+            def create_then_change(*args, **kwargs):
+                checkpoint = original_create(*args, **kwargs)
+                path.write_text(external_content, encoding="utf-8")
+                return checkpoint
+
+            with patch.object(
+                self.context.checkpoints,
+                "create",
+                side_effect=create_then_change,
+            ):
+                result = await self.call(name, arguments)
+            self.assertTrue(result.is_error, result.output)
+            self.assertIn("Stale", result.output)
+            self.assertEqual(path.read_text(encoding="utf-8"), external_content)
+
+        existing = self.root / "write.txt"
+        existing.write_text("before", encoding="utf-8")
+        await raced_call(
+            "write_file",
+            {
+                "path": "write.txt",
+                "content": "tool write",
+                "expected_sha256": sha256_text("before"),
+            },
+            existing,
+            "external write",
+        )
+
+        created = self.root / "create.txt"
+        await raced_call(
+            "write_file",
+            {
+                "path": "create.txt",
+                "content": "tool create",
+                "expected_sha256": None,
+            },
+            created,
+            "external create",
+        )
+
+        replaced = self.root / "replace.txt"
+        replaced.write_text("before", encoding="utf-8")
+        await raced_call(
+            "replace_in_file",
+            {
+                "path": "replace.txt",
+                "old_text": "before",
+                "new_text": "tool edit",
+                "expected_occurrences": 1,
+                "expected_sha256": sha256_text("before"),
+            },
+            replaced,
+            "external edit",
+        )
+
+        deleted = self.root / "delete.txt"
+        deleted.write_text("before", encoding="utf-8")
+        await raced_call(
+            "delete_file",
+            {
+                "path": "delete.txt",
+                "expected_sha256": sha256_text("before"),
+            },
+            deleted,
+            "external delete race",
+        )
+        self.assertEqual(self.context.changed_files, set())
+
     async def test_unified_patch_add_update_delete(self):
         (self.root/"a.txt").write_text("one\ntwo\n")
         patch = """--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1,1 @@\n+new\n"""
@@ -77,6 +149,7 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.is_error, result.output)
         self.assertTrue((self.root / "parent" / "child").is_dir())
+        self.assertEqual(result.metadata["changed_files"], ["parent", "parent/child"])
         self.assertEqual(self.context.changed_files, {"parent", "parent/child"})
         self.assertEqual(self.context.changed_roots, {self.root.resolve()})
 
@@ -84,6 +157,7 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         self.context.changed_roots.clear()
         existing = await self.call("make_directory", {"path": "parent/child"})
         self.assertFalse(existing.is_error, existing.output)
+        self.assertEqual(existing.metadata["changed_files"], [])
         self.assertEqual(self.context.changed_files, set())
         self.assertEqual(self.context.changed_roots, set())
 
@@ -94,6 +168,41 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         result = await self.call("apply_patch", {"patch": patch})
         self.assertTrue(result.is_error)
         self.assertEqual((self.root/"a.txt").read_text(), "a\n")
+
+    async def test_patch_rejects_change_during_checkpoint_before_any_commit(self):
+        first = self.root / "a.txt"
+        second = self.root / "b.txt"
+        first.write_text("a\n", encoding="utf-8")
+        second.write_text("b\n", encoding="utf-8")
+        patch_text = """*** Begin Patch
+*** Update File: a.txt
+@@
+-a
++A
+*** Update File: b.txt
+@@
+-b
++B
+*** End Patch"""
+        original_create = self.context.checkpoints.create
+
+        def create_then_change(*args, **kwargs):
+            checkpoint = original_create(*args, **kwargs)
+            second.write_text("external\n", encoding="utf-8")
+            return checkpoint
+
+        with patch.object(
+            self.context.checkpoints,
+            "create",
+            side_effect=create_then_change,
+        ):
+            result = await self.call("apply_patch", {"patch": patch_text})
+
+        self.assertTrue(result.is_error, result.output)
+        self.assertIn("Stale patch rejected", result.output)
+        self.assertEqual(first.read_text(encoding="utf-8"), "a\n")
+        self.assertEqual(second.read_text(encoding="utf-8"), "external\n")
+        self.assertEqual(self.context.changed_files, set())
 
     async def test_apply_patch_bare_header_and_multiple_hunks(self):
         (self.root / "a.txt").write_text("alpha\nbeta\ngamma\ndelta\n", encoding="utf-8")

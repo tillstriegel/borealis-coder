@@ -77,6 +77,14 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `auto_verify_max_seconds` | `900` | Verification time budget. |
 | `auto_verify_max_repair_cycles` | `1` | Maximum automatic repair-and-reverify cycles after a failed authoritative check. |
 | `deterministic_compaction` | `true` | Use local structured compaction rather than another model call. |
+| `compaction_version` | `2` | Provider-context compaction implementation. Set `1` only during the compatibility rollout. |
+| `compaction_target_ratio` | `0.70` | Required post-compaction share of the available input budget. |
+| `compaction_safety_margin_tokens` | `2048` | Tokens reserved for estimation error and provider differences. |
+| `compaction_provider_framing_tokens` | `512` | Minimum request-framing allowance; fallback routing uses the largest configured provider allowance. |
+| `compaction_max_overflow_retries` | `2` | Strict provider context-overflow retry limit. |
+| `compaction_summarizer_input_tokens` | `32000` | Maximum input tokens for one summary chunk. |
+| `compaction_summarizer_total_input_tokens` | `96000` | Maximum input tokens across all summary chunks. |
+| `compaction_shadow_v2` | `false` | Generate safe v2 size metrics while compatibility v1 remains active. |
 
 ## `[safety]`
 
