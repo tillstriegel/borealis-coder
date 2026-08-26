@@ -1341,6 +1341,129 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_same_batch_duplicate_mutating_tool_ids_are_rejected_before_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            executions = 0
+
+            def mutate(arguments, context):
+                nonlocal executions
+                del arguments, context
+                executions += 1
+                return ToolResult("mutated")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="duplicate_mutator",
+                    description="Count executions for duplicate ID regression coverage.",
+                    parameters=object_schema({}),
+                    function=mutate,
+                    effect=Effect.WRITE,
+                )
+            )
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="duplicate", name="duplicate_mutator", arguments={}),
+                        ToolCall(id="duplicate", name="duplicate_mutator", arguments={}),
+                    ],
+                    usage=Usage(input_tokens=7, output_tokens=3, requests=1),
+                )
+            )
+            try:
+                result = await runner.run("reject duplicate calls")
+                messages = runner.sessions.messages(result.session_id)
+
+                self.assertEqual(result.stop_reason.value, "error")
+                self.assertIn("duplicate tool-call ID", result.error or "")
+                self.assertEqual(executions, 0)
+                self.assertEqual(runner.sessions.tool_calls(result.session_id), [])
+                self.assertFalse(
+                    any(message.role == Role.ASSISTANT and message.tool_calls for message in messages)
+                )
+                self.assertEqual(runner.sessions.usage(result.session_id).total_tokens, 10)
+                self.assertEqual(runner.sessions.usage(result.session_id).requests, 1)
+            finally:
+                await runner.close()
+
+    async def test_cross_turn_duplicate_mutating_tool_id_preserves_first_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            executions: list[str] = []
+
+            def mutate(arguments, context):
+                del context
+                value = str(arguments["value"])
+                executions.append(value)
+                return ToolResult(f"mutated {value}", metadata={"value": value})
+
+            runner.tools.register(
+                FunctionTool(
+                    name="duplicate_mutator",
+                    description="Record the mutation value for duplicate ID regression coverage.",
+                    parameters=object_schema({"value": {"type": "string"}}, required=["value"]),
+                    function=mutate,
+                    effect=Effect.WRITE,
+                )
+            )
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="reused-call",
+                            name="duplicate_mutator",
+                            arguments={"value": "original"},
+                        )
+                    ],
+                    usage=Usage(requests=1),
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="reused-call",
+                            name="duplicate_mutator",
+                            arguments={"value": "replacement"},
+                        )
+                    ],
+                    usage=Usage(requests=1),
+                ),
+            )
+            try:
+                result = await runner.run("reject a reused call ID")
+                ledger = runner.sessions.tool_calls(result.session_id)
+                messages = runner.sessions.messages(result.session_id)
+
+                self.assertEqual(result.stop_reason.value, "error")
+                self.assertEqual(executions, ["original"])
+                self.assertEqual(len(ledger), 1)
+                self.assertEqual(ledger[0]["arguments"], {"value": "original"})
+                self.assertEqual(ledger[0]["output"], "mutated original")
+                self.assertEqual(ledger[0]["status"], "completed")
+                assistant_calls = [
+                    message
+                    for message in messages
+                    if message.role == Role.ASSISTANT and message.tool_calls
+                ]
+                self.assertEqual(len(assistant_calls), 1)
+                self.assertEqual(assistant_calls[0].tool_calls[0].arguments["value"], "original")
+                self.assertEqual(runner.sessions.usage(result.session_id).requests, 2)
+            finally:
+                await runner.close()
+
     async def test_pre_final_incomplete_response_drains_inflight_steering(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -646,22 +646,33 @@ class SessionStore:
     def start_tool_call(
         self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any]
     ) -> None:
+        arguments_json = json_dumps(arguments)
+        normalized_arguments = json.loads(arguments_json)
         with self._lock, self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """INSERT INTO tool_calls(
                     session_id,tool_call_id,run_id,tool_name,arguments_json,status,started_at
                 ) VALUES(?,?,?,?,?,'running',?)
-                ON CONFLICT(session_id,tool_call_id) DO UPDATE SET
-                    run_id=excluded.run_id,
-                    tool_name=excluded.tool_name,
-                    arguments_json=excluded.arguments_json,
-                    output=NULL,
-                    is_error=NULL,
-                    status='running',
-                    started_at=excluded.started_at,
-                    completed_at=NULL,
-                    metadata_json='{}'""",
-                (session_id, call_id, run_id, name, json_dumps(arguments), utc_now()),
+                ON CONFLICT(session_id,tool_call_id) DO NOTHING""",
+                (session_id, call_id, run_id, name, arguments_json, utc_now()),
+            )
+            if cursor.rowcount:
+                return
+            existing = self._connection.execute(
+                """SELECT run_id,tool_name,arguments_json,status
+                FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
+                (session_id, call_id),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["status"] == "running"
+                and existing["run_id"] == run_id
+                and existing["tool_name"] == name
+                and json.loads(existing["arguments_json"]) == normalized_arguments
+            ):
+                return
+            raise SessionError(
+                f"Tool call {call_id!r} already exists and cannot be overwritten"
             )
 
     def complete_tool_call(

@@ -150,6 +150,84 @@ class SessionStoreTests(unittest.TestCase):
 
         self.assertEqual(self.store.messages(self.session.id)[0].content, "original")
 
+    def test_running_tool_call_start_is_exactly_idempotent(self):
+        self.store.start_tool_call(
+            self.session.id,
+            "run",
+            "call",
+            "read_file",
+            {"path": "a", "start": 1},
+        )
+        original = self.store.tool_calls(self.session.id)[0]
+
+        self.store.start_tool_call(
+            self.session.id,
+            "run",
+            "call",
+            "read_file",
+            {"start": 1, "path": "a"},
+        )
+
+        self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+        for run_id, name, arguments in (
+            ("other-run", "read_file", {"path": "a", "start": 1}),
+            ("run", "write_file", {"path": "a", "start": 1}),
+            ("run", "read_file", {"path": "b", "start": 1}),
+        ):
+            with self.subTest(run_id=run_id, name=name, arguments=arguments):
+                with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+                    self.store.start_tool_call(
+                        self.session.id,
+                        run_id,
+                        "call",
+                        name,
+                        arguments,
+                    )
+                self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+
+    def test_terminal_tool_calls_cannot_be_restarted_or_overwritten(self):
+        for status in ("completed", "error", "cancelled"):
+            with self.subTest(status=status):
+                call_id = f"call-{status}"
+                self.store.start_tool_call(
+                    self.session.id,
+                    "original-run",
+                    call_id,
+                    "read_file",
+                    {"path": "original"},
+                )
+                if status == "cancelled":
+                    self.store.cancel_tool_call(self.session.id, call_id)
+                else:
+                    self.store.complete_tool_call(
+                        self.session.id,
+                        call_id,
+                        output="original output",
+                        is_error=status == "error",
+                        metadata={"original": True},
+                    )
+                original = next(
+                    row
+                    for row in self.store.tool_calls(self.session.id)
+                    if row["tool_call_id"] == call_id
+                )
+
+                with self.assertRaisesRegex(SessionError, "cannot be overwritten"):
+                    self.store.start_tool_call(
+                        self.session.id,
+                        "new-run",
+                        call_id,
+                        "write_file",
+                        {"path": "replacement"},
+                    )
+
+                current = next(
+                    row
+                    for row in self.store.tool_calls(self.session.id)
+                    if row["tool_call_id"] == call_id
+                )
+                self.assertEqual(current, original)
+
     def test_v1_tool_call_schema_migrates(self):
         self.store.close()
         path = self.root / "legacy.sqlite3"

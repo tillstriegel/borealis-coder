@@ -9,8 +9,10 @@ import string
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from borealis_coder.agent import (
+    Budget,
     BundleKind,
     CompactionError,
     CompactionEvidence,
@@ -37,7 +39,12 @@ from borealis_coder.agent.compaction_eval import (
 )
 from borealis_coder.config import ProviderConfig
 from borealis_coder.context import PromptContext
-from borealis_coder.errors import ProviderContextOverflowError, ProviderUnavailableError
+from borealis_coder.errors import (
+    BudgetExceeded,
+    ProviderContextOverflowError,
+    ProviderUnavailableError,
+    SessionError,
+)
 from borealis_coder.models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from borealis_coder.providers.anthropic import AnthropicProvider
 from borealis_coder.providers.base import Provider
@@ -2470,6 +2477,245 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         compacted = [event for event in events if event.type == "context.compacted"]
         self.assertTrue(any(event.data.get("artifact_reused") for event in compacted))
+
+    async def test_summary_is_reused_after_one_time_artifact_write_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                cache={"response_cache_enabled": False},
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(14):
+                for message in _tool_cycle(
+                    f"write-failure-{index}",
+                    content=(f"history-{index} " * 100),
+                ):
+                    runner.sessions.append_message(session.id, message)
+            runner.sessions.append_message(
+                session.id, Message(role=Role.USER, content="current request")
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider_calls = 0
+            original_usage = Usage(
+                input_tokens=50,
+                output_tokens=10,
+                requests=1,
+                cost_usd=0.2,
+            )
+
+            def handler(request: ProviderRequest, _call: int) -> ModelResponse:
+                nonlocal provider_calls
+                provider_calls += 1
+                return ModelResponse(
+                    text=_echo_evidence(request.messages[-1].content),
+                    model="resolved-summary-model",
+                    usage=original_usage,
+                )
+
+            provider.handler = handler
+            prompt_context = await asyncio.to_thread(
+                runner.context_builder.build, query="current request"
+            )
+
+            async def usage_sink(usage: Usage) -> None:
+                await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
+
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "append_compaction_artifact",
+                    side_effect=SessionError("one-time artifact write failure"),
+                ), self.assertRaisesRegex(SessionError, "one-time"):
+                    await runner._prepare_provider_request(
+                        prompt_context=prompt_context,
+                        messages=runner.sessions.messages(session.id),
+                        schemas=runner.tools.schemas(),
+                        final_turn=False,
+                        verification_finalization_pending=False,
+                        adaptive_cache=False,
+                        conversation_cache=True,
+                        usage_sink=usage_sink,
+                        cancel=asyncio.Event(),
+                        session_id=session.id,
+                        run_id="artifact-first-attempt",
+                        last_prune_signature=None,
+                    )
+            finally:
+                await runner.close()
+
+            resumed = await build_runner(root, config=config, interactive=False)
+            resumed_provider = resumed.providers[0].provider
+            assert isinstance(resumed_provider, MockProvider)
+            resumed_provider.handler = handler
+            resumed_context = await asyncio.to_thread(
+                resumed.context_builder.build, query="current request"
+            )
+
+            async def resumed_usage_sink(usage: Usage) -> None:
+                await asyncio.to_thread(
+                    resumed.sessions.add_usage,
+                    session.id,
+                    usage,
+                )
+
+            try:
+                prepared = await resumed._prepare_provider_request(
+                    prompt_context=resumed_context,
+                    messages=resumed.sessions.messages(session.id),
+                    schemas=resumed.tools.schemas(),
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=resumed_usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="artifact-resume",
+                    last_prune_signature=None,
+                )
+                artifacts = resumed.sessions.compaction_artifacts(session.id)
+                usage = resumed.sessions.usage(session.id)
+            finally:
+                await resumed.close()
+
+        self.assertTrue(prepared.compacted)
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].model, "resolved-summary-model")
+        self.assertEqual(artifacts[0].usage.to_dict(), original_usage.to_dict())
+        self.assertEqual(usage.input_tokens, original_usage.input_tokens)
+        self.assertEqual(usage.output_tokens, original_usage.output_tokens)
+        self.assertEqual(usage.requests, original_usage.requests)
+        self.assertEqual(usage.cost_usd, original_usage.cost_usd)
+        self.assertEqual(usage.application_cache_hits, 1)
+        self.assertEqual(
+            usage.application_cache_saved_tokens,
+            original_usage.total_tokens,
+        )
+        self.assertEqual(
+            usage.application_cache_saved_cost_usd,
+            original_usage.cost_usd,
+        )
+
+    async def test_summary_is_reused_after_usage_crosses_run_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "deterministic_compaction": False,
+                    "max_cost_usd": 0.1,
+                },
+                cache={"response_cache_enabled": False},
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(14):
+                for message in _tool_cycle(
+                    f"budget-failure-{index}",
+                    content=(f"history-{index} " * 100),
+                ):
+                    runner.sessions.append_message(session.id, message)
+            runner.sessions.append_message(
+                session.id, Message(role=Role.USER, content="current request")
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider_calls = 0
+            original_usage = Usage(
+                input_tokens=50,
+                output_tokens=10,
+                requests=1,
+                cost_usd=0.2,
+            )
+
+            def handler(request: ProviderRequest, _call: int) -> ModelResponse:
+                nonlocal provider_calls
+                provider_calls += 1
+                return ModelResponse(
+                    text=_echo_evidence(request.messages[-1].content),
+                    model="resolved-summary-model",
+                    usage=original_usage,
+                )
+
+            provider.handler = handler
+            prompt_context = await asyncio.to_thread(
+                runner.context_builder.build, query="current request"
+            )
+            budget = Budget.start(config.agent)
+
+            async def first_usage_sink(usage: Usage) -> None:
+                await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
+                budget.add_usage(usage)
+
+            base_arguments = {
+                "prompt_context": prompt_context,
+                "messages": runner.sessions.messages(session.id),
+                "schemas": runner.tools.schemas(),
+                "final_turn": False,
+                "verification_finalization_pending": False,
+                "adaptive_cache": False,
+                "conversation_cache": True,
+                "cancel": asyncio.Event(),
+                "session_id": session.id,
+                "run_id": "budget-retry",
+                "last_prune_signature": None,
+            }
+            try:
+                with self.assertRaises(BudgetExceeded):
+                    await runner._prepare_provider_request(
+                        **base_arguments,
+                        usage_sink=first_usage_sink,
+                    )
+                self.assertEqual(runner.sessions.compaction_artifacts(session.id), [])
+
+                resumed_budget = Budget.start(config.agent)
+
+                async def resumed_usage_sink(usage: Usage) -> None:
+                    await asyncio.to_thread(
+                        runner.sessions.add_usage,
+                        session.id,
+                        usage,
+                    )
+                    resumed_budget.add_usage(usage)
+
+                prepared = await runner._prepare_provider_request(
+                    **base_arguments,
+                    usage_sink=resumed_usage_sink,
+                )
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+                usage = runner.sessions.usage(session.id)
+            finally:
+                await runner.close()
+
+        self.assertTrue(prepared.compacted)
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].model, "resolved-summary-model")
+        self.assertEqual(artifacts[0].usage.to_dict(), original_usage.to_dict())
+        self.assertEqual(usage.input_tokens, original_usage.input_tokens)
+        self.assertEqual(usage.output_tokens, original_usage.output_tokens)
+        self.assertEqual(usage.requests, original_usage.requests)
+        self.assertEqual(usage.cost_usd, original_usage.cost_usd)
+        self.assertEqual(usage.application_cache_hits, 1)
+        self.assertEqual(
+            usage.application_cache_saved_tokens,
+            original_usage.total_tokens,
+        )
+        self.assertEqual(
+            usage.application_cache_saved_cost_usd,
+            original_usage.cost_usd,
+        )
 
     async def test_artifact_reuse_requires_the_same_retained_provider_payload(self):
         with tempfile.TemporaryDirectory() as td:

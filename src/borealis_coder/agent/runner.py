@@ -123,6 +123,7 @@ Automatic verification has already run after the mutations. Tools are unavailabl
 response. Return a final answer that accurately reports the supplied verification result and
 does not claim stronger process-lifecycle or mutation guarantees than it provides.
 """
+_COMPACTION_SUMMARY_CACHE_VERSION = 1
 
 
 def _stable_payload_hash(value: Any) -> str:
@@ -156,6 +157,24 @@ def _fits_context_limit(messages: list[Message], budget: ContextBudget) -> bool:
         + budget.safety_margin_tokens
         <= budget.input_limit
     )
+
+
+def _duplicate_tool_call_id(
+    calls: list[ToolCall],
+    earlier_messages: list[Message],
+) -> str | None:
+    durable_ids = {
+        call.id
+        for message in earlier_messages
+        if message.role == Role.ASSISTANT
+        for call in message.tool_calls
+    }
+    batch_ids: set[str] = set()
+    for call in calls:
+        if call.id in durable_ids or call.id in batch_ids:
+            return call.id
+        batch_ids.add(call.id)
+    return None
 
 
 def _abandoned_tool_call_results(
@@ -670,6 +689,20 @@ class AgentRunner:
                 response_tool_calls = [] if response_incomplete else response.tool_calls
                 if verification_finalization_pending:
                     response_tool_calls = []
+                if response_tool_calls and not tools_disabled:
+                    durable_messages = await asyncio.to_thread(
+                        self.sessions.messages,
+                        session_id,
+                    )
+                    duplicate_call_id = _duplicate_tool_call_id(
+                        response_tool_calls,
+                        durable_messages,
+                    )
+                    if duplicate_call_id is not None:
+                        raise SessionError(
+                            "Provider returned duplicate tool-call ID "
+                            f"{duplicate_call_id!r}"
+                        )
                 assistant_metadata = {
                     "model": response.model or used_route.model,
                     "response_id": response.response_id,
@@ -1606,7 +1639,12 @@ class AgentRunner:
                         }
                     compacted_messages = await compact_messages_with_summary(
                         request_messages,
-                        self._summarizer(usage_sink, cancel, summary_usage),
+                        self._summarizer(
+                            usage_sink,
+                            cancel,
+                            summary_usage,
+                            session_id=session_id,
+                        ),
                         transcript_message_ids=transcript_message_ids,
                         **compaction_kwargs,
                     )
@@ -2386,11 +2424,52 @@ class AgentRunner:
         }
         return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
 
+    def _compaction_summary_cache_key(
+        self,
+        route: ProviderRoute,
+        request: ProviderRequest,
+    ) -> str:
+        request_messages = [
+            {
+                "role": message.role.value,
+                "content": message.content,
+                "tool_calls": [call.to_dict() for call in message.tool_calls],
+                "tool_call_id": message.tool_call_id,
+                "tool_name": message.tool_name,
+                "is_error": message.is_error,
+                "metadata": message.metadata,
+            }
+            for message in request.messages
+        ]
+        payload = {
+            "version": _COMPACTION_SUMMARY_CACHE_VERSION,
+            "provider": route.provider.name,
+            "provider_route": route.name,
+            "provider_config_fingerprint": (
+                self._provider_request_config_fingerprint(route)
+            ),
+            "model": request.model,
+            "request": {
+                "system": request.system,
+                "messages": request_messages,
+                "tools": request.tools,
+                "max_output_tokens": request.max_output_tokens,
+                "temperature": request.temperature,
+                "reasoning_effort": request.reasoning_effort,
+                "parallel_tool_calls": request.parallel_tool_calls,
+                "response_schema": request.response_schema,
+                "metadata": request.metadata,
+            },
+        }
+        return "compaction_summary:" + _stable_payload_hash(payload)
+
     def _summarizer(
         self,
         usage_sink: Callable[[Usage], Awaitable[None]],
         cancel: asyncio.Event,
         usage_collector: Usage | None = None,
+        *,
+        session_id: str | None = None,
     ) -> Callable[[str], Awaitable[SummarizerResult]] | None:
         """Build an LLM-backed compaction summarizer from the primary route.
 
@@ -2411,6 +2490,38 @@ class AgentRunner:
                 response_schema=COMPACTION_RESPONSE_SCHEMA,
                 metadata={"purpose": "compaction_summary"},
             )
+            cache_key = self._compaction_summary_cache_key(route, request)
+            cached = (
+                await asyncio.to_thread(
+                    self.sessions.get_value,
+                    session_id,
+                    cache_key,
+                )
+                if session_id is not None
+                else None
+            )
+            if (
+                isinstance(cached, dict)
+                and cached.get("version") == _COMPACTION_SUMMARY_CACHE_VERSION
+            ):
+                original_usage = Usage.from_dict(cached.get("usage"))
+                cache_usage = Usage(
+                    application_cache_hits=1,
+                    application_cache_saved_tokens=original_usage.total_tokens,
+                    application_cache_saved_cost_usd=original_usage.cost_usd,
+                )
+                if usage_collector is not None:
+                    usage_collector.add(original_usage)
+                await usage_sink(cache_usage)
+                if cancel.is_set():
+                    raise Cancelled("Run cancelled")
+                return SummarizerResult(
+                    text=str(cached.get("text") or ""),
+                    model=str(cached.get("model") or request.model),
+                    requested_model=str(
+                        cached.get("requested_model") or request.model
+                    ),
+                )
             request_task = asyncio.create_task(route.provider.complete(request))
             cancel_task = asyncio.create_task(cancel.wait())
             try:
@@ -2436,6 +2547,19 @@ class AgentRunner:
                     request_task,
                     cancel_task,
                     return_exceptions=True,
+                )
+            if session_id is not None:
+                await asyncio.to_thread(
+                    self.sessions.set_value,
+                    session_id,
+                    cache_key,
+                    {
+                        "version": _COMPACTION_SUMMARY_CACHE_VERSION,
+                        "text": response.text,
+                        "model": response.model or request.model,
+                        "requested_model": request.model,
+                        "usage": asdict(response.usage),
+                    },
                 )
             if usage_collector is not None:
                 usage_collector.add(response.usage)
