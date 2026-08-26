@@ -2133,7 +2133,11 @@ class AgentRunner:
                     retryable=True,
                 )
                 continue
-            except ProviderError:
+            except ProviderError as error:
+                if not failed_usage.is_empty:
+                    if error.usage is not None:
+                        failed_usage.add(error.usage)
+                    error.usage = failed_usage
                 raise
         raise ProviderUnavailableError(
             "All provider routes failed: " + "; ".join(errors),

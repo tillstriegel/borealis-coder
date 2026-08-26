@@ -625,6 +625,66 @@ class StructuredCompactionTests(unittest.TestCase):
             ],
         )
 
+        refreshed = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[status]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=status.id,
+                    tool_name=status.name,
+                    content="working tree clean",
+                ),
+            ],
+            base=CompactionEvidence(
+                latest_verification=[
+                    "Stale: git state was recorded before the latest file mutation; "
+                    "run git status again."
+                ]
+            ),
+        )
+
+        self.assertEqual(
+            refreshed.latest_verification,
+            ["Latest recorded git state:\nworking tree clean"],
+        )
+
+    def test_git_state_before_a_later_mutation_is_marked_stale(self):
+        status = ToolCall(id="status", name="git_status", arguments={})
+        write = ToolCall(
+            id="write",
+            name="write_file",
+            arguments={"path": "src/example.py", "content": "updated"},
+        )
+
+        evidence = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[status]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=status.id,
+                    tool_name=status.name,
+                    content="working tree clean",
+                ),
+                Message(role=Role.ASSISTANT, tool_calls=[write]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=write.id,
+                    tool_name=write.name,
+                    content="updated src/example.py",
+                ),
+            ]
+        )
+
+        self.assertNotIn(
+            "Latest recorded git state:\nworking tree clean",
+            evidence.latest_verification,
+        )
+        self.assertIn(
+            "Stale: git state was recorded before the latest file mutation; "
+            "run git status again.",
+            evidence.latest_verification,
+        )
+
     def test_steering_updates_constraints_without_replacing_the_objective(self):
         evidence = extract_compaction_evidence(
             [
@@ -2148,6 +2208,66 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn(1, retry_counts)
         self.assertIn(2, retry_counts)
+
+    async def test_overflow_retry_accounts_for_failed_fallback_route_usage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "primary",
+                    "provider_fallbacks": ["fallback"],
+                    "compaction_max_overflow_retries": 1,
+                },
+            )
+            config.providers["primary"] = ProviderConfig(
+                type="mock", model="primary-model", max_retries=0
+            )
+            config.providers["fallback"] = ProviderConfig(
+                type="mock", model="fallback-model", max_retries=0
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            primary = runner.providers[0].provider
+            fallback = runner.providers[1].provider
+            assert isinstance(primary, MockProvider)
+            assert isinstance(fallback, MockProvider)
+
+            def fail_primary(_request: ProviderRequest, _call: int) -> ModelResponse:
+                raise ProviderUnavailableError(
+                    "primary unavailable",
+                    retryable=True,
+                    usage=Usage(requests=1, cost_usd=0.10),
+                )
+
+            def overflow_then_succeed(
+                _request: ProviderRequest, call: int
+            ) -> ModelResponse:
+                if call == 1:
+                    raise ProviderContextOverflowError(
+                        "context window exceeded",
+                        usage=Usage(requests=1, cost_usd=0.20),
+                    )
+                return ModelResponse(
+                    text="done",
+                    usage=Usage(requests=1, cost_usd=0.40),
+                )
+
+            primary.handler = fail_primary
+            fallback.handler = overflow_then_succeed
+            session = runner.sessions.create_session(
+                workspace=root, provider="primary", model="primary-model"
+            )
+            try:
+                result = await runner.run("continue", session_id=session.id)
+                usage = runner.sessions.usage(session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual(result.text, "done")
+        self.assertEqual(primary.calls, 2)
+        self.assertEqual(fallback.calls, 2)
+        self.assertEqual(usage.requests, 4)
+        self.assertAlmostEqual(usage.cost_usd, 0.80)
 
     async def test_provider_overflow_retry_limit_resets_after_a_successful_turn(self):
         with tempfile.TemporaryDirectory() as td:

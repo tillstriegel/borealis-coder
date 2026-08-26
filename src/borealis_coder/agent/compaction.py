@@ -65,6 +65,10 @@ _CRITICAL_SHRINK_ORDER = (
 )
 _MANDATORY_SECTIONS = frozenset(_SECTION_ORDER)
 _MESSAGE_FRAMING_TOKENS = 12
+_STALE_GIT_STATE = (
+    "Stale: git state was recorded before the latest file mutation; "
+    "run git status again."
+)
 _EVIDENCE_PLACEHOLDERS = frozenset(
     {
         "Unavailable: no structured decision evidence was recorded.",
@@ -595,7 +599,7 @@ def extract_compaction_evidence(
         evidence.user_constraints.extend(message.content.strip() for message in user_messages[-3:])
 
     latest_plan: list[dict[str, Any]] | None = None
-    latest_git_state: str | None = None
+    latest_git_state: tuple[int, str] | None = None
     call_details: dict[str, tuple[str, dict[str, Any]]] = {}
     latest_mutation_index: int | None = None
     for message_index, message in enumerate(messages):
@@ -644,8 +648,10 @@ def extract_compaction_evidence(
                 f"{failure_prefix}: {_tail(message.content, 2_000)}"
             )
         if tool_name == "git_status" and not message.is_error:
-            latest_git_state = "Latest recorded git state:\n" + truncate_text(
-                message.content.strip(), 2_000
+            latest_git_state = (
+                message_index,
+                "Latest recorded git state:\n"
+                + truncate_text(message.content.strip(), 2_000),
             )
 
     verification_messages = [
@@ -675,12 +681,20 @@ def extract_compaction_evidence(
             "verify the current state again."
         ]
     if latest_git_state is not None:
+        git_state_index, git_state = latest_git_state
         evidence.latest_verification = [
             item
             for item in evidence.latest_verification
             if not item.startswith("Latest recorded git state:\n")
+            and item != _STALE_GIT_STATE
         ]
-        evidence.latest_verification.append(latest_git_state)
+        if (
+            latest_mutation_index is not None
+            and git_state_index < latest_mutation_index
+        ):
+            evidence.latest_verification.append(_STALE_GIT_STATE)
+        else:
+            evidence.latest_verification.append(git_state)
 
     if latest_plan is not None:
         current_plan_steps = {
