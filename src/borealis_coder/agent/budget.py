@@ -90,6 +90,56 @@ def estimate_request_tokens(system: str, messages: list[Message], tools: list[di
     return tokens + len(messages) * 12 + len(tools) * 30
 
 
+def _provider_message_view(message: Message) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "role": message.role.value,
+        "content": message.content,
+    }
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": call.id,
+                "name": call.name,
+                "arguments": (
+                    call.raw_arguments
+                    if call.raw_arguments is not None
+                    else call.arguments
+                ),
+            }
+            for call in message.tool_calls
+        ]
+    if message.role.value == "tool":
+        payload.update(
+            {
+                "tool_call_id": message.tool_call_id,
+                "tool_name": message.tool_name,
+                "is_error": message.is_error,
+            }
+        )
+    continuation_state = message.metadata.get("continuation_state")
+    if continuation_state is not None:
+        payload["continuation_state"] = continuation_state
+    return payload
+
+
+def estimate_request_bytes(
+    system: str,
+    messages: list[Message],
+    tools: list[dict],  # type: ignore[type-arg]
+) -> int:
+    """Return deterministic UTF-8 bytes for the complete provider-facing view."""
+
+    return len(
+        json_dumps(
+            {
+                "system": system,
+                "messages": [_provider_message_view(message) for message in messages],
+                "tools": tools,
+            }
+        ).encode("utf-8")
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ContextBudget:
     """Provider-facing input budget with explicit fixed and variable costs."""
@@ -104,6 +154,8 @@ class ContextBudget:
     trigger_tokens: int
     target_tokens: int
     message_target_tokens: int
+    target_bytes: int
+    message_target_bytes: int
 
     @classmethod
     def calculate(
@@ -158,6 +210,12 @@ class ContextBudget:
             + continuation_state_tokens
         )
         message_target = max(1, target - fixed)
+        target_bytes = target * 4
+        empty_request_bytes = estimate_request_bytes("", [], [])
+        fixed_request_bytes = (
+            estimate_request_bytes(system, [], tools) - empty_request_bytes
+        )
+        message_target_bytes = max(1, target_bytes - fixed_request_bytes)
         return cls(
             input_limit=config.max_input_tokens,
             reserved_output_tokens=config.max_output_tokens,
@@ -169,6 +227,8 @@ class ContextBudget:
             trigger_tokens=trigger,
             target_tokens=target,
             message_target_tokens=message_target,
+            target_bytes=target_bytes,
+            message_target_bytes=message_target_bytes,
         )
 
     def estimated_total(self, messages: list[Message]) -> int:

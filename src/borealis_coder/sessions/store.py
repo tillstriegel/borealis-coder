@@ -646,6 +646,8 @@ class SessionStore:
     def start_tool_call(
         self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any]
     ) -> None:
+        if not call_id.strip():
+            raise SessionError("Tool call ID must be non-empty")
         arguments_json = json_dumps(arguments)
         normalized_arguments = json.loads(arguments_json)
         with self._lock, self._connection:
@@ -685,7 +687,29 @@ class SessionStore:
         metadata: dict[str, Any] | None = None,
         message: Message | None = None,
     ) -> None:
+        status = "error" if is_error else "completed"
+        metadata_json = json_dumps(metadata or {})
         with self._lock, self._connection:
+            existing = self._connection.execute(
+                """SELECT output,is_error,status,metadata_json
+                FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
+                (session_id, call_id),
+            ).fetchone()
+            if existing is None:
+                raise SessionError(f"Tool call {call_id!r} does not exist")
+            if existing["status"] != "running":
+                if not (
+                    existing["output"] == output
+                    and existing["is_error"] == int(is_error)
+                    and existing["status"] == status
+                    and existing["metadata_json"] == metadata_json
+                ):
+                    raise SessionError(
+                        f"Tool call {call_id!r} is terminal and cannot be overwritten"
+                    )
+                if message is not None:
+                    self._append_message_locked(session_id, message)
+                return
             self._connection.execute(
                 """UPDATE tool_calls SET
                     output=?,is_error=?,status=?,completed_at=?,metadata_json=?
@@ -693,9 +717,9 @@ class SessionStore:
                 (
                     output,
                     int(is_error),
-                    "error" if is_error else "completed",
+                    status,
                     utc_now(),
-                    json_dumps(metadata or {}),
+                    metadata_json,
                     session_id,
                     call_id,
                 ),

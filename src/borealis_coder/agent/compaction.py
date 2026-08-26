@@ -14,7 +14,11 @@ from typing import Any
 from ..errors import BudgetExceeded, Cancelled
 from ..models import Message, Role
 from ..util import estimate_tokens, json_dumps, truncate_text
-from .budget import estimate_request_tokens, is_recovery_continuation_prompt
+from .budget import (
+    estimate_request_bytes,
+    estimate_request_tokens,
+    is_recovery_continuation_prompt,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,7 +421,7 @@ def validate_tool_call_order(messages: list[Message]) -> None:
             index += 1
             continue
         call_ids = [call.id for call in message.tool_calls]
-        if any(not call_id for call_id in call_ids):
+        if any(not call_id.strip() for call_id in call_ids):
             raise CompactionError(f"Assistant message {message.id} contains an empty tool call ID")
         if len(call_ids) != len(set(call_ids)) or known_ids.intersection(call_ids):
             raise CompactionError(f"Assistant message {message.id} contains duplicate tool call IDs")
@@ -940,15 +944,35 @@ def _messages_tokens(messages: list[Message]) -> int:
     return sum(_message_tokens(message) for message in messages)
 
 
+def _messages_bytes(messages: list[Message]) -> int:
+    return estimate_request_bytes("", messages, [])
+
+
+def _messages_fit(
+    messages: list[Message],
+    *,
+    target_tokens: int,
+    target_bytes: int,
+) -> bool:
+    return bool(
+        (target_tokens <= 0 or _messages_tokens(messages) <= target_tokens)
+        and (target_bytes <= 0 or _messages_bytes(messages) <= target_bytes)
+    )
+
+
 def _shrink_diagnostic_messages(
-    messages: list[Message], *, target_tokens: int
+    messages: list[Message], *, target_tokens: int = 0, target_bytes: int = 0
 ) -> list[Message]:
     """Shrink provider-only tool diagnostics while preserving call/result records."""
 
     output = list(messages)
     tool_indexes = [index for index, message in enumerate(output) if message.role == Role.TOOL]
     for limit in (4_000, 2_000, 1_000, 500, 200):
-        if _messages_tokens(output) <= target_tokens:
+        if _messages_fit(
+            output,
+            target_tokens=target_tokens,
+            target_bytes=target_bytes,
+        ):
             break
         for index in tool_indexes:
             message = output[index]
@@ -968,13 +992,20 @@ def compact_messages_v1(
     keep_recent: int = 18,
     summary_chars: int = 18_000,
     target_tokens: int = 0,
+    target_bytes: int = 0,
     force: bool = False,
 ) -> list[Message]:
     """Compatibility compactor with secure framing and atomic tool-call splitting."""
 
     bundles = bundle_conversation(messages)
-    if not force and len(messages) <= keep_recent + 2 and (
-        target_tokens <= 0 or _messages_tokens(messages) <= target_tokens
+    if (
+        not force
+        and len(messages) <= keep_recent + 2
+        and _messages_fit(
+            messages,
+            target_tokens=target_tokens,
+            target_bytes=target_bytes,
+        )
     ):
         return messages
 
@@ -1025,10 +1056,14 @@ def compact_messages_v1(
         *,
         source: list[Message] | None = None,
     ) -> list[Message] | None:
-        if target_tokens <= 0:
+        if target_tokens <= 0 and target_bytes <= 0:
             return build_result(older, recent, summary_chars, source=source)
         smallest = build_result(older, recent, 1, source=source)
-        if _messages_tokens(smallest) > target_tokens:
+        if not _messages_fit(
+            smallest,
+            target_tokens=target_tokens,
+            target_bytes=target_bytes,
+        ):
             return None
         low = 1
         high = summary_chars
@@ -1036,7 +1071,11 @@ def compact_messages_v1(
         while low <= high:
             limit = (low + high) // 2
             candidate = build_result(older, recent, limit, source=source)
-            if _messages_tokens(candidate) <= target_tokens:
+            if _messages_fit(
+                candidate,
+                target_tokens=target_tokens,
+                target_bytes=target_bytes,
+            ):
                 best = candidate
                 low = limit + 1
             else:
@@ -1044,12 +1083,26 @@ def compact_messages_v1(
         return best
 
     if len(bundles) < 2:
-        if target_tokens <= 0 or _messages_tokens(messages) <= target_tokens:
+        if _messages_fit(
+            messages,
+            target_tokens=target_tokens,
+            target_bytes=target_bytes,
+        ):
             return messages
         summary_overhead = _messages_tokens(build_result([], [], 1))
+        summary_byte_overhead = _messages_bytes(build_result([], [], 1))
         recent = _shrink_diagnostic_messages(
             messages,
-            target_tokens=max(1, target_tokens - summary_overhead),
+            target_tokens=(
+                max(1, target_tokens - summary_overhead)
+                if target_tokens > 0
+                else 0
+            ),
+            target_bytes=(
+                max(1, target_bytes - summary_byte_overhead)
+                if target_bytes > 0
+                else 0
+            ),
         )
         fitted = fit_summary([], recent, source=messages)
         if fitted is not None:
@@ -1064,8 +1117,12 @@ def compact_messages_v1(
         fitted = fit_summary(older, recent)
         if fitted is not None:
             return fitted
-        if target_tokens > 0:
-            recent = _shrink_diagnostic_messages(recent, target_tokens=target_tokens)
+        if target_tokens > 0 or target_bytes > 0:
+            recent = _shrink_diagnostic_messages(
+                recent,
+                target_tokens=target_tokens,
+                target_bytes=target_bytes,
+            )
             fitted = fit_summary(older, recent)
             if fitted is not None:
                 return fitted
@@ -1081,6 +1138,7 @@ def compact_messages(
     summary_tokens: int = 0,
     summary_bytes: int = 0,
     target_tokens: int = 0,
+    target_bytes: int = 0,
     force: bool = False,
     base_evidence: CompactionEvidence | None = None,
     base_source_message_ids: list[str] | None = None,
@@ -1088,8 +1146,14 @@ def compact_messages(
 ) -> list[Message]:
     bundles = bundle_conversation(messages)
     retained_count = keep_recent_bundles or max(1, keep_recent)
-    if not force and len(bundles) <= retained_count + 1 and (
-        target_tokens <= 0 or _messages_tokens(messages) <= target_tokens
+    if (
+        not force
+        and len(bundles) <= retained_count + 1
+        and _messages_fit(
+            messages,
+            target_tokens=target_tokens,
+            target_bytes=target_bytes,
+        )
     ):
         return messages
     retained_count = min(retained_count, max(1, len(bundles) - 1))
@@ -1099,8 +1163,12 @@ def compact_messages(
         recent_bundles = bundles[-retained_count:]
         older = [message for bundle in older_bundles for message in bundle.messages]
         recent = [message for bundle in recent_bundles for message in bundle.messages]
-        if target_tokens > 0 and retained_count == 1:
-            recent = _shrink_diagnostic_messages(recent, target_tokens=target_tokens)
+        if (target_tokens > 0 or target_bytes > 0) and retained_count == 1:
+            recent = _shrink_diagnostic_messages(
+                recent,
+                target_tokens=target_tokens,
+                target_bytes=target_bytes,
+            )
         base_ids = base_source_message_ids or []
         current_ids = [message.id for message in messages]
         incremental = bool(
@@ -1140,13 +1208,51 @@ def compact_messages(
             )
             if summary_tokens > 0:
                 available_summary_tokens = min(summary_tokens, available_summary_tokens)
+        available_summary_bytes = summary_bytes
+        if target_bytes > 0:
+            empty_summary = Message(role=Role.SYSTEM)
+            fixed_bytes = _messages_bytes([empty_summary, *recent])
+            target_summary_bytes = max(1, target_bytes - fixed_bytes)
+            available_summary_bytes = (
+                min(summary_bytes, target_summary_bytes)
+                if summary_bytes > 0
+                else target_summary_bytes
+            )
         try:
             summary, bounded_evidence = _render_deterministic_summary_with_evidence(
                 evidence,
                 max_chars=summary_chars,
                 max_tokens=available_summary_tokens,
-                max_bytes=summary_bytes,
+                max_bytes=available_summary_bytes,
             )
+            while target_bytes > 0:
+                byte_candidate = [
+                    Message(role=Role.SYSTEM, content=summary),
+                    *recent,
+                ]
+                candidate_bytes = _messages_bytes(byte_candidate)
+                if candidate_bytes <= target_bytes:
+                    break
+                summary_size = len(summary.encode("utf-8"))
+                next_limit = summary_size - max(
+                    1,
+                    candidate_bytes - target_bytes,
+                )
+                if available_summary_bytes > 0:
+                    next_limit = min(next_limit, available_summary_bytes - 1)
+                if next_limit <= 0:
+                    raise CompactionSizeError(
+                        "Mandatory compaction state does not fit the byte target"
+                    )
+                available_summary_bytes = next_limit
+                summary, bounded_evidence = (
+                    _render_deterministic_summary_with_evidence(
+                        evidence,
+                        max_chars=summary_chars,
+                        max_tokens=available_summary_tokens,
+                        max_bytes=available_summary_bytes,
+                    )
+                )
         except CompactionError as error:
             last_error = error
             retained_count -= 1
@@ -1173,7 +1279,11 @@ def compact_messages(
             ),
             *recent,
         ]
-        if target_tokens <= 0 or _messages_tokens(result) <= target_tokens:
+        if _messages_fit(
+            result,
+            target_tokens=target_tokens,
+            target_bytes=target_bytes,
+        ):
             return result
         retained_count -= 1
     if last_error is not None:
@@ -1308,6 +1418,7 @@ async def compact_messages_with_summary(
     summarizer_input_tokens: int = 32_000,
     summarizer_total_input_tokens: int = 96_000,
     target_tokens: int = 0,
+    target_bytes: int = 0,
     transcript_message_ids: set[str] | None = None,
     force: bool = False,
     base_evidence: CompactionEvidence | None = None,
@@ -1329,6 +1440,7 @@ async def compact_messages_with_summary(
         summary_tokens=summary_tokens,
         summary_bytes=summary_bytes,
         target_tokens=target_tokens,
+        target_bytes=target_bytes,
         force=force,
         base_evidence=base_evidence,
         base_source_message_ids=base_source_message_ids,
@@ -1456,7 +1568,11 @@ async def compact_messages_with_summary(
         ),
         *compacted[1:],
     ]
-    if target_tokens > 0 and _messages_tokens(result) > target_tokens:
+    if not _messages_fit(
+        result,
+        target_tokens=target_tokens,
+        target_bytes=target_bytes,
+    ):
         return _deterministic_fallback(
             compacted,
             "summarizer_total_over_target",

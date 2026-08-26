@@ -1,6 +1,6 @@
 """Agent budgets, compaction, runtime assembly, and execution loop."""
 
-from .budget import Budget, ContextBudget, estimate_request_tokens
+from .budget import Budget, ContextBudget, estimate_request_bytes, estimate_request_tokens
 from .compaction import (
     BundleKind,
     CompactionError,
@@ -41,6 +41,7 @@ __all__ = [
     "compact_messages",
     "compact_messages_v1",
     "compact_messages_with_summary",
+    "estimate_request_bytes",
     "estimate_request_tokens",
     "extract_compaction_evidence",
     "frame_untrusted_history",

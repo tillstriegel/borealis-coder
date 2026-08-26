@@ -50,6 +50,7 @@ from ..util import estimate_tokens, json_dumps, monotonic_ms, new_id, truncate_t
 from .budget import (
     Budget,
     ContextBudget,
+    estimate_request_bytes,
     estimate_request_tokens,
     is_recovery_continuation_prompt,
     max_turns_recovery_message,
@@ -159,6 +160,101 @@ def _fits_context_limit(messages: list[Message], budget: ContextBudget) -> bool:
     )
 
 
+def _next_compaction_targets(
+    *,
+    token_target: int,
+    byte_target: int,
+    compacted_messages: list[Message],
+    retained_budget: ContextBudget,
+    system: str,
+    tools: list[dict[str, Any]],
+) -> tuple[int, int] | None:
+    retained = compacted_messages[1:]
+    compacted_tokens = estimate_request_tokens(
+        compacted_messages[0].content,
+        retained,
+        [],
+    )
+    compacted_bytes = estimate_request_bytes(
+        f"{system}\n\n{compacted_messages[0].content}",
+        retained,
+        tools,
+    )
+    tokens_fit = compacted_tokens <= retained_budget.message_target_tokens
+    bytes_fit = compacted_bytes <= retained_budget.target_bytes
+    if tokens_fit and bytes_fit:
+        return None
+
+    tighter_token_target = token_target
+    if not tokens_fit:
+        tighter_token_target = min(
+            token_target - 1,
+            retained_budget.message_target_tokens,
+        )
+    tighter_byte_target = byte_target
+    if not bytes_fit:
+        tighter_byte_target = min(
+            byte_target - 1,
+            byte_target - (compacted_bytes - retained_budget.target_bytes),
+        )
+    if tighter_byte_target <= 0:
+        raise CompactionSizeError(
+            "Retained continuation state leaves no byte compaction budget"
+        )
+    if tighter_token_target <= 0:
+        raise CompactionSizeError(
+            "Retained continuation state leaves no compaction budget"
+        )
+    if tighter_token_target == token_target and tighter_byte_target == byte_target:
+        raise CompactionSizeError(
+            "Compaction target did not shrink after continuation adjustment"
+        )
+    return tighter_token_target, tighter_byte_target
+
+
+def _fit_artifact_to_request_byte_target(
+    *,
+    artifact: Message,
+    retained_messages: list[Message],
+    deterministic_messages: list[Message],
+    system: str,
+    tools: list[dict[str, Any]],
+    target_bytes: int,
+) -> tuple[Message, list[Message]]:
+    request_bytes = estimate_request_bytes(
+        f"{system}\n\n{artifact.content}",
+        retained_messages,
+        tools,
+    )
+    if request_bytes <= target_bytes:
+        return artifact, retained_messages
+
+    fallback_artifact = deterministic_messages[0]
+    fallback_metadata = dict(fallback_artifact.metadata)
+    if artifact.metadata.get("strategy") == "llm":
+        fallback_metadata.update(
+            {
+                "fallback_reason": "summarizer_total_over_byte_target",
+                "requested_strategy": "llm",
+            }
+        )
+    fallback_artifact = replace(
+        fallback_artifact,
+        metadata=fallback_metadata,
+    )
+    fallback_retained = deterministic_messages[1:]
+    fallback_bytes = estimate_request_bytes(
+        f"{system}\n\n{fallback_artifact.content}",
+        fallback_retained,
+        tools,
+    )
+    if fallback_bytes > target_bytes:
+        raise CompactionSizeError(
+            "Compacted provider request does not fit the byte target"
+        )
+    return fallback_artifact, fallback_retained
+
+
 def _duplicate_tool_call_id(
     calls: list[ToolCall],
     earlier_messages: list[Message],
@@ -175,6 +271,26 @@ def _duplicate_tool_call_id(
             return call.id
         batch_ids.add(call.id)
     return None
+
+
+def _blank_tool_call_id(calls: list[ToolCall]) -> str | None:
+    for call in calls:
+        if not call.id.strip():
+            return call.id
+    return None
+
+
+def _validate_new_tool_call_ids(
+    calls: list[ToolCall],
+    earlier_messages: list[Message],
+) -> None:
+    if _blank_tool_call_id(calls) is not None:
+        raise SessionError("Provider returned an empty tool-call ID")
+    duplicate_call_id = _duplicate_tool_call_id(calls, earlier_messages)
+    if duplicate_call_id is not None:
+        raise SessionError(
+            f"Provider returned duplicate tool-call ID {duplicate_call_id!r}"
+        )
 
 
 def _abandoned_tool_call_results(
@@ -694,15 +810,10 @@ class AgentRunner:
                         self.sessions.messages,
                         session_id,
                     )
-                    duplicate_call_id = _duplicate_tool_call_id(
+                    _validate_new_tool_call_ids(
                         response_tool_calls,
                         durable_messages,
                     )
-                    if duplicate_call_id is not None:
-                        raise SessionError(
-                            "Provider returned duplicate tool-call ID "
-                            f"{duplicate_call_id!r}"
-                        )
                 assistant_metadata = {
                     "model": response.model or used_route.model,
                     "response_id": response.response_id,
@@ -1305,6 +1416,10 @@ class AgentRunner:
                         int(metrics.tokens_before * (0.70**overflow_retry_count)),
                     ),
                 )
+            provider_message_target_bytes = min(
+                compaction_budget.message_target_bytes,
+                provider_message_target * 4,
+            )
             intended_strategy = (
                 "deterministic"
                 if self.config.agent.deterministic_compaction
@@ -1386,7 +1501,7 @@ class AgentRunner:
             compaction_kwargs = {
                 "keep_recent": keep_recent,
                 "summary_tokens": provider_message_target,
-                "summary_bytes": provider_message_target * 4,
+                "summary_bytes": provider_message_target_bytes,
                 "summarizer_input_tokens": (
                     self.config.agent.compaction_summarizer_input_tokens
                 ),
@@ -1394,6 +1509,7 @@ class AgentRunner:
                     self.config.agent.compaction_summarizer_total_input_tokens
                 ),
                 "target_tokens": provider_message_target,
+                "target_bytes": provider_message_target_bytes,
                 "force": compaction_reason in {
                     "tool_output_volume",
                     "provider_context_overflow",
@@ -1416,8 +1532,9 @@ class AgentRunner:
                                 request_messages,
                                 keep_recent=keep_recent,
                                 summary_tokens=provider_message_target,
-                                summary_bytes=provider_message_target * 4,
+                                summary_bytes=provider_message_target_bytes,
                                 target_tokens=provider_message_target,
+                                target_bytes=provider_message_target_bytes,
                                 force=bool(compaction_kwargs["force"]),
                             )
                             shadow_metadata = shadow[0].metadata
@@ -1474,6 +1591,7 @@ class AgentRunner:
                         request_messages,
                         keep_recent=keep_recent,
                         target_tokens=provider_message_target,
+                        target_bytes=provider_message_target_bytes,
                         force=bool(compaction_kwargs["force"]),
                     )
                 else:
@@ -1493,35 +1611,34 @@ class AgentRunner:
                         providers=budget_providers,
                         overflow_retry_count=overflow_retry_count,
                     )
-                    compacted_tokens = estimate_request_tokens(
-                        deterministic_messages[0].content,
-                        retained,
-                        [],
+                    next_targets = _next_compaction_targets(
+                        token_target=provider_message_target,
+                        byte_target=provider_message_target_bytes,
+                        compacted_messages=deterministic_messages,
+                        retained_budget=retained_budget,
+                        system=turn_system,
+                        tools=schemas,
                     )
-                    if compacted_tokens <= retained_budget.message_target_tokens:
+                    if next_targets is None:
                         break
-                    tighter_target = min(
-                        provider_message_target - 1,
-                        retained_budget.message_target_tokens,
-                    )
-                    if tighter_target <= 0:
-                        raise CompactionSizeError(
-                            "Retained continuation state leaves no compaction budget"
-                        )
+                    tighter_target, tighter_byte_target = next_targets
                     target_adjustments += 1
                     if target_adjustments > len(request_messages) + 1:
                         raise CompactionSizeError(
                             "Compaction target did not converge after continuation adjustment"
                         )
                     provider_message_target = tighter_target
+                    provider_message_target_bytes = tighter_byte_target
                     compaction_kwargs["summary_tokens"] = tighter_target
-                    compaction_kwargs["summary_bytes"] = tighter_target * 4
+                    compaction_kwargs["summary_bytes"] = tighter_byte_target
                     compaction_kwargs["target_tokens"] = tighter_target
+                    compaction_kwargs["target_bytes"] = tighter_byte_target
                     if self.config.agent.compaction_version == 1:
                         deterministic_messages = compact_messages_v1(
                             request_messages,
                             keep_recent=keep_recent,
                             target_tokens=tighter_target,
+                            target_bytes=tighter_byte_target,
                             force=bool(compaction_kwargs["force"]),
                         )
                     else:
@@ -1673,6 +1790,19 @@ class AgentRunner:
                 retained_messages = [
                     message for message in compacted_messages if message is not artifact_message
                 ]
+                try:
+                    artifact_message, retained_messages = (
+                        _fit_artifact_to_request_byte_target(
+                            artifact=artifact_message,
+                            retained_messages=retained_messages,
+                            deterministic_messages=deterministic_messages,
+                            system=turn_system,
+                            tools=schemas,
+                            target_bytes=compaction_budget.target_bytes,
+                        )
+                    )
+                except CompactionSizeError as error:
+                    raise BudgetExceeded("context", str(error)) from error
                 validate_tool_call_order(retained_messages)
                 artifact_message, reused = await self._record_or_reuse_compaction_artifact(
                     session_id=session_id,
@@ -1716,6 +1846,16 @@ class AgentRunner:
                     raise CompactionError(
                         f"Compacted request size {estimated} exceeds calculated target "
                         f"{context_budget.target_tokens}"
+                    )
+                estimated_bytes = estimate_request_bytes(
+                    turn_system,
+                    request_messages,
+                    schemas,
+                )
+                if estimated_bytes > context_budget.target_bytes:
+                    raise CompactionError(
+                        f"Compacted request size {estimated_bytes} bytes exceeds calculated "
+                        f"target {context_budget.target_bytes} bytes"
                     )
                 tokens_after = estimated
                 conversation_tokens_after = estimate_request_tokens(
@@ -2146,6 +2286,8 @@ class AgentRunner:
                 "continuation_state_tokens": context_budget.continuation_state_tokens,
                 "target_tokens": context_budget.target_tokens,
                 "message_target_tokens": context_budget.message_target_tokens,
+                "target_bytes": context_budget.target_bytes,
+                "message_target_bytes": context_budget.message_target_bytes,
             },
             "summary_model": (
                 self.config.agent.small_model or self.providers[0].model
@@ -2548,22 +2690,49 @@ class AgentRunner:
                     cancel_task,
                     return_exceptions=True,
                 )
-            if session_id is not None:
-                await asyncio.to_thread(
-                    self.sessions.set_value,
-                    session_id,
-                    cache_key,
-                    {
-                        "version": _COMPACTION_SUMMARY_CACHE_VERSION,
-                        "text": response.text,
-                        "model": response.model or request.model,
-                        "requested_model": request.model,
-                        "usage": asdict(response.usage),
-                    },
-                )
-            if usage_collector is not None:
-                usage_collector.add(response.usage)
-            await usage_sink(response.usage)
+
+            async def settle_completed_response() -> None:
+                # Cache first so a budget stop can resume without another provider call.
+                cache_error: BaseException | None = None
+                if session_id is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.sessions.set_value,
+                            session_id,
+                            cache_key,
+                            {
+                                "version": _COMPACTION_SUMMARY_CACHE_VERSION,
+                                "text": response.text,
+                                "model": response.model or request.model,
+                                "requested_model": request.model,
+                                "usage": asdict(response.usage),
+                            },
+                        )
+                    except BaseException as error:
+                        cache_error = error
+                if usage_collector is not None:
+                    usage_collector.add(response.usage)
+                await usage_sink(response.usage)
+                if cache_error is not None:
+                    raise cache_error
+
+            settlement = asyncio.create_task(settle_completed_response())
+            pending_cancellation: asyncio.CancelledError | None = None
+            while not settlement.done():
+                try:
+                    await asyncio.shield(settlement)
+                except asyncio.CancelledError as error:
+                    pending_cancellation = error
+                except BaseException as error:
+                    if pending_cancellation is not None:
+                        raise pending_cancellation from error
+                    raise
+            if pending_cancellation is not None:
+                # Observe settlement errors, but preserve the caller's cancellation.
+                with contextlib.suppress(BaseException):
+                    settlement.result()
+                raise pending_cancellation
+            settlement.result()
             if cancel.is_set():
                 raise Cancelled("Run cancelled")
             return SummarizerResult(
@@ -2961,15 +3130,19 @@ class AgentRunner:
         except asyncio.CancelledError:
             if not workspace_reconciled:
                 self._mark_workspace_tracking_incomplete(context)
-            result.metadata.setdefault("workspace_change_tracking", "incomplete")
+                result.metadata.setdefault("workspace_change_tracking", "incomplete")
+                cancellation_message = replace(
+                    cancellation_message,
+                    metadata=dict(result.metadata),
+                )
             await asyncio.shield(
                 asyncio.to_thread(
                     self.sessions.complete_tool_call,
                     context.session_id,
                     call.id,
-                    output=result.output,
-                    is_error=result.is_error,
-                    metadata=result.metadata,
+                    output=cancellation_message.content,
+                    is_error=cancellation_message.is_error,
+                    metadata=cancellation_message.metadata,
                     message=cancellation_message,
                 )
             )

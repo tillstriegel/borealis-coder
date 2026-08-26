@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from borealis_coder.agent import AgentRunner, build_runner
+from borealis_coder.agent import AgentRunner, build_runner, validate_tool_call_order
 from borealis_coder.config import ProviderConfig
 from borealis_coder.errors import (
     ConfigurationError,
@@ -1393,6 +1393,67 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_blank_mutating_tool_id_is_rejected_before_persistence_and_can_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            executions = 0
+
+            def mutate(arguments, context):
+                nonlocal executions
+                del arguments, context
+                executions += 1
+                return ToolResult("mutated")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="blank_id_mutator",
+                    description="Count executions for blank ID regression coverage.",
+                    parameters=object_schema({}),
+                    function=mutate,
+                    effect=Effect.WRITE,
+                )
+            )
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id=" \t ", name="blank_id_mutator", arguments={})
+                    ],
+                    usage=Usage(requests=1),
+                ),
+                ModelResponse(text="resumed safely", usage=Usage(requests=1)),
+            )
+            try:
+                rejected = await runner.run("reject the blank call")
+                before_resume = runner.sessions.messages(rejected.session_id)
+
+                self.assertEqual(rejected.stop_reason.value, "error")
+                self.assertIn("empty tool-call ID", rejected.error or "")
+                self.assertEqual(executions, 0)
+                self.assertEqual(runner.sessions.tool_calls(rejected.session_id), [])
+                self.assertFalse(
+                    any(
+                        message.role == Role.ASSISTANT and message.tool_calls
+                        for message in before_resume
+                    )
+                )
+                validate_tool_call_order(before_resume)
+
+                resumed = await runner.run("continue", session_id=rejected.session_id)
+                durable = runner.sessions.messages(rejected.session_id)
+
+                self.assertEqual(resumed.text, "resumed safely")
+                self.assertEqual(executions, 0)
+                validate_tool_call_order(durable)
+            finally:
+                await runner.close()
+
     async def test_cross_turn_duplicate_mutating_tool_id_preserves_first_execution(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1950,6 +2011,80 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(fast_messages[0].content, "fast result")
             finally:
                 fast_persisted.set()
+                await runner.close()
+
+    async def test_cancellation_after_tool_completion_keeps_ledger_and_message_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[ToolCall(id="race-call", name="race_tool", arguments={})],
+                    usage=Usage(requests=1),
+                )
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="race_tool",
+                    description="Return a stable result for cancellation reconciliation.",
+                    parameters=object_schema({}),
+                    function=lambda arguments, context: ToolResult(
+                        "stable result",
+                        metadata={"stable": True},
+                    ),
+                )
+            )
+            original_complete = runner.sessions.complete_tool_call
+            durable_written = threading.Event()
+            release_first_completion = threading.Event()
+            completion_calls = 0
+            completion_lock = threading.Lock()
+
+            def pause_after_first_completion(session_id, call_id, **kwargs):
+                nonlocal completion_calls
+                original_complete(session_id, call_id, **kwargs)
+                with completion_lock:
+                    completion_calls += 1
+                    current_call = completion_calls
+                if current_call == 1:
+                    durable_written.set()
+                    release_first_completion.wait(timeout=3)
+
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "complete_tool_call",
+                    side_effect=pause_after_first_completion,
+                ):
+                    task = asyncio.create_task(runner.run("exercise the completion race"))
+                    self.assertTrue(await asyncio.to_thread(durable_written.wait, 1))
+                    task.cancel()
+                    await asyncio.sleep(0.05)
+                    task.cancel()
+                    release_first_completion.set()
+                    result = await asyncio.wait_for(task, timeout=2)
+
+                ledger = runner.sessions.tool_calls(result.session_id)[0]
+                tool_message = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                )
+                self.assertEqual(result.stop_reason.value, "cancelled")
+                self.assertEqual(ledger["status"], "completed")
+                self.assertEqual(ledger["output"], tool_message.content)
+                self.assertEqual(ledger["is_error"], tool_message.is_error)
+                self.assertEqual(ledger["metadata"], tool_message.metadata)
+                self.assertTrue(ledger["metadata"]["stable"])
+                self.assertGreaterEqual(completion_calls, 2)
+            finally:
+                release_first_completion.set()
                 await runner.close()
 
     async def test_max_time_is_an_end_to_end_deadline(self):

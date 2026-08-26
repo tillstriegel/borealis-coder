@@ -185,6 +185,76 @@ class SessionStoreTests(unittest.TestCase):
                     )
                 self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
 
+    def test_empty_tool_call_ids_are_rejected_without_ledger_mutation(self):
+        for call_id in ("", "   ", "\t\n"):
+            with self.subTest(call_id=repr(call_id)), self.assertRaisesRegex(
+                SessionError,
+                "must be non-empty",
+            ):
+                self.store.start_tool_call(
+                    self.session.id,
+                    "run",
+                    call_id,
+                    "read_file",
+                    {"path": "a"},
+                )
+
+        self.assertEqual(self.store.tool_calls(self.session.id), [])
+
+    def test_terminal_tool_completion_accepts_only_exact_replay(self):
+        self.store.start_tool_call(
+            self.session.id,
+            "run",
+            "call",
+            "read_file",
+            {"path": "a"},
+        )
+        message = Message(
+            id="result",
+            role=Role.TOOL,
+            content="original",
+            tool_call_id="call",
+            tool_name="read_file",
+            metadata={"stable": True},
+        )
+        self.store.complete_tool_call(
+            self.session.id,
+            "call",
+            output="original",
+            is_error=False,
+            metadata={"stable": True},
+            message=message,
+        )
+        original = self.store.tool_calls(self.session.id)[0]
+
+        self.store.complete_tool_call(
+            self.session.id,
+            "call",
+            output="original",
+            is_error=False,
+            metadata={"stable": True},
+            message=message,
+        )
+
+        self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+        self.assertEqual(len(self.store.messages(self.session.id)), 1)
+        for output, is_error, metadata in (
+            ("replacement", False, {"stable": True}),
+            ("original", True, {"stable": True}),
+            ("original", False, {"stable": False}),
+        ):
+            with self.subTest(output=output, is_error=is_error, metadata=metadata):
+                with self.assertRaisesRegex(SessionError, "terminal"):
+                    self.store.complete_tool_call(
+                        self.session.id,
+                        "call",
+                        output=output,
+                        is_error=is_error,
+                        metadata=metadata,
+                        message=message,
+                    )
+                self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+
     def test_terminal_tool_calls_cannot_be_restarted_or_overwritten(self):
         for status in ("completed", "error", "cancelled"):
             with self.subTest(status=status):
