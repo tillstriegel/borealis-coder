@@ -25,12 +25,16 @@ from borealis_coder.agent import (
     render_deterministic_summary,
     validate_tool_call_order,
 )
+from borealis_coder.agent.compaction import (
+    COMPACTION_RESPONSE_SCHEMA,
+    COMPACTION_SUMMARIZER_SYSTEM,
+)
 from borealis_coder.agent.compaction_eval import (
     evaluate_compaction_case,
     load_compaction_corpus,
 )
 from borealis_coder.config import ProviderConfig
-from borealis_coder.errors import ProviderContextOverflowError
+from borealis_coder.errors import ProviderContextOverflowError, ProviderUnavailableError
 from borealis_coder.models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from borealis_coder.providers.anthropic import AnthropicProvider
 from borealis_coder.providers.base import Provider
@@ -257,6 +261,75 @@ class StructuredCompactionTests(unittest.TestCase):
             evidence.latest_verification,
             ["Verification: 12 passed, retry test failed."],
         )
+
+    def test_mutation_after_verification_marks_the_result_stale(self):
+        write = ToolCall(
+            id="write-after-verification",
+            name="write_file",
+            arguments={"path": "src/state.py", "content": "new state"},
+        )
+        mutation = [
+            Message(role=Role.ASSISTANT, tool_calls=[write]),
+            Message(
+                role=Role.TOOL,
+                tool_call_id=write.id,
+                tool_name=write.name,
+                content="wrote src/state.py",
+                metadata={"path": "src/state.py"},
+            ),
+        ]
+
+        incremental = extract_compaction_evidence(
+            mutation,
+            base=CompactionEvidence(latest_verification=["Verification: 12 passed."]),
+        )
+        same_batch = extract_compaction_evidence(
+            [
+                Message(
+                    role=Role.USER,
+                    content="Verification: 12 passed.",
+                    metadata={"internal": "verification_result"},
+                ),
+                *mutation,
+            ]
+        )
+
+        for evidence in (incremental, same_batch):
+            self.assertEqual(
+                evidence.latest_verification,
+                [
+                    "Stale: files changed after the latest recorded verification; "
+                    "verify the current state again."
+                ],
+            )
+
+    def test_verification_after_mutation_is_current(self):
+        write = ToolCall(
+            id="write-before-verification",
+            name="write_file",
+            arguments={"path": "src/state.py", "content": "new state"},
+        )
+
+        evidence = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[write]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=write.id,
+                    tool_name=write.name,
+                    content="wrote src/state.py",
+                    metadata={"path": "src/state.py"},
+                ),
+                Message(
+                    role=Role.USER,
+                    content="Verification: 13 passed.",
+                    metadata={"internal": "verification_result"},
+                ),
+            ],
+            base=CompactionEvidence(latest_verification=["Verification: 12 passed."]),
+        )
+
+        self.assertEqual(evidence.latest_verification, ["Verification: 13 passed."])
 
     def test_tight_allocator_preserves_actionable_entries_within_sections(self):
         common = {
@@ -805,6 +878,46 @@ class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("invented.py", compacted[0].content)
 
+    async def test_omitted_structured_evidence_falls_back(self):
+        messages = [
+            Message(
+                role=Role.USER if index % 2 == 0 else Role.ASSISTANT,
+                content=f"history-{index}",
+            )
+            for index in range(20)
+        ]
+        authoritative = CompactionEvidence(
+            completed_work=["implemented durable compaction"],
+            important_decisions=["artifacts remain immutable"],
+        )
+
+        for omitted_field in ("completed_work", "important_decisions"):
+            with self.subTest(omitted_field=omitted_field):
+
+                async def omit_evidence(
+                    prompt: str, field: str = omitted_field
+                ) -> str:
+                    value = json.loads(_echo_evidence(prompt))
+                    value[field] = []
+                    return json.dumps(value)
+
+                compacted = await compact_messages_with_summary(
+                    messages,
+                    omit_evidence,
+                    keep_recent_bundles=4,
+                    base_evidence=authoritative,
+                    base_source_message_ids=[message.id for message in messages[:2]],
+                )
+
+                self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
+                self.assertEqual(
+                    compacted[0].metadata["fallback_reason"],
+                    "summarizer_validation_failed",
+                )
+                self.assertIn(
+                    getattr(authoritative, omitted_field)[0], compacted[0].content
+                )
+
     async def test_large_transcript_uses_bounded_chunks(self):
         messages: list[Message] = []
         for index in range(18):
@@ -822,7 +935,13 @@ class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
         async def summarize(prompt: str) -> str:
             nonlocal calls
             calls += 1
-            prompt_sizes.append(estimate_tokens(prompt))
+            prompt_sizes.append(
+                estimate_request_tokens(
+                    COMPACTION_SUMMARIZER_SYSTEM,
+                    [Message(role=Role.USER, content=prompt)],
+                    [COMPACTION_RESPONSE_SCHEMA],
+                )
+            )
             return _echo_evidence(prompt)
 
         compacted = await compact_messages_with_summary(
@@ -850,7 +969,13 @@ class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
         prompt_sizes: list[int] = []
 
         async def summarize(prompt: str) -> str:
-            prompt_sizes.append(estimate_tokens(prompt))
+            prompt_sizes.append(
+                estimate_request_tokens(
+                    COMPACTION_SUMMARIZER_SYSTEM,
+                    [Message(role=Role.USER, content=prompt)],
+                    [COMPACTION_RESPONSE_SCHEMA],
+                )
+            )
             return _echo_evidence(prompt)
 
         compacted = await compact_messages_with_summary(
@@ -976,6 +1101,204 @@ class OverflowProvider(Provider):
 
 
 class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compaction_recomputes_reserve_after_old_continuation_is_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "deterministic_compaction": True,
+                    "max_input_tokens": 16_000,
+                    "max_output_tokens": 1_000,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            old_continuation = Message(
+                role=Role.ASSISTANT,
+                content="old response",
+                metadata={
+                    "continuation_state": {
+                        "provider": "mock",
+                        "model": "deterministic",
+                        "items": ["x" * 45_000],
+                    }
+                },
+            )
+            runner.sessions.append_message(
+                session.id, Message(role=Role.USER, content="original request")
+            )
+            runner.sessions.append_message(session.id, old_continuation)
+            for index in range(20):
+                runner.sessions.append_message(
+                    session.id, Message(role=Role.USER, content=f"request-{index}")
+                )
+                runner.sessions.append_message(
+                    session.id,
+                    Message(role=Role.ASSISTANT, content=f"response-{index}"),
+                )
+            try:
+                prompt_context = await asyncio.to_thread(
+                    runner.context_builder.build, query="current request"
+                )
+
+                async def usage_sink(_usage: Usage) -> None:
+                    return None
+
+                prepared = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=runner.sessions.messages(session.id),
+                    schemas=runner.tools.schemas(),
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="run-continuation",
+                    last_prune_signature=None,
+                )
+            finally:
+                await runner.close()
+
+        self.assertTrue(prepared.compacted)
+        self.assertNotIn(old_continuation.id, [item.id for item in prepared.request.messages])
+        self.assertFalse(
+            any(
+                message.metadata.get("continuation_state")
+                for message in prepared.request.messages
+            )
+        )
+        assert prepared.compaction_metadata is not None
+        self.assertLessEqual(
+            prepared.estimated_tokens,
+            prepared.compaction_metadata["target_tokens"],
+        )
+
+    async def test_artifact_records_every_routed_fallback_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "primary",
+                    "provider_fallbacks": ["fallback"],
+                    "deterministic_compaction": True,
+                },
+                context={"compact_tool_output_tokens": 10},
+            )
+            config.providers["primary"] = ProviderConfig(
+                type="mock", model="primary-model", max_retries=0
+            )
+            config.providers["fallback"] = ProviderConfig(
+                type="mock", model="fallback-model", max_retries=0
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="primary", model="primary-model"
+            )
+            for index in range(14):
+                for message in _tool_cycle(
+                    f"route-{index}", content=(f"history-{index} " * 100)
+                ):
+                    runner.sessions.append_message(session.id, message)
+            runner.sessions.append_message(
+                session.id,
+                Message(role=Role.USER, content="continue with the fallback"),
+            )
+            primary = runner.providers[0].provider
+            fallback = runner.providers[1].provider
+            assert isinstance(primary, MockProvider)
+            assert isinstance(fallback, MockProvider)
+            captured: list[ProviderRequest] = []
+
+            def fail_primary(_request: ProviderRequest, _call: int) -> ModelResponse:
+                raise ProviderUnavailableError("primary unavailable", retryable=True)
+
+            def capture_fallback(request: ProviderRequest, _call: int) -> ModelResponse:
+                captured.append(request)
+                return ModelResponse(text="done", usage=Usage(requests=1))
+
+            primary.handler = fail_primary
+            fallback.handler = capture_fallback
+            events = []
+            runner.events.subscribe(lambda event: events.append(event))
+            try:
+                prompt_context = await asyncio.to_thread(
+                    runner.context_builder.build, query="current request"
+                )
+
+                async def usage_sink(_usage: Usage) -> None:
+                    return None
+
+                prepared = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=runner.sessions.messages(session.id),
+                    schemas=runner.tools.schemas(),
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="run-route",
+                    last_prune_signature=None,
+                )
+                _, used_route = await runner._complete_with_fallback(
+                    prepared.request,
+                    session.id,
+                    "run-route",
+                    asyncio.Event(),
+                    "assistant-route",
+                )
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertTrue(prepared.compacted)
+        self.assertEqual(used_route.name, "fallback")
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(
+            captured[0].metadata["compaction_artifact_id"], artifacts[0].id
+        )
+        contexts = {
+            item["provider_route"]: item
+            for item in artifacts[0].metadata["provider_contexts"]
+        }
+        fallback_context = contexts["fallback"]
+        self.assertEqual(fallback_context["model"], captured[0].model)
+        self.assertEqual(fallback_context["system"], captured[0].system)
+        self.assertEqual(
+            fallback_context["messages"],
+            [message.to_dict() for message in captured[0].messages],
+        )
+        self.assertEqual(fallback_context["tools"], captured[0].tools)
+        self.assertEqual(captured[0].metadata["provider_route"], "fallback")
+        for key, value in fallback_context["metadata"].items():
+            self.assertEqual(value, captured[0].metadata[key])
+        route_events = [
+            event
+            for event in events
+            if event.type == "context.compaction_route_started"
+        ]
+        self.assertEqual(
+            [event.data["provider"] for event in route_events],
+            ["primary", "fallback"],
+        )
+        for event in route_events:
+            self.assertEqual(event.data["compaction_artifact_id"], artifacts[0].id)
+            self.assertEqual(
+                event.data["compacted_context_hash"],
+                artifacts[0].metadata["compacted_context_hashes"][
+                    event.data["provider"]
+                ],
+            )
+
     async def test_v1_can_shadow_v2_without_exposing_summary_text(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

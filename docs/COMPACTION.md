@@ -12,7 +12,7 @@ Compaction v2 creates a bounded provider view. It does not edit the durable sess
 - Current objectives, recent user constraints, pending work, blockers, changed files, and verification evidence have priority.
 - A successful compaction must fit the calculated target in tokens and bytes.
 - Cancellation, provider errors, usage, and cost keep their normal accounting behavior.
-- Each artifact records the exact summary, source IDs and hash, configuration fingerprint, retained IDs, usage, and parent artifact.
+- Each artifact records the exact summary, source IDs and hash, configuration fingerprint, retained IDs, routed provider contexts, usage, and parent artifact.
 - An invalid or failed model summary falls back to the deterministic artifact.
 
 ## Provider view
@@ -41,15 +41,15 @@ Borealis records an unavailable marker when durable structured evidence does not
 
 ## Context budget
 
-`ContextBudget` starts with the configured model input limit. It reserves output tokens, system and tool-schema tokens, provider framing, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input.
+`ContextBudget` starts with the configured model input limit. It reserves output tokens, system and tool-schema tokens, provider framing, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input. Bundle selection does not reserve continuation metadata that it may remove. Borealis recalculates the reserve from retained messages and tightens the artifact again when needed.
 
 After a provider overflow, Borealis increases the safety margin and retries with a smaller provider-message target. `compaction_max_overflow_retries` is a strict upper bound. The reduction order is historical excerpts, retained bundles, and diagnostic output. The final fallback preserves mandatory state and the latest actionable bundle or returns a context-budget error before another provider call.
 
 ## Durable reuse
 
-An artifact is reusable only when its source-content hash, strategy, prompt version, model selection, configuration fingerprint, and retained provider messages match. The artifact stores the exact summary, retained provider payload, and compacted-context hash. Resume checks it before it calls an LLM summarizer. A new artifact records the previous artifact as its parent when the old source range is an exact prefix. Only the new transcript suffix is sent to the summarizer.
+An artifact is reusable only when its source-content hash, strategy, prompt version, model selection, configuration fingerprint, retained provider messages, and routed provider contexts match. The artifact stores the exact summary, every configured route's provider payload, and a compacted-context hash for each route. Each routed attempt records the artifact ID and matching context hash without logging summary text. Resume checks the artifact before it calls an LLM summarizer. A new artifact records the previous artifact as its parent when the old source range is an exact prefix. Only the new transcript suffix is sent to the summarizer.
 
-LLM compaction uses a strict JSON schema and bounded chunks. Output must retain all critical source fields and may contain only source-backed values. Empty, malformed, invented, over-budget, cancelled, or overflowing summaries use the deterministic artifact. Usage from completed or failed summary requests is recorded before an error is propagated.
+LLM compaction uses a strict JSON schema and bounded complete requests. Output must retain every structured source field and may contain only source-backed historical excerpts. Empty, malformed, invented, over-budget, cancelled, or overflowing summaries use the deterministic artifact. Usage from completed or failed summary requests is recorded before an error is propagated.
 
 ## Evaluation and release gates
 
