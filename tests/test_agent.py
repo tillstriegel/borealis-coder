@@ -4007,6 +4007,69 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 never_complete.set()
                 await runner.close()
 
+    async def test_tool_result_wins_simultaneous_cancellation_and_is_persisted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            committed_path = root / "committed.txt"
+            committed_path.write_text("before", encoding="utf-8")
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="committed-call", name="commit_then_cancel", arguments={})
+                    ],
+                    usage=Usage(requests=1),
+                )
+            )
+
+            async def commit_then_cancel(call, context):
+                del call
+                committed_path.write_text("committed", encoding="utf-8")
+                self.assertTrue(runner.cancel(context.session_id))
+                return ToolResult("committed result", metadata={"committed": True})
+
+            runner.tools.register(
+                FunctionTool(
+                    name="commit_then_cancel",
+                    description="Commit a mutation and cancel the active run.",
+                    parameters=object_schema({}),
+                    function=lambda arguments, context: ToolResult("not called"),
+                    effect=Effect.EXECUTE,
+                )
+            )
+            try:
+                with patch.object(
+                    runner.tools,
+                    "execute",
+                    side_effect=commit_then_cancel,
+                ):
+                    result = await runner.run("commit and cancel")
+                ledger = runner.sessions.tool_calls(result.session_id)
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                ]
+            finally:
+                await runner.close()
+
+        self.assertEqual(result.stop_reason.value, "cancelled")
+        self.assertEqual(result.changed_files, ["committed.txt"])
+        self.assertEqual(result.mutation_tracking, "complete")
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["status"], "completed")
+        self.assertEqual(ledger[0]["output"], "committed result")
+        self.assertTrue(ledger[0]["metadata"]["committed"])
+        self.assertEqual(len(tool_messages), 1)
+        self.assertEqual(tool_messages[0].content, "committed result")
+        self.assertEqual(tool_messages[0].metadata, ledger[0]["metadata"])
+
     async def test_cancelled_shell_exposes_incomplete_mutation_tracking(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

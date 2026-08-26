@@ -10,6 +10,7 @@ from typing import Any
 from ..errors import PatchError
 from ..models import Effect, ToolResult
 from ..util import atomic_write_text, sha256_text
+from ._workspace_lock import workspace_transaction
 from .base import MutationScope, Tool, ToolContext, object_schema
 
 
@@ -59,8 +60,12 @@ class ApplyPatchTool(Tool):
         patches = parse_patch(str(arguments["patch"]))
         if not patches:
             raise PatchError("Patch contains no file changes")
+        with workspace_transaction(context.workspace):
+            return self._apply(patches, context)
+
+    def _apply(self, patches: list[FilePatch], context: ToolContext) -> ToolResult:
         targets: list[Path] = []
-        planned: list[tuple[FilePatch, Path, str, str | None]] = []
+        planned: list[tuple[Path, str, str | None, bytes | None]] = []
         seen: set[Path] = set()
         for item in patches:
             path = item.new_path or item.old_path
@@ -80,32 +85,33 @@ class ApplyPatchTool(Tool):
                     raise PatchError(
                         f"Added file exceeds {context.config.context.max_file_bytes} byte limit: {display}"
                     )
-                planned.append((item, target, "add", item.add_content))
+                planned.append((target, "add", item.add_content, None))
                 continue
             if not target.is_file():
                 operation = "delete" if item.delete else "update"
                 raise PatchError(f"Cannot {operation} missing file: {display}")
-            original = target.read_text(encoding="utf-8")
-            if len(original.encode("utf-8")) > context.config.context.max_file_bytes:
+            original_bytes = target.read_bytes()
+            if len(original_bytes) > context.config.context.max_file_bytes:
                 raise PatchError(
                     f"File exceeds {context.config.context.max_file_bytes} byte edit limit: {display}"
                 )
+            original = original_bytes.decode("utf-8")
             if item.delete and not item.hunks:
                 # The apply_patch envelope's Delete File directive names the
                 # complete target; unified deletions still validate their hunks.
-                planned.append((item, target, "delete", None))
+                planned.append((target, "delete", None, original_bytes))
                 continue
             updated = apply_hunks(original, item.hunks, display)
             if item.delete:
                 if updated != "":
                     raise PatchError(f"Delete patch for {display} did not remove the entire file")
-                planned.append((item, target, "delete", None))
+                planned.append((target, "delete", None, original_bytes))
             else:
                 if len(updated.encode("utf-8")) > context.config.context.max_file_bytes:
                     raise PatchError(
                         f"Updated file exceeds {context.config.context.max_file_bytes} byte limit: {display}"
                     )
-                planned.append((item, target, "update", updated))
+                planned.append((target, "update", updated, original_bytes))
 
         # All hunks are validated before any file is changed. The checkpoint then
         # provides rollback if an unexpected filesystem error occurs during commit.
@@ -114,9 +120,21 @@ class ApplyPatchTool(Tool):
             label=f"apply_patch ({len(patches)} files)",
             active=True,
         )
+        try:
+            for target, operation, _, original in planned:
+                _require_preimage(
+                    target,
+                    original,
+                    context.roots.display(target),
+                    operation,
+                )
+        except Exception:
+            if checkpoint is not None:
+                context.checkpoints.release(checkpoint.id)
+            raise
         outcomes: list[str] = []
         try:
-            for _, target, operation, content in planned:
+            for target, operation, content, _ in planned:
                 display = context.roots.display(target)
                 if operation == "delete":
                     target.unlink()
@@ -138,6 +156,37 @@ class ApplyPatchTool(Tool):
             "files": [context.roots.display(item) for item in targets],
             "checkpoint_id": checkpoint.id if checkpoint else None,
         })
+
+
+def _require_preimage(
+    path: Path,
+    expected: bytes | None,
+    display: str,
+    operation: str,
+) -> None:
+    if expected is None:
+        if not path.exists() and not path.is_symlink():
+            return
+        raise PatchError(
+            f"Stale patch rejected for {display}: "
+            f"{operation} target changed before commit"
+        )
+    if not path.is_file():
+        raise PatchError(
+            f"Stale patch rejected for {display}: "
+            f"{operation} target changed before commit"
+        )
+    try:
+        actual = path.read_bytes()
+    except OSError as error:
+        raise PatchError(
+            f"Stale patch rejected for {display}: target changed"
+        ) from error
+    if actual != expected:
+        raise PatchError(
+            f"Stale patch rejected for {display}: "
+            f"{operation} target changed before commit"
+        )
 
 
 def parse_patch(text: str) -> list[FilePatch]:

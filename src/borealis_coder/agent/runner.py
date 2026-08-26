@@ -3302,6 +3302,8 @@ class AgentRunner:
                 {task, cancel_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if task in done:
+                return task.result()
             if cancel_task in done and cancel.is_set():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
