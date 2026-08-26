@@ -860,8 +860,8 @@ class SessionStore:
         session_id: str,
         key: str,
         value: dict[str, Any],
-    ) -> None:
-        """Persist a provider summary before its usage is settled."""
+    ) -> bool:
+        """Persist a provider summary and return whether this caller owns it."""
 
         pending = {**value, "usage_settled": False}
         with self._lock, self._connection:
@@ -871,7 +871,7 @@ class SessionStore:
                 (session_id, key, json_dumps(pending)),
             )
             if cursor.rowcount:
-                return
+                return True
             row = self._connection.execute(
                 "SELECT value_json FROM key_values WHERE session_id=? AND key=?",
                 (session_id, key),
@@ -879,10 +879,9 @@ class SessionStore:
             existing = json.loads(row["value_json"]) if row is not None else None
             if not isinstance(existing, dict):
                 raise SessionError(f"Compaction summary {key!r} has invalid durable state")
-            comparable = dict(existing)
-            comparable.pop("usage_settled", None)
-            if comparable != value:
-                raise SessionError(f"Compaction summary {key!r} cannot be overwritten")
+            # The cache key identifies the request, not the nondeterministic response.
+            # An identical or different provider response is still a losing write.
+            return False
 
     def get_compaction_summary(
         self,

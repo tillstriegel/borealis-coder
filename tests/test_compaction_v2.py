@@ -3098,9 +3098,10 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             loop = asyncio.get_running_loop()
 
             def blocking_put_pending(session_id, key, value):
-                original_put_pending(session_id, key, value)
+                owns_entry = original_put_pending(session_id, key, value)
                 loop.call_soon_threadsafe(cache_written.set)
                 release_write.wait(timeout=3)
+                return owns_entry
 
             try:
                 with patch.object(
@@ -3236,6 +3237,238 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_usage.requests, original_usage.requests)
         self.assertEqual(final_usage.cost_usd, original_usage.cost_usd)
         self.assertEqual(final_usage.application_cache_hits, 1)
+
+    async def test_concurrent_summary_misses_charge_each_response_and_cache_one(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                cache={"response_cache_enabled": False},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            both_started = asyncio.Event()
+            release = asyncio.Event()
+            provider_calls = 0
+            responses = [
+                ModelResponse(
+                    text="first summary",
+                    usage=Usage(input_tokens=10, output_tokens=1, requests=1, cost_usd=0.1),
+                ),
+                ModelResponse(
+                    text="second summary",
+                    usage=Usage(input_tokens=20, output_tokens=2, requests=1, cost_usd=0.2),
+                ),
+            ]
+
+            async def complete(_request: ProviderRequest) -> ModelResponse:
+                nonlocal provider_calls
+                index = provider_calls
+                provider_calls += 1
+                if provider_calls == 2:
+                    both_started.set()
+                await release.wait()
+                return responses[index]
+
+            run_budgets = [Budget.start(config.agent), Budget.start(config.agent)]
+
+            def sinks(index: int):
+                async def usage_sink(usage: Usage) -> None:
+                    await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
+                    run_budgets[index].add_usage(usage)
+
+                async def settled_usage_sink(usage: Usage) -> None:
+                    run_budgets[index].add_usage(usage)
+
+                return usage_sink, settled_usage_sink
+
+            first_sink, first_settled_sink = sinks(0)
+            second_sink, second_settled_sink = sinks(1)
+            first_summarizer = runner._summarizer(
+                first_sink,
+                asyncio.Event(),
+                session_id=session.id,
+                settled_usage_sink=first_settled_sink,
+            )
+            second_summarizer = runner._summarizer(
+                second_sink,
+                asyncio.Event(),
+                session_id=session.id,
+                settled_usage_sink=second_settled_sink,
+            )
+            assert first_summarizer is not None
+            assert second_summarizer is not None
+
+            try:
+                with patch.object(provider, "complete", new=complete):
+                    first_task = asyncio.ensure_future(first_summarizer("same transcript"))
+                    second_task = asyncio.ensure_future(second_summarizer("same transcript"))
+                    await asyncio.wait_for(both_started.wait(), timeout=1)
+                    release.set()
+                    results = await asyncio.gather(first_task, second_task)
+
+                    reuse_budget = Budget.start(config.agent)
+
+                    async def reuse_sink(usage: Usage) -> None:
+                        await asyncio.to_thread(
+                            runner.sessions.add_usage, session.id, usage
+                        )
+                        reuse_budget.add_usage(usage)
+
+                    async def reuse_settled_sink(usage: Usage) -> None:
+                        reuse_budget.add_usage(usage)
+
+                    reuse = runner._summarizer(
+                        reuse_sink,
+                        asyncio.Event(),
+                        session_id=session.id,
+                        settled_usage_sink=reuse_settled_sink,
+                    )
+                    assert reuse is not None
+                    reused = await reuse("same transcript")
+
+                cache_rows = runner.sessions._connection.execute(
+                    "SELECT value_json FROM key_values WHERE session_id=? "
+                    "AND key LIKE 'compaction_summary:%'",
+                    (session.id,),
+                ).fetchall()
+                durable_usage = runner.sessions.usage(session.id)
+            finally:
+                release.set()
+                await runner.close()
+
+        self.assertEqual(provider_calls, 2)
+        self.assertEqual({result.text for result in results}, {"first summary", "second summary"})
+        self.assertEqual(len(cache_rows), 1)
+        cached = json.loads(cache_rows[0]["value_json"])
+        self.assertTrue(cached["usage_settled"])
+        self.assertEqual(reused.text, cached["text"])
+        first_run_usage = run_budgets[0].usage
+        second_run_usage = run_budgets[1].usage
+        assert first_run_usage is not None
+        assert second_run_usage is not None
+        self.assertEqual(
+            sorted(
+                (usage.input_tokens, usage.output_tokens, usage.requests)
+                for usage in (first_run_usage, second_run_usage)
+            ),
+            [(10, 1, 1), (20, 2, 1)],
+        )
+        self.assertEqual(durable_usage.input_tokens, 30)
+        self.assertEqual(durable_usage.output_tokens, 3)
+        self.assertEqual(durable_usage.requests, 2)
+        self.assertAlmostEqual(durable_usage.cost_usd, 0.3)
+        self.assertEqual(durable_usage.application_cache_hits, 1)
+        reuse_usage = reuse_budget.usage
+        assert reuse_usage is not None
+        self.assertEqual(reuse_usage.input_tokens, 0)
+        self.assertEqual(reuse_usage.requests, 0)
+        self.assertEqual(reuse_usage.application_cache_hits, 1)
+
+    async def test_cache_reader_cannot_steal_owner_run_budget_charge(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                cache={"response_cache_enabled": False},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider_calls = 0
+            original_usage = Usage(
+                input_tokens=12,
+                output_tokens=3,
+                requests=1,
+                cost_usd=0.15,
+            )
+
+            async def complete(_request: ProviderRequest) -> ModelResponse:
+                nonlocal provider_calls
+                provider_calls += 1
+                return ModelResponse(text="owned summary", usage=original_usage)
+
+            owner_budget = Budget.start(config.agent)
+            reader_budget = Budget.start(config.agent)
+
+            def sinks(budget: Budget):
+                async def usage_sink(usage: Usage) -> None:
+                    await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
+                    budget.add_usage(usage)
+
+                async def settled_usage_sink(usage: Usage) -> None:
+                    budget.add_usage(usage)
+
+                return usage_sink, settled_usage_sink
+
+            owner_sink, owner_settled_sink = sinks(owner_budget)
+            reader_sink, reader_settled_sink = sinks(reader_budget)
+            owner = runner._summarizer(
+                owner_sink,
+                asyncio.Event(),
+                session_id=session.id,
+                settled_usage_sink=owner_settled_sink,
+            )
+            reader = runner._summarizer(
+                reader_sink,
+                asyncio.Event(),
+                session_id=session.id,
+                settled_usage_sink=reader_settled_sink,
+            )
+            assert owner is not None
+            assert reader is not None
+            original_put_pending = runner.sessions.put_pending_compaction_summary
+            pending_written = asyncio.Event()
+            release_owner = threading.Event()
+            loop = asyncio.get_running_loop()
+
+            def block_owner_after_cache_insert(session_id, key, value):
+                owns_entry = original_put_pending(session_id, key, value)
+                if owns_entry:
+                    loop.call_soon_threadsafe(pending_written.set)
+                    release_owner.wait(timeout=3)
+                return owns_entry
+
+            try:
+                with patch.object(provider, "complete", new=complete), patch.object(
+                    runner.sessions,
+                    "put_pending_compaction_summary",
+                    side_effect=block_owner_after_cache_insert,
+                ):
+                    owner_task = asyncio.ensure_future(owner("same transcript"))
+                    await asyncio.wait_for(pending_written.wait(), timeout=1)
+                    reader_result = await reader("same transcript")
+                    release_owner.set()
+                    owner_result = await asyncio.wait_for(owner_task, timeout=2)
+                durable_usage = runner.sessions.usage(session.id)
+            finally:
+                release_owner.set()
+                await runner.close()
+
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(owner_result.text, "owned summary")
+        self.assertEqual(reader_result.text, "owned summary")
+        owner_run_usage = owner_budget.usage
+        reader_run_usage = reader_budget.usage
+        assert owner_run_usage is not None
+        assert reader_run_usage is not None
+        self.assertEqual(owner_run_usage.input_tokens, original_usage.input_tokens)
+        self.assertEqual(owner_run_usage.requests, 1)
+        self.assertEqual(reader_run_usage.input_tokens, 0)
+        self.assertEqual(reader_run_usage.requests, 0)
+        self.assertEqual(reader_run_usage.application_cache_hits, 1)
+        self.assertEqual(durable_usage.input_tokens, original_usage.input_tokens)
+        self.assertEqual(durable_usage.requests, 1)
+        self.assertEqual(durable_usage.application_cache_hits, 1)
 
     async def test_artifact_reuse_requires_the_same_retained_provider_payload(self):
         with tempfile.TemporaryDirectory() as td:

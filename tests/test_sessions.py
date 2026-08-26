@@ -50,6 +50,37 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(exported["usage"]["total_tokens"], 7)
         self.assertEqual(exported["tool_calls"][0]["status"], "completed")
 
+    def test_pending_compaction_summary_reports_single_owner(self):
+        value = {
+            "version": 2,
+            "text": "winner",
+            "usage": Usage(input_tokens=3, requests=1).to_dict(),
+        }
+
+        self.assertTrue(
+            self.store.put_pending_compaction_summary(
+                self.session.id, "compaction_summary:key", value
+            )
+        )
+        self.assertFalse(
+            self.store.put_pending_compaction_summary(
+                self.session.id, "compaction_summary:key", value
+            )
+        )
+        self.assertFalse(
+            self.store.put_pending_compaction_summary(
+                self.session.id,
+                "compaction_summary:key",
+                {**value, "text": "loser"},
+            )
+        )
+        cached = self.store.get_compaction_summary(
+            self.session.id, "compaction_summary:key"
+        )
+        assert cached is not None
+        self.assertEqual(cached["text"], "winner")
+        self.assertFalse(cached["usage_settled"])
+
     def test_export_contains_more_than_one_event_query_page(self):
         self.store.append_events(
             Event(type="model.text_delta", session_id=self.session.id, data={"text": "x"})

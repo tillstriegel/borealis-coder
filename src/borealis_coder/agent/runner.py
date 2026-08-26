@@ -2697,7 +2697,7 @@ class AgentRunner:
             ):
                 assert session_id is not None
                 try:
-                    cached, original_usage, newly_settled = await asyncio.to_thread(
+                    cached, original_usage, _ = await asyncio.to_thread(
                         self.sessions.settle_compaction_summary_usage,
                         session_id,
                         cache_key,
@@ -2706,8 +2706,6 @@ class AgentRunner:
                     raise SessionError(
                         "Could not settle cached compaction summary usage"
                     ) from error
-                if newly_settled and settled_usage_sink is not None:
-                    await settled_usage_sink(original_usage)
                 cache_usage = Usage(
                     application_cache_hits=1,
                     application_cache_saved_tokens=original_usage.total_tokens,
@@ -2756,7 +2754,7 @@ class AgentRunner:
                 # Cache first so a budget stop can resume without another provider call.
                 if session_id is not None:
                     try:
-                        await asyncio.to_thread(
+                        owns_cache_entry = await asyncio.to_thread(
                             self.sessions.put_pending_compaction_summary,
                             session_id,
                             cache_key,
@@ -2775,18 +2773,23 @@ class AgentRunner:
                         raise SessionError(
                             "Could not persist the pending compaction summary"
                         ) from cache_error
-                    try:
-                        _, _, newly_settled = await asyncio.to_thread(
-                            self.sessions.settle_compaction_summary_usage,
-                            session_id,
-                            cache_key,
-                        )
-                    except Exception as error:
-                        raise SessionError(
-                            "Could not settle compaction summary usage"
-                        ) from error
-                    if newly_settled and settled_usage_sink is not None:
-                        await settled_usage_sink(response.usage)
+                    if owns_cache_entry:
+                        try:
+                            await asyncio.to_thread(
+                                self.sessions.settle_compaction_summary_usage,
+                                session_id,
+                                cache_key,
+                            )
+                        except Exception as error:
+                            raise SessionError(
+                                "Could not settle compaction summary usage"
+                            ) from error
+                        # This run incurred the provider charge even if another
+                        # process settled the durable cache entry first.
+                        if settled_usage_sink is not None:
+                            await settled_usage_sink(response.usage)
+                    else:
+                        await usage_sink(response.usage)
                 else:
                     await usage_sink(response.usage)
                 if usage_collector is not None:
