@@ -53,13 +53,22 @@ LLM compaction uses a strict JSON schema and bounded chunks. Output must retain 
 
 ## Evaluation and release gates
 
-Run the fixed offline corpus:
+Run the fixed offline structural corpus:
 
 ```sh
 PYTHONPATH=src python scripts/evaluate_compaction.py
 ```
 
-The corpus covers multi-file work, requirement changes, repeated failures, large output, cancellation and resume, continuation metadata, steering, hostile content, repeated compaction, and provider overflow. It reports critical-fact recall, false completion claims, boundary escapes, tool ordering, token reduction, target compliance, latency, cost, resume determinism, and full-history versus compacted completion scores. The offline score uses source-backed task facts; callers can supply a model or human-backed scorer for deeper quality evaluation.
+The corpus covers multi-file work, requirement changes, repeated failures, large output, cancellation and resume, continuation metadata, steering, hostile content, repeated compaction, and provider overflow. It reports critical-fact recall, false completion claims, boundary escapes, tool ordering, token reduction, target compliance, latency, cost, and resume determinism. Without an independent completion scorer, completion quality and the full release gate are reported as `not_evaluated` instead of being inferred from the critical-fact checks.
+
+Supply an independent model-backed or human-backed scorer to compare task-completion quality against full history:
+
+```sh
+PYTHONPATH=src python scripts/evaluate_compaction.py \
+  --completion-scorer your_package.compaction_eval:score_completion
+```
+
+The scorer receives `(messages, case)` and returns a score from 0 to 1. The command evaluates the full release gate only when this scorer is present. Otherwise, its exit status covers the offline structural gate only.
 
 The release gates are:
 
@@ -68,7 +77,7 @@ The release gates are:
 - zero invalid tool sequences;
 - every successful size case below target;
 - no second LLM charge for an unchanged resume;
-- no completion-quality regression greater than five percentage points when a completion scorer is supplied.
+- an independently measured completion-quality regression no greater than five percentage points.
 
 ## Rollout
 
@@ -76,7 +85,7 @@ The release gates are:
 
 1. Set `compaction_version = 1` and `compaction_shadow_v2 = true` to emit safe v2 comparison metrics while v1 remains active.
 2. Set `compaction_version = 2` with `deterministic_compaction = true` to enable deterministic v2 and durable reuse.
-3. Set `deterministic_compaction = false` only after the evaluation gates pass for the configured summarizer provider.
+3. Set `deterministic_compaction = false` only after both the structural gate and an independent completion-quality gate pass for the configured summarizer provider.
 4. Remove v1 after the compatibility release.
 
 `context.compacted` and `context.compaction_shadow` events contain sizes, counts, strategy, artifact version, reuse state, overflow retry count, fallback reason, usage, and latency. They do not contain summary text.

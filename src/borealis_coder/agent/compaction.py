@@ -531,24 +531,33 @@ def extract_compaction_evidence(
         )
     ]
     if user_messages:
-        evidence.current_objective = [user_messages[-1].content.strip()]
+        objective_messages = [
+            message for message in user_messages if not message.metadata.get("steering")
+        ]
+        evidence.current_objective = [
+            (objective_messages or user_messages)[-1].content.strip()
+        ]
         evidence.user_constraints.extend(message.content.strip() for message in user_messages[-3:])
 
     latest_plan: list[dict[str, Any]] | None = None
+    latest_git_state: str | None = None
     call_details: dict[str, tuple[str, dict[str, Any]]] = {}
     for message in messages:
         for call in message.tool_calls:
             call_details[call.id] = (call.name, call.arguments)
-            plan_value = call.arguments.get("items") or call.arguments.get("plan")
-            if call.name == "update_plan" and isinstance(plan_value, list):
-                latest_plan = [
-                    dict(item) for item in plan_value if isinstance(item, dict)
-                ]
         if message.role != Role.TOOL:
             continue
         tool_name, arguments = call_details.get(
             message.tool_call_id or "", (message.tool_name or "", {})
         )
+        if tool_name == "update_plan" and not message.is_error:
+            plan_value = message.metadata.get("items")
+            if not isinstance(plan_value, list):
+                plan_value = arguments.get("items") or arguments.get("plan")
+            if isinstance(plan_value, list):
+                latest_plan = [
+                    dict(item) for item in plan_value if isinstance(item, dict)
+                ]
         paths = _mutation_paths(message.metadata, arguments)
         has_changed_file_metadata = bool(
             message.metadata.get("changed_files") or message.metadata.get("files")
@@ -572,7 +581,9 @@ def extract_compaction_evidence(
                 + _tail(message.content, 2_000)
             )
         if tool_name == "git_status" and not message.is_error:
-            evidence.latest_verification.append("Latest recorded git state:\n" + _tail(message.content, 2_000))
+            latest_git_state = "Latest recorded git state:\n" + truncate_text(
+                message.content.strip(), 2_000
+            )
 
     verification_messages = [
         message
@@ -581,7 +592,11 @@ def extract_compaction_evidence(
         or str(message.metadata.get("internal") or "").startswith("verification_")
     ]
     if verification_messages:
-        evidence.latest_verification = [_tail(verification_messages[-1].content, 4_000)]
+        evidence.latest_verification = [
+            truncate_text(verification_messages[-1].content.strip(), 4_000)
+        ]
+    if latest_git_state is not None:
+        evidence.latest_verification.append(latest_git_state)
 
     if latest_plan is not None:
         evidence.pending_work = [
@@ -733,39 +748,88 @@ def _shrink_diagnostic_messages(
 
 
 def compact_messages_v1(
-    messages: list[Message], *, keep_recent: int = 18, summary_chars: int = 18_000
+    messages: list[Message],
+    *,
+    keep_recent: int = 18,
+    summary_chars: int = 18_000,
+    target_tokens: int = 0,
+    force: bool = False,
 ) -> list[Message]:
     """Compatibility compactor with secure framing and atomic tool-call splitting."""
 
-    validate_tool_call_order(messages)
-    if len(messages) <= keep_recent + 2:
+    bundles = bundle_conversation(messages)
+    if not force and len(messages) <= keep_recent + 2 and (
+        target_tokens <= 0 or _messages_tokens(messages) <= target_tokens
+    ):
         return messages
-    split = len(messages) - keep_recent
-    while split > 0 and messages[split].role == Role.TOOL:
-        split -= 1
-    older = messages[:split]
-    recent = messages[split:]
-    summary = frame_untrusted_history(
-        render_transcript(older), strategy="deterministic", limit=summary_chars
+    if len(bundles) < 2:
+        raise CompactionSizeError("Compaction v1 has no older bundle to summarize")
+
+    boundaries: list[int] = []
+    message_count = 0
+    for bundle in bundles[:-1]:
+        message_count += len(bundle.messages)
+        boundaries.append(message_count)
+    preferred_split = max(1, len(messages) - keep_recent)
+    start = max(
+        (index for index, boundary in enumerate(boundaries) if boundary <= preferred_split),
+        default=0,
     )
-    return [
-        Message(
-            role=Role.SYSTEM,
-            content=summary,
-            metadata={
-                "compacted": True,
-                "artifact_version": 1,
-                "strategy": "deterministic",
-                "source_messages": len(older),
-                "source_message_ids": [message.id for message in older],
-                "source_hash": _source_hash(older),
-                "source_bundles": len(bundle_conversation(older)),
-                "retained_bundles": len(bundle_conversation(recent)),
-                "evidence": {},
-            },
-        ),
-        *recent,
-    ]
+
+    def build_result(older: list[Message], recent: list[Message], limit: int) -> list[Message]:
+        summary = frame_untrusted_history(
+            render_transcript(older), strategy="deterministic", limit=limit
+        )
+        return [
+            Message(
+                role=Role.SYSTEM,
+                content=summary,
+                metadata={
+                    "compacted": True,
+                    "artifact_version": 1,
+                    "strategy": "deterministic",
+                    "source_messages": len(older),
+                    "source_message_ids": [message.id for message in older],
+                    "source_hash": _source_hash(older),
+                    "source_bundles": len(bundle_conversation(older)),
+                    "retained_bundles": len(bundle_conversation(recent)),
+                    "evidence": {},
+                },
+            ),
+            *recent,
+        ]
+
+    def fit_summary(older: list[Message], recent: list[Message]) -> list[Message] | None:
+        if target_tokens <= 0:
+            return build_result(older, recent, summary_chars)
+        smallest = build_result(older, recent, 1)
+        if _messages_tokens(smallest) > target_tokens:
+            return None
+        low = 1
+        high = summary_chars
+        best = smallest
+        while low <= high:
+            limit = (low + high) // 2
+            candidate = build_result(older, recent, limit)
+            if _messages_tokens(candidate) <= target_tokens:
+                best = candidate
+                low = limit + 1
+            else:
+                high = limit - 1
+        return best
+
+    for split in boundaries[start:]:
+        older = messages[:split]
+        recent = messages[split:]
+        fitted = fit_summary(older, recent)
+        if fitted is not None:
+            return fitted
+        if target_tokens > 0:
+            recent = _shrink_diagnostic_messages(recent, target_tokens=target_tokens)
+            fitted = fit_summary(older, recent)
+            if fitted is not None:
+                return fitted
+    raise CompactionSizeError("Compaction v1 does not fit the configured target")
 
 
 def compact_messages(

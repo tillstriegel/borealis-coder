@@ -1108,6 +1108,7 @@ class AgentRunner:
                 "deterministic"
                 if self.config.agent.deterministic_compaction
                 or self.config.agent.compaction_version == 1
+                or compaction_reason == "provider_context_overflow"
                 else "llm"
             )
             artifact_version = self.config.agent.compaction_version
@@ -1129,6 +1130,16 @@ class AgentRunner:
                     config_fingerprint=fingerprint,
                     strategy="deterministic",
                 )
+            if incremental_parent is None and overflow_retry_count:
+                previous_artifact = await asyncio.to_thread(
+                    self.sessions.latest_compaction_artifact,
+                    session_id,
+                )
+                if (
+                    previous_artifact is not None
+                    and previous_artifact.version == artifact_version
+                ):
+                    incremental_parent = previous_artifact
             current_source_ids = [message.id for message in request_messages]
             parent_is_prefix = bool(
                 incremental_parent is not None
@@ -1229,6 +1240,8 @@ class AgentRunner:
                     deterministic_messages = compact_messages_v1(
                         request_messages,
                         keep_recent=keep_recent,
+                        target_tokens=provider_message_target,
+                        force=bool(compaction_kwargs["force"]),
                     )
                 else:
                     deterministic_messages = await compact_messages_with_summary(
@@ -1504,7 +1517,11 @@ class AgentRunner:
             config_fingerprint=config_fingerprint,
             strategy=strategy,
         )
-        if reusable is not None:
+        provider_messages = [message.to_dict() for message in retained_messages]
+        if (
+            reusable is not None
+            and reusable.metadata.get("provider_messages") == provider_messages
+        ):
             return (
                 replace(
                     artifact_message,
@@ -1530,6 +1547,16 @@ class AgentRunner:
             config_fingerprint=config_fingerprint,
             strategy=strategy,
         )
+        if parent is None:
+            previous_artifact = await asyncio.to_thread(
+                self.sessions.latest_compaction_artifact,
+                session_id,
+            )
+            if (
+                previous_artifact is not None
+                and previous_artifact.version == artifact_version
+            ):
+                parent = previous_artifact
         parent_id: str | None = None
         if parent is not None and source_ids[: len(parent.source_message_ids)] == parent.source_message_ids:
             parent_id = parent.id
@@ -1550,7 +1577,9 @@ class AgentRunner:
             ),
             config_fingerprint=config_fingerprint,
             estimated_tokens_before=estimate_request_tokens("", source, []),
-            estimated_tokens_after=estimate_tokens(artifact_message.content) + 12,
+            estimated_tokens_after=estimate_request_tokens(
+                artifact_message.content, retained_messages, []
+            ),
             usage=summary_usage,
             source_start_sequence=min(sequences) if sequences else None,
             source_end_sequence=max(sequences) if sequences else None,
@@ -1564,9 +1593,7 @@ class AgentRunner:
                     "compacted_bundles", 0
                 ),
                 "retained_message_ids": [message.id for message in retained_messages],
-                "provider_messages": [
-                    message.to_dict() for message in retained_messages
-                ],
+                "provider_messages": provider_messages,
                 "compacted_context_hash": hashlib.sha256(
                     json_dumps(
                         {
