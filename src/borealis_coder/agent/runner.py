@@ -498,11 +498,13 @@ class AgentRunner:
                         provider_overflow_retry_count=provider_overflow_retries,
                         fallback_reason="provider_context_overflow",
                     )
+                    budget.retry_current_turn()
                     continue
                 except ProviderError as error:
                     if error.usage is not None:
                         await usage_sink(error.usage)
                     raise
+                provider_overflow_retries = 0
                 await asyncio.to_thread(self.sessions.add_usage, session_id, response.usage)
                 usage_budget_error: BudgetExceeded | None = None
                 try:
@@ -2178,23 +2180,67 @@ class AgentRunner:
                 self._check_cancel(cancel)
                 return await self._execute_one(call, context, cancel)
 
-        if reads:
-            read_tasks = [asyncio.create_task(run_read(call)) for call in reads]
-            try:
-                read_messages = await asyncio.gather(*read_tasks)
-            except BaseException:
-                await asyncio.gather(*read_tasks, return_exceptions=True)
-                raise
-            messages.update(
-                {
-                    call.id: message
-                    for call, message in zip(reads, read_messages, strict=True)
-                }
-            )
-        for call in writes:
-            self._check_cancel(cancel)
-            messages[call.id] = await self._execute_one(call, context, cancel)
+        try:
+            if reads:
+                read_tasks = [asyncio.create_task(run_read(call)) for call in reads]
+                try:
+                    read_messages = await asyncio.gather(*read_tasks)
+                except BaseException:
+                    await asyncio.gather(*read_tasks, return_exceptions=True)
+                    raise
+                messages.update(
+                    {
+                        call.id: message
+                        for call, message in zip(reads, read_messages, strict=True)
+                    }
+                )
+            for call in writes:
+                self._check_cancel(cancel)
+                messages[call.id] = await self._execute_one(call, context, cancel)
+        except (asyncio.CancelledError, Cancelled):
+            await self._record_missing_cancelled_calls(calls, context)
+            raise
         return [messages[call.id] for call in calls]
+
+    async def _record_missing_cancelled_calls(
+        self,
+        calls: list[ToolCall],
+        context: ToolContext,
+    ) -> None:
+        """Close advertised calls that cancellation prevented from starting."""
+
+        durable_messages = await asyncio.to_thread(
+            self.sessions.messages,
+            context.session_id,
+        )
+        result_ids = {
+            message.tool_call_id
+            for message in durable_messages
+            if message.role == Role.TOOL and message.tool_call_id
+        }
+        for call in calls:
+            if call.id in result_ids:
+                continue
+            result = ToolResult(
+                "Run cancelled before tool execution",
+                is_error=True,
+                metadata={"cancelled": True, "not_started": True},
+            )
+            await asyncio.to_thread(
+                self.sessions.start_tool_call,
+                context.session_id,
+                context.run_id,
+                call.id,
+                call.name,
+                call.arguments,
+            )
+            await asyncio.to_thread(
+                self.sessions.cancel_tool_call,
+                context.session_id,
+                call.id,
+                reason=result.output,
+                message=self._tool_result_message(call, result),
+            )
 
     async def _execute_one(
         self,

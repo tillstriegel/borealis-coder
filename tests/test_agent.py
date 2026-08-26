@@ -1533,6 +1533,92 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.stop_reason.value, "cancelled")
             await runner.close()
 
+    async def test_cancelled_serial_batch_records_unstarted_results_before_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            first_started = asyncio.Event()
+            never_complete = asyncio.Event()
+
+            async def blocked_tool(arguments, context):
+                del arguments, context
+                first_started.set()
+                await never_complete.wait()
+                return ToolResult("unexpected completion")
+
+            async def unstarted_tool(arguments, context):
+                del arguments, context
+                self.fail("The second serial tool must not start after cancellation")
+
+            runner.tools.register(
+                FunctionTool(
+                    name="blocked_serial",
+                    description="Block until the run is cancelled.",
+                    parameters=object_schema({}),
+                    function=blocked_tool,
+                )
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="unstarted_serial",
+                    description="Remain pending behind the blocked tool.",
+                    parameters=object_schema({}),
+                    function=unstarted_tool,
+                )
+            )
+
+            def respond(_request: ProviderRequest, call: int) -> ModelResponse:
+                if call == 1:
+                    return ModelResponse(
+                        tool_calls=[
+                            ToolCall(id="blocked-call", name="blocked_serial", arguments={}),
+                            ToolCall(
+                                id="unstarted-call",
+                                name="unstarted_serial",
+                                arguments={},
+                            ),
+                        ],
+                        usage=Usage(requests=1),
+                    )
+                return ModelResponse(text="resumed", usage=Usage(requests=1))
+
+            provider.handler = respond
+            try:
+                task = asyncio.create_task(runner.run("run serial tools"))
+                await asyncio.wait_for(first_started.wait(), timeout=1)
+                session_id = next(iter(runner._cancel))
+                self.assertTrue(runner.cancel(session_id))
+                cancelled = await asyncio.wait_for(task, timeout=2)
+
+                tool_messages = [
+                    message
+                    for message in runner.sessions.messages(session_id)
+                    if message.role == Role.TOOL
+                ]
+                self.assertEqual(
+                    [message.tool_call_id for message in tool_messages],
+                    ["blocked-call", "unstarted-call"],
+                )
+                self.assertTrue(tool_messages[1].metadata["not_started"])
+                self.assertEqual(
+                    [item["status"] for item in runner.sessions.tool_calls(session_id)],
+                    ["cancelled", "cancelled"],
+                )
+
+                resumed = await runner.run("resume", session_id=session_id)
+            finally:
+                never_complete.set()
+                await runner.close()
+
+        self.assertEqual(cancelled.stop_reason.value, "cancelled")
+        self.assertEqual(resumed.text, "resumed")
+
     async def test_cancel_waits_for_all_parallel_read_finalizers(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

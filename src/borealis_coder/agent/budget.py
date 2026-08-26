@@ -55,6 +55,13 @@ class Budget:
             )
         self.turns += 1
 
+    def retry_current_turn(self) -> None:
+        """Keep a failed provider attempt within its current logical model turn."""
+
+        if self.turns <= 0:
+            raise RuntimeError("Cannot retry a model turn before it starts")
+        self.turns -= 1
+
     def add_usage(self, usage: Usage) -> None:
         assert self.usage is not None
         self.usage.add(usage)

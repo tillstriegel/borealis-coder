@@ -500,6 +500,35 @@ class StructuredCompactionTests(unittest.TestCase):
         validate_tool_call_order(first[1:])
         validate_tool_call_order(second[1:])
 
+    def test_v1_single_bundle_passes_through_or_shrinks_to_target(self):
+        small = [Message(role=Role.USER, content="small request")]
+        self.assertEqual(
+            compact_messages_v1(
+                small,
+                target_tokens=2_000,
+                force=True,
+            ),
+            small,
+        )
+
+        large = [
+            Message(role=Role.USER, content="inspect diagnostics"),
+            *_tool_cycle("single-v1", content="diagnostic " * 2_000),
+        ]
+        compacted = compact_messages_v1(
+            large,
+            target_tokens=2_000,
+            force=True,
+        )
+
+        self.assertTrue(compacted[0].metadata["compacted"])
+        self.assertEqual(
+            compacted[0].metadata["source_message_ids"],
+            [message.id for message in large],
+        )
+        validate_tool_call_order(compacted[1:])
+        self.assertLessEqual(estimate_request_tokens("", compacted, []), 2_000)
+
     def test_changed_files_use_mutation_evidence_not_read_paths(self):
         read = ToolCall(id="read", name="read_file", arguments={"path": "read.py"})
         shell = ToolCall(id="shell", name="shell", arguments={"command": "test and edit"})
@@ -561,6 +590,27 @@ class StructuredCompactionTests(unittest.TestCase):
         self.assertIn("PENDING-MUST-STAY", summary)
         self.assertLessEqual(estimate_tokens(summary), 700)
         self.assertLessEqual(len(summary.encode("utf-8")), 2_800)
+
+    def test_large_objective_and_constraints_shrink_after_lower_priority_sections(self):
+        objective = "OBJECTIVE-HEAD " + ("detail " * 700) + "OBJECTIVE-TAIL"
+        messages = [
+            Message(role=Role.ASSISTANT, content="Earlier terminal response."),
+            Message(role=Role.USER, content=objective),
+        ]
+
+        compacted = compact_messages(
+            messages,
+            keep_recent_bundles=1,
+            target_tokens=2_000,
+            force=True,
+        )
+
+        self.assertEqual(compacted[-1].content, objective)
+        self.assertIn("## Current objective", compacted[0].content)
+        self.assertIn("## User constraints", compacted[0].content)
+        self.assertIn("OBJECTIVE-HEAD", compacted[0].content)
+        self.assertIn("OBJECTIVE-TAIL", compacted[0].content)
+        self.assertLessEqual(estimate_request_tokens("", compacted, []), 2_000)
 
     def test_context_budget_reserves_output_fixed_costs_and_overflow_margin(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1320,6 +1370,97 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn(1, retry_counts)
         self.assertIn(2, retry_counts)
+
+    async def test_provider_overflow_retry_limit_resets_after_a_successful_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"compaction_max_overflow_retries": 1},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(14):
+                for message in _tool_cycle(
+                    f"reset-overflow-{index}",
+                    content=(f"diagnostic-{index} " * 200),
+                ):
+                    runner.sessions.append_message(session.id, message)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+
+            def handler(_request: ProviderRequest, call: int) -> ModelResponse:
+                if call in {1, 3}:
+                    raise ProviderContextOverflowError("context window exceeded")
+                if call == 2:
+                    return ModelResponse(
+                        tool_calls=[
+                            ToolCall(
+                                id="list-after-overflow",
+                                name="list_directory",
+                                arguments={"path": "."},
+                            )
+                        ],
+                        usage=Usage(requests=1),
+                    )
+                return ModelResponse(text="done", usage=Usage(requests=1))
+
+            provider.handler = handler
+            events = []
+            runner.events.subscribe(lambda event: events.append(event))
+            try:
+                result = await runner.run("continue", session_id=session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual(result.text, "done")
+        self.assertEqual(provider.calls, 4)
+        retry_counts = [
+            event.data["provider_overflow_retry_count"]
+            for event in events
+            if event.type == "context.overflow_retry"
+        ]
+        self.assertEqual(retry_counts, [1, 1])
+
+    async def test_provider_overflow_retry_does_not_consume_the_final_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "compaction_max_overflow_retries": 1,
+                    "max_turns": 1,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(10):
+                runner.sessions.append_message(
+                    session.id,
+                    Message(role=Role.USER, content=f"history-{index}"),
+                )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+
+            def handler(_request: ProviderRequest, call: int) -> ModelResponse:
+                if call == 1:
+                    raise ProviderContextOverflowError("context window exceeded")
+                return ModelResponse(text="recovered", usage=Usage(requests=1))
+
+            provider.handler = handler
+            try:
+                result = await runner.run("continue", session_id=session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual(result.text, "recovered")
+        self.assertEqual(result.stop_reason.value, "end_turn")
+        self.assertEqual(result.turns, 1)
+        self.assertEqual(provider.calls, 2)
 
     async def test_provider_overflow_never_exceeds_retry_limit(self):
         with tempfile.TemporaryDirectory() as td:

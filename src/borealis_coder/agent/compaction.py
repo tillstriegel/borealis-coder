@@ -58,6 +58,10 @@ _SHRINK_ORDER = (
     "Files changed",
     "Pending work",
 )
+_CRITICAL_SHRINK_ORDER = (
+    "User constraints",
+    "Current objective",
+)
 _MANDATORY_SECTIONS = frozenset(_SECTION_ORDER)
 _EVIDENCE_PLACEHOLDERS = frozenset(
     {
@@ -770,6 +774,18 @@ def render_deterministic_summary(
             else:
                 break
             candidate = framed()
+    for heading in _CRITICAL_SHRINK_ORDER:
+        while not _within_limits(
+            candidate, max_chars=max_chars, max_tokens=max_tokens, max_bytes=max_bytes
+        ):
+            values = sections[heading]
+            if len(values) > 1:
+                values.pop(0)
+            elif values and len(values[0]) > 160:
+                values[0] = truncate_text(values[0], max(160, len(values[0]) // 2))
+            else:
+                break
+            candidate = framed()
     if not _within_limits(
         candidate, max_chars=max_chars, max_tokens=max_tokens, max_bytes=max_bytes
     ):
@@ -827,8 +843,6 @@ def compact_messages_v1(
         target_tokens <= 0 or _messages_tokens(messages) <= target_tokens
     ):
         return messages
-    if len(bundles) < 2:
-        raise CompactionSizeError("Compaction v1 has no older bundle to summarize")
 
     boundaries: list[int] = []
     message_count = 0
@@ -841,7 +855,14 @@ def compact_messages_v1(
         default=0,
     )
 
-    def build_result(older: list[Message], recent: list[Message], limit: int) -> list[Message]:
+    def build_result(
+        older: list[Message],
+        recent: list[Message],
+        limit: int,
+        *,
+        source: list[Message] | None = None,
+    ) -> list[Message]:
+        source = older if source is None else source
         summary = frame_untrusted_history(
             render_transcript(older), strategy="deterministic", limit=limit
         )
@@ -853,10 +874,10 @@ def compact_messages_v1(
                     "compacted": True,
                     "artifact_version": 1,
                     "strategy": "deterministic",
-                    "source_messages": len(older),
-                    "source_message_ids": [message.id for message in older],
-                    "source_hash": _source_hash(older),
-                    "source_bundles": len(bundle_conversation(older)),
+                    "source_messages": len(source),
+                    "source_message_ids": [message.id for message in source],
+                    "source_hash": _source_hash(source),
+                    "source_bundles": len(bundle_conversation(source)),
                     "retained_bundles": len(bundle_conversation(recent)),
                     "evidence": {},
                 },
@@ -864,10 +885,15 @@ def compact_messages_v1(
             *recent,
         ]
 
-    def fit_summary(older: list[Message], recent: list[Message]) -> list[Message] | None:
+    def fit_summary(
+        older: list[Message],
+        recent: list[Message],
+        *,
+        source: list[Message] | None = None,
+    ) -> list[Message] | None:
         if target_tokens <= 0:
-            return build_result(older, recent, summary_chars)
-        smallest = build_result(older, recent, 1)
+            return build_result(older, recent, summary_chars, source=source)
+        smallest = build_result(older, recent, 1, source=source)
         if _messages_tokens(smallest) > target_tokens:
             return None
         low = 1
@@ -875,13 +901,28 @@ def compact_messages_v1(
         best = smallest
         while low <= high:
             limit = (low + high) // 2
-            candidate = build_result(older, recent, limit)
+            candidate = build_result(older, recent, limit, source=source)
             if _messages_tokens(candidate) <= target_tokens:
                 best = candidate
                 low = limit + 1
             else:
                 high = limit - 1
         return best
+
+    if len(bundles) < 2:
+        if target_tokens <= 0 or _messages_tokens(messages) <= target_tokens:
+            return messages
+        summary_overhead = _messages_tokens(build_result([], [], 1))
+        recent = _shrink_diagnostic_messages(
+            messages,
+            target_tokens=max(1, target_tokens - summary_overhead),
+        )
+        fitted = fit_summary([], recent, source=messages)
+        if fitted is not None:
+            return fitted
+        raise CompactionSizeError(
+            "Compaction v1 single bundle does not fit the configured target"
+        )
 
     for split in boundaries[start:]:
         older = messages[:split]
