@@ -3370,6 +3370,152 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reuse_usage.requests, 0)
         self.assertEqual(reuse_usage.application_cache_hits, 1)
 
+    async def test_losing_summary_worker_settles_cache_after_owner_dies(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                cache={"response_cache_enabled": False},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            both_started = asyncio.Event()
+            release_owner = asyncio.Event()
+            release_loser = asyncio.Event()
+            provider_calls = 0
+            responses = [
+                ModelResponse(
+                    text="owner summary",
+                    usage=Usage(input_tokens=10, output_tokens=1, requests=1, cost_usd=0.1),
+                ),
+                ModelResponse(
+                    text="loser summary",
+                    usage=Usage(input_tokens=20, output_tokens=2, requests=1, cost_usd=0.2),
+                ),
+            ]
+
+            async def complete(_request: ProviderRequest) -> ModelResponse:
+                nonlocal provider_calls
+                index = provider_calls
+                provider_calls += 1
+                if provider_calls == 2:
+                    both_started.set()
+                await (release_owner if index == 0 else release_loser).wait()
+                return responses[index]
+
+            budgets = [Budget.start(config.agent), Budget.start(config.agent)]
+
+            def sinks(index: int):
+                async def usage_sink(usage: Usage) -> None:
+                    await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
+                    budgets[index].add_usage(usage)
+
+                async def settled_usage_sink(usage: Usage) -> None:
+                    budgets[index].add_usage(usage)
+
+                return usage_sink, settled_usage_sink
+
+            owner_sink, owner_settled_sink = sinks(0)
+            loser_sink, loser_settled_sink = sinks(1)
+            owner = runner._summarizer(
+                owner_sink,
+                asyncio.Event(),
+                session_id=session.id,
+                settled_usage_sink=owner_settled_sink,
+            )
+            loser = runner._summarizer(
+                loser_sink,
+                asyncio.Event(),
+                session_id=session.id,
+                settled_usage_sink=loser_settled_sink,
+            )
+            assert owner is not None
+            assert loser is not None
+            original_settle = runner.sessions.settle_compaction_summary_usage
+            settlement_calls = 0
+
+            def owner_dies_before_settlement(session_id: str, key: str):
+                nonlocal settlement_calls
+                settlement_calls += 1
+                if settlement_calls == 1:
+                    raise SessionError("owner process died")
+                return original_settle(session_id, key)
+
+            try:
+                with patch.object(provider, "complete", new=complete), patch.object(
+                    runner.sessions,
+                    "settle_compaction_summary_usage",
+                    side_effect=owner_dies_before_settlement,
+                ):
+                    owner_task = asyncio.ensure_future(owner("same transcript"))
+                    loser_task = asyncio.ensure_future(loser("same transcript"))
+                    await asyncio.wait_for(both_started.wait(), timeout=1)
+                    release_owner.set()
+                    with self.assertRaisesRegex(SessionError, "settle"):
+                        await owner_task
+                    self.assertEqual(runner.sessions.usage(session.id).requests, 0)
+
+                    release_loser.set()
+                    loser_result = await loser_task
+
+                reuse_budget = Budget.start(config.agent)
+
+                async def reuse_sink(usage: Usage) -> None:
+                    await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
+                    reuse_budget.add_usage(usage)
+
+                async def reuse_settled_sink(usage: Usage) -> None:
+                    reuse_budget.add_usage(usage)
+
+                reuse = runner._summarizer(
+                    reuse_sink,
+                    asyncio.Event(),
+                    session_id=session.id,
+                    settled_usage_sink=reuse_settled_sink,
+                )
+                assert reuse is not None
+                reused = await reuse("same transcript")
+                cache_rows = runner.sessions._connection.execute(
+                    "SELECT value_json FROM key_values WHERE session_id=? "
+                    "AND key LIKE 'compaction_summary:%'",
+                    (session.id,),
+                ).fetchall()
+                durable_usage = runner.sessions.usage(session.id)
+            finally:
+                release_owner.set()
+                release_loser.set()
+                await runner.close()
+
+        self.assertEqual(provider_calls, 2)
+        self.assertEqual(settlement_calls, 2)
+        self.assertEqual(loser_result.text, "loser summary")
+        self.assertEqual(len(cache_rows), 1)
+        cached = json.loads(cache_rows[0]["value_json"])
+        self.assertEqual(cached["text"], "owner summary")
+        self.assertTrue(cached["usage_settled"])
+        self.assertEqual(reused.text, "owner summary")
+        self.assertEqual(durable_usage.input_tokens, 30)
+        self.assertEqual(durable_usage.output_tokens, 3)
+        self.assertEqual(durable_usage.requests, 2)
+        self.assertAlmostEqual(durable_usage.cost_usd, 0.3)
+        self.assertEqual(durable_usage.application_cache_hits, 1)
+        owner_budget_usage = budgets[0].usage
+        loser_budget_usage = budgets[1].usage
+        reuse_budget_usage = reuse_budget.usage
+        assert owner_budget_usage is not None
+        assert loser_budget_usage is not None
+        assert reuse_budget_usage is not None
+        self.assertEqual(owner_budget_usage.requests, 0)
+        self.assertEqual(loser_budget_usage.input_tokens, 20)
+        self.assertEqual(loser_budget_usage.requests, 1)
+        self.assertEqual(reuse_budget_usage.input_tokens, 0)
+        self.assertEqual(reuse_budget_usage.application_cache_hits, 1)
+
     async def test_cache_reader_cannot_steal_owner_run_budget_charge(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

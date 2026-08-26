@@ -2789,6 +2789,17 @@ class AgentRunner:
                         if settled_usage_sink is not None:
                             await settled_usage_sink(response.usage)
                     else:
+                        try:
+                            await asyncio.to_thread(
+                                self.sessions.settle_compaction_summary_usage,
+                                session_id,
+                                cache_key,
+                            )
+                        except Exception as error:
+                            await usage_sink(response.usage)
+                            raise SessionError(
+                                "Could not settle the winning compaction summary usage"
+                            ) from error
                         await usage_sink(response.usage)
                 else:
                     await usage_sink(response.usage)

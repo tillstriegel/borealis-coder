@@ -690,14 +690,28 @@ class SessionStore:
         status = "error" if is_error else "completed"
         metadata_json = json_dumps(metadata or {})
         with self._lock, self._connection:
-            existing = self._connection.execute(
-                """SELECT output,is_error,status,metadata_json
-                FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
-                (session_id, call_id),
-            ).fetchone()
-            if existing is None:
-                raise SessionError(f"Tool call {call_id!r} does not exist")
-            if existing["status"] != "running":
+            cursor = self._connection.execute(
+                """UPDATE tool_calls SET
+                    output=?,is_error=?,status=?,completed_at=?,metadata_json=?
+                WHERE session_id=? AND tool_call_id=? AND status='running'""",
+                (
+                    output,
+                    int(is_error),
+                    status,
+                    utc_now(),
+                    metadata_json,
+                    session_id,
+                    call_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                existing = self._connection.execute(
+                    """SELECT output,is_error,status,metadata_json
+                    FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
+                    (session_id, call_id),
+                ).fetchone()
+                if existing is None:
+                    raise SessionError(f"Tool call {call_id!r} does not exist")
                 if not (
                     existing["output"] == output
                     and existing["is_error"] == int(is_error)
@@ -710,20 +724,6 @@ class SessionStore:
                 if message is not None:
                     self._append_message_locked(session_id, message)
                 return
-            self._connection.execute(
-                """UPDATE tool_calls SET
-                    output=?,is_error=?,status=?,completed_at=?,metadata_json=?
-                WHERE session_id=? AND tool_call_id=?""",
-                (
-                    output,
-                    int(is_error),
-                    status,
-                    utc_now(),
-                    metadata_json,
-                    session_id,
-                    call_id,
-                ),
-            )
             if message is not None:
                 self._append_message_locked(session_id, message)
 

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from borealis_coder.errors import SessionError
 from borealis_coder.events import EventBus, JsonlTrace
-from borealis_coder.models import CompactionArtifact, Event, Message, Role, Usage
+from borealis_coder.models import CompactionArtifact, Event, Message, Role, ToolCall, Usage
 from borealis_coder.sessions import SessionStore
 
 
@@ -285,6 +285,99 @@ class SessionStoreTests(unittest.TestCase):
                         message=message,
                     )
                 self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
+
+    def test_concurrent_cancellation_wins_over_stale_completion(self):
+        call = ToolCall(id="raced-call", name="read_file", arguments={"path": "a"})
+        assistant = Message(role=Role.ASSISTANT, tool_calls=[call])
+        self.store.append_message(self.session.id, assistant)
+        self.store.start_tool_call(
+            self.session.id, "run", call.id, call.name, call.arguments
+        )
+        completion_store = SessionStore(self.store.path)
+        update_started = threading.Event()
+        release_update = threading.Event()
+        completion_errors: list[BaseException] = []
+
+        class PausingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __enter__(self):
+                self.connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.connection.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, statement, parameters=()):
+                if (
+                    "UPDATE tool_calls SET" in statement
+                    and "status=?" in statement
+                ):
+                    update_started.set()
+                    release_update.wait(timeout=3)
+                return self.connection.execute(statement, parameters)
+
+        completion_message = Message(
+            role=Role.TOOL,
+            content="stale success",
+            tool_call_id=call.id,
+            tool_name=call.name,
+        )
+
+        def complete() -> None:
+            try:
+                completion_store.complete_tool_call(
+                    self.session.id,
+                    call.id,
+                    output=completion_message.content,
+                    is_error=False,
+                    message=completion_message,
+                )
+            except BaseException as error:
+                completion_errors.append(error)
+
+        original_connection = completion_store._connection
+        try:
+            with patch.object(
+                completion_store,
+                "_connection",
+                PausingConnection(original_connection),
+            ):
+                thread = threading.Thread(target=complete)
+                thread.start()
+                self.assertTrue(update_started.wait(timeout=1))
+                cancellation_message = Message(
+                    role=Role.TOOL,
+                    content="cancel won",
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    is_error=True,
+                    metadata={"cancelled": True},
+                )
+                self.store.cancel_tool_call(
+                    self.session.id,
+                    call.id,
+                    reason=cancellation_message.content,
+                    message=cancellation_message,
+                )
+                release_update.set()
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+        finally:
+            release_update.set()
+            completion_store.close()
+
+        self.assertEqual(len(completion_errors), 1)
+        self.assertIsInstance(completion_errors[0], SessionError)
+        ledger = self.store.tool_calls(self.session.id)[0]
+        self.assertEqual(ledger["status"], "cancelled")
+        self.assertEqual(ledger["output"], "cancel won")
+        messages = self.store.messages(self.session.id)
+        self.assertEqual(messages, [assistant, cancellation_message])
 
     def test_tool_cancellation_accepts_only_exact_cancelled_replay(self):
         with self.assertRaisesRegex(SessionError, "does not exist"):
