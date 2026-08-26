@@ -425,6 +425,36 @@ class StructuredCompactionTests(unittest.TestCase):
         self.assertEqual(evidence.latest_verification[0], "Automatic verification passed.")
         self.assertIn("Latest recorded git state:\nM src/example.py", evidence.latest_verification)
 
+    def test_incremental_git_state_replaces_the_parent_state(self):
+        status = ToolCall(id="status", name="git_status", arguments={})
+        base = CompactionEvidence(
+            latest_verification=[
+                "Automatic verification passed.",
+                "Latest recorded git state:\nM src/old.py",
+            ]
+        )
+
+        evidence = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[status]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=status.id,
+                    tool_name=status.name,
+                    content="working tree clean",
+                ),
+            ],
+            base=base,
+        )
+
+        self.assertEqual(
+            evidence.latest_verification,
+            [
+                "Automatic verification passed.",
+                "Latest recorded git state:\nworking tree clean",
+            ],
+        )
+
     def test_steering_updates_constraints_without_replacing_the_objective(self):
         evidence = extract_compaction_evidence(
             [
@@ -499,6 +529,24 @@ class StructuredCompactionTests(unittest.TestCase):
         self.assertLess(second_size, first_size)
         validate_tool_call_order(first[1:])
         validate_tool_call_order(second[1:])
+
+    def test_v2_summary_allocation_reserves_synthetic_message_framing(self):
+        messages = [
+            Message(
+                role=Role.USER if index % 2 == 0 else Role.ASSISTANT,
+                content=(f"message-{index} " * 20),
+            )
+            for index in range(20)
+        ]
+
+        compacted = compact_messages(
+            messages,
+            keep_recent_bundles=1,
+            target_tokens=510,
+            force=True,
+        )
+
+        self.assertLessEqual(estimate_request_tokens("", compacted, []), 510)
 
     def test_v1_single_bundle_passes_through_or_shrinks_to_target(self):
         small = [Message(role=Role.USER, content="small request")]

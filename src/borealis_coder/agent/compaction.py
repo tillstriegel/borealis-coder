@@ -63,6 +63,7 @@ _CRITICAL_SHRINK_ORDER = (
     "Current objective",
 )
 _MANDATORY_SECTIONS = frozenset(_SECTION_ORDER)
+_MESSAGE_FRAMING_TOKENS = 12
 _EVIDENCE_PLACEHOLDERS = frozenset(
     {
         "Unavailable: no structured decision evidence was recorded.",
@@ -319,7 +320,7 @@ def _mutation_paths(metadata: dict[str, Any], arguments: dict[str, Any]) -> list
 
 
 def _message_tokens(message: Message) -> int:
-    tokens = estimate_tokens(message.content) + 12
+    tokens = estimate_tokens(message.content) + _MESSAGE_FRAMING_TOKENS
     if message.tool_calls:
         tokens += estimate_tokens(json_dumps([call.to_dict() for call in message.tool_calls]))
     return tokens
@@ -649,6 +650,11 @@ def extract_compaction_evidence(
             truncate_text(verification_messages[-1].content.strip(), 4_000)
         ]
     if latest_git_state is not None:
+        evidence.latest_verification = [
+            item
+            for item in evidence.latest_verification
+            if not item.startswith("Latest recorded git state:\n")
+        ]
         evidence.latest_verification.append(latest_git_state)
 
     if latest_plan is not None:
@@ -989,7 +995,12 @@ def compact_messages(
             evidence.historical_excerpts = render_transcript(older).splitlines()
         available_summary_tokens = summary_tokens
         if target_tokens > 0:
-            available_summary_tokens = max(1, target_tokens - _messages_tokens(recent))
+            available_summary_tokens = max(
+                1,
+                target_tokens
+                - _messages_tokens(recent)
+                - _MESSAGE_FRAMING_TOKENS,
+            )
             if summary_tokens > 0:
                 available_summary_tokens = min(summary_tokens, available_summary_tokens)
         try:
