@@ -129,6 +129,20 @@ def _stable_payload_hash(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _incremental_parent_evidence(
+    artifact: CompactionArtifact,
+) -> CompactionEvidence | None:
+    authoritative = artifact.metadata.get("authoritative_evidence")
+    bounded = artifact.metadata.get("evidence")
+    if not isinstance(authoritative, dict) or not isinstance(bounded, dict):
+        return None
+    evidence = CompactionEvidence.from_dict(authoritative)
+    evidence.historical_excerpts = CompactionEvidence.from_dict(
+        bounded
+    ).historical_excerpts
+    return evidence
+
+
 class AgentRunner:
     def __init__(
         self,
@@ -1162,16 +1176,6 @@ class AgentRunner:
                     config_fingerprint=fingerprint,
                     strategy="deterministic",
                 )
-            if incremental_parent is None:
-                previous_artifact = await asyncio.to_thread(
-                    self.sessions.latest_compaction_artifact,
-                    session_id,
-                )
-                if (
-                    previous_artifact is not None
-                    and previous_artifact.version == artifact_version
-                ):
-                    incremental_parent = previous_artifact
             current_source_ids = [message.id for message in request_messages]
             current_provider_source_hash = _stable_payload_hash(
                 [message.to_dict() for message in request_messages]
@@ -1191,27 +1195,34 @@ class AgentRunner:
                 )
             )
             parent_compacted_message_ids: list[str] | None = None
+            parent_evidence: CompactionEvidence | None = None
             if parent_is_prefix and incremental_parent is not None:
-                recorded_compacted_ids = incremental_parent.metadata.get(
-                    "compacted_message_ids"
-                )
-                if isinstance(recorded_compacted_ids, list):
-                    parent_compacted_message_ids = [
-                        str(item) for item in recorded_compacted_ids
-                    ]
+                parent_evidence = _incremental_parent_evidence(incremental_parent)
+                if parent_evidence is None:
+                    parent_is_prefix = False
                 else:
-                    recorded_retained_ids = incremental_parent.metadata.get(
-                        "retained_message_ids"
+                    recorded_compacted_ids = incremental_parent.metadata.get(
+                        "compacted_message_ids"
                     )
-                    if isinstance(recorded_retained_ids, list):
-                        retained_id_set = {str(item) for item in recorded_retained_ids}
+                    if isinstance(recorded_compacted_ids, list):
                         parent_compacted_message_ids = [
-                            message_id
-                            for message_id in incremental_parent.source_message_ids
-                            if message_id not in retained_id_set
+                            str(item) for item in recorded_compacted_ids
                         ]
                     else:
-                        parent_is_prefix = False
+                        recorded_retained_ids = incremental_parent.metadata.get(
+                            "retained_message_ids"
+                        )
+                        if isinstance(recorded_retained_ids, list):
+                            retained_id_set = {
+                                str(item) for item in recorded_retained_ids
+                            }
+                            parent_compacted_message_ids = [
+                                message_id
+                                for message_id in incremental_parent.source_message_ids
+                                if message_id not in retained_id_set
+                            ]
+                        else:
+                            parent_is_prefix = False
             compaction_kwargs = {
                 "keep_recent": keep_recent,
                 "summary_tokens": provider_message_target,
@@ -1227,14 +1238,7 @@ class AgentRunner:
                     "tool_output_volume",
                     "provider_context_overflow",
                 },
-                "base_evidence": (
-                    CompactionEvidence.from_dict(
-                        incremental_parent.metadata.get("authoritative_evidence")
-                        or incremental_parent.metadata.get("evidence")
-                    )
-                    if parent_is_prefix and incremental_parent is not None
-                    else None
-                ),
+                "base_evidence": parent_evidence if parent_is_prefix else None,
                 "base_source_message_ids": (
                     incremental_parent.source_message_ids
                     if parent_is_prefix and incremental_parent is not None
@@ -1917,7 +1921,7 @@ class AgentRunner:
         fingerprint_payload = {
             "artifact_version": artifact_version,
             "strategy": strategy,
-            "prompt_version": 2,
+            "prompt_version": 3,
             "provider_context": {
                 "routes": [
                     {

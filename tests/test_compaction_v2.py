@@ -977,6 +977,35 @@ class StructuredCompactionTests(unittest.TestCase):
         self.assertIn("src/old.py", evidence["files_changed"])
         self.assertEqual(evidence["current_objective"], ["New constraint"])
 
+    def test_deterministic_artifact_separates_bounded_and_authoritative_evidence(self):
+        messages = [
+            Message(
+                role=Role.USER if index % 2 == 0 else Role.ASSISTANT,
+                content=f"historical-{index} " + ("diagnostic " * 80),
+            )
+            for index in range(40)
+        ]
+
+        compacted = compact_messages(
+            messages,
+            keep_recent_bundles=1,
+            summary_tokens=400,
+            summary_bytes=1_600,
+            force=True,
+        )
+
+        bounded = compacted[0].metadata["evidence"]
+        authoritative = compacted[0].metadata["authoritative_evidence"]
+        self.assertLess(
+            len(json.dumps(bounded)),
+            len(json.dumps(authoritative)),
+        )
+        self.assertLess(
+            len(bounded["historical_excerpts"]),
+            len(authoritative["historical_excerpts"]),
+        )
+        self.assertLessEqual(estimate_tokens(compacted[0].content), 400)
+
     def test_incremental_compaction_summarizes_a_parent_retained_bundle_that_ages_out(
         self,
     ):
@@ -1581,8 +1610,8 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
 
             provider.handler = handler
             try:
-                await runner.run("first", session_id=session.id)
-                await runner.run("second", session_id=session.id)
+                await runner.run("continue", session_id=session.id)
+                await runner.run("continue", session_id=session.id)
                 artifacts = runner.sessions.compaction_artifacts(session.id)
             finally:
                 await runner.close()
@@ -1630,13 +1659,13 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
 
             provider.handler = handler
             try:
-                await runner.run("first", session_id=session.id)
+                await runner.run("continue", session_id=session.id)
                 for index in range(14, 20):
                     for message in _tool_cycle(
                         f"incremental-{index}", content=(f"new-history-{index} " * 100)
                     ):
                         runner.sessions.append_message(session.id, message)
-                await runner.run("second", session_id=session.id)
+                await runner.run("continue", session_id=session.id)
                 artifacts = runner.sessions.compaction_artifacts(session.id)
                 source_messages = runner.sessions.messages(session.id)
             finally:
@@ -1667,6 +1696,119 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifacts[1].parent_artifact_id, artifacts[0].id)
         self.assertTrue(
             any(marker in artifacts[1].summary_text for marker in aged_markers)
+        )
+
+    async def test_incremental_llm_inherits_only_bounded_parent_excerpts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(200):
+                for message in _tool_cycle(
+                    f"bounded-{index}", content=(f"prior-{index} " * 30)
+                ):
+                    runner.sessions.append_message(session.id, message)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+
+            def handler(request: ProviderRequest, _call: int) -> ModelResponse:
+                if request.metadata.get("purpose") == "compaction_summary":
+                    return ModelResponse(text=_echo_evidence(request.messages[-1].content))
+                return ModelResponse(text="done")
+
+            provider.handler = handler
+            try:
+                await runner.run("continue", session_id=session.id)
+                for index in range(200, 204):
+                    for message in _tool_cycle(
+                        f"bounded-{index}", content=(f"suffix-{index} " * 30)
+                    ):
+                        runner.sessions.append_message(session.id, message)
+                await runner.run("continue", session_id=session.id)
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual([artifact.strategy for artifact in artifacts], ["llm", "llm"])
+        self.assertGreater(
+            len(artifacts[0].metadata["authoritative_evidence"]["historical_excerpts"]),
+            100,
+        )
+        self.assertEqual(artifacts[0].metadata["evidence"]["historical_excerpts"], [])
+        for artifact in artifacts:
+            self.assertLessEqual(
+                artifact.estimated_tokens_after,
+                artifact.metadata["context_budget"]["message_target_tokens"],
+            )
+
+    async def test_incompatible_artifact_is_not_an_incremental_parent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(30):
+                for message in _tool_cycle(
+                    f"config-{index}", content=(f"old-config-{index} " * 20)
+                ):
+                    runner.sessions.append_message(session.id, message)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            summary_prompts: list[str] = []
+
+            def handler(request: ProviderRequest, _call: int) -> ModelResponse:
+                if request.metadata.get("purpose") == "compaction_summary":
+                    summary_prompts.append(request.messages[-1].content)
+                    return ModelResponse(
+                        text=_echo_evidence_with_transcript(
+                            request.messages[-1].content
+                        )
+                    )
+                return ModelResponse(text="done")
+
+            provider.handler = handler
+            try:
+                await runner.run("continue", session_id=session.id)
+                first_artifact = runner.sessions.compaction_artifacts(session.id)[0]
+                source_by_id = {
+                    message.id: message
+                    for message in runner.sessions.messages(session.id)
+                }
+                old_marker = next(
+                    source_by_id[message_id].content.split()[0]
+                    for message_id in first_artifact.metadata["compacted_message_ids"]
+                    if source_by_id[message_id].role == Role.TOOL
+                )
+                runner.config.agent.compaction_summarizer_input_tokens += 1
+                for index in range(30, 36):
+                    for message in _tool_cycle(
+                        f"config-{index}", content=(f"new-config-{index} " * 20)
+                    ):
+                        runner.sessions.append_message(session.id, message)
+                await runner.run("continue", session_id=session.id)
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual(len(summary_prompts), 2)
+        self.assertIn(old_marker, summary_prompts[0])
+        self.assertIn(old_marker, summary_prompts[1])
+        self.assertNotEqual(
+            artifacts[0].config_fingerprint,
+            artifacts[1].config_fingerprint,
         )
 
     async def test_llm_incremental_evidence_invalidates_changed_pruned_prefix(self):

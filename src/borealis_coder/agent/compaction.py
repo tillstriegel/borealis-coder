@@ -793,6 +793,20 @@ def _render_sections(sections: dict[str, list[str]]) -> str:
     return "\n\n".join(parts)
 
 
+def _evidence_from_sections(sections: dict[str, list[str]]) -> CompactionEvidence:
+    return CompactionEvidence(
+        current_objective=list(sections["Current objective"]),
+        user_constraints=list(sections["User constraints"]),
+        completed_work=list(sections["Completed work"]),
+        files_changed=list(sections["Files changed"]),
+        important_decisions=list(sections["Important decisions"]),
+        latest_verification=list(sections["Latest verification"]),
+        open_failures_and_blockers=list(sections["Open failures and blockers"]),
+        pending_work=list(sections["Pending work"]),
+        historical_excerpts=list(sections["Historical excerpts"]),
+    )
+
+
 def _within_limits(text: str, *, max_chars: int, max_tokens: int, max_bytes: int) -> bool:
     return bool(
         (max_chars <= 0 or len(text) <= max_chars)
@@ -813,13 +827,13 @@ def _shrink_value_index(heading: str, values: list[str]) -> int:
     return 0
 
 
-def render_deterministic_summary(
+def _render_deterministic_summary_with_evidence(
     evidence: CompactionEvidence,
     *,
     max_chars: int = 18_000,
     max_tokens: int = 0,
     max_bytes: int = 0,
-) -> str:
+) -> tuple[str, CompactionEvidence]:
     """Allocate space by section priority and preserve every section heading."""
 
     sections = {name: list(values) for name, values in _section_values(evidence).items()}
@@ -864,7 +878,25 @@ def render_deterministic_summary(
         )
     if set(sections) != _MANDATORY_SECTIONS:
         raise CompactionError("A mandatory deterministic summary section was removed")
-    return candidate
+    return candidate, _evidence_from_sections(sections)
+
+
+def render_deterministic_summary(
+    evidence: CompactionEvidence,
+    *,
+    max_chars: int = 18_000,
+    max_tokens: int = 0,
+    max_bytes: int = 0,
+) -> str:
+    """Allocate space by section priority and preserve every section heading."""
+
+    summary, _ = _render_deterministic_summary_with_evidence(
+        evidence,
+        max_chars=max_chars,
+        max_tokens=max_tokens,
+        max_bytes=max_bytes,
+    )
+    return summary
 
 
 def _source_hash(messages: list[Message]) -> str:
@@ -1077,7 +1109,7 @@ def compact_messages(
             if summary_tokens > 0:
                 available_summary_tokens = min(summary_tokens, available_summary_tokens)
         try:
-            summary = render_deterministic_summary(
+            summary, bounded_evidence = _render_deterministic_summary_with_evidence(
                 evidence,
                 max_chars=summary_chars,
                 max_tokens=available_summary_tokens,
@@ -1103,7 +1135,7 @@ def compact_messages(
                     "source_bundles": len(bundles),
                     "compacted_bundles": len(older_bundles),
                     "retained_bundles": len(recent_bundles),
-                    "evidence": evidence.to_dict(),
+                    "evidence": bounded_evidence.to_dict(),
                     "authoritative_evidence": evidence.to_dict(),
                 },
             ),
@@ -1253,7 +1285,10 @@ async def compact_messages_with_summary(
     transcript = render_transcript(older)
     if not transcript.strip() and transcript_message_ids is None:
         return _deterministic_fallback(compacted, "empty_incremental_suffix")
-    evidence = CompactionEvidence.from_dict(compacted[0].metadata.get("evidence"))
+    evidence = CompactionEvidence.from_dict(
+        compacted[0].metadata.get("authoritative_evidence")
+        or compacted[0].metadata.get("evidence")
+    )
     prompt_evidence = CompactionEvidence.from_dict(evidence.to_dict())
     prompt_evidence.historical_excerpts = []
     evidence_json = json.dumps(prompt_evidence.to_dict(), ensure_ascii=False, sort_keys=True)
