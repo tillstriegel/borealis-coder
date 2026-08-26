@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import random
 import string
 import tempfile
@@ -256,6 +257,60 @@ class StructuredCompactionTests(unittest.TestCase):
             evidence.latest_verification,
             ["Verification: 12 passed, retry test failed."],
         )
+
+    def test_tight_allocator_preserves_actionable_entries_within_sections(self):
+        common = {
+            "current_objective": ["objective"],
+            "user_constraints": ["constraint"],
+            "completed_work": ["done"],
+            "files_changed": ["src/example.py"],
+            "important_decisions": ["decision"],
+            "open_failures_and_blockers": ["blocker"],
+            "historical_excerpts": ["history"],
+        }
+        verification = "AUTHORITATIVE VERIFICATION " + ("details " * 100)
+        git_state = "Latest recorded git state:\nworking tree clean"
+        preferred_verification = CompactionEvidence(
+            **common,
+            latest_verification=[verification],
+            pending_work=["[pending] follow up"],
+        )
+        verification_target = estimate_tokens(
+            render_deterministic_summary(preferred_verification)
+        )
+
+        verification_summary = render_deterministic_summary(
+            CompactionEvidence(
+                **common,
+                latest_verification=[verification, git_state],
+                pending_work=["[pending] follow up"],
+            ),
+            max_tokens=verification_target,
+        )
+
+        self.assertIn("AUTHORITATIVE VERIFICATION", verification_summary)
+        self.assertNotIn("Latest recorded git state", verification_summary)
+
+        active = "[in_progress] active repair " + ("details " * 100)
+        later = "[pending] later cleanup"
+        preferred_pending = CompactionEvidence(
+            **common,
+            latest_verification=["verification"],
+            pending_work=[active],
+        )
+        pending_target = estimate_tokens(render_deterministic_summary(preferred_pending))
+
+        pending_summary = render_deterministic_summary(
+            CompactionEvidence(
+                **common,
+                latest_verification=["verification"],
+                pending_work=[active, later],
+            ),
+            max_tokens=pending_target,
+        )
+
+        self.assertIn("[in_progress] active repair", pending_summary)
+        self.assertNotIn("[pending] later cleanup", pending_summary)
 
     def test_failed_plan_update_does_not_create_completion_evidence(self):
         plan = ToolCall(
@@ -782,6 +837,36 @@ class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(calls, 1)
         self.assertTrue(all(size <= 8_000 for size in prompt_sizes))
 
+    async def test_non_ascii_transcript_uses_estimator_bounded_chunks(self):
+        messages = [Message(role=Role.USER, content="small objective")]
+        for index in range(8):
+            messages.extend(
+                _tool_cycle(
+                    f"non-ascii-{index}",
+                    content="漢字" * 2_000,
+                )
+            )
+        messages.append(Message(role=Role.ASSISTANT, content="continue"))
+        prompt_sizes: list[int] = []
+
+        async def summarize(prompt: str) -> str:
+            prompt_sizes.append(estimate_tokens(prompt))
+            return _echo_evidence(prompt)
+
+        compacted = await compact_messages_with_summary(
+            messages,
+            summarize,
+            keep_recent_bundles=1,
+            force=True,
+            summarizer_input_tokens=2_000,
+            summarizer_total_input_tokens=8_000,
+        )
+
+        self.assertEqual(compacted[0].metadata["strategy"], "llm")
+        self.assertGreater(len(prompt_sizes), 1)
+        self.assertTrue(all(size <= 2_000 for size in prompt_sizes))
+        self.assertLessEqual(sum(prompt_sizes), 8_000)
+
     async def test_llm_summary_that_exceeds_total_target_falls_back(self):
         messages = [
             Message(
@@ -1016,6 +1101,108 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(artifacts), 2)
         self.assertEqual(artifacts[1].parent_artifact_id, artifacts[0].id)
 
+    async def test_incremental_evidence_invalidates_changed_pruned_prefix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            path = "src/state.py"
+            sha = "a" * 64
+            read = ToolCall(
+                id="read-state",
+                name="read_file",
+                arguments={"path": path},
+            )
+            initial_messages = [
+                Message(role=Role.USER, content="Inspect the state file."),
+                Message(role=Role.ASSISTANT, tool_calls=[read]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=read.id,
+                    tool_name=read.name,
+                    content=(
+                        f"path: {path}\nsha256: {sha}\n"
+                        + ("STALE FILE CONTENT " * 300)
+                    ),
+                ),
+            ]
+            for index in range(24):
+                initial_messages.extend(_tool_cycle(f"history-{index}"))
+            for message in initial_messages:
+                runner.sessions.append_message(session.id, message)
+
+            prompt_context = await asyncio.to_thread(
+                runner.context_builder.build, query="Inspect the state file."
+            )
+
+            async def usage_sink(_usage: Usage) -> None:
+                return None
+
+            try:
+                first = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=runner.sessions.messages(session.id),
+                    schemas=runner.tools.schemas(),
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="run-first",
+                    last_prune_signature=None,
+                )
+                write = ToolCall(
+                    id="write-state",
+                    name="write_file",
+                    arguments={"path": path, "content": "fresh"},
+                )
+                for message in (
+                    Message(role=Role.ASSISTANT, tool_calls=[write]),
+                    Message(
+                        role=Role.TOOL,
+                        tool_call_id=write.id,
+                        tool_name=write.name,
+                        content="updated",
+                        metadata={"path": path},
+                    ),
+                    Message(role=Role.USER, content="Continue after the edit."),
+                ):
+                    runner.sessions.append_message(session.id, message)
+                second = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=runner.sessions.messages(session.id),
+                    schemas=runner.tools.schemas(),
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="run-second",
+                    last_prune_signature=None,
+                )
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertIn("STALE FILE CONTENT", first.request.system)
+        self.assertNotIn("STALE FILE CONTENT", second.request.system)
+        self.assertIn("[superseded read:", second.request.system)
+        self.assertEqual(len(artifacts), 2)
+        self.assertNotEqual(
+            artifacts[0].metadata["provider_source_hash"],
+            artifacts[1].metadata["provider_source_hash"],
+        )
+
     async def test_unchanged_resume_reuses_artifact_without_duplicate_llm_charge(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1135,14 +1322,22 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).hexdigest(),
         )
         self.assertTrue(artifacts[0].metadata["provider_messages"])
+        provider_context = artifacts[0].metadata["provider_context"]
+        self.assertEqual(provider_context["system"], first.request.system)
+        self.assertEqual(provider_context["system_blocks"], first.request.metadata["system_blocks"])
+        self.assertEqual(
+            provider_context["messages"],
+            [message.to_dict() for message in first.request.messages],
+        )
+        self.assertEqual(provider_context["tools"], first.request.tools)
         self.assertEqual(
             artifacts[0].metadata["compacted_context_hash"],
             hashlib.sha256(
-                json_dumps(
-                    {
-                        "summary_text": artifacts[0].summary_text,
-                        "messages": artifacts[0].metadata["provider_messages"],
-                    }
+                json.dumps(
+                    provider_context,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest(),
         )
@@ -1196,6 +1391,9 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                     retained_messages=first_retained,
                     context_budget=context_budget,
                     summary_usage=Usage(),
+                    base_system="system",
+                    base_system_blocks=[{"text": "system", "cacheable": True}],
+                    tools=[],
                 )
                 _, second_reused = await runner._record_or_reuse_compaction_artifact(
                     session_id=session.id,
@@ -1204,6 +1402,9 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                     retained_messages=second_retained,
                     context_budget=context_budget,
                     summary_usage=Usage(),
+                    base_system="system",
+                    base_system_blocks=[{"text": "system", "cacheable": True}],
+                    tools=[],
                 )
                 artifacts = runner.sessions.compaction_artifacts(session.id)
             finally:
@@ -1221,7 +1422,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             [message.to_dict() for message in second_retained],
         )
 
-    async def test_artifact_reuse_requires_the_same_effective_context_budget(self):
+    async def test_artifact_reuse_requires_the_same_provider_context_and_budget(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(root)
@@ -1252,17 +1453,29 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             retained = [Message(role=Role.USER, content="retained")]
+            first_system = "system alpha"
+            second_system = "system bravo"
+            third_system = "larger system " * 2_000
+            first_tools = [{"name": "tool-alpha", "description": "same schema"}]
+            second_tools = [{"name": "tool-bravo", "description": "same schema"}]
             first_budget = ContextBudget.calculate(
                 config.agent,
-                system="short system",
-                tools=[],
+                system=first_system,
+                tools=first_tools,
+                messages=retained,
+                provider="mock",
+            )
+            third_budget = ContextBudget.calculate(
+                config.agent,
+                system=third_system,
+                tools=second_tools,
                 messages=retained,
                 provider="mock",
             )
             second_budget = ContextBudget.calculate(
                 config.agent,
-                system="larger system " * 2_000,
-                tools=[],
+                system=second_system,
+                tools=second_tools,
                 messages=retained,
                 provider="mock",
             )
@@ -1274,6 +1487,9 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                     retained_messages=retained,
                     context_budget=first_budget,
                     summary_usage=Usage(),
+                    base_system=first_system,
+                    base_system_blocks=[{"text": first_system, "cacheable": True}],
+                    tools=first_tools,
                 )
                 replacement = Message(
                     role=artifact.role,
@@ -1288,20 +1504,47 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                         retained_messages=retained,
                         context_budget=second_budget,
                         summary_usage=Usage(),
+                        base_system=second_system,
+                        base_system_blocks=[
+                            {"text": second_system, "cacheable": True}
+                        ],
+                        tools=second_tools,
+                    )
+                )
+                third = Message(
+                    role=artifact.role,
+                    content="budget replacement",
+                    metadata=artifact.metadata,
+                )
+                third_result, third_reused = (
+                    await runner._record_or_reuse_compaction_artifact(
+                        session_id=session.id,
+                        source_messages=source,
+                        artifact_message=third,
+                        retained_messages=retained,
+                        context_budget=third_budget,
+                        summary_usage=Usage(),
+                        base_system=third_system,
+                        base_system_blocks=[
+                            {"text": third_system, "cacheable": True}
+                        ],
+                        tools=second_tools,
                     )
                 )
                 artifacts = runner.sessions.compaction_artifacts(session.id)
             finally:
                 await runner.close()
 
-        self.assertLess(
-            second_budget.message_target_tokens,
-            first_budget.message_target_tokens,
-        )
+        self.assertEqual(second_budget.system_tokens, first_budget.system_tokens)
+        self.assertEqual(second_budget.tool_schema_tokens, first_budget.tool_schema_tokens)
+        self.assertEqual(second_budget.message_target_tokens, first_budget.message_target_tokens)
+        self.assertLess(third_budget.message_target_tokens, second_budget.message_target_tokens)
         self.assertFalse(first_reused)
         self.assertFalse(second_reused)
+        self.assertFalse(third_reused)
         self.assertEqual(second.content, "smaller replacement")
-        self.assertEqual(len(artifacts), 2)
+        self.assertEqual(third_result.content, "budget replacement")
+        self.assertEqual(len(artifacts), 3)
 
     async def test_llm_compaction_is_not_recharged_during_overflow_reduction(self):
         with tempfile.TemporaryDirectory() as td:

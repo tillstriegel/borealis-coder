@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import html
+import json
 import os
 import stat
 import threading
@@ -115,6 +116,16 @@ Automatic verification has already run after the mutations. Tools are unavailabl
 response. Return a final answer that accurately reports the supplied verification result and
 does not claim stronger process-lifecycle or mutation guarantees than it provides.
 """
+
+
+def _stable_payload_hash(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class AgentRunner:
@@ -1118,6 +1129,9 @@ class AgentRunner:
                 context_budget,
                 intended_strategy,
                 artifact_version,
+                system=turn_system,
+                system_blocks=turn_system_blocks,
+                tools=schemas,
             )
             incremental_parent = await asyncio.to_thread(
                 self.sessions.latest_compaction_artifact,
@@ -1132,7 +1146,7 @@ class AgentRunner:
                     config_fingerprint=fingerprint,
                     strategy="deterministic",
                 )
-            if incremental_parent is None and overflow_retry_count:
+            if incremental_parent is None:
                 previous_artifact = await asyncio.to_thread(
                     self.sessions.latest_compaction_artifact,
                     session_id,
@@ -1143,10 +1157,22 @@ class AgentRunner:
                 ):
                     incremental_parent = previous_artifact
             current_source_ids = [message.id for message in request_messages]
+            current_provider_source_hash = _stable_payload_hash(
+                [message.to_dict() for message in request_messages]
+            )
             parent_is_prefix = bool(
                 incremental_parent is not None
                 and current_source_ids[: len(incremental_parent.source_message_ids)]
                 == incremental_parent.source_message_ids
+                and incremental_parent.metadata.get("provider_source_hash")
+                == _stable_payload_hash(
+                    [
+                        message.to_dict()
+                        for message in request_messages[
+                            : len(incremental_parent.source_message_ids)
+                        ]
+                    ]
+                )
             )
             compaction_kwargs = {
                 "keep_recent": keep_recent,
@@ -1280,6 +1306,7 @@ class AgentRunner:
                     metadata={
                         **deterministic_artifact.metadata,
                         "source_hash": durable_source_hash,
+                        "provider_source_hash": current_provider_source_hash,
                     },
                 )
                 deterministic_messages = [
@@ -1305,6 +1332,10 @@ class AgentRunner:
                 if reusable is not None and reusable.metadata.get(
                     "provider_messages"
                 ) != [message.to_dict() for message in deterministic_messages[1:]]:
+                    reusable = None
+                if reusable is not None and reusable.metadata.get(
+                    "provider_source_hash"
+                ) != current_provider_source_hash:
                     reusable = None
                 if reusable is not None:
                     compacted_messages = [
@@ -1385,6 +1416,9 @@ class AgentRunner:
                     retained_messages=retained_messages,
                     context_budget=context_budget,
                     summary_usage=summary_usage,
+                    base_system=turn_system,
+                    base_system_blocks=turn_system_blocks,
+                    tools=schemas,
                 )
                 turn_system = f"{turn_system}\n\n{artifact_message.content}"
                 turn_system_blocks = [
@@ -1500,6 +1534,9 @@ class AgentRunner:
         retained_messages: list[Message],
         context_budget: ContextBudget,
         summary_usage: Usage,
+        base_system: str,
+        base_system_blocks: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
     ) -> tuple[Message, bool]:
         """Reuse an exact immutable artifact or persist the exact new provider context."""
 
@@ -1509,9 +1546,17 @@ class AgentRunner:
         )
         artifact_version = int(artifact_message.metadata.get("artifact_version", 2))
         config_fingerprint = self._compaction_config_fingerprint(
-            context_budget, requested_strategy, artifact_version
+            context_budget,
+            requested_strategy,
+            artifact_version,
+            system=base_system,
+            system_blocks=base_system_blocks,
+            tools=tools,
         )
         source_hash = str(artifact_message.metadata["source_hash"])
+        provider_source_hash = _stable_payload_hash(
+            [message.to_dict() for message in source_messages]
+        )
         reusable = await asyncio.to_thread(
             self.sessions.reusable_compaction_artifact,
             session_id,
@@ -1523,6 +1568,7 @@ class AgentRunner:
         if (
             reusable is not None
             and reusable.metadata.get("provider_messages") == provider_messages
+            and reusable.metadata.get("provider_source_hash") == provider_source_hash
         ):
             return (
                 replace(
@@ -1562,6 +1608,20 @@ class AgentRunner:
         parent_id: str | None = None
         if parent is not None and source_ids[: len(parent.source_message_ids)] == parent.source_message_ids:
             parent_id = parent.id
+        provider_context = {
+            "provider": self.providers[0].provider.name,
+            "model": self.providers[0].model,
+            "system": f"{base_system}\n\n{artifact_message.content}",
+            "system_blocks": [
+                *base_system_blocks,
+                {"text": artifact_message.content, "cacheable": False},
+            ],
+            "messages": provider_messages,
+            "tools": tools,
+            "max_output_tokens": self.config.agent.max_output_tokens,
+            "reasoning_effort": self.config.agent.reasoning_effort or None,
+            "parallel_tool_calls": True,
+        }
         artifact = CompactionArtifact(
             session_id=session_id,
             version=artifact_version,
@@ -1596,16 +1656,9 @@ class AgentRunner:
                 ),
                 "retained_message_ids": [message.id for message in retained_messages],
                 "provider_messages": provider_messages,
-                "compacted_context_hash": hashlib.sha256(
-                    json_dumps(
-                        {
-                            "summary_text": artifact_message.content,
-                            "messages": [
-                                message.to_dict() for message in retained_messages
-                            ],
-                        }
-                    ).encode("utf-8")
-                ).hexdigest(),
+                "provider_source_hash": provider_source_hash,
+                "provider_context": provider_context,
+                "compacted_context_hash": _stable_payload_hash(provider_context),
                 "evidence": artifact_message.metadata.get("evidence", {}),
                 "authoritative_evidence": artifact_message.metadata.get(
                     "authoritative_evidence",
@@ -1634,11 +1687,22 @@ class AgentRunner:
         context_budget: ContextBudget,
         strategy: str,
         artifact_version: int = 2,
+        *,
+        system: str,
+        system_blocks: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
     ) -> str:
         fingerprint_payload = {
             "artifact_version": artifact_version,
             "strategy": strategy,
             "prompt_version": 2,
+            "provider_context": {
+                "provider": self.providers[0].provider.name,
+                "model": self.providers[0].model,
+                "system_hash": _stable_payload_hash(system),
+                "system_blocks_hash": _stable_payload_hash(system_blocks),
+                "tool_schema_hash": _stable_payload_hash(tools),
+            },
             "context_budget": {
                 "input_limit": context_budget.input_limit,
                 "reserved_output_tokens": context_budget.reserved_output_tokens,

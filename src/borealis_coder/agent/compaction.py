@@ -749,6 +749,18 @@ def _within_limits(text: str, *, max_chars: int, max_tokens: int, max_bytes: int
     )
 
 
+def _shrink_value_index(heading: str, values: list[str]) -> int:
+    if heading == "Latest verification":
+        for index, value in enumerate(values):
+            if value.startswith("Latest recorded git state:\n"):
+                return index
+    elif heading == "Pending work":
+        for index in range(len(values) - 1, -1, -1):
+            if not values[index].startswith("[in_progress]"):
+                return index
+    return 0
+
+
 def render_deterministic_summary(
     evidence: CompactionEvidence,
     *,
@@ -772,7 +784,7 @@ def render_deterministic_summary(
         ):
             values = sections[heading]
             if len(values) > 1:
-                values.pop(0)
+                values.pop(_shrink_value_index(heading, values))
             elif values and len(values[0]) > 160:
                 values[0] = truncate_text(values[0], max(160, len(values[0]) // 2))
             elif values != ["Omitted due to the compaction budget."]:
@@ -1060,6 +1072,65 @@ def _deterministic_fallback(messages: list[Message], reason: str) -> list[Messag
     ]
 
 
+def _largest_fitting_transcript_chunk(
+    transcript: str,
+    *,
+    instruction: str,
+    max_tokens: int,
+) -> str:
+    low = 1
+    high = len(transcript)
+    best = 0
+    while low <= high:
+        size = (low + high) // 2
+        prompt = instruction + _frame_untrusted_transcript(transcript[:size])
+        if estimate_tokens(prompt) <= max_tokens:
+            best = size
+            low = size + 1
+        else:
+            high = size - 1
+    return transcript[:best]
+
+
+def _bounded_summarizer_chunks(
+    transcript: str,
+    *,
+    instruction: str,
+    input_tokens: int,
+    total_input_tokens: int,
+) -> list[tuple[str, int]]:
+    if not transcript:
+        prompt_tokens = estimate_tokens(instruction + _frame_untrusted_transcript(""))
+        return [("", prompt_tokens)] if prompt_tokens <= total_input_tokens else []
+
+    transcript_limit = len(transcript)
+    while transcript_limit > 0:
+        bounded = truncate_text(transcript, transcript_limit)
+        chunks: list[tuple[str, int]] = []
+        cursor = 0
+        consumed_tokens = 0
+        while cursor < len(bounded):
+            chunk = _largest_fitting_transcript_chunk(
+                bounded[cursor:],
+                instruction=instruction,
+                max_tokens=input_tokens,
+            )
+            if not chunk:
+                return []
+            prompt_tokens = estimate_tokens(instruction + _frame_untrusted_transcript(chunk))
+            chunks.append((chunk, prompt_tokens))
+            consumed_tokens += prompt_tokens
+            cursor += len(chunk)
+        if consumed_tokens <= total_input_tokens:
+            return chunks
+        next_limit = max(
+            1,
+            int(transcript_limit * total_input_tokens / consumed_tokens * 0.9),
+        )
+        transcript_limit = min(transcript_limit - 1, next_limit)
+    return []
+
+
 async def compact_messages_with_summary(
     messages: list[Message],
     summarizer: Summarizer | None,
@@ -1122,18 +1193,18 @@ async def compact_messages_with_summary(
     fixed_tokens = estimate_tokens(instruction + _frame_untrusted_transcript(""))
     if fixed_tokens >= summarizer_input_tokens:
         return _deterministic_fallback(compacted, "summarizer_evidence_over_budget")
-    total_transcript_tokens = max(0, summarizer_total_input_tokens - fixed_tokens)
-    bounded_transcript = truncate_text(transcript, total_transcript_tokens * 3)
-    chunk_chars = max(1_000, (summarizer_input_tokens - fixed_tokens) * 3)
-    chunks = [
-        bounded_transcript[index : index + chunk_chars]
-        for index in range(0, len(bounded_transcript), chunk_chars)
-    ] or [""]
+    chunks = _bounded_summarizer_chunks(
+        transcript,
+        instruction=instruction,
+        input_tokens=summarizer_input_tokens,
+        total_input_tokens=summarizer_total_input_tokens,
+    )
+    if not chunks:
+        return _deterministic_fallback(compacted, "summarizer_input_over_budget")
     summaries: list[CompactionEvidence] = []
     consumed_tokens = 0
-    for chunk in chunks:
+    for chunk, prompt_tokens in chunks:
         prompt = instruction + _frame_untrusted_transcript(chunk)
-        prompt_tokens = estimate_tokens(prompt)
         if (
             prompt_tokens > summarizer_input_tokens
             or consumed_tokens + prompt_tokens > summarizer_total_input_tokens
