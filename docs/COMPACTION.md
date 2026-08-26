@@ -41,7 +41,7 @@ Borealis records an unavailable marker when durable structured evidence does not
 
 ## Context budget
 
-`ContextBudget` starts with the configured model input limit. It reserves output tokens, system and tool-schema tokens, the largest framing allowance across every configured provider route, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input. Bundle selection does not reserve continuation metadata that it may remove. Borealis recalculates the reserve from retained messages and tightens the artifact again when needed.
+`ContextBudget` starts with the configured model input limit. It reserves output tokens, system and tool-schema tokens, the largest framing allowance across every configured provider route, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input. A sole current user request bypasses proactive compaction when the complete request still fits the hard input limit because there is no historical bundle to remove. Provider-overflow retries never use this bypass. Bundle selection does not reserve continuation metadata that it may remove. Borealis recalculates the reserve from retained messages and tightens the artifact again when needed.
 
 After a provider overflow, Borealis increases the safety margin and retries with a smaller provider-message target. `compaction_max_overflow_retries` is a strict upper bound. The reduction order is historical excerpts, retained bundles, and diagnostic output. The final fallback preserves mandatory state and the latest actionable bundle or returns a context-budget error before another provider call.
 

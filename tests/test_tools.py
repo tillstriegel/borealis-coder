@@ -77,6 +77,7 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.is_error, result.output)
         self.assertTrue((self.root / "parent" / "child").is_dir())
+        self.assertEqual(result.metadata["changed_files"], ["parent", "parent/child"])
         self.assertEqual(self.context.changed_files, {"parent", "parent/child"})
         self.assertEqual(self.context.changed_roots, {self.root.resolve()})
 
@@ -84,6 +85,7 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         self.context.changed_roots.clear()
         existing = await self.call("make_directory", {"path": "parent/child"})
         self.assertFalse(existing.is_error, existing.output)
+        self.assertEqual(existing.metadata["changed_files"], [])
         self.assertEqual(self.context.changed_files, set())
         self.assertEqual(self.context.changed_roots, set())
 

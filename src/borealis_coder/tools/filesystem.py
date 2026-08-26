@@ -179,11 +179,16 @@ class MakeDirectoryTool(Tool):
             missing_directories.append(candidate)
             candidate = candidate.parent
         resolved.path.mkdir(parents=True, exist_ok=True)
-        for path in missing_directories:
-            context.changed_files.add(context.roots.display(path))
+        changed_files = sorted(
+            context.roots.display(path) for path in missing_directories
+        )
+        context.changed_files.update(changed_files)
         if missing_directories:
             context.changed_roots.add(resolved.root)
-        return ToolResult(f"Directory ready: {resolved.display}", metadata={"path": resolved.display})
+        return ToolResult(
+            f"Directory ready: {resolved.display}",
+            metadata={"path": resolved.display, "changed_files": changed_files},
+        )
 
 
 class ListDirectoryTool(Tool):

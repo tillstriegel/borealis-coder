@@ -36,6 +36,7 @@ from borealis_coder.agent.compaction_eval import (
     load_compaction_corpus,
 )
 from borealis_coder.config import ProviderConfig
+from borealis_coder.context import PromptContext
 from borealis_coder.errors import ProviderContextOverflowError, ProviderUnavailableError
 from borealis_coder.models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from borealis_coder.providers.anthropic import AnthropicProvider
@@ -356,6 +357,39 @@ class StructuredCompactionTests(unittest.TestCase):
                     "verify the current state again."
                 ],
             )
+
+    def test_created_directories_invalidate_older_verification(self):
+        make_directory = ToolCall(
+            id="mkdir-after-verification",
+            name="make_directory",
+            arguments={"path": "parent/child"},
+        )
+
+        evidence = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[make_directory]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=make_directory.id,
+                    tool_name=make_directory.name,
+                    content="Directory ready: parent/child",
+                    metadata={
+                        "path": "parent/child",
+                        "changed_files": ["parent", "parent/child"],
+                    },
+                ),
+            ],
+            base=CompactionEvidence(latest_verification=["Verification: 12 passed."]),
+        )
+
+        self.assertEqual(evidence.files_changed, ["parent", "parent/child"])
+        self.assertEqual(
+            evidence.latest_verification,
+            [
+                "Stale: files changed after the latest recorded verification; "
+                "verify the current state again."
+            ],
+        )
 
     def test_verification_after_mutation_is_current(self):
         write = ToolCall(
@@ -1343,6 +1377,71 @@ class OverflowProvider(Provider):
 
 
 class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_fitting_request_bypasses_compaction_trigger(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "max_input_tokens": 6_000,
+                    "max_output_tokens": 1_000,
+                    "compact_at_ratio": 0.5,
+                    "compaction_target_ratio": 0.4,
+                    "compaction_safety_margin_tokens": 128,
+                    "compaction_provider_framing_tokens": 64,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            message = Message(role=Role.USER, content="large-request " * 800)
+            runner.sessions.append_message(session.id, message)
+            prompt_context = PromptContext(stable="system")
+            context_budget = ContextBudget.calculate(
+                config.agent,
+                system=prompt_context.text,
+                tools=[],
+                messages=[message],
+                provider="mock",
+            )
+
+            async def usage_sink(_usage: Usage) -> None:
+                return None
+
+            try:
+                prepared = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=[message],
+                    schemas=[],
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="single-request",
+                    last_prune_signature=None,
+                )
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertGreaterEqual(
+            context_budget.estimated_total([message]),
+            context_budget.trigger_tokens,
+        )
+        self.assertLessEqual(
+            context_budget.estimated_total([message])
+            + context_budget.reserved_output_tokens
+            + context_budget.safety_margin_tokens,
+            context_budget.input_limit,
+        )
+        self.assertFalse(prepared.compacted)
+        self.assertEqual(prepared.request.messages, [message])
+        self.assertEqual(artifacts, [])
+
     async def test_compaction_recomputes_reserve_after_old_continuation_is_removed(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1810,6 +1909,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             artifacts[0].config_fingerprint,
             artifacts[1].config_fingerprint,
         )
+        self.assertIsNone(artifacts[1].parent_artifact_id)
 
     async def test_llm_incremental_evidence_invalidates_changed_pruned_prefix(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2430,8 +2530,8 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             [artifact.strategy for artifact in artifacts],
             ["llm", "deterministic", "deterministic"],
         )
-        self.assertEqual(artifacts[1].parent_artifact_id, artifacts[0].id)
-        self.assertEqual(artifacts[2].parent_artifact_id, artifacts[1].id)
+        self.assertIsNone(artifacts[1].parent_artifact_id)
+        self.assertIsNone(artifacts[2].parent_artifact_id)
 
     async def test_provider_overflow_retries_are_bounded_smaller_and_accounted(self):
         with tempfile.TemporaryDirectory() as td:

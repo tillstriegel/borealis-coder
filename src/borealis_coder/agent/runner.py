@@ -143,6 +143,17 @@ def _incremental_parent_evidence(
     return evidence
 
 
+def _fits_context_limit(estimated_tokens: int, budget: ContextBudget) -> bool:
+    return (
+        estimated_tokens
+        + budget.reserved_output_tokens
+        + budget.safety_margin_tokens
+        + budget.provider_framing_tokens
+        + budget.continuation_state_tokens
+        <= budget.input_limit
+    )
+
+
 class AgentRunner:
     def __init__(
         self,
@@ -1094,6 +1105,13 @@ class AgentRunner:
             >= self.config.context.compact_tool_output_tokens
         ):
             compaction_reason = "tool_output_volume"
+        if (
+            compaction_reason not in {None, "provider_context_overflow"}
+            and len(request_messages) == 1
+            and request_messages[0].role == Role.USER
+            and _fits_context_limit(estimated, context_budget)
+        ):
+            compaction_reason = None
         prune_signature = (
             metrics.tokens_before,
             metrics.tokens_after,
@@ -1604,14 +1622,7 @@ class AgentRunner:
                     messages=len(request_messages),
                     **compaction_metadata,
                 )
-        if (
-            estimated
-            + context_budget.reserved_output_tokens
-            + context_budget.safety_margin_tokens
-            + context_budget.provider_framing_tokens
-            + context_budget.continuation_state_tokens
-            > context_budget.input_limit
-        ):
+        if not _fits_context_limit(estimated, context_budget):
             raise BudgetExceeded(
                 "context",
                 f"Estimated request size {estimated} exceeds "
@@ -1742,16 +1753,13 @@ class AgentRunner:
             config_fingerprint=config_fingerprint,
             strategy=strategy,
         )
-        if parent is None:
-            previous_artifact = await asyncio.to_thread(
+        if parent is None and requested_strategy == "llm":
+            parent = await asyncio.to_thread(
                 self.sessions.latest_compaction_artifact,
                 session_id,
+                config_fingerprint=config_fingerprint,
+                strategy="deterministic",
             )
-            if (
-                previous_artifact is not None
-                and previous_artifact.version == artifact_version
-            ):
-                parent = previous_artifact
         parent_id: str | None = None
         if parent is not None and source_ids[: len(parent.source_message_ids)] == parent.source_message_ids:
             parent_id = parent.id
