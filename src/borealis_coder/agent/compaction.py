@@ -1020,6 +1020,7 @@ def compact_messages(
     force: bool = False,
     base_evidence: CompactionEvidence | None = None,
     base_source_message_ids: list[str] | None = None,
+    base_compacted_message_ids: list[str] | None = None,
 ) -> list[Message]:
     bundles = bundle_conversation(messages)
     retained_count = keep_recent_bundles or max(1, keep_recent)
@@ -1049,8 +1050,16 @@ def compact_messages(
                 messages[len(base_ids) :], base=base_evidence
             )
             base_history = list(base_evidence.historical_excerpts)
-            base_id_set = set(base_ids)
-            new_older = [message for message in older if message.id not in base_id_set]
+            previously_compacted_ids = set(
+                base_compacted_message_ids
+                if base_compacted_message_ids is not None
+                else base_ids
+            )
+            new_older = [
+                message
+                for message in older
+                if message.id not in previously_compacted_ids
+            ]
             evidence.historical_excerpts = _dedupe(
                 [*base_history, *render_transcript(new_older).splitlines()]
             )
@@ -1213,6 +1222,7 @@ async def compact_messages_with_summary(
     force: bool = False,
     base_evidence: CompactionEvidence | None = None,
     base_source_message_ids: list[str] | None = None,
+    base_compacted_message_ids: list[str] | None = None,
 ) -> list[Message]:
     """Compact with an LLM summary when a summarizer is available.
 
@@ -1232,6 +1242,7 @@ async def compact_messages_with_summary(
         force=force,
         base_evidence=base_evidence,
         base_source_message_ids=base_source_message_ids,
+        base_compacted_message_ids=base_compacted_message_ids,
     )
     if summarizer is None or compacted == messages:
         return compacted
@@ -1298,6 +1309,13 @@ async def compact_messages_with_summary(
             return _deterministic_fallback(compacted, "summarizer_validation_failed")
         summaries.append(parsed)
     llm_evidence = _merge_llm_evidence(summaries, prompt_evidence)
+    if base_evidence is not None:
+        llm_evidence.historical_excerpts = _dedupe(
+            [
+                *base_evidence.historical_excerpts,
+                *llm_evidence.historical_excerpts,
+            ]
+        )
     try:
         body = _render_sections(_section_values(llm_evidence))
         summary = frame_untrusted_history(body, strategy="llm", limit=0)

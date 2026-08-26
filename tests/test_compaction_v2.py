@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import random
 import string
@@ -31,6 +32,7 @@ from borealis_coder.agent.compaction import (
 )
 from borealis_coder.agent.compaction_eval import (
     evaluate_compaction_case,
+    evaluate_compaction_release_case,
     load_compaction_corpus,
 )
 from borealis_coder.config import ProviderConfig
@@ -65,6 +67,16 @@ def _echo_evidence(prompt: str) -> str:
     start = prompt.index(marker) + len(marker)
     end = prompt.index("\n</untrusted_structured_evidence>", start)
     return prompt[start:end]
+
+
+def _echo_evidence_with_transcript(prompt: str) -> str:
+    evidence = json.loads(_echo_evidence(prompt))
+    marker = "<untrusted_conversation_transcript>\n"
+    start = prompt.index(marker) + len(marker)
+    end = prompt.index("\n</untrusted_conversation_transcript>", start)
+    transcript = html.unescape(prompt[start:end])
+    evidence["historical_excerpts"] = transcript.splitlines()
+    return json.dumps(evidence, ensure_ascii=False)
 
 
 class CompactionBoundaryTests(unittest.TestCase):
@@ -956,11 +968,51 @@ class StructuredCompactionTests(unittest.TestCase):
                 first[0].metadata["authoritative_evidence"]
             ),
             base_source_message_ids=first[0].metadata["source_message_ids"],
+            base_compacted_message_ids=first[0].metadata[
+                "compacted_message_ids"
+            ],
         )
 
         evidence = second[0].metadata["authoritative_evidence"]
         self.assertIn("src/old.py", evidence["files_changed"])
         self.assertEqual(evidence["current_objective"], ["New constraint"])
+
+    def test_incremental_compaction_summarizes_a_parent_retained_bundle_that_ages_out(
+        self,
+    ):
+        original = [
+            Message(role=Role.USER, content="initial request"),
+            Message(role=Role.ASSISTANT, content="initial response"),
+            Message(role=Role.USER, content="second request"),
+            Message(role=Role.ASSISTANT, content="AGED-OUT RETAINED RESPONSE"),
+            Message(role=Role.USER, content="third request"),
+            Message(role=Role.ASSISTANT, content="recent response"),
+        ]
+        first = compact_messages(
+            original,
+            keep_recent_bundles=2,
+            force=True,
+        )
+        extended = [
+            *original,
+            Message(role=Role.USER, content="fourth request"),
+            Message(role=Role.ASSISTANT, content="latest response"),
+        ]
+
+        second = compact_messages(
+            extended,
+            keep_recent_bundles=2,
+            force=True,
+            base_evidence=CompactionEvidence.from_dict(
+                first[0].metadata["authoritative_evidence"]
+            ),
+            base_source_message_ids=first[0].metadata["source_message_ids"],
+            base_compacted_message_ids=first[0].metadata[
+                "compacted_message_ids"
+            ],
+        )
+
+        self.assertIn("AGED-OUT RETAINED RESPONSE", second[0].content)
 
 
 class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
@@ -1161,7 +1213,7 @@ class CompactionEvaluationTests(unittest.TestCase):
             )
         )
 
-    def test_independent_completion_scorer_controls_quality_release_gate(self):
+    def test_completion_scorer_alone_does_not_claim_an_llm_release_gate(self):
         case = {
             "name": "quality hook",
             "target_tokens": 2_000,
@@ -1179,13 +1231,64 @@ class CompactionEvaluationTests(unittest.TestCase):
         self.assertEqual(report.full_history_quality, 1.0)
         self.assertEqual(report.compacted_quality, 1.0)
         self.assertTrue(report.quality_gate_passed)
-        self.assertTrue(report.release_gate_passed)
+        self.assertIsNone(report.release_gate_passed)
 
         with self.assertRaisesRegex(ValueError, "finite score from 0 to 1"):
             evaluate_compaction_case(
                 case,
                 completion_scorer=lambda _messages, _case: 2.0,
             )
+
+    def test_llm_release_gate_measures_durable_unchanged_resume_reuse(self):
+        root = Path(__file__).resolve().parents[1]
+        case = load_compaction_corpus(root / "evals" / "compaction_v2_corpus.json")[0]
+
+        def summarizer(prompt: str, _case: dict[str, object]) -> ModelResponse:
+            return ModelResponse(
+                text=_echo_evidence_with_transcript(prompt),
+                usage=Usage(
+                    input_tokens=50,
+                    output_tokens=10,
+                    requests=1,
+                    cost_usd=0.01,
+                ),
+            )
+
+        report = asyncio.run(
+            evaluate_compaction_release_case(
+                case,
+                summarizer=summarizer,
+                completion_scorer=lambda _messages, _case: 1.0,
+            )
+        )
+
+        self.assertTrue(report.llm_compaction_evaluated)
+        self.assertEqual(report.strategy, "llm")
+        self.assertGreater(report.summarizer_calls, 0)
+        self.assertGreater(report.cost_usd, 0.0)
+        self.assertTrue(report.resume_artifact_reused)
+        self.assertEqual(report.resume_summarizer_calls, 0)
+        self.assertEqual(report.resume_cost_usd, 0.0)
+        self.assertTrue(report.release_gate_passed)
+
+    def test_llm_release_gate_rejects_a_deterministic_fallback(self):
+        root = Path(__file__).resolve().parents[1]
+        case = load_compaction_corpus(root / "evals" / "compaction_v2_corpus.json")[0]
+
+        report = asyncio.run(
+            evaluate_compaction_release_case(
+                case,
+                summarizer=lambda _prompt, _case: ModelResponse(
+                    text="{}",
+                    usage=Usage(requests=1, cost_usd=0.01),
+                ),
+                completion_scorer=lambda _messages, _case: 1.0,
+            )
+        )
+
+        self.assertTrue(report.llm_compaction_evaluated)
+        self.assertEqual(report.strategy, "deterministic")
+        self.assertFalse(report.release_gate_passed)
 
 
 class OverflowProvider(Provider):
@@ -1494,7 +1597,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "summarizer_validation_failed",
             )
 
-    async def test_incremental_artifact_summarizes_only_new_source_suffix(self):
+    async def test_incremental_artifact_summarizes_newly_compacted_parent_messages(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(
@@ -1518,7 +1621,11 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             def handler(request: ProviderRequest, _call: int) -> ModelResponse:
                 if request.metadata.get("purpose") == "compaction_summary":
                     summary_prompts.append(request.messages[-1].content)
-                    return ModelResponse(text=_echo_evidence(request.messages[-1].content))
+                    return ModelResponse(
+                        text=_echo_evidence_with_transcript(
+                            request.messages[-1].content
+                        )
+                    )
                 return ModelResponse(text="done")
 
             provider.handler = handler
@@ -1531,14 +1638,36 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                         runner.sessions.append_message(session.id, message)
                 await runner.run("second", session_id=session.id)
                 artifacts = runner.sessions.compaction_artifacts(session.id)
+                source_messages = runner.sessions.messages(session.id)
             finally:
                 await runner.close()
 
+        source_by_id = {message.id: message for message in source_messages}
+        first_compacted_ids = set(artifacts[0].metadata["compacted_message_ids"])
+        second_compacted_ids = set(artifacts[1].metadata["compacted_message_ids"])
+        newly_compacted_ids = second_compacted_ids - first_compacted_ids
+        first_marker = next(
+            source_by_id[message_id].content.split()[0]
+            for message_id in first_compacted_ids
+            if source_by_id[message_id].role == Role.TOOL
+        )
+        aged_markers = {
+            source_by_id[message_id].content.split()[0]
+            for message_id in newly_compacted_ids
+            if source_by_id[message_id].role == Role.TOOL
+        }
         self.assertEqual(len(summary_prompts), 2)
-        self.assertIn("old-history-0", summary_prompts[0])
-        self.assertNotIn("old-history-0", summary_prompts[1])
+        self.assertIn(first_marker, summary_prompts[0])
+        self.assertNotIn(first_marker, summary_prompts[1])
+        self.assertTrue(aged_markers)
+        for marker in aged_markers:
+            self.assertIn(marker, summary_prompts[1])
+        self.assertNotIn("new-history-19", summary_prompts[1])
         self.assertEqual(len(artifacts), 2)
         self.assertEqual(artifacts[1].parent_artifact_id, artifacts[0].id)
+        self.assertTrue(
+            any(marker in artifacts[1].summary_text for marker in aged_markers)
+        )
 
     async def test_llm_incremental_evidence_invalidates_changed_pruned_prefix(self):
         with tempfile.TemporaryDirectory() as td:

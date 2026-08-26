@@ -1190,6 +1190,28 @@ class AgentRunner:
                     ]
                 )
             )
+            parent_compacted_message_ids: list[str] | None = None
+            if parent_is_prefix and incremental_parent is not None:
+                recorded_compacted_ids = incremental_parent.metadata.get(
+                    "compacted_message_ids"
+                )
+                if isinstance(recorded_compacted_ids, list):
+                    parent_compacted_message_ids = [
+                        str(item) for item in recorded_compacted_ids
+                    ]
+                else:
+                    recorded_retained_ids = incremental_parent.metadata.get(
+                        "retained_message_ids"
+                    )
+                    if isinstance(recorded_retained_ids, list):
+                        retained_id_set = {str(item) for item in recorded_retained_ids}
+                        parent_compacted_message_ids = [
+                            message_id
+                            for message_id in incremental_parent.source_message_ids
+                            if message_id not in retained_id_set
+                        ]
+                    else:
+                        parent_is_prefix = False
             compaction_kwargs = {
                 "keep_recent": keep_recent,
                 "summary_tokens": provider_message_target,
@@ -1217,6 +1239,9 @@ class AgentRunner:
                     incremental_parent.source_message_ids
                     if parent_is_prefix and incremental_parent is not None
                     else None
+                ),
+                "base_compacted_message_ids": (
+                    parent_compacted_message_ids if parent_is_prefix else None
                 ),
             }
             try:
@@ -1436,12 +1461,18 @@ class AgentRunner:
                     if (
                         parent_is_prefix
                         and incremental_parent is not None
+                        and parent_compacted_message_ids is not None
                         and source_ids[: len(incremental_parent.source_message_ids)]
                         == incremental_parent.source_message_ids
                     ):
-                        transcript_message_ids = set(
-                            source_ids[len(incremental_parent.source_message_ids) :]
-                        )
+                        previously_compacted_ids = set(parent_compacted_message_ids)
+                        transcript_message_ids = {
+                            str(item)
+                            for item in deterministic_artifact.metadata.get(
+                                "compacted_message_ids", []
+                            )
+                            if str(item) not in previously_compacted_ids
+                        }
                     compacted_messages = await compact_messages_with_summary(
                         request_messages,
                         self._summarizer(usage_sink, cancel, summary_usage),
@@ -1764,6 +1795,12 @@ class AgentRunner:
                     "compacted_bundles", 0
                 ),
                 "retained_message_ids": [message.id for message in retained_messages],
+                "compacted_message_ids": [
+                    str(item)
+                    for item in artifact_message.metadata.get(
+                        "compacted_message_ids", []
+                    )
+                ],
                 "provider_messages": provider_messages,
                 "provider_source_hash": provider_source_hash,
                 "provider_context": provider_context,

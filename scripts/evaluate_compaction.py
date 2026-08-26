@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Run the fixed offline compaction-v2 release-gate corpus."""
+"""Run the fixed compaction-v2 structural or LLM release-gate corpus."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import json
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from borealis_coder.agent.compaction_eval import (
+    CompactionEvaluation,
     CompletionScorer,
+    ReleaseSummarizer,
     evaluate_compaction_case,
+    evaluate_compaction_release_case,
     load_compaction_corpus,
 )
 
@@ -26,6 +30,16 @@ def _load_completion_scorer(reference: str) -> CompletionScorer:
     return cast(CompletionScorer, scorer)
 
 
+def _load_summarizer(reference: str) -> ReleaseSummarizer:
+    module_name, separator, attribute = reference.partition(":")
+    if not separator or not module_name or not attribute:
+        raise ValueError("Summarizer must use the form module:function")
+    summarizer = getattr(importlib.import_module(module_name), attribute)
+    if not callable(summarizer):
+        raise TypeError(f"Summarizer is not callable: {reference}")
+    return cast(ReleaseSummarizer, summarizer)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run the compaction-v2 structural corpus and optional quality gate."
@@ -37,18 +51,36 @@ def main(argv: list[str] | None = None) -> int:
             "(messages, case) and returns a score from 0 to 1."
         ),
     )
+    parser.add_argument(
+        "--summarizer",
+        help=(
+            "Import a release summarizer as module:function. The callable receives "
+            "(prompt, case) and returns a ModelResponse with summary text and usage."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.completion_scorer and not args.summarizer:
+        parser.error("--completion-scorer requires --summarizer for the LLM release gate")
+    if args.summarizer and not args.completion_scorer:
+        parser.error("--summarizer requires --completion-scorer for the release gate")
     completion_scorer = (
         _load_completion_scorer(args.completion_scorer)
         if args.completion_scorer
         else None
     )
+    summarizer = _load_summarizer(args.summarizer) if args.summarizer else None
     root = Path(__file__).resolve().parents[1]
     cases = load_compaction_corpus(root / "evals" / "compaction_v2_corpus.json")
-    reports = [
-        evaluate_compaction_case(case, completion_scorer=completion_scorer)
-        for case in cases
-    ]
+    if summarizer is None or completion_scorer is None:
+        reports = [evaluate_compaction_case(case) for case in cases]
+    else:
+        reports = asyncio.run(
+            _evaluate_release_cases(
+                cases,
+                summarizer=summarizer,
+                completion_scorer=completion_scorer,
+            )
+        )
     print(
         json.dumps(
             [
@@ -65,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
                     "deterministic": report.deterministic,
                     "latency_ms": round(report.latency_ms, 3),
                     "cost_usd": report.cost_usd,
+                    "strategy": report.strategy,
+                    "llm_compaction_evaluated": report.llm_compaction_evaluated,
+                    "summarizer_calls": report.summarizer_calls,
+                    "resume_artifact_reused": report.resume_artifact_reused,
+                    "resume_summarizer_calls": report.resume_summarizer_calls,
+                    "resume_cost_usd": report.resume_cost_usd,
                     "full_history_quality": report.full_history_quality,
                     "compacted_quality": report.compacted_quality,
                     "completion_quality_status": (
@@ -82,9 +120,27 @@ def main(argv: list[str] | None = None) -> int:
             sort_keys=True,
         )
     )
-    if completion_scorer is None:
+    if summarizer is None or completion_scorer is None:
         return 0 if all(report.structural_gate_passed for report in reports) else 1
     return 0 if all(report.release_gate_passed is True for report in reports) else 1
+
+
+async def _evaluate_release_cases(
+    cases: list[dict[str, Any]],
+    *,
+    summarizer: ReleaseSummarizer,
+    completion_scorer: CompletionScorer,
+) -> list[CompactionEvaluation]:
+    reports: list[CompactionEvaluation] = []
+    for case in cases:
+        reports.append(
+            await evaluate_compaction_release_case(
+                case,
+                summarizer=summarizer,
+                completion_scorer=completion_scorer,
+            )
+        )
+    return reports
 
 
 if __name__ == "__main__":

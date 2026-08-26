@@ -47,7 +47,7 @@ After a provider overflow, Borealis increases the safety margin and retries with
 
 ## Durable reuse
 
-An artifact is reusable only when its source-content hash, strategy, prompt version, model selection, configuration fingerprint, retained provider messages, and routed provider contexts match. The artifact stores the exact summary, every configured route's provider payload, a secret-free fingerprint of model-affecting provider settings, and a compacted-context hash for each route. Each routed attempt records the artifact ID and matching context hash without logging summary text. Resume checks the artifact before it calls an LLM summarizer. A new artifact records the previous artifact as its parent when both the old source IDs and provider payload are an exact prefix. Only that exact new transcript suffix is sent to the summarizer.
+An artifact is reusable only when its source-content hash, strategy, prompt version, model selection, configuration fingerprint, retained provider messages, and routed provider contexts match. The artifact stores the exact summary, the IDs that were compacted versus retained, every configured route's provider payload, a secret-free fingerprint of model-affecting provider settings, and a compacted-context hash for each route. Each routed attempt records the artifact ID and matching context hash without logging summary text. Resume checks the artifact before it calls an LLM summarizer. A new artifact records the previous artifact as its parent when both the old source IDs and provider payload are an exact prefix. Incremental compaction sends only messages that have newly aged out of the retained window to the summarizer and carries the parent's bounded excerpts forward.
 
 LLM compaction uses a strict JSON schema and bounded complete requests. Output must retain every structured source field and may contain only source-backed historical excerpts. Empty, malformed, invented, over-budget, cancelled, or overflowing summaries use the deterministic artifact. Usage from completed or failed summary requests is recorded before an error is propagated.
 
@@ -59,16 +59,17 @@ Run the fixed offline structural corpus:
 PYTHONPATH=src python scripts/evaluate_compaction.py
 ```
 
-The corpus covers multi-file work, requirement changes, repeated failures, large output, cancellation and resume, continuation metadata, steering, hostile content, repeated compaction, and provider overflow. It reports critical-fact recall, false completion claims, boundary escapes, tool ordering, token reduction, target compliance, latency, cost, and resume determinism. Without an independent completion scorer, completion quality and the full release gate are reported as `not_evaluated` instead of being inferred from the critical-fact checks.
+The corpus covers multi-file work, requirement changes, repeated failures, large output, cancellation and resume, continuation metadata, steering, hostile content, repeated compaction, and provider overflow. It reports critical-fact recall, false completion claims, boundary escapes, tool ordering, token reduction, target compliance, latency, cost, and resume determinism. The default command is an offline deterministic structural gate and never claims that the LLM release gate passed.
 
-Supply an independent model-backed or human-backed scorer to compare task-completion quality against full history:
+Supply both the configured release summarizer and an independent model-backed or human-backed completion scorer for the full release gate:
 
 ```sh
 PYTHONPATH=src python scripts/evaluate_compaction.py \
+  --summarizer your_package.compaction_eval:summarize \
   --completion-scorer your_package.compaction_eval:score_completion
 ```
 
-The scorer receives `(messages, case)` and returns a score from 0 to 1. The command evaluates the full release gate only when this scorer is present. Otherwise, its exit status covers the offline structural gate only.
+The summarizer receives `(prompt, case)` and returns a `ModelResponse` containing the structured summary text and measured usage. The scorer receives `(messages, case)` and returns a score from 0 to 1. For every case, the release evaluator runs the production LLM compaction path, stores its artifact, reopens the durable session, and verifies that the unchanged request reuses the exact artifact without another summarizer call or charge. Both callbacks are required; otherwise, the command runs only the offline structural gate.
 
 The release gates are:
 
