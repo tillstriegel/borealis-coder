@@ -142,6 +142,28 @@ class ConversationBundleTests(unittest.TestCase):
         self.assertEqual([bundle.kind for bundle in standalone], [BundleKind.TOOL_CYCLE])
         self.assertEqual(len(standalone[0].messages), 2)
 
+    def test_consecutive_tool_cycles_are_separate_atomic_bundles(self):
+        messages = [
+            Message(role=Role.USER, content="implement"),
+            *_tool_cycle("call-1"),
+            *_tool_cycle("call-2"),
+            *_tool_cycle("call-3"),
+            Message(role=Role.ASSISTANT, content="terminal"),
+        ]
+
+        bundles = bundle_conversation(messages)
+
+        self.assertEqual(
+            [bundle.kind for bundle in bundles],
+            [
+                BundleKind.REQUEST,
+                BundleKind.TOOL_CYCLE,
+                BundleKind.TOOL_CYCLE,
+                BundleKind.TERMINAL,
+            ],
+        )
+        self.assertEqual([len(bundle.messages) for bundle in bundles], [3, 2, 2, 1])
+
     def test_malformed_tool_relationships_fail_closed(self):
         call = ToolCall(id="call-1", name="shell", arguments={})
         malformed = (
@@ -261,7 +283,99 @@ class StructuredCompactionTests(unittest.TestCase):
         )
 
         self.assertNotIn("[completed] ship without tests", evidence.completed_work)
-        self.assertIn("update_plan: plan update cancelled", evidence.open_failures_and_blockers)
+        self.assertEqual(len(evidence.open_failures_and_blockers), 1)
+        self.assertIn("update_plan invocation", evidence.open_failures_and_blockers[0])
+        self.assertIn("plan update cancelled", evidence.open_failures_and_blockers[0])
+
+    def test_steering_suffix_preserves_parent_objective(self):
+        base = CompactionEvidence(
+            current_objective=["Implement compaction v2."],
+            user_constraints=["Keep provider adapters compatible."],
+        )
+
+        evidence = extract_compaction_evidence(
+            [
+                Message(
+                    role=Role.USER,
+                    content="Keep the diff small.",
+                    metadata={"steering": True},
+                )
+            ],
+            base=base,
+        )
+
+        self.assertEqual(evidence.current_objective, ["Implement compaction v2."])
+        self.assertIn("Keep the diff small.", evidence.user_constraints)
+
+    def test_model_verification_drafts_do_not_replace_recorded_result(self):
+        evidence = extract_compaction_evidence(
+            [
+                Message(
+                    role=Role.USER,
+                    content="Automatic verification failed: pytest",
+                    metadata={"internal": "verification_result"},
+                ),
+                Message(
+                    role=Role.ASSISTANT,
+                    content="Everything is fixed and complete.",
+                    metadata={"internal": "verification_candidate"},
+                ),
+                Message(
+                    role=Role.ASSISTANT,
+                    content="Ready to report success.",
+                    metadata={"internal": "verification_finalizer"},
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            evidence.latest_verification,
+            ["Automatic verification failed: pytest"],
+        )
+
+    def test_later_success_clears_matching_failed_shell_command(self):
+        failed_call = ToolCall(
+            id="failed-test",
+            name="shell",
+            arguments={"command": "pytest tests/test_retry.py -q"},
+        )
+        first = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[failed_call]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=failed_call.id,
+                    tool_name=failed_call.name,
+                    content="AssertionError: retry failed",
+                    is_error=True,
+                ),
+            ]
+        )
+        self.assertIn(
+            "pytest tests/test_retry.py -q",
+            first.open_failures_and_blockers[0],
+        )
+        self.assertIn("AssertionError: retry failed", first.open_failures_and_blockers[0])
+
+        successful_call = ToolCall(
+            id="successful-test",
+            name="shell",
+            arguments={"command": "pytest tests/test_retry.py -q"},
+        )
+        second = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[successful_call]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=successful_call.id,
+                    tool_name=successful_call.name,
+                    content="1 passed",
+                ),
+            ],
+            base=first,
+        )
+
+        self.assertEqual(second.open_failures_and_blockers, ["None recorded."])
 
     def test_verification_truncation_preserves_status_command_and_diagnostic_tail(self):
         content = (
@@ -569,6 +683,43 @@ class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(compacted[0].metadata["strategy"], "llm")
         self.assertGreater(calls, 1)
         self.assertTrue(all(size <= 8_000 for size in prompt_sizes))
+
+    async def test_llm_summary_that_exceeds_total_target_falls_back(self):
+        messages = [
+            Message(
+                role=Role.USER if index % 2 == 0 else Role.ASSISTANT,
+                content=f"history-{index}-" + ("detail " * 120),
+            )
+            for index in range(20)
+        ]
+
+        async def retain_all_excerpts(prompt: str) -> str:
+            import json
+
+            value = json.loads(_echo_evidence(prompt))
+            marker = "<untrusted_conversation_transcript>\n"
+            start = prompt.index(marker) + len(marker)
+            end = prompt.index("\n</untrusted_conversation_transcript>", start)
+            value["historical_excerpts"] = prompt[start:end].splitlines()
+            return json.dumps(value)
+
+        compacted = await compact_messages_with_summary(
+            messages,
+            retain_all_excerpts,
+            keep_recent_bundles=1,
+            summary_chars=100_000,
+            target_tokens=2_500,
+        )
+
+        self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
+        self.assertEqual(
+            compacted[0].metadata["fallback_reason"],
+            "summarizer_total_over_target",
+        )
+        self.assertLessEqual(
+            sum(estimate_tokens(message.content) for message in compacted),
+            2_500,
+        )
 
 
 class CompactionEvaluationTests(unittest.TestCase):
@@ -971,6 +1122,88 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             artifacts[1].metadata["provider_messages"],
             [message.to_dict() for message in second_retained],
         )
+
+    async def test_artifact_reuse_requires_the_same_effective_context_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root)
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            source = [Message(role=Role.USER, content="durable source")]
+            for message in source:
+                runner.sessions.append_message(session.id, message)
+            source_hash = hashlib.sha256(
+                json_dumps([message.to_dict() for message in source]).encode("utf-8")
+            ).hexdigest()
+            artifact = Message(
+                role=Role.SYSTEM,
+                content="first bounded summary",
+                metadata={
+                    "compacted": True,
+                    "artifact_version": 2,
+                    "strategy": "deterministic",
+                    "source_hash": source_hash,
+                    "source_message_ids": [message.id for message in source],
+                    "source_bundles": 1,
+                    "retained_bundles": 1,
+                    "compacted_bundles": 1,
+                    "evidence": {},
+                    "authoritative_evidence": {},
+                },
+            )
+            retained = [Message(role=Role.USER, content="retained")]
+            first_budget = ContextBudget.calculate(
+                config.agent,
+                system="short system",
+                tools=[],
+                messages=retained,
+                provider="mock",
+            )
+            second_budget = ContextBudget.calculate(
+                config.agent,
+                system="larger system " * 2_000,
+                tools=[],
+                messages=retained,
+                provider="mock",
+            )
+            try:
+                _, first_reused = await runner._record_or_reuse_compaction_artifact(
+                    session_id=session.id,
+                    source_messages=source,
+                    artifact_message=artifact,
+                    retained_messages=retained,
+                    context_budget=first_budget,
+                    summary_usage=Usage(),
+                )
+                replacement = Message(
+                    role=artifact.role,
+                    content="smaller replacement",
+                    metadata=artifact.metadata,
+                )
+                second, second_reused = (
+                    await runner._record_or_reuse_compaction_artifact(
+                        session_id=session.id,
+                        source_messages=source,
+                        artifact_message=replacement,
+                        retained_messages=retained,
+                        context_budget=second_budget,
+                        summary_usage=Usage(),
+                    )
+                )
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertLess(
+            second_budget.message_target_tokens,
+            first_budget.message_target_tokens,
+        )
+        self.assertFalse(first_reused)
+        self.assertFalse(second_reused)
+        self.assertEqual(second.content, "smaller replacement")
+        self.assertEqual(len(artifacts), 2)
 
     async def test_llm_compaction_is_not_recharged_during_overflow_reduction(self):
         with tempfile.TemporaryDirectory() as td:

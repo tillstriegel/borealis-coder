@@ -59,6 +59,18 @@ _SHRINK_ORDER = (
     "Pending work",
 )
 _MANDATORY_SECTIONS = frozenset(_SECTION_ORDER)
+_EVIDENCE_PLACEHOLDERS = frozenset(
+    {
+        "Unavailable: no structured decision evidence was recorded.",
+        "Unavailable: no verification result was recorded.",
+        "Unavailable: no structured completion evidence was recorded.",
+        "Unavailable: no changed-file metadata was recorded.",
+        "None recorded.",
+        "Unavailable: no active structured plan was recorded.",
+        "Unavailable: no current user objective was recorded.",
+        "Unavailable: no recent user constraints were recorded.",
+    }
+)
 COMPACTION_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -432,7 +444,7 @@ def bundle_conversation(messages: list[Message]) -> list[ConversationBundle]:
             index += 1
             if kind == BundleKind.REQUEST:
                 request_cycle = [message]
-                while (
+                if (
                     index < len(messages)
                     and messages[index].role == Role.ASSISTANT
                     and messages[index].tool_calls
@@ -513,6 +525,36 @@ def _tail(value: str, limit: int) -> str:
     return "[diagnostic head omitted]\n" + value[-limit:]
 
 
+def _tool_failure_prefix(
+    tool_name: str,
+    arguments: dict[str, Any],
+    message: Message,
+) -> str:
+    """Return a stable, bounded label for one tool invocation."""
+
+    recorded_name = tool_name or message.tool_name or ""
+    resolved_name = recorded_name or "tool"
+    identity: dict[str, Any] = {"name": resolved_name, "arguments": arguments}
+    if not recorded_name and message.tool_call_id:
+        identity["tool_call_id"] = message.tool_call_id
+    digest = hashlib.sha256(json_dumps(identity).encode("utf-8")).hexdigest()[:12]
+    command = arguments.get("command")
+    if resolved_name == "shell" and isinstance(command, str) and command.strip():
+        display = truncate_text(command.strip(), 500)
+        return f"shell command {json.dumps(display, ensure_ascii=False)} [{digest}]"
+    return f"{resolved_name} invocation [{digest}]"
+
+
+def _has_real_evidence(items: list[str]) -> bool:
+    return any(item not in _EVIDENCE_PLACEHOLDERS for item in items)
+
+
+def _remove_placeholders(items: list[str]) -> list[str]:
+    if not _has_real_evidence(items):
+        return items
+    return [item for item in items if item not in _EVIDENCE_PLACEHOLDERS]
+
+
 def extract_compaction_evidence(
     messages: list[Message],
     *,
@@ -534,9 +576,10 @@ def extract_compaction_evidence(
         objective_messages = [
             message for message in user_messages if not message.metadata.get("steering")
         ]
-        evidence.current_objective = [
-            (objective_messages or user_messages)[-1].content.strip()
-        ]
+        if objective_messages:
+            evidence.current_objective = [objective_messages[-1].content.strip()]
+        elif not _has_real_evidence(evidence.current_objective):
+            evidence.current_objective = [user_messages[-1].content.strip()]
         evidence.user_constraints.extend(message.content.strip() for message in user_messages[-3:])
 
     latest_plan: list[dict[str, Any]] | None = None
@@ -575,10 +618,15 @@ def extract_compaction_evidence(
                 evidence.completed_work.append(
                     f"Recorded checkpoint {checkpoint_id} for {tool_name or 'mutation'}."
                 )
+        failure_prefix = _tool_failure_prefix(tool_name, arguments, message)
+        evidence.open_failures_and_blockers = [
+            item
+            for item in evidence.open_failures_and_blockers
+            if not item.startswith(f"{failure_prefix}: ")
+        ]
         if message.is_error:
             evidence.open_failures_and_blockers.append(
-                f"{tool_name or message.tool_name or message.tool_call_id or 'tool'}: "
-                + _tail(message.content, 2_000)
+                f"{failure_prefix}: {_tail(message.content, 2_000)}"
             )
         if tool_name == "git_status" and not message.is_error:
             latest_git_state = "Latest recorded git state:\n" + truncate_text(
@@ -589,7 +637,8 @@ def extract_compaction_evidence(
         message
         for message in messages
         if message.metadata.get("authoritative_verification")
-        or str(message.metadata.get("internal") or "").startswith("verification_")
+        or message.metadata.get("internal")
+        in {"verification_result", "verification_result_terminal"}
     ]
     if verification_messages:
         evidence.latest_verification = [
@@ -611,6 +660,22 @@ def extract_compaction_evidence(
             for item in latest_plan
             if item.get("status") == "completed"
             and str(item.get("content") or item.get("step") or "").strip()
+        )
+
+    for field_name in (
+        "current_objective",
+        "user_constraints",
+        "completed_work",
+        "files_changed",
+        "important_decisions",
+        "latest_verification",
+        "open_failures_and_blockers",
+        "pending_work",
+    ):
+        setattr(
+            evidence,
+            field_name,
+            _remove_placeholders(getattr(evidence, field_name)),
         )
 
     evidence.important_decisions = evidence.important_decisions or [
@@ -1054,7 +1119,7 @@ async def compact_messages_with_summary(
             return _deterministic_fallback(compacted, "summarizer_output_over_budget")
     except CompactionError:
         return _deterministic_fallback(compacted, "summarizer_render_failed")
-    return [
+    result = [
         Message(
             role=Role.SYSTEM,
             content=summary,
@@ -1066,6 +1131,9 @@ async def compact_messages_with_summary(
         ),
         *compacted[1:],
     ]
+    if target_tokens > 0 and _messages_tokens(result) > target_tokens:
+        return _deterministic_fallback(compacted, "summarizer_total_over_target")
+    return result
 
 
 def _parse_and_validate_llm_evidence(

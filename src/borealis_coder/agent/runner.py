@@ -1637,7 +1637,15 @@ class AgentRunner:
             "artifact_version": artifact_version,
             "strategy": strategy,
             "prompt_version": 2,
-            "target_tokens": context_budget.target_tokens,
+            "context_budget": {
+                "input_limit": context_budget.input_limit,
+                "reserved_output_tokens": context_budget.reserved_output_tokens,
+                "system_tokens": context_budget.system_tokens,
+                "tool_schema_tokens": context_budget.tool_schema_tokens,
+                "continuation_state_tokens": context_budget.continuation_state_tokens,
+                "target_tokens": context_budget.target_tokens,
+                "message_target_tokens": context_budget.message_target_tokens,
+            },
             "summary_model": (
                 self.config.agent.small_model or self.providers[0].model
                 if strategy == "llm"
