@@ -216,6 +216,9 @@ async def evaluate_compaction_release_case(
             first_usage.add(usage)
             await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
 
+        async def first_settled_usage_sink(usage: Usage) -> None:
+            first_usage.add(usage)
+
         try:
             first = await runner._prepare_provider_request(
                 prompt_context=prompt_context,
@@ -226,6 +229,7 @@ async def evaluate_compaction_release_case(
                 adaptive_cache=False,
                 conversation_cache=True,
                 usage_sink=first_usage_sink,
+                settled_usage_sink=first_settled_usage_sink,
                 cancel=asyncio.Event(),
                 session_id=session.id,
                 run_id="compaction-eval-first",

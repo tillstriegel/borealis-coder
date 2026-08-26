@@ -255,6 +255,60 @@ class SessionStoreTests(unittest.TestCase):
                     )
                 self.assertEqual(self.store.tool_calls(self.session.id)[0], original)
 
+    def test_tool_cancellation_accepts_only_exact_cancelled_replay(self):
+        with self.assertRaisesRegex(SessionError, "does not exist"):
+            self.store.cancel_tool_call(self.session.id, "missing")
+
+        self.store.start_tool_call(
+            self.session.id, "run", "cancelled-call", "read_file", {"path": "a"}
+        )
+        message = Message(
+            id="cancelled-result",
+            role=Role.TOOL,
+            content="stopped",
+            tool_call_id="cancelled-call",
+            tool_name="read_file",
+            is_error=True,
+            metadata={"cancelled": True},
+        )
+        self.store.cancel_tool_call(
+            self.session.id, "cancelled-call", reason="stopped", message=message
+        )
+        cancelled = self.store.tool_calls(self.session.id)[0]
+        self.store.cancel_tool_call(
+            self.session.id, "cancelled-call", reason="stopped", message=message
+        )
+        self.assertEqual(self.store.tool_calls(self.session.id)[0], cancelled)
+        self.assertEqual(self.store.messages(self.session.id), [message])
+
+        for status in ("completed", "error"):
+            call_id = f"terminal-{status}"
+            self.store.start_tool_call(
+                self.session.id, "run", call_id, "read_file", {"path": status}
+            )
+            self.store.complete_tool_call(
+                self.session.id,
+                call_id,
+                output=f"{status} result",
+                is_error=status == "error",
+                metadata={"stable": True},
+            )
+            original = next(
+                row
+                for row in self.store.tool_calls(self.session.id)
+                if row["tool_call_id"] == call_id
+            )
+            with self.assertRaisesRegex(SessionError, "terminal"):
+                self.store.cancel_tool_call(
+                    self.session.id, call_id, reason="stale cancellation"
+                )
+            current = next(
+                row
+                for row in self.store.tool_calls(self.session.id)
+                if row["tool_call_id"] == call_id
+            )
+            self.assertEqual(current, original)
+
     def test_terminal_tool_calls_cannot_be_restarted_or_overwritten(self):
         for status in ("completed", "error", "cancelled"):
             with self.subTest(status=status):

@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
-from ..errors import BudgetExceeded, Cancelled
+from ..errors import BudgetExceeded, Cancelled, SessionError
 from ..models import Message, Role
 from ..util import estimate_tokens, json_dumps, truncate_text
 from .budget import (
@@ -1502,7 +1502,7 @@ async def compact_messages_with_summary(
                 resolved = await outcome
             else:
                 resolved = outcome
-        except (BudgetExceeded, Cancelled):
+        except (BudgetExceeded, Cancelled, SessionError):
             raise
         except Exception:
             return _deterministic_fallback(

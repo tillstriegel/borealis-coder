@@ -154,6 +154,8 @@ class ContextBudget:
     trigger_tokens: int
     target_tokens: int
     message_target_tokens: int
+    hard_bytes: int
+    trigger_bytes: int
     target_bytes: int
     message_target_bytes: int
 
@@ -210,7 +212,18 @@ class ContextBudget:
             + continuation_state_tokens
         )
         message_target = max(1, target - fixed)
-        target_bytes = target * 4
+        hard_bytes = max(
+            1,
+            (
+                config.max_input_tokens
+                - config.max_output_tokens
+                - dynamic_margin
+                - provider_framing
+            )
+            * 4,
+        )
+        trigger_bytes = max(1, int(hard_bytes * config.compact_at_ratio))
+        target_bytes = max(1, int(hard_bytes * effective_target_ratio))
         empty_request_bytes = estimate_request_bytes("", [], [])
         fixed_request_bytes = (
             estimate_request_bytes(system, [], tools) - empty_request_bytes
@@ -227,6 +240,8 @@ class ContextBudget:
             trigger_tokens=trigger,
             target_tokens=target,
             message_target_tokens=message_target,
+            hard_bytes=hard_bytes,
+            trigger_bytes=trigger_bytes,
             target_bytes=target_bytes,
             message_target_bytes=message_target_bytes,
         )

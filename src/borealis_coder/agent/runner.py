@@ -124,7 +124,7 @@ Automatic verification has already run after the mutations. Tools are unavailabl
 response. Return a final answer that accurately reports the supplied verification result and
 does not claim stronger process-lifecycle or mutation guarantees than it provides.
 """
-_COMPACTION_SUMMARY_CACHE_VERSION = 1
+_COMPACTION_SUMMARY_CACHE_VERSION = 2
 
 
 def _stable_payload_hash(value: Any) -> str:
@@ -151,12 +151,19 @@ def _incremental_parent_evidence(
     return evidence
 
 
-def _fits_context_limit(messages: list[Message], budget: ContextBudget) -> bool:
+def _fits_context_limit(
+    messages: list[Message],
+    budget: ContextBudget,
+    *,
+    system: str,
+    tools: list[dict[str, Any]],
+) -> bool:
     return (
         budget.estimated_total(messages)
         + budget.reserved_output_tokens
         + budget.safety_margin_tokens
         <= budget.input_limit
+        and estimate_request_bytes(system, messages, tools) <= budget.hard_bytes
     )
 
 
@@ -578,6 +585,9 @@ class AgentRunner:
             await asyncio.to_thread(self.sessions.add_usage, session_id, usage)
             budget.add_usage(usage)
 
+        async def settled_usage_sink(usage: Usage) -> None:
+            budget.add_usage(usage)
+
         context.metadata["usage_sink"] = usage_sink
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
         tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
@@ -716,6 +726,7 @@ class AgentRunner:
                     adaptive_cache=adaptive_cache,
                     conversation_cache=conversation_cache,
                     usage_sink=usage_sink,
+                    settled_usage_sink=settled_usage_sink,
                     cancel=cancel,
                     session_id=session_id,
                     run_id=run_id,
@@ -1310,6 +1321,7 @@ class AgentRunner:
         session_id: str,
         run_id: str,
         last_prune_signature: tuple[int, ...] | None,
+        settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
         overflow_retry_count: int = 0,
     ) -> PreparedProviderRequest:
         turn_system = prompt_context.text
@@ -1348,11 +1360,18 @@ class AgentRunner:
             overflow_retry_count=overflow_retry_count,
         )
         estimated = context_budget.estimated_total(request_messages)
+        estimated_bytes = estimate_request_bytes(
+            turn_system,
+            request_messages,
+            schemas,
+        )
         compaction_reason: str | None = None
         if overflow_retry_count:
             compaction_reason = "provider_context_overflow"
-        elif context_budget.estimated_total(request_messages) >= context_budget.trigger_tokens:
+        elif estimated >= context_budget.trigger_tokens:
             compaction_reason = "estimated_tokens"
+        elif estimated_bytes >= context_budget.trigger_bytes:
+            compaction_reason = "estimated_bytes"
         elif (
             metrics.tool_output_tokens_before
             >= self.config.context.compact_tool_output_tokens
@@ -1362,9 +1381,21 @@ class AgentRunner:
             compaction_reason not in {None, "provider_context_overflow"}
             and len(request_messages) == 1
             and request_messages[0].role == Role.USER
-            and _fits_context_limit(request_messages, context_budget)
         ):
-            compaction_reason = None
+            if _fits_context_limit(
+                request_messages,
+                context_budget,
+                system=turn_system,
+                tools=schemas,
+            ):
+                compaction_reason = None
+            else:
+                raise BudgetExceeded(
+                    "context",
+                    f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
+                    f"exceeds context budget {self.config.agent.max_input_tokens} "
+                    f"tokens/{context_budget.hard_bytes} bytes",
+                )
         prune_signature = (
             metrics.tokens_before,
             metrics.tokens_after,
@@ -1761,6 +1792,7 @@ class AgentRunner:
                             cancel,
                             summary_usage,
                             session_id=session_id,
+                            settled_usage_sink=settled_usage_sink,
                         ),
                         transcript_message_ids=transcript_message_ids,
                         **compaction_kwargs,
@@ -1909,11 +1941,22 @@ class AgentRunner:
                     messages=len(request_messages),
                     **compaction_metadata,
                 )
-        if not _fits_context_limit(request_messages, context_budget):
+        estimated_bytes = estimate_request_bytes(
+            turn_system,
+            request_messages,
+            schemas,
+        )
+        if not _fits_context_limit(
+            request_messages,
+            context_budget,
+            system=turn_system,
+            tools=schemas,
+        ):
             raise BudgetExceeded(
                 "context",
-                f"Estimated request size {estimated} exceeds "
-                f"{self.config.agent.max_input_tokens} token context budget",
+                f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
+                f"exceeds context budget {self.config.agent.max_input_tokens} "
+                f"tokens/{context_budget.hard_bytes} bytes",
             )
         request = ProviderRequest(
             model=self.providers[0].model,
@@ -2286,6 +2329,8 @@ class AgentRunner:
                 "continuation_state_tokens": context_budget.continuation_state_tokens,
                 "target_tokens": context_budget.target_tokens,
                 "message_target_tokens": context_budget.message_target_tokens,
+                "hard_bytes": context_budget.hard_bytes,
+                "trigger_bytes": context_budget.trigger_bytes,
                 "target_bytes": context_budget.target_bytes,
                 "message_target_bytes": context_budget.message_target_bytes,
             },
@@ -2612,6 +2657,7 @@ class AgentRunner:
         usage_collector: Usage | None = None,
         *,
         session_id: str | None = None,
+        settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
     ) -> Callable[[str], Awaitable[SummarizerResult]] | None:
         """Build an LLM-backed compaction summarizer from the primary route.
 
@@ -2633,20 +2679,35 @@ class AgentRunner:
                 metadata={"purpose": "compaction_summary"},
             )
             cache_key = self._compaction_summary_cache_key(route, request)
-            cached = (
-                await asyncio.to_thread(
-                    self.sessions.get_value,
-                    session_id,
-                    cache_key,
+            try:
+                cached = (
+                    await asyncio.to_thread(
+                        self.sessions.get_compaction_summary,
+                        session_id,
+                        cache_key,
+                    )
+                    if session_id is not None
+                    else None
                 )
-                if session_id is not None
-                else None
-            )
+            except Exception as error:
+                raise SessionError("Could not read the compaction summary cache") from error
             if (
                 isinstance(cached, dict)
                 and cached.get("version") == _COMPACTION_SUMMARY_CACHE_VERSION
             ):
-                original_usage = Usage.from_dict(cached.get("usage"))
+                assert session_id is not None
+                try:
+                    cached, original_usage, newly_settled = await asyncio.to_thread(
+                        self.sessions.settle_compaction_summary_usage,
+                        session_id,
+                        cache_key,
+                    )
+                except Exception as error:
+                    raise SessionError(
+                        "Could not settle cached compaction summary usage"
+                    ) from error
+                if newly_settled and settled_usage_sink is not None:
+                    await settled_usage_sink(original_usage)
                 cache_usage = Usage(
                     application_cache_hits=1,
                     application_cache_saved_tokens=original_usage.total_tokens,
@@ -2693,11 +2754,10 @@ class AgentRunner:
 
             async def settle_completed_response() -> None:
                 # Cache first so a budget stop can resume without another provider call.
-                cache_error: BaseException | None = None
                 if session_id is not None:
                     try:
                         await asyncio.to_thread(
-                            self.sessions.set_value,
+                            self.sessions.put_pending_compaction_summary,
                             session_id,
                             cache_key,
                             {
@@ -2708,13 +2768,29 @@ class AgentRunner:
                                 "usage": asdict(response.usage),
                             },
                         )
-                    except BaseException as error:
-                        cache_error = error
+                    except Exception as cache_error:
+                        if usage_collector is not None:
+                            usage_collector.add(response.usage)
+                        await usage_sink(response.usage)
+                        raise SessionError(
+                            "Could not persist the pending compaction summary"
+                        ) from cache_error
+                    try:
+                        _, _, newly_settled = await asyncio.to_thread(
+                            self.sessions.settle_compaction_summary_usage,
+                            session_id,
+                            cache_key,
+                        )
+                    except Exception as error:
+                        raise SessionError(
+                            "Could not settle compaction summary usage"
+                        ) from error
+                    if newly_settled and settled_usage_sink is not None:
+                        await settled_usage_sink(response.usage)
+                else:
+                    await usage_sink(response.usage)
                 if usage_collector is not None:
                     usage_collector.add(response.usage)
-                await usage_sink(response.usage)
-                if cache_error is not None:
-                    raise cache_error
 
             settlement = asyncio.create_task(settle_completed_response())
             pending_cancellation: asyncio.CancelledError | None = None
@@ -2994,21 +3070,64 @@ class AgentRunner:
                 is_error=True,
                 metadata={"cancelled": True, "not_started": True},
             )
+            try:
+                await asyncio.to_thread(
+                    self.sessions.start_tool_call,
+                    context.session_id,
+                    context.run_id,
+                    call.id,
+                    call.name,
+                    call.arguments,
+                )
+            except SessionError:
+                if await asyncio.to_thread(
+                    self._tool_call_is_terminal,
+                    context.session_id,
+                    call.id,
+                ):
+                    continue
+                raise
             await asyncio.to_thread(
-                self.sessions.start_tool_call,
-                context.session_id,
-                context.run_id,
-                call.id,
-                call.name,
-                call.arguments,
-            )
-            await asyncio.to_thread(
-                self.sessions.cancel_tool_call,
+                self._cancel_tool_call_if_running,
                 context.session_id,
                 call.id,
                 reason=result.output,
                 message=self._tool_result_message(call, result),
             )
+
+    def _cancel_tool_call_if_running(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        reason: str,
+        message: Message,
+    ) -> None:
+        """Ignore a stale cancellation only when another finalizer won the race."""
+
+        try:
+            self.sessions.cancel_tool_call(
+                session_id,
+                call_id,
+                reason=reason,
+                message=message,
+            )
+        except SessionError:
+            if self._tool_call_is_terminal(session_id, call_id):
+                return
+            raise
+
+    def _tool_call_is_terminal(self, session_id: str, call_id: str) -> bool:
+        matching = [
+            row
+            for row in self.sessions.tool_calls(session_id)
+            if row["tool_call_id"] == call_id
+        ]
+        return len(matching) == 1 and matching[0]["status"] in {
+            "completed",
+            "error",
+            "cancelled",
+        }
 
     async def _execute_one(
         self,
@@ -3060,7 +3179,7 @@ class AgentRunner:
                 self._mark_workspace_tracking_incomplete(context)
                 cancelled_result.metadata["workspace_change_tracking"] = "incomplete"
             await asyncio.to_thread(
-                self.sessions.cancel_tool_call,
+                self._cancel_tool_call_if_running,
                 context.session_id,
                 call.id,
                 reason=cancelled_result.output,

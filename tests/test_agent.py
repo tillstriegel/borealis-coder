@@ -2087,6 +2087,57 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 release_first_completion.set()
                 await runner.close()
 
+    async def test_stale_runtime_cancellation_preserves_terminal_tool_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(root, config=make_config(root), interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            call = ToolCall(id="stale-cancel", name="read_file", arguments={})
+            stable = Message(
+                role=Role.TOOL,
+                content="durable success",
+                tool_call_id=call.id,
+                tool_name=call.name,
+                metadata={"stable": True},
+            )
+            runner.sessions.start_tool_call(
+                session.id, "run", call.id, call.name, call.arguments
+            )
+            runner.sessions.complete_tool_call(
+                session.id,
+                call.id,
+                output=stable.content,
+                is_error=False,
+                metadata=stable.metadata,
+                message=stable,
+            )
+
+            try:
+                runner._cancel_tool_call_if_running(
+                    session.id,
+                    call.id,
+                    reason="Run cancelled",
+                    message=Message(
+                        role=Role.TOOL,
+                        content="Run cancelled",
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        is_error=True,
+                        metadata={"cancelled": True},
+                    ),
+                )
+                ledger = runner.sessions.tool_calls(session.id)[0]
+                durable = runner.sessions.messages(session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual(ledger["status"], "completed")
+        self.assertEqual(ledger["output"], stable.content)
+        self.assertEqual(ledger["metadata"], stable.metadata)
+        self.assertEqual(durable, [stable])
+
     async def test_max_time_is_an_end_to_end_deadline(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

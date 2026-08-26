@@ -735,13 +735,31 @@ class SessionStore:
         reason: str = "cancelled",
         message: Message | None = None,
     ) -> None:
+        metadata_json = json_dumps({"cancelled": True})
         with self._lock, self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """UPDATE tool_calls SET
                     output=?,is_error=1,status='cancelled',completed_at=?,metadata_json=?
-                WHERE session_id=? AND tool_call_id=?""",
-                (reason, utc_now(), json_dumps({"cancelled": True}), session_id, call_id),
+                WHERE session_id=? AND tool_call_id=? AND status='running'""",
+                (reason, utc_now(), metadata_json, session_id, call_id),
             )
+            if cursor.rowcount == 0:
+                existing = self._connection.execute(
+                    """SELECT output,is_error,status,metadata_json
+                    FROM tool_calls WHERE session_id=? AND tool_call_id=?""",
+                    (session_id, call_id),
+                ).fetchone()
+                if existing is None:
+                    raise SessionError(f"Tool call {call_id!r} does not exist")
+                if not (
+                    existing["output"] == reason
+                    and existing["is_error"] == 1
+                    and existing["status"] == "cancelled"
+                    and existing["metadata_json"] == metadata_json
+                ):
+                    raise SessionError(
+                        f"Tool call {call_id!r} is terminal and cannot be overwritten"
+                    )
             if message is not None:
                 self._append_message_locked(session_id, message)
 
@@ -803,8 +821,12 @@ class SessionStore:
 
     def add_usage(self, session_id: str, usage: Usage) -> Usage:
         with self._lock, self._connection:
-            self._connection.execute(
-                """UPDATE usage SET
+            self._add_usage_locked(session_id, usage)
+        return self.usage(session_id)
+
+    def _add_usage_locked(self, session_id: str, usage: Usage) -> None:
+        cursor = self._connection.execute(
+            """UPDATE usage SET
                 input_tokens=input_tokens+?, output_tokens=output_tokens+?,
                 cached_input_tokens=cached_input_tokens+?, cache_write_tokens=cache_write_tokens+?,
                 reasoning_tokens=reasoning_tokens+?, requests=requests+?, cost_usd=cost_usd+?,
@@ -814,23 +836,106 @@ class SessionStore:
                 application_cache_saved_tokens=application_cache_saved_tokens+?,
                 application_cache_saved_cost_usd=application_cache_saved_cost_usd+?
                 WHERE session_id=?""",
-                (
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cached_input_tokens,
-                    usage.cache_write_tokens,
-                    usage.reasoning_tokens,
-                    usage.requests,
-                    usage.cost_usd,
-                    usage.cache_savings_usd,
-                    usage.application_cache_hits,
-                    usage.application_cache_misses,
-                    usage.application_cache_saved_tokens,
-                    usage.application_cache_saved_cost_usd,
-                    session_id,
-                ),
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens,
+                usage.cache_write_tokens,
+                usage.reasoning_tokens,
+                usage.requests,
+                usage.cost_usd,
+                usage.cache_savings_usd,
+                usage.application_cache_hits,
+                usage.application_cache_misses,
+                usage.application_cache_saved_tokens,
+                usage.application_cache_saved_cost_usd,
+                session_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise SessionError(f"Unknown session: {session_id}")
+
+    def put_pending_compaction_summary(
+        self,
+        session_id: str,
+        key: str,
+        value: dict[str, Any],
+    ) -> None:
+        """Persist a provider summary before its usage is settled."""
+
+        pending = {**value, "usage_settled": False}
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """INSERT INTO key_values(session_id,key,value_json) VALUES(?,?,?)
+                ON CONFLICT(session_id,key) DO NOTHING""",
+                (session_id, key, json_dumps(pending)),
             )
-        return self.usage(session_id)
+            if cursor.rowcount:
+                return
+            row = self._connection.execute(
+                "SELECT value_json FROM key_values WHERE session_id=? AND key=?",
+                (session_id, key),
+            ).fetchone()
+            existing = json.loads(row["value_json"]) if row is not None else None
+            if not isinstance(existing, dict):
+                raise SessionError(f"Compaction summary {key!r} has invalid durable state")
+            comparable = dict(existing)
+            comparable.pop("usage_settled", None)
+            if comparable != value:
+                raise SessionError(f"Compaction summary {key!r} cannot be overwritten")
+
+    def get_compaction_summary(
+        self,
+        session_id: str,
+        key: str,
+    ) -> dict[str, Any] | None:
+        value = self.get_value(session_id, key)
+        return value if isinstance(value, dict) else None
+
+    def settle_compaction_summary_usage(
+        self,
+        session_id: str,
+        key: str,
+    ) -> tuple[dict[str, Any], Usage, bool]:
+        """Atomically charge pending summary usage exactly once."""
+
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT value_json FROM key_values WHERE session_id=? AND key=?",
+                (session_id, key),
+            ).fetchone()
+            if row is None:
+                raise SessionError(f"Compaction summary {key!r} does not exist")
+            value = json.loads(row["value_json"])
+            if not isinstance(value, dict):
+                raise SessionError(f"Compaction summary {key!r} has invalid durable state")
+            usage = Usage.from_dict(value.get("usage"))
+            if value.get("usage_settled") is True:
+                return value, usage, False
+            original_json = row["value_json"]
+            value["usage_settled"] = True
+            cursor = self._connection.execute(
+                """UPDATE key_values SET value_json=?
+                WHERE session_id=? AND key=? AND value_json=?""",
+                (json_dumps(value), session_id, key, original_json),
+            )
+            if cursor.rowcount == 0:
+                current = self._connection.execute(
+                    "SELECT value_json FROM key_values WHERE session_id=? AND key=?",
+                    (session_id, key),
+                ).fetchone()
+                current_value = (
+                    json.loads(current["value_json"]) if current is not None else None
+                )
+                if isinstance(current_value, dict) and current_value.get(
+                    "usage_settled"
+                ) is True:
+                    return current_value, Usage.from_dict(current_value.get("usage")), False
+                raise SessionError(
+                    f"Compaction summary {key!r} changed during usage settlement"
+                )
+            self._add_usage_locked(session_id, usage)
+            return value, usage, True
 
     def usage(self, session_id: str) -> Usage:
         with self._lock:

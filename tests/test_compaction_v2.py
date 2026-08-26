@@ -1023,6 +1023,8 @@ class StructuredCompactionTests(unittest.TestCase):
         self.assertLess(retry.message_target_tokens, first.message_target_tokens)
         self.assertEqual(anthropic.provider_framing_tokens, 768)
         self.assertEqual(fallback_routes.provider_framing_tokens, 1_024)
+        self.assertLess(first.target_bytes, first.trigger_bytes)
+        self.assertLess(first.trigger_bytes, first.hard_bytes)
 
         continuation = Message(
             role=Role.ASSISTANT,
@@ -1038,6 +1040,43 @@ class StructuredCompactionTests(unittest.TestCase):
         self.assertLess(
             with_continuation.message_target_tokens,
             first.message_target_tokens,
+        )
+
+    def test_request_byte_estimate_includes_the_complete_multibyte_provider_view(self):
+        call = ToolCall(
+            id="multibyte",
+            name="write_file",
+            arguments={"content": "🙂" * 200},
+        )
+        messages = [
+            Message(
+                role=Role.ASSISTANT,
+                content="界" * 200,
+                tool_calls=[call],
+                metadata={"continuation_state": {"items": ["🚀" * 200]}},
+            ),
+            Message(
+                role=Role.TOOL,
+                content="é" * 200,
+                tool_call_id=call.id,
+                tool_name=call.name,
+            ),
+        ]
+        schemas = [
+            {
+                "name": "write_file",
+                "description": "工具" * 200,
+                "parameters": {"type": "object"},
+            }
+        ]
+        system = "制度" * 200
+        complete = estimate_request_bytes(system, messages, schemas)
+
+        self.assertGreater(complete, estimate_request_bytes("", messages, schemas))
+        self.assertGreater(complete, estimate_request_bytes(system, messages, []))
+        self.assertGreater(
+            complete,
+            estimate_request_bytes(system, [Message(role=Role.USER, content="plain")], schemas),
         )
 
     def test_deterministic_incremental_evidence_preserves_parent_state(self):
@@ -1725,7 +1764,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             list(dict.fromkeys(actual_models)),
         )
 
-    async def test_single_fitting_request_bypasses_compaction_trigger(self):
+    async def test_single_fitting_multibyte_request_bypasses_byte_compaction_trigger(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(
@@ -1743,7 +1782,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             session = runner.sessions.create_session(
                 workspace=root, provider="mock", model="deterministic"
             )
-            message = Message(role=Role.USER, content="large-request " * 800)
+            message = Message(role=Role.USER, content="🙂" * 2_500)
             runner.sessions.append_message(session.id, message)
             prompt_context = PromptContext(stable="system")
             context_budget = ContextBudget.calculate(
@@ -1776,9 +1815,16 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+        self.assertLess(
+            context_budget.estimated_total([message]), context_budget.trigger_tokens
+        )
         self.assertGreaterEqual(
-            context_budget.estimated_total([message]),
-            context_budget.trigger_tokens,
+            estimate_request_bytes(prompt_context.text, [message], []),
+            context_budget.trigger_bytes,
+        )
+        self.assertLessEqual(
+            estimate_request_bytes(prompt_context.text, [message], []),
+            context_budget.hard_bytes,
         )
         self.assertLessEqual(
             context_budget.estimated_total([message])
@@ -1789,6 +1835,129 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(prepared.compacted)
         self.assertEqual(prepared.request.messages, [message])
         self.assertEqual(artifacts, [])
+
+    async def test_uncompacted_multibyte_request_over_hard_byte_limit_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "max_input_tokens": 6_000,
+                    "max_output_tokens": 1_000,
+                    "compact_at_ratio": 0.5,
+                    "compaction_target_ratio": 0.4,
+                    "compaction_safety_margin_tokens": 128,
+                    "compaction_provider_framing_tokens": 64,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            message = Message(role=Role.USER, content="🙂" * 5_000)
+            runner.sessions.append_message(session.id, message)
+            prompt_context = PromptContext(stable="system")
+            context_budget = ContextBudget.calculate(
+                config.agent,
+                system=prompt_context.text,
+                tools=[],
+                messages=[message],
+                provider="mock",
+            )
+
+            async def usage_sink(_usage: Usage) -> None:
+                return None
+
+            try:
+                with self.assertRaisesRegex(BudgetExceeded, "bytes"):
+                    await runner._prepare_provider_request(
+                        prompt_context=prompt_context,
+                        messages=[message],
+                        schemas=[],
+                        final_turn=False,
+                        verification_finalization_pending=False,
+                        adaptive_cache=False,
+                        conversation_cache=True,
+                        usage_sink=usage_sink,
+                        cancel=asyncio.Event(),
+                        session_id=session.id,
+                        run_id="single-request-byte-hard-gate",
+                        last_prune_signature=None,
+                    )
+            finally:
+                await runner.close()
+
+        self.assertLess(
+            context_budget.estimated_total([message]), context_budget.trigger_tokens
+        )
+        self.assertGreater(
+            estimate_request_bytes(prompt_context.text, [message], []),
+            context_budget.hard_bytes,
+        )
+
+    async def test_multibyte_history_triggers_compaction_before_token_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "max_input_tokens": 6_000,
+                    "max_output_tokens": 1_000,
+                    "compact_at_ratio": 0.5,
+                    "compaction_target_ratio": 0.4,
+                    "compaction_safety_margin_tokens": 128,
+                    "compaction_provider_framing_tokens": 64,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            messages = [
+                Message(role=Role.USER, content="🙂" * 2_500),
+                Message(role=Role.ASSISTANT, content="old answer"),
+                Message(role=Role.USER, content="current request"),
+            ]
+            for message in messages:
+                runner.sessions.append_message(session.id, message)
+            prompt_context = PromptContext(stable="system")
+            context_budget = ContextBudget.calculate(
+                config.agent,
+                system=prompt_context.text,
+                tools=[],
+                messages=messages,
+                provider="mock",
+            )
+
+            async def usage_sink(_usage: Usage) -> None:
+                return None
+
+            try:
+                prepared = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=messages,
+                    schemas=[],
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="byte-trigger",
+                    last_prune_signature=None,
+                )
+            finally:
+                await runner.close()
+
+        self.assertLess(
+            context_budget.estimated_total(messages), context_budget.trigger_tokens
+        )
+        self.assertGreaterEqual(
+            estimate_request_bytes(prompt_context.text, messages, []),
+            context_budget.trigger_bytes,
+        )
+        self.assertTrue(prepared.compacted)
 
     async def test_compaction_recomputes_reserve_after_old_continuation_is_removed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2789,6 +2958,9 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
                 budget.add_usage(usage)
 
+            async def first_settled_usage_sink(usage: Usage) -> None:
+                budget.add_usage(usage)
+
             base_arguments = {
                 "prompt_context": prompt_context,
                 "messages": runner.sessions.messages(session.id),
@@ -2807,6 +2979,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                     await runner._prepare_provider_request(
                         **base_arguments,
                         usage_sink=first_usage_sink,
+                        settled_usage_sink=first_settled_usage_sink,
                     )
                 self.assertEqual(runner.sessions.compaction_artifacts(session.id), [])
 
@@ -2820,9 +2993,13 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                     )
                     resumed_budget.add_usage(usage)
 
+                async def resumed_settled_usage_sink(usage: Usage) -> None:
+                    resumed_budget.add_usage(usage)
+
                 prepared = await runner._prepare_provider_request(
                     **base_arguments,
                     usage_sink=resumed_usage_sink,
+                    settled_usage_sink=resumed_settled_usage_sink,
                 )
                 artifacts = runner.sessions.compaction_artifacts(session.id)
                 usage = runner.sessions.usage(session.id)
@@ -2915,21 +3092,21 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "run_id": "cache-cancel",
                 "last_prune_signature": None,
             }
-            original_set_value = runner.sessions.set_value
+            original_put_pending = runner.sessions.put_pending_compaction_summary
             cache_written = asyncio.Event()
             release_write = threading.Event()
             loop = asyncio.get_running_loop()
 
-            def blocking_set_value(session_id, key, value):
-                original_set_value(session_id, key, value)
+            def blocking_put_pending(session_id, key, value):
+                original_put_pending(session_id, key, value)
                 loop.call_soon_threadsafe(cache_written.set)
                 release_write.wait(timeout=3)
 
             try:
                 with patch.object(
                     runner.sessions,
-                    "set_value",
-                    side_effect=blocking_set_value,
+                    "put_pending_compaction_summary",
+                    side_effect=blocking_put_pending,
                 ):
                     task = asyncio.create_task(
                         runner._prepare_provider_request(**arguments)
@@ -2958,6 +3135,107 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             final_usage.application_cache_saved_tokens,
             original_usage.total_tokens,
         )
+
+    async def test_pending_summary_usage_settles_once_after_settlement_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"deterministic_compaction": False},
+                cache={"response_cache_enabled": False},
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            for index in range(14):
+                for message in _tool_cycle(
+                    f"settlement-failure-{index}",
+                    content=(f"history-{index} " * 100),
+                ):
+                    runner.sessions.append_message(session.id, message)
+            runner.sessions.append_message(
+                session.id, Message(role=Role.USER, content="current request")
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider_calls = 0
+            original_usage = Usage(
+                input_tokens=50,
+                output_tokens=10,
+                requests=1,
+                cost_usd=0.2,
+            )
+
+            def handler(request: ProviderRequest, _call: int) -> ModelResponse:
+                nonlocal provider_calls
+                provider_calls += 1
+                return ModelResponse(
+                    text=_echo_evidence(request.messages[-1].content),
+                    model="resolved-summary-model",
+                    usage=original_usage,
+                )
+
+            provider.handler = handler
+            prompt_context = await asyncio.to_thread(
+                runner.context_builder.build, query="current request"
+            )
+
+            async def usage_sink(usage: Usage) -> None:
+                await asyncio.to_thread(runner.sessions.add_usage, session.id, usage)
+
+            arguments = {
+                "prompt_context": prompt_context,
+                "messages": runner.sessions.messages(session.id),
+                "schemas": runner.tools.schemas(),
+                "final_turn": False,
+                "verification_finalization_pending": False,
+                "adaptive_cache": False,
+                "conversation_cache": True,
+                "usage_sink": usage_sink,
+                "cancel": asyncio.Event(),
+                "session_id": session.id,
+                "run_id": "settlement-failure",
+                "last_prune_signature": None,
+            }
+            original_settle = runner.sessions.settle_compaction_summary_usage
+            settlement_calls = 0
+
+            def fail_first_settlement(session_id, key):
+                nonlocal settlement_calls
+                settlement_calls += 1
+                if settlement_calls == 1:
+                    raise SessionError("injected settlement failure")
+                return original_settle(session_id, key)
+
+            try:
+                with patch.object(
+                    runner.sessions,
+                    "settle_compaction_summary_usage",
+                    side_effect=fail_first_settlement,
+                ), self.assertRaisesRegex(SessionError, "settle"):
+                    await runner._prepare_provider_request(**arguments)
+
+                pending_usage = runner.sessions.usage(session.id)
+                self.assertEqual(pending_usage.total_tokens, 0)
+                self.assertEqual(runner.sessions.compaction_artifacts(session.id), [])
+
+                prepared = await runner._prepare_provider_request(**arguments)
+                final_usage = runner.sessions.usage(session.id)
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertTrue(prepared.compacted)
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(settlement_calls, 1)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(final_usage.input_tokens, original_usage.input_tokens)
+        self.assertEqual(final_usage.output_tokens, original_usage.output_tokens)
+        self.assertEqual(final_usage.requests, original_usage.requests)
+        self.assertEqual(final_usage.cost_usd, original_usage.cost_usd)
+        self.assertEqual(final_usage.application_cache_hits, 1)
 
     async def test_artifact_reuse_requires_the_same_retained_provider_payload(self):
         with tempfile.TemporaryDirectory() as td:
