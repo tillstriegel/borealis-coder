@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from ..config import AgentConfig
@@ -106,6 +107,7 @@ class ContextBudget:
         tools: list[dict],  # type: ignore[type-arg]
         messages: list[Message],
         provider: str = "",
+        providers: Iterable[str] = (),
         overflow_retry_count: int = 0,
     ) -> ContextBudget:
         system_tokens = estimate_tokens(system)
@@ -116,8 +118,14 @@ class ContextBudget:
             if message.metadata.get("continuation_state")
         )
         provider_framing = max(
-            config.compaction_provider_framing_tokens,
-            _PROVIDER_FRAMING_ALLOWANCE.get(provider, 0),
+            [
+                config.compaction_provider_framing_tokens,
+                _PROVIDER_FRAMING_ALLOWANCE.get(provider, 0),
+                *(
+                    _PROVIDER_FRAMING_ALLOWANCE.get(name, 0)
+                    for name in providers
+                ),
+            ]
         )
         dynamic_margin = config.compaction_safety_margin_tokens + (
             provider_framing * max(0, overflow_retry_count)

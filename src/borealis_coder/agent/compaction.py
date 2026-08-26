@@ -683,6 +683,19 @@ def extract_compaction_evidence(
         evidence.latest_verification.append(latest_git_state)
 
     if latest_plan is not None:
+        current_plan_steps = {
+            str(item.get("content") or item.get("step") or "").strip()
+            for item in latest_plan
+            if str(item.get("content") or item.get("step") or "").strip()
+        }
+        evidence.completed_work = [
+            item
+            for item in evidence.completed_work
+            if not (
+                item.startswith("[completed] ")
+                and item.removeprefix("[completed] ") in current_plan_steps
+            )
+        ]
         evidence.pending_work = [
             f"[{item.get('status', 'unknown')}] "
             f"{item.get('content') or item.get('step', '')}".strip()

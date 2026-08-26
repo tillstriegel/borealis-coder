@@ -262,6 +262,48 @@ class StructuredCompactionTests(unittest.TestCase):
             ["Verification: 12 passed, retry test failed."],
         )
 
+    def test_latest_plan_removes_inherited_completion_for_reopened_work(self):
+        reopened = ToolCall(
+            id="reopened-plan",
+            name="update_plan",
+            arguments={
+                "items": [
+                    {"content": "fix provider routing", "status": "in_progress"},
+                    {"content": "keep completed item", "status": "completed"},
+                ]
+            },
+        )
+        base = CompactionEvidence(
+            completed_work=[
+                "[completed] fix provider routing",
+                "[completed] keep completed item",
+                "Recorded successful write_file: src/provider.py",
+            ]
+        )
+
+        evidence = extract_compaction_evidence(
+            [
+                Message(role=Role.ASSISTANT, tool_calls=[reopened]),
+                Message(
+                    role=Role.TOOL,
+                    tool_call_id=reopened.id,
+                    tool_name=reopened.name,
+                    content="plan updated",
+                ),
+            ],
+            base=base,
+        )
+
+        self.assertNotIn("[completed] fix provider routing", evidence.completed_work)
+        self.assertIn("[in_progress] fix provider routing", evidence.pending_work)
+        self.assertEqual(
+            evidence.completed_work.count("[completed] keep completed item"), 1
+        )
+        self.assertIn(
+            "Recorded successful write_file: src/provider.py",
+            evidence.completed_work,
+        )
+
     def test_mutation_after_verification_marks_the_result_stale(self):
         write = ToolCall(
             id="write-after-verification",
@@ -807,11 +849,19 @@ class StructuredCompactionTests(unittest.TestCase):
             messages=messages,
             provider="anthropic",
         )
+        fallback_routes = ContextBudget.calculate(
+            config,
+            system="system",
+            tools=[],
+            messages=messages,
+            providers=("openai", "gemini"),
+        )
 
         self.assertEqual(first.reserved_output_tokens, config.max_output_tokens)
         self.assertLess(retry.target_tokens, first.target_tokens)
         self.assertLess(retry.message_target_tokens, first.message_target_tokens)
         self.assertEqual(anthropic.provider_framing_tokens, 768)
+        self.assertEqual(fallback_routes.provider_framing_tokens, 1_024)
 
     def test_deterministic_incremental_evidence_preserves_parent_state(self):
         write = ToolCall(
@@ -1213,6 +1263,8 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             fallback = runner.providers[1].provider
             assert isinstance(primary, MockProvider)
             assert isinstance(fallback, MockProvider)
+            primary.name = "openai"
+            fallback.name = "gemini"
             captured: list[ProviderRequest] = []
 
             def fail_primary(_request: ProviderRequest, _call: int) -> ModelResponse:
@@ -1263,6 +1315,10 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(used_route.name, "fallback")
         self.assertEqual(len(captured), 1)
         self.assertEqual(len(artifacts), 1)
+        self.assertEqual(
+            artifacts[0].metadata["context_budget"]["provider_framing_tokens"],
+            1_024,
+        )
         self.assertEqual(
             captured[0].metadata["compaction_artifact_id"], artifacts[0].id
         )
@@ -1424,11 +1480,12 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(artifacts), 2)
         self.assertEqual(artifacts[1].parent_artifact_id, artifacts[0].id)
 
-    async def test_incremental_evidence_invalidates_changed_pruned_prefix(self):
+    async def test_llm_incremental_evidence_invalidates_changed_pruned_prefix(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(
                 root,
+                agent={"deterministic_compaction": False},
                 context={"compact_tool_output_tokens": 10},
             )
             runner = await build_runner(root, config=config, interactive=False)
@@ -1466,6 +1523,20 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
 
             async def usage_sink(_usage: Usage) -> None:
                 return None
+
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            summary_prompts: list[str] = []
+
+            def handler(request: ProviderRequest, _call: int) -> ModelResponse:
+                if request.metadata.get("purpose") == "compaction_summary":
+                    summary_prompts.append(request.messages[-1].content)
+                    return ModelResponse(
+                        text=_echo_evidence(request.messages[-1].content)
+                    )
+                return ModelResponse(text="done")
+
+            provider.handler = handler
 
             try:
                 first = await runner._prepare_provider_request(
@@ -1517,9 +1588,12 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
-        self.assertIn("STALE FILE CONTENT", first.request.system)
-        self.assertNotIn("STALE FILE CONTENT", second.request.system)
-        self.assertIn("[superseded read:", second.request.system)
+        self.assertTrue(first.compacted)
+        self.assertTrue(second.compacted)
+        self.assertEqual(len(summary_prompts), 2)
+        self.assertIn("STALE FILE CONTENT", summary_prompts[0])
+        self.assertNotIn("STALE FILE CONTENT", summary_prompts[1])
+        self.assertIn("[superseded read:", summary_prompts[1])
         self.assertEqual(len(artifacts), 2)
         self.assertNotEqual(
             artifacts[0].metadata["provider_source_hash"],
@@ -1744,6 +1818,96 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             artifacts[1].metadata["provider_messages"],
             [message.to_dict() for message in second_retained],
         )
+
+    async def test_artifact_reuse_tracks_model_affecting_provider_configuration(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root)
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            source = [Message(role=Role.USER, content="durable source")]
+            runner.sessions.append_message(session.id, source[0])
+            artifact = Message(
+                role=Role.SYSTEM,
+                content="bounded summary",
+                metadata={
+                    "compacted": True,
+                    "artifact_version": 2,
+                    "strategy": "deterministic",
+                    "source_hash": hashlib.sha256(
+                        json_dumps([message.to_dict() for message in source]).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest(),
+                    "source_message_ids": [source[0].id],
+                    "source_bundles": 1,
+                    "retained_bundles": 1,
+                    "compacted_bundles": 1,
+                    "evidence": {},
+                    "authoritative_evidence": {},
+                },
+            )
+            retained = [Message(role=Role.USER, content="retained")]
+            context_budget = ContextBudget.calculate(
+                config.agent,
+                system="system",
+                tools=[],
+                messages=retained,
+                provider="mock",
+            )
+            provider_config = runner.providers[0].provider.config
+            provider_config.headers = {"Authorization": "secret-header"}
+            provider_config.extra_body = {"api_token": "secret-body"}
+
+            async def record() -> bool:
+                _, reused = await runner._record_or_reuse_compaction_artifact(
+                    session_id=session.id,
+                    source_messages=source,
+                    artifact_message=artifact,
+                    retained_messages=retained,
+                    context_budget=context_budget,
+                    summary_usage=Usage(),
+                    base_system="system",
+                    base_system_blocks=[{"text": "system", "cacheable": True}],
+                    tools=[],
+                )
+                return reused
+
+            try:
+                reuse_results = [await record()]
+                provider_config.api_style = "chat"
+                reuse_results.append(await record())
+                provider_config.model_fallbacks = ["fallback-model"]
+                reuse_results.append(await record())
+                provider_config.provider_preferences = {"order": ["provider-a"]}
+                reuse_results.append(await record())
+                provider_config.extra_body = {
+                    "api_token": "secret-body",
+                    "temperature": 0.25,
+                }
+                reuse_results.append(await record())
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertEqual(reuse_results, [False] * 5)
+        self.assertEqual(len({item.config_fingerprint for item in artifacts}), 5)
+        self.assertEqual(
+            len(
+                {
+                    item.metadata["provider_context"][
+                        "provider_config_fingerprint"
+                    ]
+                    for item in artifacts
+                }
+            ),
+            5,
+        )
+        serialized = json.dumps([item.to_dict() for item in artifacts])
+        self.assertNotIn("secret-header", serialized)
+        self.assertNotIn("secret-body", serialized)
 
     async def test_artifact_reuse_requires_the_same_provider_context_and_budget(self):
         with tempfile.TemporaryDirectory() as td:

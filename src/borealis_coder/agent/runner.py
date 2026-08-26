@@ -1059,6 +1059,7 @@ class AgentRunner:
 
         request_messages, metrics = prune_provider_messages(messages)
         validate_tool_call_order(request_messages)
+        budget_providers = tuple(route.provider.name for route in self.providers)
         raw_estimated = estimate_request_tokens(turn_system, messages, schemas)
         estimated = estimate_request_tokens(turn_system, request_messages, schemas)
         context_budget = ContextBudget.calculate(
@@ -1066,7 +1067,7 @@ class AgentRunner:
             system=turn_system,
             tools=schemas,
             messages=request_messages,
-            provider=self.providers[0].provider.name,
+            providers=budget_providers,
             overflow_retry_count=overflow_retry_count,
         )
         compaction_reason: str | None = None
@@ -1113,7 +1114,7 @@ class AgentRunner:
                 system=turn_system,
                 tools=schemas,
                 messages=[],
-                provider=self.providers[0].provider.name,
+                providers=budget_providers,
                 overflow_retry_count=overflow_retry_count,
             )
             provider_message_target = compaction_budget.message_target_tokens
@@ -1300,7 +1301,7 @@ class AgentRunner:
                         system=turn_system,
                         tools=schemas,
                         messages=retained,
-                        provider=self.providers[0].provider.name,
+                        providers=budget_providers,
                         overflow_retry_count=overflow_retry_count,
                     )
                     compacted_tokens = estimate_request_tokens(
@@ -1433,7 +1434,8 @@ class AgentRunner:
                         ]
                     ]
                     if (
-                        incremental_parent is not None
+                        parent_is_prefix
+                        and incremental_parent is not None
                         and source_ids[: len(incremental_parent.source_message_ids)]
                         == incremental_parent.source_message_ids
                     ):
@@ -1501,7 +1503,7 @@ class AgentRunner:
                     system=turn_system,
                     tools=schemas,
                     messages=request_messages,
-                    provider=self.providers[0].provider.name,
+                    providers=budget_providers,
                     overflow_retry_count=overflow_retry_count,
                 )
                 tool_tokens = sum(
@@ -1820,6 +1822,9 @@ class AgentRunner:
                 "provider": route.provider.name,
                 "provider_route": route.name,
                 "model": route.model,
+                "provider_config_fingerprint": (
+                    self._provider_request_config_fingerprint(route)
+                ),
                 "system": f"{base_system}\n\n{summary_text}",
                 "system_blocks": system_blocks,
                 "messages": provider_messages,
@@ -1841,6 +1846,24 @@ class AgentRunner:
             }
             for route in self.providers
         ]
+
+    @staticmethod
+    def _provider_request_config_fingerprint(route: ProviderRoute) -> str:
+        """Hash provider settings that can change the model-facing request."""
+
+        config = route.provider.config
+        payload = {
+            "type": config.type,
+            "base_url": config.base_url,
+            "api_style": getattr(route.provider, "api_style", config.api_style),
+            "headers": config.headers,
+            "site_url": config.site_url,
+            "app_name": config.app_name,
+            "model_fallbacks": config.model_fallbacks,
+            "provider_preferences": config.provider_preferences,
+            "extra_body": config.extra_body,
+        }
+        return _stable_payload_hash(payload)
 
     def _compaction_config_fingerprint(
         self,
@@ -1864,6 +1887,9 @@ class AgentRunner:
                         "provider": route.provider.name,
                         "provider_route": route.name,
                         "model": route.model,
+                        "provider_config_fingerprint": (
+                            self._provider_request_config_fingerprint(route)
+                        ),
                     }
                     for route in self.providers
                 ],
