@@ -18,12 +18,19 @@ _PROVIDER_FRAMING_ALLOWANCE = {
     "openrouter": 768,
     "openai_compatible": 768,
 }
+_RECOVERY_CONTINUATION_PROMPT = "continue"
+
+
+def is_recovery_continuation_prompt(prompt: str) -> bool:
+    """Return whether a user prompt is the bare documented recovery command."""
+
+    return prompt.strip().casefold() == _RECOVERY_CONTINUATION_PROMPT
 
 
 def max_turns_recovery_message(max_turns: int) -> str:
     return (
         f"Run incomplete: maximum {max_turns} model turns reached. "
-        "Session preserved; send 'continue' to resume."
+        f"Session preserved; send '{_RECOVERY_CONTINUATION_PROMPT}' to resume."
     )
 
 

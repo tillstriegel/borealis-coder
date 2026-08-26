@@ -75,7 +75,7 @@ def _echo_evidence_with_transcript(prompt: str) -> str:
     marker = "<untrusted_conversation_transcript>\n"
     start = prompt.index(marker) + len(marker)
     end = prompt.index("\n</untrusted_conversation_transcript>", start)
-    transcript = html.unescape(prompt[start:end])
+    transcript = prompt[start:end]
     evidence["historical_excerpts"] = transcript.splitlines()
     return json.dumps(evidence, ensure_ascii=False)
 
@@ -238,6 +238,51 @@ class ConversationBundleTests(unittest.TestCase):
 
 
 class StructuredCompactionTests(unittest.TestCase):
+    def test_repeated_recovery_continuations_do_not_replace_tight_objective(self):
+        objective = "Implement the durable original objective across every resume."
+        messages = [Message(role=Role.USER, content=objective)]
+        for index in range(4):
+            messages.extend(
+                [
+                    Message(
+                        role=Role.ASSISTANT,
+                        content=(f"progress-{index} " * 200),
+                    ),
+                    Message(
+                        role=Role.USER,
+                        content="continue",
+                        metadata=(
+                            {"recovery_continuation": {"prompt": "continue"}}
+                            if index != 1
+                            else {}
+                        ),
+                    ),
+                ]
+            )
+
+        compacted = compact_messages(
+            messages,
+            keep_recent_bundles=1,
+            summary_tokens=300,
+            force=True,
+        )
+
+        evidence = compacted[0].metadata["evidence"]
+        self.assertEqual(evidence["current_objective"], [objective])
+        self.assertEqual(evidence["user_constraints"], [objective])
+        self.assertEqual(
+            evidence["historical_excerpts"],
+            ["Omitted due to the compaction budget."],
+        )
+
+    def test_sole_initial_continue_remains_an_objective_fallback(self):
+        evidence = extract_compaction_evidence(
+            [Message(role=Role.USER, content="continue")]
+        )
+
+        self.assertEqual(evidence.current_objective, ["continue"])
+        self.assertEqual(evidence.user_constraints, ["continue"])
+
     def test_structured_plan_and_verification_are_prioritized(self):
         plan = ToolCall(
             id="plan",
@@ -1095,6 +1140,35 @@ class StructuredCompactionTests(unittest.TestCase):
 
 
 class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_escaped_excerpt_is_decoded_once_and_keeps_llm_strategy(self):
+        source = "literal <tag> > & entity &lt;"
+        messages = [
+            Message(role=Role.USER, content=source),
+            Message(role=Role.ASSISTANT, content="historical response"),
+            Message(role=Role.USER, content="current request"),
+        ]
+        prompts: list[str] = []
+
+        async def exact_copy(prompt: str) -> str:
+            prompts.append(prompt)
+            return _echo_evidence_with_transcript(prompt)
+
+        compacted = await compact_messages_with_summary(
+            messages,
+            exact_copy,
+            keep_recent_bundles=1,
+            force=True,
+        )
+
+        escaped_source = "literal &lt;tag&gt; &gt; &amp; entity &amp;lt;"
+        self.assertEqual(compacted[0].metadata["strategy"], "llm")
+        self.assertNotIn("fallback_reason", compacted[0].metadata)
+        self.assertIn(escaped_source, prompts[0])
+        self.assertIn(escaped_source, compacted[0].content)
+        decoded_once = html.unescape(compacted[0].content)
+        self.assertIn(source, decoded_once)
+        self.assertNotIn("literal <tag> > & entity <", decoded_once)
+
     async def test_hallucinated_file_falls_back_to_authoritative_deterministic_artifact(self):
         messages = [
             Message(role=Role.USER if index % 2 == 0 else Role.ASSISTANT, content=f"m{index}")
@@ -1393,6 +1467,126 @@ class OverflowProvider(Provider):
 
 
 class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_session_bare_continue_has_recovery_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root,
+                config=make_config(root),
+                interactive=False,
+            )
+            session = runner.sessions.create_session(
+                workspace=root,
+                provider="mock",
+                model="deterministic",
+            )
+            runner.sessions.append_message(
+                session.id,
+                Message(role=Role.USER, content="Original request"),
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.handler = lambda _request, _call: ModelResponse(text="done")
+            try:
+                await runner.run("continue", session_id=session.id)
+                user_messages = [
+                    message
+                    for message in runner.sessions.messages(session.id)
+                    if message.role == Role.USER
+                ]
+            finally:
+                await runner.close()
+
+        self.assertEqual(
+            user_messages[-1].metadata["recovery_continuation"],
+            {"prompt": "continue"},
+        )
+
+    async def test_artifact_records_provider_resolved_summarizer_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            requested_model = "requested-summary-model"
+            routed_models = ["provider-route-a", "provider-route-b"]
+            config = make_config(
+                root,
+                agent={
+                    "deterministic_compaction": False,
+                    "small_model": requested_model,
+                    "compaction_summarizer_input_tokens": 2_000,
+                    "compaction_summarizer_total_input_tokens": 8_000,
+                },
+                context={"compact_tool_output_tokens": 10},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root,
+                provider="mock",
+                model="deterministic",
+            )
+            for index in range(40):
+                for message in _tool_cycle(
+                    f"model-lineage-{index}",
+                    content=(f"history-{index} " * 100),
+                ):
+                    runner.sessions.append_message(session.id, message)
+            runner.sessions.append_message(
+                session.id,
+                Message(role=Role.USER, content="Current request"),
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            actual_models: list[str] = []
+
+            def handler(request: ProviderRequest, _call: int) -> ModelResponse:
+                model = routed_models[len(actual_models) % len(routed_models)]
+                actual_models.append(model)
+                return ModelResponse(
+                    text=_echo_evidence(request.messages[-1].content),
+                    model=model,
+                    usage=Usage(requests=1),
+                )
+
+            provider.handler = handler
+            prompt_context = await asyncio.to_thread(
+                runner.context_builder.build,
+                query="Current request",
+            )
+
+            async def usage_sink(_usage: Usage) -> None:
+                return None
+
+            try:
+                prepared = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=runner.sessions.messages(session.id),
+                    schemas=runner.tools.schemas(),
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="model-lineage",
+                    last_prune_signature=None,
+                )
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+            finally:
+                await runner.close()
+
+        self.assertTrue(prepared.compacted)
+        self.assertEqual(len(artifacts), 1)
+        self.assertGreater(len(actual_models), 1)
+        self.assertEqual(artifacts[0].model, actual_models[-1])
+        self.assertEqual(
+            artifacts[0].metadata["summarizer_requested_model"],
+            requested_model,
+        )
+        self.assertEqual(
+            artifacts[0].metadata["summarizer_models"],
+            list(dict.fromkeys(actual_models)),
+        )
+
     async def test_single_fitting_request_bypasses_compaction_trigger(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

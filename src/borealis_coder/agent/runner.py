@@ -47,14 +47,20 @@ from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import MutationScope, ToolContext, ToolRegistry, VerificationPlanner
 from ..util import estimate_tokens, json_dumps, monotonic_ms, new_id, truncate_text
-from .budget import Budget, ContextBudget, estimate_request_tokens, max_turns_recovery_message
+from .budget import (
+    Budget,
+    ContextBudget,
+    estimate_request_tokens,
+    is_recovery_continuation_prompt,
+    max_turns_recovery_message,
+)
 from .compaction import (
     COMPACTION_RESPONSE_SCHEMA,
     COMPACTION_SUMMARIZER_SYSTEM,
     CompactionError,
     CompactionEvidence,
     CompactionSizeError,
-    Summarizer,
+    SummarizerResult,
     compact_messages,
     compact_messages_v1,
     compact_messages_with_summary,
@@ -315,6 +321,7 @@ class AgentRunner:
         if not prompt:
             raise ValueError("Prompt cannot be empty")
         route = self.providers[0]
+        existing_session = session_id is not None
         if session_id is None:
             session = await asyncio.to_thread(
                 self.sessions.create_session,
@@ -347,6 +354,7 @@ class AgentRunner:
                         deadline_expired=deadline_expired,
                         user_message_id=user_message_id,
                         user_metadata=user_metadata,
+                        existing_session=existing_session,
                     )
                 )
                 try:
@@ -398,6 +406,7 @@ class AgentRunner:
         deadline_expired: asyncio.Event,
         user_message_id: str | None,
         user_metadata: dict[str, Any] | None,
+        existing_session: bool,
     ) -> AgentResult:
         cancel = asyncio.Event()
         self._cancel[session_id] = cancel
@@ -471,11 +480,14 @@ class AgentRunner:
                     repair,
                 )
         messages.extend(repairs)
+        durable_user_metadata = dict(user_metadata or {})
+        if existing_session and is_recovery_continuation_prompt(prompt):
+            durable_user_metadata["recovery_continuation"] = {"prompt": "continue"}
         user = Message(
             id=user_message_id or new_id("msg"),
             role=Role.USER,
             content=prompt,
-            metadata=dict(user_metadata or {}),
+            metadata=durable_user_metadata,
         )
         messages.append(user)
         await asyncio.to_thread(self.sessions.append_message, session_id, user)
@@ -1910,7 +1922,11 @@ class AgentRunner:
                 self.providers[0].name if requested_strategy == "llm" else None
             ),
             model=(
-                self.config.agent.small_model or self.providers[0].model
+                str(
+                    artifact_message.metadata.get("summarizer_model")
+                    or self.config.agent.small_model
+                    or self.providers[0].model
+                )
                 if requested_strategy == "llm"
                 else None
             ),
@@ -1952,6 +1968,17 @@ class AgentRunner:
                 ),
                 "fallback_reason": artifact_message.metadata.get("fallback_reason"),
                 "requested_strategy": requested_strategy,
+                "summarizer_requested_model": artifact_message.metadata.get(
+                    "summarizer_requested_model",
+                    (
+                        self.config.agent.small_model or self.providers[0].model
+                        if requested_strategy == "llm"
+                        else None
+                    ),
+                ),
+                "summarizer_models": artifact_message.metadata.get(
+                    "summarizer_models", []
+                ),
                 "context_budget": asdict(context_budget),
             },
         )
@@ -2364,7 +2391,7 @@ class AgentRunner:
         usage_sink: Callable[[Usage], Awaitable[None]],
         cancel: asyncio.Event,
         usage_collector: Usage | None = None,
-    ) -> Summarizer | None:
+    ) -> Callable[[str], Awaitable[SummarizerResult]] | None:
         """Build an LLM-backed compaction summarizer from the primary route.
 
         Uses the small model when configured (cheap summarization), falling back
@@ -2375,7 +2402,7 @@ class AgentRunner:
             return None
         route = self.providers[0]
 
-        async def summarize(transcript: str) -> str:
+        async def summarize(transcript: str) -> SummarizerResult:
             request = ProviderRequest(
                 model=self.config.agent.small_model or route.model,
                 system=COMPACTION_SUMMARIZER_SYSTEM,
@@ -2415,7 +2442,11 @@ class AgentRunner:
             await usage_sink(response.usage)
             if cancel.is_set():
                 raise Cancelled("Run cancelled")
-            return response.text
+            return SummarizerResult(
+                text=response.text,
+                model=response.model or request.model,
+                requested_model=request.model,
+            )
 
         return summarize
 
