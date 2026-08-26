@@ -21,6 +21,7 @@ from borealis_coder.errors import (
 from borealis_coder.models import (
     ContinuationState,
     Effect,
+    Message,
     ModelResponse,
     ProviderRequest,
     Role,
@@ -1947,8 +1948,92 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(repair.tool_call_id, "repeated-2")
                 self.assertTrue(repair.is_error)
                 self.assertTrue(repair.metadata["cancelled"])
+                self.assertTrue(repair.metadata["not_started"])
                 self.assertTrue(repair.metadata["abandoned"])
+                self.assertNotIn(
+                    "repeated-2",
+                    {
+                        call["tool_call_id"]
+                        for call in runner.sessions.tool_calls(first.session_id)
+                    },
+                )
                 self.assertEqual(after_resume[abandoned_index + 2].content, "continue")
+            finally:
+                await runner.close()
+
+    async def test_resume_recovers_unknown_mutation_outcome_and_verifies(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={"provider": "mock", "auto_verify": True},
+            )
+            crashed_runner = await build_runner(root, config=config, interactive=False)
+            session = crashed_runner.sessions.create_session(
+                workspace=root,
+                provider="mock",
+                model="deterministic",
+            )
+            call = ToolCall(
+                id="crashed-write",
+                name="write_file",
+                arguments={
+                    "path": "result.txt",
+                    "content": "mutated before crash\n",
+                    "expected_sha256": None,
+                },
+            )
+            original = Message(
+                id="original-assistant",
+                role=Role.ASSISTANT,
+                tool_calls=[call],
+            )
+            crashed_runner.sessions.append_message(session.id, original)
+            crashed_runner.sessions.start_tool_call(
+                session.id,
+                "crashed-run",
+                call.id,
+                call.name,
+                call.arguments,
+            )
+            (root / "result.txt").write_text("mutated before crash\n", encoding="utf-8")
+            await crashed_runner.close()
+
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(text="Resume candidate."),
+                ModelResponse(text="Resume finalizer."),
+            )
+
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=VerificationReport(ok=True),
+                ) as verify:
+                    resumed = await runner.run("resume", session_id=session.id)
+
+                messages = runner.sessions.messages(session.id)
+                self.assertEqual(messages[0], original)
+                repair = messages[1]
+                self.assertEqual(repair.role, Role.TOOL)
+                self.assertEqual(repair.tool_call_id, call.id)
+                self.assertTrue(repair.is_error)
+                self.assertTrue(repair.metadata["unknown_outcome"])
+                self.assertTrue(repair.metadata["execution_started"])
+                self.assertEqual(
+                    repair.metadata["workspace_change_tracking"],
+                    "incomplete",
+                )
+                self.assertNotIn("cancelled", repair.metadata)
+                ledger = runner.sessions.tool_calls(session.id)[0]
+                self.assertEqual(ledger["status"], "error")
+                self.assertEqual(ledger["output"], repair.content)
+                self.assertEqual(ledger["metadata"], repair.metadata)
+                self.assertEqual(resumed.mutation_tracking, "incomplete")
+                self.assertEqual(verify.await_count, 1)
             finally:
                 await runner.close()
 

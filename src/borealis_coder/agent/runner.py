@@ -152,7 +152,11 @@ def _fits_context_limit(messages: list[Message], budget: ContextBudget) -> bool:
     )
 
 
-def _abandoned_tool_call_results(messages: list[Message]) -> list[Message]:
+def _abandoned_tool_call_results(
+    messages: list[Message],
+    *,
+    running_call_ids: set[str],
+) -> list[Message]:
     """Complete only an unfinished trailing tool bundle from a prior run."""
 
     index = len(messages) - 1
@@ -170,24 +174,36 @@ def _abandoned_tool_call_results(messages: list[Message]) -> list[Message]:
         for message in messages[index + 1 :]
         if message.role == Role.TOOL and message.tool_call_id
     }
-    repairs = [
-        Message(
-            role=Role.TOOL,
-            content=(
-                "Cancelled: the previous run ended before this tool call was executed."
-            ),
-            tool_call_id=call.id,
-            tool_name=call.name,
-            is_error=True,
-            metadata={
-                "cancelled": True,
-                "abandoned": True,
-                "recovery": "previous_run_ended",
-            },
+    repairs = []
+    for call in assistant.tool_calls:
+        if call.id in observed_ids:
+            continue
+        execution_started = call.id in running_call_ids
+        repairs.append(
+            Message(
+                role=Role.TOOL,
+                content=(
+                    "Unknown outcome: the previous run ended after this tool call "
+                    "started but before its result was recorded. The tool may have "
+                    "executed."
+                    if execution_started
+                    else "Cancelled: the previous run ended before this tool call "
+                    "was executed."
+                ),
+                tool_call_id=call.id,
+                tool_name=call.name,
+                is_error=True,
+                metadata={
+                    **(
+                        {"unknown_outcome": True, "execution_started": True}
+                        if execution_started
+                        else {"cancelled": True, "not_started": True}
+                    ),
+                    "abandoned": True,
+                    "recovery": "previous_run_ended",
+                },
+            )
         )
-        for call in assistant.tool_calls
-        if call.id not in observed_ids
-    ]
     validate_tool_call_order([*messages, *repairs])
     return repairs
 
@@ -420,9 +436,40 @@ class AgentRunner:
 
         context.metadata["usage_sink"] = usage_sink
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
-        repairs = _abandoned_tool_call_results(messages)
+        tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
+        running_call_ids = {
+            str(row["tool_call_id"])
+            for row in tool_call_rows
+            if row["status"] == "running"
+        }
+        repairs = _abandoned_tool_call_results(
+            messages,
+            running_call_ids=running_call_ids,
+        )
         for repair in repairs:
-            await asyncio.to_thread(self.sessions.append_message, session_id, repair)
+            if repair.tool_call_id in running_call_ids:
+                tool = self.tools.get(repair.tool_name or "")
+                if (
+                    tool is None
+                    or tool.effective_mutation_scope != MutationScope.NONE
+                ):
+                    repair.metadata["workspace_change_tracking"] = "incomplete"
+                    self._mark_workspace_tracking_incomplete(context)
+                await asyncio.to_thread(
+                    self.sessions.complete_tool_call,
+                    session_id,
+                    repair.tool_call_id,
+                    output=repair.content,
+                    is_error=True,
+                    metadata=repair.metadata,
+                    message=repair,
+                )
+            else:
+                await asyncio.to_thread(
+                    self.sessions.append_message,
+                    session_id,
+                    repair,
+                )
         messages.extend(repairs)
         user = Message(
             id=user_message_id or new_id("msg"),
@@ -1811,8 +1858,20 @@ class AgentRunner:
                 strategy="deterministic",
             )
         parent_id: str | None = None
-        if parent is not None and source_ids[: len(parent.source_message_ids)] == parent.source_message_ids:
-            parent_id = parent.id
+        if parent is not None:
+            parent_source_length = len(parent.source_message_ids)
+            current_provider_prefix_hash = _stable_payload_hash(
+                [
+                    message.to_dict()
+                    for message in source_messages[:parent_source_length]
+                ]
+            )
+            if (
+                source_ids[:parent_source_length] == parent.source_message_ids
+                and parent.metadata.get("provider_source_hash")
+                == current_provider_prefix_hash
+            ):
+                parent_id = parent.id
         provider_contexts = self._compaction_provider_contexts(
             session_id=session_id,
             summary_text=artifact_message.content,

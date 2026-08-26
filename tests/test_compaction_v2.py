@@ -2134,6 +2134,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             artifacts[0].metadata["provider_source_hash"],
             artifacts[1].metadata["provider_source_hash"],
         )
+        self.assertIsNone(artifacts[1].parent_artifact_id)
 
     async def test_unchanged_resume_reuses_artifact_without_duplicate_llm_charge(self):
         with tempfile.TemporaryDirectory() as td:
