@@ -144,7 +144,12 @@ class ContextBudget:
             max(0.1, config.compact_at_ratio * 0.85),
         )
         target = max(1, int(available * effective_target_ratio))
-        fixed = system_tokens + tool_schema_tokens + provider_framing
+        fixed = (
+            system_tokens
+            + tool_schema_tokens
+            + provider_framing
+            + continuation_state_tokens
+        )
         message_target = max(1, target - fixed)
         return cls(
             input_limit=config.max_input_tokens,

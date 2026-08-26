@@ -969,6 +969,22 @@ class StructuredCompactionTests(unittest.TestCase):
         self.assertEqual(anthropic.provider_framing_tokens, 768)
         self.assertEqual(fallback_routes.provider_framing_tokens, 1_024)
 
+        continuation = Message(
+            role=Role.ASSISTANT,
+            metadata={"continuation_state": {"items": ["x" * 4_000]}},
+        )
+        with_continuation = ContextBudget.calculate(
+            config,
+            system="system",
+            tools=[],
+            messages=[continuation],
+        )
+        self.assertGreater(with_continuation.continuation_state_tokens, 0)
+        self.assertLess(
+            with_continuation.message_target_tokens,
+            first.message_target_tokens,
+        )
+
     def test_deterministic_incremental_evidence_preserves_parent_state(self):
         write = ToolCall(
             id="write",
@@ -1512,6 +1528,94 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 message.metadata.get("continuation_state")
                 for message in prepared.request.messages
             )
+        )
+        assert prepared.compaction_metadata is not None
+        self.assertLessEqual(
+            prepared.estimated_tokens,
+            prepared.compaction_metadata["target_tokens"],
+        )
+
+    async def test_retained_continuation_counts_toward_compacted_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "deterministic_compaction": True,
+                    "max_input_tokens": 12_000,
+                    "max_output_tokens": 1_000,
+                    "compact_at_ratio": 0.7,
+                    "compaction_target_ratio": 0.7,
+                    "compaction_safety_margin_tokens": 128,
+                    "compaction_provider_framing_tokens": 64,
+                },
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            session = runner.sessions.create_session(
+                workspace=root, provider="mock", model="deterministic"
+            )
+            messages: list[Message] = []
+            for index in range(40):
+                messages.extend(
+                    [
+                        Message(
+                            role=Role.USER,
+                            content=f"request-{index} " + ("history " * 150),
+                        ),
+                        Message(
+                            role=Role.ASSISTANT,
+                            content=f"response-{index}",
+                            metadata=(
+                                {
+                                    "continuation_state": {
+                                        "provider": "mock",
+                                        "model": "deterministic",
+                                        "items": ["x" * 8_000],
+                                    }
+                                }
+                                if index == 39
+                                else {}
+                            ),
+                        ),
+                    ]
+                )
+            for message in messages:
+                runner.sessions.append_message(session.id, message)
+            prompt_context = PromptContext(stable="system")
+
+            async def usage_sink(_usage: Usage) -> None:
+                return None
+
+            try:
+                prepared = await runner._prepare_provider_request(
+                    prompt_context=prompt_context,
+                    messages=messages,
+                    schemas=[],
+                    final_turn=False,
+                    verification_finalization_pending=False,
+                    adaptive_cache=False,
+                    conversation_cache=True,
+                    usage_sink=usage_sink,
+                    cancel=asyncio.Event(),
+                    session_id=session.id,
+                    run_id="retained-continuation",
+                    last_prune_signature=None,
+                )
+            finally:
+                await runner.close()
+
+        actual_budget = ContextBudget.calculate(
+            config.agent,
+            system=prepared.request.system,
+            tools=prepared.request.tools,
+            messages=prepared.request.messages,
+            provider="mock",
+        )
+        self.assertTrue(prepared.compacted)
+        self.assertGreater(actual_budget.continuation_state_tokens, 0)
+        self.assertEqual(
+            prepared.estimated_tokens,
+            actual_budget.estimated_total(prepared.request.messages),
         )
         assert prepared.compaction_metadata is not None
         self.assertLessEqual(
@@ -2202,7 +2306,19 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                     "authoritative_evidence": {},
                 },
             )
-            first_retained = [Message(role=Role.USER, content="retained A")]
+            first_retained = [
+                Message(
+                    role=Role.ASSISTANT,
+                    content="retained A",
+                    metadata={
+                        "continuation_state": {
+                            "provider": "mock",
+                            "model": "deterministic",
+                            "items": ["retained-state" * 100],
+                        }
+                    },
+                )
+            ]
             second_retained = [Message(role=Role.USER, content="retained B")]
             context_budget = ContextBudget.calculate(
                 config.agent,
@@ -2243,7 +2359,13 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(artifacts), 2)
         self.assertEqual(
             artifacts[0].estimated_tokens_after,
-            estimate_request_tokens(artifact.content, first_retained, []),
+            ContextBudget.calculate(
+                config.agent,
+                system=f"system\n\n{artifact.content}",
+                tools=[],
+                messages=first_retained,
+                provider="mock",
+            ).estimated_total(first_retained),
         )
         self.assertEqual(
             artifacts[1].metadata["provider_messages"],

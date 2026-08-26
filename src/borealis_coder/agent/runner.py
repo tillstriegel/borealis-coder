@@ -143,15 +143,53 @@ def _incremental_parent_evidence(
     return evidence
 
 
-def _fits_context_limit(estimated_tokens: int, budget: ContextBudget) -> bool:
+def _fits_context_limit(messages: list[Message], budget: ContextBudget) -> bool:
     return (
-        estimated_tokens
+        budget.estimated_total(messages)
         + budget.reserved_output_tokens
         + budget.safety_margin_tokens
-        + budget.provider_framing_tokens
-        + budget.continuation_state_tokens
         <= budget.input_limit
     )
+
+
+def _abandoned_tool_call_results(messages: list[Message]) -> list[Message]:
+    """Complete only an unfinished trailing tool bundle from a prior run."""
+
+    index = len(messages) - 1
+    while index >= 0 and messages[index].role == Role.TOOL:
+        index -= 1
+    if index < 0 or not messages[index].tool_calls:
+        validate_tool_call_order(messages)
+        return []
+    assistant = messages[index]
+    if assistant.role != Role.ASSISTANT:
+        validate_tool_call_order(messages)
+        return []
+    observed_ids = {
+        message.tool_call_id
+        for message in messages[index + 1 :]
+        if message.role == Role.TOOL and message.tool_call_id
+    }
+    repairs = [
+        Message(
+            role=Role.TOOL,
+            content=(
+                "Cancelled: the previous run ended before this tool call was executed."
+            ),
+            tool_call_id=call.id,
+            tool_name=call.name,
+            is_error=True,
+            metadata={
+                "cancelled": True,
+                "abandoned": True,
+                "recovery": "previous_run_ended",
+            },
+        )
+        for call in assistant.tool_calls
+        if call.id not in observed_ids
+    ]
+    validate_tool_call_order([*messages, *repairs])
+    return repairs
 
 
 class AgentRunner:
@@ -382,6 +420,10 @@ class AgentRunner:
 
         context.metadata["usage_sink"] = usage_sink
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
+        repairs = _abandoned_tool_call_results(messages)
+        for repair in repairs:
+            await asyncio.to_thread(self.sessions.append_message, session_id, repair)
+        messages.extend(repairs)
         user = Message(
             id=user_message_id or new_id("msg"),
             role=Role.USER,
@@ -1085,8 +1127,15 @@ class AgentRunner:
         request_messages, metrics = prune_provider_messages(messages)
         validate_tool_call_order(request_messages)
         budget_providers = tuple(route.provider.name for route in self.providers)
-        raw_estimated = estimate_request_tokens(turn_system, messages, schemas)
-        estimated = estimate_request_tokens(turn_system, request_messages, schemas)
+        raw_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=turn_system,
+            tools=schemas,
+            messages=messages,
+            providers=budget_providers,
+            overflow_retry_count=overflow_retry_count,
+        )
+        raw_estimated = raw_budget.estimated_total(messages)
         context_budget = ContextBudget.calculate(
             self.config.agent,
             system=turn_system,
@@ -1095,6 +1144,7 @@ class AgentRunner:
             providers=budget_providers,
             overflow_retry_count=overflow_retry_count,
         )
+        estimated = context_budget.estimated_total(request_messages)
         compaction_reason: str | None = None
         if overflow_retry_count:
             compaction_reason = "provider_context_overflow"
@@ -1109,7 +1159,7 @@ class AgentRunner:
             compaction_reason not in {None, "provider_context_overflow"}
             and len(request_messages) == 1
             and request_messages[0].role == Role.USER
-            and _fits_context_limit(estimated, context_budget)
+            and _fits_context_limit(request_messages, context_budget)
         ):
             compaction_reason = None
         prune_signature = (
@@ -1564,7 +1614,7 @@ class AgentRunner:
                     for message in request_messages
                     if message.role == Role.TOOL
                 )
-                estimated = estimate_request_tokens(turn_system, request_messages, schemas)
+                estimated = context_budget.estimated_total(request_messages)
                 if estimated > context_budget.target_tokens:
                     raise CompactionError(
                         f"Compacted request size {estimated} exceeds calculated target "
@@ -1622,7 +1672,7 @@ class AgentRunner:
                     messages=len(request_messages),
                     **compaction_metadata,
                 )
-        if not _fits_context_limit(estimated, context_budget):
+        if not _fits_context_limit(request_messages, context_budget):
             raise BudgetExceeded(
                 "context",
                 f"Estimated request size {estimated} exceeds "
@@ -1774,6 +1824,22 @@ class AgentRunner:
             conversation_cache=conversation_cache,
         )
         provider_context = provider_contexts[0]
+        provider_names = tuple(route.provider.name for route in self.providers)
+        source_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=base_system,
+            tools=tools,
+            messages=source,
+            providers=provider_names,
+        )
+        compacted_system = f"{base_system}\n\n{artifact_message.content}"
+        artifact_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=compacted_system,
+            tools=tools,
+            messages=retained_messages,
+            providers=provider_names,
+        )
         artifact = CompactionArtifact(
             session_id=session_id,
             version=artifact_version,
@@ -1790,10 +1856,8 @@ class AgentRunner:
                 else None
             ),
             config_fingerprint=config_fingerprint,
-            estimated_tokens_before=estimate_request_tokens("", source, []),
-            estimated_tokens_after=estimate_request_tokens(
-                artifact_message.content, retained_messages, []
-            ),
+            estimated_tokens_before=source_budget.estimated_total(source),
+            estimated_tokens_after=artifact_budget.estimated_total(retained_messages),
             usage=summary_usage,
             source_start_sequence=min(sequences) if sequences else None,
             source_end_sequence=max(sequences) if sequences else None,

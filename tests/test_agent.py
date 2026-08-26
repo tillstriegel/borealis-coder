@@ -245,6 +245,38 @@ class OneToolProvider(Provider):
         )
 
 
+class RepeatedToolProvider(Provider):
+    name = "repeated_tool"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.complete_after_stuck = False
+
+    async def complete(self, request):
+        self.calls += 1
+        if self.complete_after_stuck:
+            return ModelResponse(
+                text="Recovered after abandoned call.",
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            tool_calls=[
+                ToolCall(
+                    id=f"repeated-{self.calls}",
+                    name="read_file",
+                    arguments={
+                        "path": "a.txt",
+                        "start_line": None,
+                        "end_line": None,
+                        "max_chars": None,
+                    },
+                )
+            ],
+            usage=Usage(requests=1),
+        )
+
+
 class FinalTurnProvider(Provider):
     name = "final_turn"
 
@@ -1864,6 +1896,59 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 assistant = runner.sessions.messages(result.session_id)[-1]
                 self.assertEqual(assistant.role, Role.ASSISTANT)
                 self.assertEqual(assistant.tool_calls, [])
+            finally:
+                await runner.close()
+
+    async def test_resume_repairs_tool_call_abandoned_by_stuck_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "a.txt").write_text("a")
+            config = make_config(
+                root,
+                agent={
+                    "provider": "repeated",
+                    "max_turns": 10,
+                    "max_repeated_calls": 1,
+                },
+            )
+            config.providers["repeated"] = ProviderConfig(
+                type="repeated_tool",
+                model="repeated",
+                max_retries=0,
+            )
+            provider = RepeatedToolProvider(config.providers["repeated"])
+            registry = ProviderRegistry()
+            registry.register("repeated_tool", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                first = await runner.run("inspect repeatedly")
+                self.assertEqual(first.stop_reason.value, "stuck")
+                before_resume = runner.sessions.messages(first.session_id)
+                self.assertEqual(before_resume[-1].role, Role.ASSISTANT)
+                self.assertEqual(before_resume[-1].tool_calls[0].id, "repeated-2")
+
+                provider.complete_after_stuck = True
+                resumed = await runner.run("continue", session_id=first.session_id)
+
+                self.assertEqual(resumed.text, "Recovered after abandoned call.")
+                after_resume = runner.sessions.messages(first.session_id)
+                abandoned_index = next(
+                    index
+                    for index, message in enumerate(after_resume)
+                    if any(call.id == "repeated-2" for call in message.tool_calls)
+                )
+                repair = after_resume[abandoned_index + 1]
+                self.assertEqual(repair.role, Role.TOOL)
+                self.assertEqual(repair.tool_call_id, "repeated-2")
+                self.assertTrue(repair.is_error)
+                self.assertTrue(repair.metadata["cancelled"])
+                self.assertTrue(repair.metadata["abandoned"])
+                self.assertEqual(after_resume[abandoned_index + 2].content, "continue")
             finally:
                 await runner.close()
 

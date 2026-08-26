@@ -25,6 +25,8 @@ The durable messages remain unchanged. Request preparation first validates and g
 - verification result;
 - terminal assistant response.
 
+If a prior run ended after persisting a trailing assistant tool call but before execution, resume appends explicit cancelled error results for the missing calls before the new user message. This preserves the original durable call, restores an atomic provider bundle, and does not repair malformed history elsewhere.
+
 The deterministic artifact contains these sections in a stable order:
 
 1. Current objective
