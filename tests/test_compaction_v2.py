@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import borealis_coder.agent.compaction as compaction_module
 from borealis_coder.agent import (
     Budget,
     BundleKind,
@@ -1398,21 +1399,29 @@ class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(calls, 1)
         self.assertTrue(all(size <= 8_000 for size in prompt_sizes))
 
-    async def test_non_ascii_transcript_uses_estimator_bounded_chunks(self):
+    async def test_multibyte_transcript_uses_token_and_byte_bounded_chunks(self):
         messages = [Message(role=Role.USER, content="small objective")]
         for index in range(8):
             messages.extend(
                 _tool_cycle(
                     f"non-ascii-{index}",
-                    content="漢字" * 2_000,
+                    content="🙂" * 2_500,
                 )
             )
         messages.append(Message(role=Role.ASSISTANT, content="continue"))
         prompt_sizes: list[int] = []
+        prompt_bytes: list[int] = []
 
         async def summarize(prompt: str) -> str:
             prompt_sizes.append(
                 estimate_request_tokens(
+                    COMPACTION_SUMMARIZER_SYSTEM,
+                    [Message(role=Role.USER, content=prompt)],
+                    [COMPACTION_RESPONSE_SCHEMA],
+                )
+            )
+            prompt_bytes.append(
+                estimate_request_bytes(
                     COMPACTION_SUMMARIZER_SYSTEM,
                     [Message(role=Role.USER, content=prompt)],
                     [COMPACTION_RESPONSE_SCHEMA],
@@ -1433,6 +1442,62 @@ class LLMSummaryHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(prompt_sizes), 1)
         self.assertTrue(all(size <= 2_000 for size in prompt_sizes))
         self.assertLessEqual(sum(prompt_sizes), 8_000)
+        self.assertTrue(all(size <= 8_000 for size in prompt_bytes))
+        self.assertLessEqual(sum(prompt_bytes), 32_000)
+
+    async def test_multibyte_mandatory_evidence_falls_back_before_provider_call(self):
+        messages = [
+            Message(role=Role.USER, content="small historical request"),
+            Message(role=Role.ASSISTANT, content="historical response"),
+            Message(role=Role.USER, content="🙂" * 4_000),
+        ]
+        calls = 0
+        request_tokens: list[int] = []
+        request_bytes: list[int] = []
+        original_request_tokens = compaction_module._summarizer_request_tokens
+        original_request_bytes = compaction_module._summarizer_request_bytes
+
+        def measure_tokens(prompt: str) -> int:
+            measured = original_request_tokens(prompt)
+            request_tokens.append(measured)
+            return measured
+
+        def measure_bytes(prompt: str) -> int:
+            measured = original_request_bytes(prompt)
+            request_bytes.append(measured)
+            return measured
+
+        async def summarize(_prompt: str) -> str:
+            nonlocal calls
+            calls += 1
+            return "must not be called"
+
+        with patch.object(
+            compaction_module,
+            "_summarizer_request_tokens",
+            side_effect=measure_tokens,
+        ), patch.object(
+            compaction_module,
+            "_summarizer_request_bytes",
+            side_effect=measure_bytes,
+        ):
+            compacted = await compact_messages_with_summary(
+                messages,
+                summarize,
+                keep_recent_bundles=1,
+                force=True,
+                summarizer_input_tokens=5_000,
+                summarizer_total_input_tokens=20_000,
+            )
+
+        self.assertEqual(calls, 0)
+        self.assertLess(request_tokens[0], 5_000)
+        self.assertGreater(request_bytes[0], 20_000)
+        self.assertEqual(compacted[0].metadata["strategy"], "deterministic")
+        self.assertEqual(
+            compacted[0].metadata["fallback_reason"],
+            "summarizer_evidence_over_budget",
+        )
 
     async def test_llm_summary_that_exceeds_total_target_falls_back(self):
         messages = [

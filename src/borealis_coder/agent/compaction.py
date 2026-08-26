@@ -1343,11 +1343,22 @@ def _summarizer_request_tokens(prompt: str) -> int:
     )
 
 
+def _summarizer_request_bytes(prompt: str) -> int:
+    """Measure the complete deterministic UTF-8 provider request."""
+
+    return estimate_request_bytes(
+        COMPACTION_SUMMARIZER_SYSTEM,
+        [Message(role=Role.USER, content=prompt)],
+        [COMPACTION_RESPONSE_SCHEMA],
+    )
+
+
 def _largest_fitting_transcript_chunk(
     transcript: str,
     *,
     instruction: str,
     max_tokens: int,
+    max_bytes: int = 0,
 ) -> str:
     low = 1
     high = len(transcript)
@@ -1355,7 +1366,10 @@ def _largest_fitting_transcript_chunk(
     while low <= high:
         size = (low + high) // 2
         prompt = instruction + _frame_untrusted_transcript(transcript[:size])
-        if _summarizer_request_tokens(prompt) <= max_tokens:
+        if (
+            _summarizer_request_tokens(prompt) <= max_tokens
+            and (max_bytes <= 0 or _summarizer_request_bytes(prompt) <= max_bytes)
+        ):
             best = size
             low = size + 1
         else:
@@ -1370,11 +1384,20 @@ def _bounded_summarizer_chunks(
     input_tokens: int,
     total_input_tokens: int,
 ) -> list[tuple[str, int]]:
+    input_bytes = input_tokens * 4
+    total_input_bytes = total_input_tokens * 4
     if not transcript:
-        prompt_tokens = _summarizer_request_tokens(
-            instruction + _frame_untrusted_transcript("")
+        prompt = instruction + _frame_untrusted_transcript("")
+        prompt_tokens = _summarizer_request_tokens(prompt)
+        prompt_bytes = _summarizer_request_bytes(prompt)
+        return (
+            [("", prompt_tokens)]
+            if prompt_tokens <= input_tokens
+            and prompt_tokens <= total_input_tokens
+            and prompt_bytes <= input_bytes
+            and prompt_bytes <= total_input_bytes
+            else []
         )
-        return [("", prompt_tokens)] if prompt_tokens <= total_input_tokens else []
 
     transcript_limit = len(transcript)
     while transcript_limit > 0:
@@ -1382,25 +1405,35 @@ def _bounded_summarizer_chunks(
         chunks: list[tuple[str, int]] = []
         cursor = 0
         consumed_tokens = 0
+        consumed_bytes = 0
         while cursor < len(bounded):
             chunk = _largest_fitting_transcript_chunk(
                 bounded[cursor:],
                 instruction=instruction,
                 max_tokens=input_tokens,
+                max_bytes=input_bytes,
             )
             if not chunk:
                 return []
-            prompt_tokens = _summarizer_request_tokens(
-                instruction + _frame_untrusted_transcript(chunk)
-            )
+            prompt = instruction + _frame_untrusted_transcript(chunk)
+            prompt_tokens = _summarizer_request_tokens(prompt)
+            prompt_bytes = _summarizer_request_bytes(prompt)
             chunks.append((chunk, prompt_tokens))
             consumed_tokens += prompt_tokens
+            consumed_bytes += prompt_bytes
             cursor += len(chunk)
-        if consumed_tokens <= total_input_tokens:
+        if (
+            consumed_tokens <= total_input_tokens
+            and consumed_bytes <= total_input_bytes
+        ):
             return chunks
+        limiting_ratio = min(
+            total_input_tokens / consumed_tokens,
+            total_input_bytes / consumed_bytes,
+        )
         next_limit = max(
             1,
-            int(transcript_limit * total_input_tokens / consumed_tokens * 0.9),
+            int(transcript_limit * limiting_ratio * 0.9),
         )
         transcript_limit = min(transcript_limit - 1, next_limit)
     return []
@@ -1475,7 +1508,15 @@ async def compact_messages_with_summary(
     fixed_tokens = _summarizer_request_tokens(
         instruction + _frame_untrusted_transcript("")
     )
-    if fixed_tokens >= summarizer_input_tokens:
+    summarizer_input_bytes = summarizer_input_tokens * 4
+    summarizer_total_input_bytes = summarizer_total_input_tokens * 4
+    fixed_bytes = _summarizer_request_bytes(
+        instruction + _frame_untrusted_transcript("")
+    )
+    if (
+        fixed_tokens >= summarizer_input_tokens
+        or fixed_bytes >= summarizer_input_bytes
+    ):
         return _deterministic_fallback(compacted, "summarizer_evidence_over_budget")
     chunks = _bounded_summarizer_chunks(
         transcript,
@@ -1488,14 +1529,19 @@ async def compact_messages_with_summary(
     summaries: list[CompactionEvidence] = []
     summarizer_results: list[SummarizerResult] = []
     consumed_tokens = 0
+    consumed_bytes = 0
     for chunk, prompt_tokens in chunks:
         prompt = instruction + _frame_untrusted_transcript(chunk)
+        prompt_bytes = _summarizer_request_bytes(prompt)
         if (
             prompt_tokens > summarizer_input_tokens
             or consumed_tokens + prompt_tokens > summarizer_total_input_tokens
+            or prompt_bytes > summarizer_input_bytes
+            or consumed_bytes + prompt_bytes > summarizer_total_input_bytes
         ):
             return _deterministic_fallback(compacted, "summarizer_input_over_budget")
         consumed_tokens += prompt_tokens
+        consumed_bytes += prompt_bytes
         try:
             outcome = summarizer(prompt)
             if isinstance(outcome, Awaitable):
