@@ -34,11 +34,19 @@ def max_turns_recovery_message(max_turns: int) -> str:
     )
 
 
+def max_model_requests_recovery_message(max_model_requests: int) -> str:
+    return (
+        f"Run incomplete: maximum {max_model_requests} model requests reached. "
+        f"Session preserved; send '{_RECOVERY_CONTINUATION_PROMPT}' to resume."
+    )
+
+
 @dataclass(slots=True)
 class Budget:
     config: AgentConfig
     started_ms: int
     turns: int = 0
+    model_requests: int = 0
     usage: Usage | None = None
 
     @classmethod
@@ -69,6 +77,18 @@ class Budget:
         if self.turns <= 0:
             raise RuntimeError("Cannot retry a model turn before it starts")
         self.turns -= 1
+
+    def before_model_request(self) -> None:
+        """Reserve one logical provider request across the whole run."""
+
+        if self.model_requests >= self.config.max_model_requests:
+            raise BudgetExceeded(
+                "model_requests",
+                max_model_requests_recovery_message(
+                    self.config.max_model_requests
+                ),
+            )
+        self.model_requests += 1
 
     def add_usage(self, usage: Usage) -> None:
         assert self.usage is not None

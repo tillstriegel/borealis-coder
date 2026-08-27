@@ -103,6 +103,27 @@ class PreparedProviderRequest:
     compaction_metadata: dict[str, Any] | None = None
 
 
+@dataclass(slots=True)
+class ReadOnlyWorkState:
+    limit: int
+    consecutive_turns: int = 0
+
+    @property
+    def synthesis_pending(self) -> bool:
+        return self.consecutive_turns >= self.limit
+
+    def observe_results(self, results: list[Message]) -> None:
+        observed_change = any(
+            result.metadata.get("changed_files")
+            for result in results
+        )
+        self.consecutive_turns = 0 if observed_change else self.consecutive_turns + 1
+
+    def reset_if(self, condition: bool) -> None:
+        if condition:
+            self.consecutive_turns = 0
+
+
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
 _INCOMPLETE_STOP_REASONS = frozenset(
     {"incomplete", "length", "max_tokens", "model_context_window_exceeded"}
@@ -124,6 +145,11 @@ _VERIFICATION_FINAL_INSTRUCTION = """# Authoritative verification result
 Automatic verification has already run after the mutations. Tools are unavailable for this
 response. Return a final answer that accurately reports the supplied verification result and
 does not claim stronger process-lifecycle or mutation guarantees than it provides.
+"""
+_READ_ONLY_SYNTHESIS_INSTRUCTION = """# Read-only investigation checkpoint
+The run has reached its read-only evidence limit. Tools are unavailable for this response.
+Answer the user's request now using the evidence already gathered. State any material
+uncertainty instead of doing more investigation.
 """
 _COMPACTION_SUMMARY_CACHE_VERSION = 2
 
@@ -612,6 +638,7 @@ class AgentRunner:
             budget.add_usage(usage)
 
         context.metadata["usage_sink"] = usage_sink
+        context.metadata["before_model_request"] = budget.before_model_request
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
         tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
         running_call_ids = {
@@ -687,37 +714,9 @@ class AgentRunner:
         provider_overflow_retries = 0
         last_prune_signature: tuple[int, ...] | None = None
         previous_request_tokens: int | None = None
-
-        async def publish_authoritative_result(text: str) -> None:
-            if not text:
-                return
-            message = Message(
-                role=Role.ASSISTANT,
-                content=text,
-                metadata={"authoritative_verification": True},
-            )
-            messages.append(message)
-            await asyncio.to_thread(self.sessions.append_message, session_id, message)
-            await self.events.emit(
-                "model.text_delta",
-                session_id=session_id,
-                run_id=run_id,
-                message_id=message.id,
-                text=text,
-            )
-            await self.events.emit(
-                "model.completed",
-                session_id=session_id,
-                run_id=run_id,
-                turn=budget.turns,
-                message_id=message.id,
-                text=text,
-                reasoning_summary="",
-                tool_calls=[],
-                usage={},
-                stop_reason=stop_reason.value,
-                authoritative_verification=True,
-            )
+        read_only_work = ReadOnlyWorkState(
+            limit=self.config.agent.max_read_only_turns
+        )
 
         try:
             prompt_context = await asyncio.to_thread(self.context_builder.build, query=prompt)
@@ -740,14 +739,25 @@ class AgentRunner:
                 self._check_cancel(cancel)
                 budget.before_turn()
                 final_turn = budget.turns == self.config.agent.max_turns
-                tools_disabled = final_turn or verification_finalization_pending
+                read_only_synthesis_pending = read_only_work.synthesis_pending
+                tools_disabled = (
+                    final_turn
+                    or verification_finalization_pending
+                    or read_only_synthesis_pending
+                )
                 schemas = [] if tools_disabled else self.tools.schemas()
+                await self._emit_read_only_synthesis_event(
+                    read_only_work,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
                 prepared = await self._prepare_provider_request(
                     prompt_context=prompt_context,
                     messages=messages,
                     schemas=schemas,
                     final_turn=final_turn,
                     verification_finalization_pending=verification_finalization_pending,
+                    read_only_synthesis_pending=read_only_synthesis_pending,
                     adaptive_cache=adaptive_cache,
                     conversation_cache=conversation_cache,
                     usage_sink=usage_sink,
@@ -758,6 +768,7 @@ class AgentRunner:
                     last_prune_signature=last_prune_signature,
                     overflow_retry_count=provider_overflow_retries,
                     previous_request_tokens=previous_request_tokens,
+                    before_model_request=budget.before_model_request,
                 )
                 request = prepared.request
                 estimated = prepared.estimated_tokens
@@ -784,6 +795,7 @@ class AgentRunner:
                     )
                 )
                 try:
+                    budget.before_model_request()
                     response, used_route = await self._complete_with_fallback(
                         request,
                         session_id,
@@ -841,7 +853,7 @@ class AgentRunner:
                 )
                 response_incomplete = _is_incomplete_response(response)
                 response_tool_calls = [] if response_incomplete else response.tool_calls
-                if verification_finalization_pending:
+                if verification_finalization_pending or read_only_synthesis_pending:
                     response_tool_calls = []
                 if response_tool_calls and not tools_disabled:
                     durable_messages = await asyncio.to_thread(
@@ -900,6 +912,10 @@ class AgentRunner:
                 )
                 if response.text:
                     final_text = response.text
+                _require_read_only_conclusion(
+                    pending=read_only_synthesis_pending,
+                    text=response.text,
+                )
                 final_response_incomplete = final_turn and response_incomplete
                 if final_turn and (response_tool_calls or final_response_incomplete):
                     recovery_message = max_turns_recovery_message(
@@ -918,10 +934,12 @@ class AgentRunner:
                 if usage_budget_error is not None:
                     raise usage_budget_error
                 if response_incomplete:
-                    await self._drain_steering(session_id, run_id, messages)
+                    steered = await self._drain_steering(session_id, run_id, messages)
+                    read_only_work.reset_if(steered)
                     continue
                 if not response_tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
+                        read_only_work.consecutive_turns = 0
                         verification_finalization_pending = False
                         verification_final_answer_safe = False
                         continue
@@ -955,25 +973,14 @@ class AgentRunner:
                     if decision.continue_loop:
                         continue
                     break
-                batch_signature = hashlib.sha256(
-                    json_dumps(
-                        [
-                            {"name": call.name, "arguments": call.arguments}
-                            for call in response_tool_calls
-                        ]
-                    ).encode()
-                ).hexdigest()
-                if batch_signature == last_batch_signature:
-                    repeated_batch_count += 1
-                else:
-                    last_batch_signature = batch_signature
-                    repeated_batch_count = 1
-                if repeated_batch_count > self.config.agent.max_repeated_calls:
-                    stop_reason = StopReason.STUCK
-                    raise BudgetExceeded(
-                        "stuck",
-                        f"Repeated identical tool-call batch {repeated_batch_count} times",
+                last_batch_signature, repeated_batch_count = (
+                    _track_repeated_tool_batch(
+                        response_tool_calls,
+                        previous_signature=last_batch_signature,
+                        previous_count=repeated_batch_count,
+                        maximum=self.config.agent.max_repeated_calls,
                     )
+                )
                 tool_messages = await self._execute_calls(
                     response_tool_calls,
                     cancel,
@@ -981,17 +988,20 @@ class AgentRunner:
                 )
                 for tool_message in tool_messages:
                     messages.append(tool_message)
-                if any(
+                batch_may_mutate = any(
                     (tool := self.tools.get(call.name)) is not None
                     and tool.effective_mutation_scope != MutationScope.NONE
                     and _tool_result_may_have_mutated(message)
                     for call, message in zip(response_tool_calls, tool_messages, strict=True)
-                ):
+                )
+                if batch_may_mutate:
                     mutation_revision += 1
                     verification_finalization_pending = False
                     verification_final_answer_safe = False
                     awaiting_repair = False
-                await self._drain_steering(session_id, run_id, messages)
+                read_only_work.observe_results(tool_messages)
+                steered = await self._drain_steering(session_id, run_id, messages)
+                read_only_work.reset_if(steered)
             if (
                 verification is None
                 and (context.changed_roots or context.mutation_tracking == "incomplete")
@@ -1024,74 +1034,18 @@ class AgentRunner:
                 "run.error", session_id=session_id, run_id=run_id, error=error_message
             )
         finally:
-            if (
-                stop_reason == StopReason.MAX_TURNS
-                and verification is None
-                and (context.changed_roots or context.mutation_tracking == "incomplete")
-                and self.config.agent.auto_verify
-            ):
-                verified_revision = mutation_revision
-                try:
-                    verification = await self._verify_changes(context, cancel)
-                except Cancelled as verification_error:
-                    verification = {
-                        "ok": False,
-                        "checks_ok": False,
-                        "process_lifecycle_complete": False,
-                        "process_lifecycle_guaranteed": False,
-                        "mutation_tracking": context.mutation_tracking,
-                        "steps": [],
-                        "error": str(verification_error),
-                    }
-                    recovery_message = error_message or max_turns_recovery_message(
-                        self.config.agent.max_turns
-                    )
-                    error_message = (
-                        f"{recovery_message} Automatic verification was interrupted: "
-                        f"{verification_error}."
-                    )
-                except asyncio.CancelledError:
-                    if deadline_expired.is_set():
-                        verification_error = (
-                            f"Maximum {self.config.agent.max_time_seconds}s run time reached"
-                        )
-                    else:
-                        verification_error = "Run cancelled"
-                    verification = {
-                        "ok": False,
-                        "checks_ok": False,
-                        "process_lifecycle_complete": False,
-                        "process_lifecycle_guaranteed": False,
-                        "mutation_tracking": context.mutation_tracking,
-                        "steps": [],
-                        "error": verification_error,
-                    }
-                    recovery_message = error_message or max_turns_recovery_message(
-                        self.config.agent.max_turns
-                    )
-                    error_message = (
-                        f"{recovery_message} Automatic verification was interrupted: "
-                        f"{verification_error}."
-                    )
-                except Exception as verification_error:
-                    verification = {
-                        "ok": False,
-                        "checks_ok": False,
-                        "process_lifecycle_complete": False,
-                        "process_lifecycle_guaranteed": False,
-                        "mutation_tracking": context.mutation_tracking,
-                        "steps": [],
-                        "error": (
-                            f"{type(verification_error).__name__}: {verification_error}"
-                        ),
-                    }
-                    recovery_message = error_message or max_turns_recovery_message(
-                        self.config.agent.max_turns
-                    )
-                    error_message = (
-                        f"{recovery_message} Automatic verification could not run: "
-                        f"{verification['error']}"
-                    )
+            verification, verified_revision, error_message = (
+                await self._verify_max_turn_exit(
+                    stop_reason=stop_reason,
+                    verification=verification,
+                    verified_revision=verified_revision,
+                    mutation_revision=mutation_revision,
+                    error_message=error_message,
+                    context=context,
+                    cancel=cancel,
+                    deadline_expired=deadline_expired,
+                )
+            )
         try:
             if verification is not None and verified_revision != mutation_revision:
                 verification = {
@@ -1161,7 +1115,14 @@ class AgentRunner:
                     session_id,
                     terminal_feedback,
                 )
-                await publish_authoritative_result(final_text)
+                await self._publish_authoritative_result(
+                    final_text,
+                    messages=messages,
+                    session_id=session_id,
+                    run_id=run_id,
+                    turn=budget.turns,
+                    stop_reason=stop_reason,
+                )
             if stop_reason == StopReason.MAX_TURNS:
                 await self._drain_steering(session_id, run_id, messages)
         finally:
@@ -1184,12 +1145,112 @@ class AgentRunner:
             mutation_tracking=context.mutation_tracking,
             verification=verification,
             error=error_message,
-            incomplete=stop_reason == StopReason.MAX_TURNS,
+            incomplete=stop_reason in {StopReason.MAX_TURNS, StopReason.BUDGET},
         )
         await self.events.emit(
             "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
         )
         return result
+
+    async def _verify_max_turn_exit(
+        self,
+        *,
+        stop_reason: StopReason,
+        verification: dict[str, Any] | None,
+        verified_revision: int,
+        mutation_revision: int,
+        error_message: str | None,
+        context: ToolContext,
+        cancel: asyncio.Event,
+        deadline_expired: asyncio.Event,
+    ) -> tuple[dict[str, Any] | None, int, str | None]:
+        should_verify = (
+            stop_reason == StopReason.MAX_TURNS
+            and verification is None
+            and (context.changed_roots or context.mutation_tracking == "incomplete")
+            and self.config.agent.auto_verify
+        )
+        if not should_verify:
+            return verification, verified_revision, error_message
+        verified_revision = mutation_revision
+        try:
+            verification = await self._verify_changes(context, cancel)
+        except Cancelled as verification_error:
+            verification = _interrupted_verification(
+                context,
+                str(verification_error),
+            )
+            recovery_message = error_message or max_turns_recovery_message(
+                self.config.agent.max_turns
+            )
+            error_message = (
+                f"{recovery_message} Automatic verification was interrupted: "
+                f"{verification_error}."
+            )
+        except asyncio.CancelledError:
+            verification_error = (
+                f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+                if deadline_expired.is_set()
+                else "Run cancelled"
+            )
+            verification = _interrupted_verification(context, verification_error)
+            recovery_message = error_message or max_turns_recovery_message(
+                self.config.agent.max_turns
+            )
+            error_message = (
+                f"{recovery_message} Automatic verification was interrupted: "
+                f"{verification_error}."
+            )
+        except Exception as verification_error:
+            failure = f"{type(verification_error).__name__}: {verification_error}"
+            verification = _interrupted_verification(context, failure)
+            recovery_message = error_message or max_turns_recovery_message(
+                self.config.agent.max_turns
+            )
+            error_message = (
+                f"{recovery_message} Automatic verification could not run: {failure}"
+            )
+        return verification, verified_revision, error_message
+
+    async def _publish_authoritative_result(
+        self,
+        text: str,
+        *,
+        messages: list[Message],
+        session_id: str,
+        run_id: str,
+        turn: int,
+        stop_reason: StopReason,
+    ) -> None:
+        if not text:
+            return
+        message = Message(
+            role=Role.ASSISTANT,
+            content=text,
+            metadata={"authoritative_verification": True},
+        )
+        messages.append(message)
+        await asyncio.to_thread(self.sessions.append_message, session_id, message)
+        await self.events.emit(
+            "model.text_delta",
+            session_id=session_id,
+            run_id=run_id,
+            message_id=message.id,
+            text=text,
+        )
+        await self.events.emit(
+            "model.completed",
+            session_id=session_id,
+            run_id=run_id,
+            turn=turn,
+            message_id=message.id,
+            text=text,
+            reasoning_summary="",
+            tool_calls=[],
+            usage={},
+            stop_reason=stop_reason.value,
+            authoritative_verification=True,
+        )
 
     async def _verify_changes(
         self,
@@ -1276,6 +1337,22 @@ class AgentRunner:
             **verification,
         )
         return verification
+
+    async def _emit_read_only_synthesis_event(
+        self,
+        state: ReadOnlyWorkState,
+        *,
+        session_id: str,
+        run_id: str,
+    ) -> None:
+        if not state.synthesis_pending:
+            return
+        await self.events.emit(
+            "run.read_only_synthesis",
+            session_id=session_id,
+            run_id=run_id,
+            read_only_turns=state.consecutive_turns,
+        )
 
     async def _handle_candidate_verification(
         self,
@@ -1376,6 +1453,8 @@ class AgentRunner:
         settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
         overflow_retry_count: int = 0,
         previous_request_tokens: int | None = None,
+        read_only_synthesis_pending: bool = False,
+        before_model_request: Callable[[], None] | None = None,
     ) -> PreparedProviderRequest:
         turn_system = prompt_context.text
         turn_system_blocks = prompt_context.system_blocks
@@ -1390,6 +1469,12 @@ class AgentRunner:
             turn_system_blocks = [
                 *turn_system_blocks,
                 {"text": _VERIFICATION_FINAL_INSTRUCTION, "cacheable": False},
+            ]
+        elif read_only_synthesis_pending:
+            turn_system = f"{turn_system}\n\n{_READ_ONLY_SYNTHESIS_INSTRUCTION}"
+            turn_system_blocks = [
+                *turn_system_blocks,
+                {"text": _READ_ONLY_SYNTHESIS_INSTRUCTION, "cacheable": False},
             ]
 
         request_messages, metrics = prune_provider_messages(messages)
@@ -1418,6 +1503,10 @@ class AgentRunner:
             request_messages,
             schemas,
         )
+        tool_output_over_budget = (
+            metrics.tool_output_tokens_before
+            >= self.config.context.compact_tool_output_tokens
+        )
         compaction_reason: str | None = None
         if overflow_retry_count:
             compaction_reason = "provider_context_overflow"
@@ -1425,10 +1514,7 @@ class AgentRunner:
             compaction_reason = "estimated_tokens"
         elif estimated_bytes >= context_budget.trigger_bytes:
             compaction_reason = "estimated_bytes"
-        elif (
-            metrics.tool_output_tokens_before
-            >= self.config.context.compact_tool_output_tokens
-        ):
+        elif tool_output_over_budget:
             compaction_reason = "tool_output_volume"
         if (
             compaction_reason not in {None, "provider_context_overflow"}
@@ -1473,7 +1559,11 @@ class AgentRunner:
         compaction_artifact_id: str | None = None
         compaction_context_hashes: dict[str, str] | None = None
         compaction_metadata: dict[str, Any] | None = None
-        if compaction_reason == "tool_output_volume":
+        if compaction_reason in {
+            "estimated_tokens",
+            "estimated_bytes",
+            "tool_output_volume",
+        }:
             incremental = await self._reuse_incremental_compaction(
                 session_id=session_id,
                 durable_messages=messages,
@@ -1561,7 +1651,7 @@ class AgentRunner:
                 overflow_retry_count=overflow_retry_count,
             )
             provider_message_target = compaction_budget.message_target_tokens
-            if compaction_reason == "tool_output_volume":
+            if tool_output_over_budget:
                 configured_tool_target = (
                     int(self.config.context.compact_tool_output_tokens * 0.75)
                     if self.config.context.compact_tool_output_tokens >= 4_096
@@ -1571,7 +1661,7 @@ class AgentRunner:
                     provider_message_target,
                     max(1_024, configured_tool_target),
                 )
-            elif compaction_reason == "provider_context_overflow":
+            if compaction_reason == "provider_context_overflow":
                 if previous_request_tokens is not None:
                     overflow_target = (
                         int(previous_request_tokens * 0.70)
@@ -1680,10 +1770,10 @@ class AgentRunner:
                 ),
                 "target_tokens": provider_message_target,
                 "target_bytes": provider_message_target_bytes,
-                "force": compaction_reason in {
-                    "tool_output_volume",
-                    "provider_context_overflow",
-                },
+                "force": (
+                    tool_output_over_budget
+                    or compaction_reason == "provider_context_overflow"
+                ),
                 "base_evidence": parent_evidence if parent_is_prefix else None,
                 "base_source_message_ids": (
                     incremental_parent.source_message_ids
@@ -1932,6 +2022,7 @@ class AgentRunner:
                             summary_usage,
                             session_id=session_id,
                             settled_usage_sink=settled_usage_sink,
+                            before_model_request=before_model_request,
                         ),
                         transcript_message_ids=transcript_message_ids,
                         **compaction_kwargs,
@@ -2920,6 +3011,7 @@ class AgentRunner:
         *,
         session_id: str | None = None,
         settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
+        before_model_request: Callable[[], None] | None = None,
     ) -> Callable[[str], Awaitable[SummarizerResult]] | None:
         """Build an LLM-backed compaction summarizer from the primary route.
 
@@ -2985,6 +3077,8 @@ class AgentRunner:
                         cached.get("requested_model") or request.model
                     ),
                 )
+            if before_model_request is not None:
+                before_model_request()
             request_task = asyncio.create_task(route.provider.complete(request))
             cancel_task = asyncio.create_task(cancel.wait())
             try:
@@ -4149,6 +4243,54 @@ def _is_incomplete_response(response: ModelResponse) -> bool:
         return bool(response.stop_reason)
     stop_reason = str(response.stop_reason or "").strip().lower()
     return stop_reason in _INCOMPLETE_STOP_REASONS
+
+
+def _require_read_only_conclusion(*, pending: bool, text: str) -> None:
+    if pending and not text.strip():
+        raise BudgetExceeded(
+            "read_only",
+            "Run incomplete: read-only investigation reached its evidence limit "
+            "without a textual conclusion. Session preserved; send 'continue' to resume.",
+        )
+
+
+def _interrupted_verification(
+    context: ToolContext,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "checks_ok": False,
+        "process_lifecycle_complete": False,
+        "process_lifecycle_guaranteed": False,
+        "mutation_tracking": context.mutation_tracking,
+        "steps": [],
+        "error": error,
+    }
+
+
+def _track_repeated_tool_batch(
+    calls: list[ToolCall],
+    *,
+    previous_signature: str | None,
+    previous_count: int,
+    maximum: int,
+) -> tuple[str, int]:
+    signature = hashlib.sha256(
+        json_dumps(
+            [
+                {"name": call.name, "arguments": call.arguments}
+                for call in calls
+            ]
+        ).encode()
+    ).hexdigest()
+    count = previous_count + 1 if signature == previous_signature else 1
+    if count > maximum:
+        raise BudgetExceeded(
+            "stuck",
+            f"Repeated identical tool-call batch {count} times",
+        )
+    return signature, count
 
 
 def _path_is_within(path: Path, directory: Path) -> bool:

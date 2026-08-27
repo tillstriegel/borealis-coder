@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import posixpath
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
@@ -226,7 +227,10 @@ def prune_provider_messages(
             call_details[call.id] = (call.name, call.arguments)
 
     copies: list[Message] = []
-    latest_reads: dict[tuple[str, str, str], int] = {}
+    reads_by_revision: dict[
+        tuple[str, str],
+        list[tuple[int, tuple[int, int] | None, str]],
+    ] = {}
     latest_discovery: dict[str, int] = {}
     latest_mutation: dict[str, int] = {}
     for index, message in enumerate(messages):
@@ -239,8 +243,12 @@ def prune_provider_messages(
                 metadata.setdefault("sha256", sha)
             if path and sha and not message.is_error:
                 arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
-                latest_reads[(path, sha, _read_slice_identity(arguments, message.content))] = (
-                    index
+                reads_by_revision.setdefault((path, sha), []).append(
+                    (
+                        index,
+                        _read_interval(arguments, message.content),
+                        _read_slice_identity(arguments, message.content),
+                    )
                 )
         if message.role == Role.TOOL:
             tool_name, arguments = call_details.get(
@@ -266,12 +274,21 @@ def prune_provider_messages(
             path = str(message.metadata.get("path") or "")
             sha = str(message.metadata.get("sha256") or "")
             arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
-            identity = (path, sha, _read_slice_identity(arguments, message.content))
+            interval = _read_interval(arguments, message.content)
+            slice_identity = _read_slice_identity(arguments, message.content)
+            later_reads = reads_by_revision.get((path, sha), [])
             superseded = bool(
                 path
                 and sha
                 and (
-                    latest_reads.get(identity, index) > index
+                    any(
+                        later_index > index
+                        and (
+                            later_slice_identity == slice_identity
+                            or _interval_covers(later_interval, interval)
+                        )
+                        for later_index, later_interval, later_slice_identity in later_reads
+                    )
                     or latest_mutation.get(path, -1) > index
                 )
             )
@@ -324,7 +341,42 @@ def _read_identity(content: str, metadata: dict[str, Any]) -> tuple[str, str]:
     if not sha:
         match = re.search(r"(?m)^sha256: ([0-9a-f]{64})$", content)
         sha = match.group(1) if match else ""
-    return path, sha
+    return _canonical_path(path), sha
+
+
+def _canonical_path(path: str) -> str:
+    if not path:
+        return ""
+    return posixpath.normpath(path.replace("\\", "/"))
+
+
+def _read_interval(
+    arguments: dict[str, Any],
+    content: str,
+) -> tuple[int, int] | None:
+    numbered_lines = [
+        int(match)
+        for match in re.findall(r"(?m)^\s*(\d+)\t", content)
+    ]
+    if numbered_lines:
+        return numbered_lines[0], numbered_lines[-1]
+    start = arguments.get("start_line")
+    end = arguments.get("end_line")
+    if start is not None and end is not None:
+        return int(start), int(end)
+    return None
+
+
+def _interval_covers(
+    candidate: tuple[int, int] | None,
+    covered: tuple[int, int] | None,
+) -> bool:
+    return bool(
+        candidate is not None
+        and covered is not None
+        and candidate[0] <= covered[0]
+        and candidate[1] >= covered[1]
+    )
 
 
 def _read_slice_identity(arguments: dict[str, Any], content: str) -> str:
@@ -342,9 +394,9 @@ def _read_slice_identity(arguments: dict[str, Any], content: str) -> str:
 def _mutation_paths(metadata: dict[str, Any], arguments: dict[str, Any]) -> list[str]:
     paths = metadata.get("files") or metadata.get("changed_files")
     if isinstance(paths, list):
-        return [str(path) for path in paths if path]
+        return [_canonical_path(str(path)) for path in paths if path]
     path = metadata.get("path") or arguments.get("path")
-    return [str(path)] if path else []
+    return [_canonical_path(str(path))] if path else []
 
 
 def _message_tokens(message: Message) -> int:

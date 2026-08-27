@@ -430,11 +430,17 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(latest_read.metadata["path"], "src/large.py")
         self.assertEqual(latest_read.metadata["sha256"], current_sha)
 
-    async def test_tool_output_volume_triggers_compaction_metrics(self):
+    async def test_token_trigger_preserves_tool_output_hysteresis_and_reuse(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(
                 root,
+                agent={
+                    "max_input_tokens": 30_000,
+                    "max_output_tokens": 1_000,
+                    "compact_at_ratio": 0.5,
+                    "compaction_target_ratio": 0.4,
+                },
                 context={"compact_tool_output_tokens": 5_000},
             )
             runner = await build_runner(root, config=config, interactive=False)
@@ -488,7 +494,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.stop_reason.value, "end_turn")
                 self.assertEqual(len(compacted_events), 2)
                 metrics = compacted_events[0].data
-                self.assertEqual(metrics["compaction_reason"], "tool_output_volume")
+                self.assertEqual(metrics["compaction_reason"], "estimated_tokens")
                 self.assertGreater(metrics["tokens_before"], metrics["tokens_after"])
                 self.assertLess(
                     metrics["tool_output_tokens_retained"],
@@ -560,6 +566,56 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics.superseded_reads_removed, 1)
         self.assertIn("SECOND_SLICE", provider_text)
         self.assertEqual(provider_text.count("FIRST_SLICE"), 1)
+
+    def test_later_covering_read_supersedes_normalized_partial_reads(self):
+        sha = "a" * 64
+        messages: list[Message] = []
+        for call_id, path, start, end in (
+            ("first", "src/example.py", 1, 10),
+            ("second", "src/example.py", 20, 30),
+            ("covering", "./src/example.py", 1, 30),
+        ):
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(
+                            id=call_id,
+                            name="read_file",
+                            arguments={
+                                "path": path,
+                                "start_line": start,
+                                "end_line": end,
+                                "max_chars": None,
+                            },
+                        )
+                    ],
+                )
+            )
+            numbered = "".join(
+                f"{line:>6}\tline {line}\n" for line in range(start, end + 1)
+            )
+            messages.append(
+                Message(
+                    role=Role.TOOL,
+                    tool_name="read_file",
+                    tool_call_id=call_id,
+                    content=f"path: {path}\nsha256: {sha}\nlines: 30\n\n{numbered}",
+                )
+            )
+
+        pruned, metrics = prune_provider_messages(messages)
+
+        self.assertEqual(metrics.superseded_reads_removed, 2)
+        retained_reads = [
+            message
+            for message in pruned
+            if message.role == Role.TOOL
+            and message.tool_name == "read_file"
+            and not message.metadata.get("provider_compacted")
+        ]
+        self.assertEqual(len(retained_reads), 1)
+        self.assertEqual(retained_reads[0].metadata["path"], "src/example.py")
 
     def test_failed_shell_with_changed_files_invalidates_stale_reads(self):
         sha = "a" * 64

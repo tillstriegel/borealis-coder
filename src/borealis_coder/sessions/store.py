@@ -17,7 +17,8 @@ from ..errors import SessionError
 from ..models import CompactionArtifact, Event, Message, SessionInfo, Usage
 from ..util import ensure_private_directory, ensure_private_file, json_dumps, new_id, utc_now
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
+_DEDUPLICATED_PROVIDER_CONTEXT_STORAGE = "deduplicated-v1"
 _EVENT_EXPORT_PAGE_SIZE = 1_000
 
 
@@ -212,6 +213,20 @@ class SessionStore:
                 ON compaction_artifacts(session_id, sequence DESC);
             CREATE INDEX IF NOT EXISTS idx_compaction_artifacts_reuse
                 ON compaction_artifacts(session_id, source_hash, config_fingerprint, strategy);
+            CREATE TABLE IF NOT EXISTS compaction_provider_messages (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                message_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY(session_id, message_hash)
+            );
+            CREATE TABLE IF NOT EXISTS compaction_artifact_message_refs (
+                artifact_id TEXT NOT NULL REFERENCES compaction_artifacts(artifact_id)
+                    ON DELETE CASCADE,
+                context_index INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                message_hash TEXT NOT NULL,
+                PRIMARY KEY(artifact_id, context_index, position)
+            );
             """
         )
         current = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
@@ -233,6 +248,9 @@ class SessionStore:
                 version = 3
             if version < 4:
                 self._migrate_compaction_v4()
+                version = 4
+            if version < 5:
+                self._migrate_compaction_v5()
             conn.execute(
                 "UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),)
             )
@@ -314,6 +332,46 @@ class SessionStore:
                 ON compaction_artifacts(session_id, source_hash, config_fingerprint, strategy);
             """
         )
+
+    def _migrate_compaction_v5(self) -> None:
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS compaction_provider_messages (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                message_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY(session_id, message_hash)
+            );
+            CREATE TABLE IF NOT EXISTS compaction_artifact_message_refs (
+                artifact_id TEXT NOT NULL REFERENCES compaction_artifacts(artifact_id)
+                    ON DELETE CASCADE,
+                context_index INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                message_hash TEXT NOT NULL,
+                PRIMARY KEY(artifact_id, context_index, position)
+            );
+            """
+        )
+        rows = self._connection.execute(
+            "SELECT artifact_id,session_id,metadata_json FROM compaction_artifacts"
+        ).fetchall()
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            stored_metadata, messages, references = self._deduplicate_provider_contexts(
+                metadata
+            )
+            if not references:
+                continue
+            self._connection.execute(
+                "UPDATE compaction_artifacts SET metadata_json=? WHERE artifact_id=?",
+                (json_dumps(stored_metadata), row["artifact_id"]),
+            )
+            self._store_compaction_message_references(
+                artifact_id=str(row["artifact_id"]),
+                session_id=str(row["session_id"]),
+                messages=messages,
+                references=references,
+            )
 
     def create_session(
         self,
@@ -485,6 +543,9 @@ class SessionStore:
     def append_compaction_artifact(self, artifact: CompactionArtifact) -> None:
         """Persist an immutable artifact separately from durable messages."""
 
+        stored_metadata, provider_messages, references = (
+            self._deduplicate_provider_contexts(artifact.metadata)
+        )
         with self._lock, self._connection:
             self._connection.execute(
                 """INSERT INTO compaction_artifacts(
@@ -511,8 +572,14 @@ class SessionStore:
                     json_dumps(artifact.usage.to_dict()),
                     artifact.created_at,
                     artifact.parent_artifact_id,
-                    json_dumps(artifact.metadata),
+                    json_dumps(stored_metadata),
                 ),
+            )
+            self._store_compaction_message_references(
+                artifact_id=artifact.id,
+                session_id=artifact.session_id,
+                messages=provider_messages,
+                references=references,
             )
             self._connection.execute(
                 "UPDATE sessions SET updated_at=? WHERE id=?",
@@ -537,7 +604,7 @@ class SessionStore:
         query += " ORDER BY sequence DESC LIMIT 1"
         with self._lock:
             row = self._connection.execute(query, parameters).fetchone()
-        return _compaction_artifact(row) if row is not None else None
+            return self._load_compaction_artifact(row) if row is not None else None
 
     def reusable_compaction_artifact(
         self,
@@ -554,7 +621,101 @@ class SessionStore:
                 ORDER BY sequence DESC LIMIT 1""",
                 (session_id, source_hash, config_fingerprint, strategy),
             ).fetchone()
-        return _compaction_artifact(row) if row is not None else None
+            return self._load_compaction_artifact(row) if row is not None else None
+
+    @staticmethod
+    def _deduplicate_provider_contexts(
+        metadata: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, str],
+        list[tuple[int, int, str]],
+    ]:
+        stored = json.loads(json_dumps(metadata))
+        contexts = stored.get("provider_contexts")
+        if not isinstance(contexts, list):
+            return stored, {}, []
+        provider_messages: dict[str, str] = {}
+        references: list[tuple[int, int, str]] = []
+        for context_index, provider_context in enumerate(contexts):
+            if not isinstance(provider_context, dict):
+                continue
+            messages = provider_context.get("messages")
+            if not isinstance(messages, list):
+                continue
+            for position, message in enumerate(messages):
+                payload = json_dumps(message)
+                message_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                provider_messages[message_hash] = payload
+                references.append((context_index, position, message_hash))
+            provider_context.pop("messages", None)
+            provider_context["message_count"] = len(messages)
+        if references:
+            stored["provider_context_storage"] = (
+                _DEDUPLICATED_PROVIDER_CONTEXT_STORAGE
+            )
+        return stored, provider_messages, references
+
+    def _store_compaction_message_references(
+        self,
+        *,
+        artifact_id: str,
+        session_id: str,
+        messages: dict[str, str],
+        references: list[tuple[int, int, str]],
+    ) -> None:
+        for message_hash, payload in messages.items():
+            self._connection.execute(
+                """INSERT INTO compaction_provider_messages(
+                    session_id,message_hash,payload_json
+                ) VALUES(?,?,?) ON CONFLICT(session_id,message_hash) DO NOTHING""",
+                (session_id, message_hash, payload),
+            )
+        self._connection.executemany(
+            """INSERT INTO compaction_artifact_message_refs(
+                artifact_id,context_index,position,message_hash
+            ) VALUES(?,?,?,?)""",
+            [
+                (artifact_id, context_index, position, message_hash)
+                for context_index, position, message_hash in references
+            ],
+        )
+
+    def _load_compaction_artifact(self, row: sqlite3.Row) -> CompactionArtifact:
+        metadata = json.loads(row["metadata_json"] or "{}")
+        if metadata.get("provider_context_storage") != (
+            _DEDUPLICATED_PROVIDER_CONTEXT_STORAGE
+        ):
+            return _compaction_artifact(row, metadata=metadata)
+        contexts = metadata.get("provider_contexts")
+        if not isinstance(contexts, list):
+            raise SessionError("Deduplicated compaction artifact has no provider contexts")
+        references = self._connection.execute(
+            """SELECT refs.context_index,refs.position,messages.payload_json
+            FROM compaction_artifact_message_refs AS refs
+            JOIN compaction_provider_messages AS messages
+              ON messages.session_id=? AND messages.message_hash=refs.message_hash
+            WHERE refs.artifact_id=?
+            ORDER BY refs.context_index,refs.position""",
+            (row["session_id"], row["artifact_id"]),
+        ).fetchall()
+        messages_by_context: dict[int, list[dict[str, Any]]] = {}
+        for reference in references:
+            messages_by_context.setdefault(int(reference["context_index"]), []).append(
+                json.loads(reference["payload_json"])
+            )
+        for context_index, provider_context in enumerate(contexts):
+            if not isinstance(provider_context, dict):
+                continue
+            expected = int(provider_context.pop("message_count", 0))
+            restored = messages_by_context.get(context_index, [])
+            if len(restored) != expected:
+                raise SessionError(
+                    f"Compaction artifact {row['artifact_id']} has incomplete provider messages"
+                )
+            provider_context["messages"] = restored
+        metadata.pop("provider_context_storage", None)
+        return _compaction_artifact(row, metadata=metadata)
 
     def append_event(self, event: Event) -> None:
         self.append_events([event])
@@ -1177,7 +1338,7 @@ class SessionStore:
                 "SELECT * FROM compaction_artifacts WHERE session_id=? ORDER BY sequence",
                 (session_id,),
             ).fetchall()
-        return [_compaction_artifact(row) for row in rows]
+            return [self._load_compaction_artifact(row) for row in rows]
 
 
 def _session_info(row: sqlite3.Row) -> SessionInfo:
@@ -1194,7 +1355,11 @@ def _session_info(row: sqlite3.Row) -> SessionInfo:
     )
 
 
-def _compaction_artifact(row: sqlite3.Row) -> CompactionArtifact:
+def _compaction_artifact(
+    row: sqlite3.Row,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> CompactionArtifact:
     return CompactionArtifact(
         id=row["artifact_id"],
         session_id=row["session_id"],
@@ -1213,5 +1378,9 @@ def _compaction_artifact(row: sqlite3.Row) -> CompactionArtifact:
         usage=Usage.from_dict(json.loads(row["usage_json"] or "{}")),
         created_at=row["created_at"],
         parent_artifact_id=row["parent_artifact_id"],
-        metadata=json.loads(row["metadata_json"] or "{}"),
+        metadata=(
+            metadata
+            if metadata is not None
+            else json.loads(row["metadata_json"] or "{}")
+        ),
     )

@@ -71,6 +71,8 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
 | `max_time_seconds` | `3600` | End-to-end run wall-time ceiling. |
 | `max_cost_usd` | `25.0` | Cumulative run cost ceiling when adapter pricing is configured. |
+| `max_model_requests` | `40` | Logical parent, delegate, and summarizer request ceiling for one run. |
+| `max_read_only_turns` | `8` | Consecutive tool turns with no observed file changes before Borealis requires an answer from gathered evidence. |
 | `parallel_reads` | `8` | Maximum concurrent read-only tool calls. |
 | `max_repeated_calls` | `3` | Repeated identical call threshold for stuck detection. |
 | `auto_verify` | `true` | Run project verification after mutations. |

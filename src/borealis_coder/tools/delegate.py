@@ -27,6 +27,7 @@ class DelegateTaskTool(Tool):
         registry = context.metadata.get("tool_registry")
         builder = context.metadata.get("context_builder")
         usage_sink = context.metadata.get("usage_sink")
+        before_model_request = context.metadata.get("before_model_request")
         if not routes or registry is None or builder is None:
             return ToolResult("Delegation is unavailable in this runtime", is_error=True)
         route = routes[0]
@@ -61,12 +62,24 @@ class DelegateTaskTool(Tool):
         )
         pending_cancellation: asyncio.CancelledError | None = None
         try:
-            for _ in range(int(arguments["max_turns"])):
+            max_turns = int(arguments["max_turns"])
+            for turn_index in range(max_turns):
+                synthesis_turn = turn_index == max_turns - 1
+                if callable(before_model_request):
+                    before_model_request()
                 request = ProviderRequest(
-                    model=route.model, system=system, messages=messages, tools=schemas,
+                    model=route.model,
+                    system=(
+                        system
+                        if not synthesis_turn
+                        else system
+                        + "\n\nThis is your final turn. Do not request tools. Return the concise, evidence-backed conclusion now."
+                    ),
+                    messages=messages,
+                    tools=[] if synthesis_turn else schemas,
                     max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
                     reasoning_effort=context.config.agent.reasoning_effort or None,
-                    parallel_tool_calls=True,
+                    parallel_tool_calls=not synthesis_turn,
                     metadata={"parent_session_id": context.session_id, "delegated": True},
                 )
                 response = await route.provider.with_retries(
@@ -75,9 +88,12 @@ class DelegateTaskTool(Tool):
                 usage.add(response.usage)
                 assistant = Message(role=Role.ASSISTANT, content=response.text, tool_calls=response.tool_calls)
                 messages.append(assistant)
-                if response.text:
+                if response.text and not response.tool_calls:
                     final = response.text
                 if not response.tool_calls:
+                    break
+                if synthesis_turn:
+                    final = ""
                     break
                 calls: list[ToolCall] = []
                 for call in response.tool_calls:
@@ -132,7 +148,13 @@ class DelegateTaskTool(Tool):
             turns=turns,
             usage=usage.to_dict(),
         )
+        if not final:
+            return ToolResult(
+                "Delegated investigation ended without the required textual conclusion.",
+                is_error=True,
+                metadata={"usage": usage.to_dict(), "turns": turns, "delegation_id": delegation_id},
+            )
         return ToolResult(
-            truncate_text(final or "Delegated investigation completed without a textual conclusion.", context.config.context.tool_output_chars),
+            truncate_text(final, context.config.context.tool_output_chars),
             metadata={"usage": usage.to_dict(), "turns": turns, "delegation_id": delegation_id},
         )

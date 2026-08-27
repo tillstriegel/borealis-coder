@@ -84,6 +84,57 @@ class CountingProvider(Provider):
         )
 
 
+class ReadUntilSynthesisProvider(Provider):
+    name = "read_until_synthesis"
+
+    def __init__(self, config, api_key=""):
+        super().__init__(config, api_key)
+        self.calls = 0
+        self.tool_counts: list[int] = []
+
+    async def complete(self, request):
+        self.calls += 1
+        self.tool_counts.append(len(request.tools))
+        if request.tools:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"read-{self.calls}",
+                        name="read_file",
+                        arguments={"path": "example.txt"},
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            text="The gathered evidence is sufficient.",
+            usage=Usage(requests=1),
+        )
+
+
+class NoChangeShellUntilSynthesisProvider(ReadUntilSynthesisProvider):
+    name = "no_change_shell_until_synthesis"
+
+    async def complete(self, request):
+        self.calls += 1
+        self.tool_counts.append(len(request.tools))
+        if request.tools:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"shell-{self.calls}",
+                        name="shell",
+                        arguments={"command": "pwd"},
+                    )
+                ],
+                usage=Usage(requests=1),
+            )
+        return ModelResponse(
+            text="The no-change checks are sufficient.",
+            usage=Usage(requests=1),
+        )
+
+
 class AliasContinuationProvider(Provider):
     name = "alias_implementation"
 
@@ -2911,7 +2962,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     tool_calls=[
                         ToolCall(
                             name="delegate_task",
-                            arguments={"task": "read the example", "max_turns": 1},
+                            arguments={"task": "read the example", "max_turns": 2},
                         )
                     ]
                 ),
@@ -2929,6 +2980,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     usage=Usage(input_tokens=5, requests=1),
                 ),
+                ModelResponse(text="Delegation finished."),
                 ModelResponse(text="Delegation finished."),
             )
             events = []
@@ -2961,6 +3013,220 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(nested_read.run_id, result.run_id)
                 durable = runner.sessions.tool_calls(result.session_id)
                 self.assertEqual([item["tool_name"] for item in durable], ["delegate_task"])
+            finally:
+                await runner.close()
+
+    async def test_delegate_reserves_its_final_turn_for_a_textual_conclusion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "example.txt").write_text("example\n")
+            config = make_config(root, agent={"provider": "mock"})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            requests: list[ProviderRequest] = []
+
+            def handler(request: ProviderRequest, call: int) -> ModelResponse:
+                requests.append(request)
+                if call == 1:
+                    return ModelResponse(
+                        tool_calls=[
+                            ToolCall(
+                                name="delegate_task",
+                                arguments={
+                                    "task": "read the example",
+                                    "max_turns": 2,
+                                },
+                            )
+                        ]
+                    )
+                if call == 2:
+                    return ModelResponse(
+                        tool_calls=[
+                            ToolCall(
+                                name="read_file",
+                                arguments={"path": "example.txt"},
+                            )
+                        ]
+                    )
+                if call == 3:
+                    return ModelResponse(text="The file contains example.")
+                return ModelResponse(text="Done.")
+
+            provider.handler = handler
+            try:
+                result = await runner.run("delegate a read")
+
+                self.assertEqual(result.text, "Done.")
+                self.assertEqual(provider.calls, 4)
+                self.assertEqual(requests[2].tools, [])
+                self.assertFalse(requests[2].parallel_tool_calls)
+                delegate_result = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                    and message.tool_name == "delegate_task"
+                )
+                self.assertEqual(delegate_result.content, "The file contains example.")
+                self.assertFalse(delegate_result.is_error)
+            finally:
+                await runner.close()
+
+    async def test_delegate_and_parent_share_the_model_request_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "example.txt").write_text("example\n")
+            config = make_config(
+                root,
+                agent={"provider": "mock", "max_model_requests": 2},
+            )
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="delegate_task",
+                            arguments={"task": "read the example", "max_turns": 2},
+                        )
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(name="read_file", arguments={"path": "example.txt"})
+                    ]
+                ),
+            )
+            try:
+                result = await runner.run("delegate a read")
+
+                self.assertEqual(result.stop_reason.value, "budget")
+                self.assertTrue(result.incomplete)
+                self.assertIn("maximum 2 model requests reached", result.error or "")
+                self.assertEqual(provider.calls, 2)
+            finally:
+                await runner.close()
+
+    async def test_delegate_without_a_final_conclusion_returns_a_tool_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "example.txt").write_text("example\n")
+            config = make_config(root, agent={"provider": "mock"})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="delegate_task",
+                            arguments={"task": "read the example", "max_turns": 1},
+                        )
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(name="read_file", arguments={"path": "example.txt"})
+                    ]
+                ),
+                ModelResponse(text="Done."),
+            )
+            try:
+                result = await runner.run("delegate a read")
+
+                delegate_result = next(
+                    message
+                    for message in runner.sessions.messages(result.session_id)
+                    if message.role == Role.TOOL
+                    and message.tool_name == "delegate_task"
+                )
+                self.assertTrue(delegate_result.is_error)
+                self.assertIn("without the required textual conclusion", delegate_result.content)
+                self.assertEqual(result.text, "Done.")
+            finally:
+                await runner.close()
+
+    async def test_read_only_turn_limit_forces_synthesis_without_more_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "example.txt").write_text("example\n")
+            config = make_config(
+                root,
+                agent={
+                    "provider": "read_until_synthesis",
+                    "max_read_only_turns": 2,
+                },
+            )
+            config.providers["read_until_synthesis"] = ProviderConfig(
+                type="read_until_synthesis",
+                model="read-until-synthesis",
+                max_retries=0,
+            )
+            provider = ReadUntilSynthesisProvider(
+                config.providers["read_until_synthesis"]
+            )
+            registry = ProviderRegistry()
+            registry.register(
+                "read_until_synthesis",
+                lambda cfg, key: provider,
+            )
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            events = []
+            runner.events.subscribe(events.append)
+            try:
+                result = await runner.run("inspect the example")
+
+                self.assertEqual(result.text, "The gathered evidence is sufficient.")
+                self.assertEqual(provider.calls, 3)
+                self.assertGreater(provider.tool_counts[0], 0)
+                self.assertGreater(provider.tool_counts[1], 0)
+                self.assertEqual(provider.tool_counts[2], 0)
+                self.assertEqual(
+                    sum(event.type == "run.read_only_synthesis" for event in events),
+                    1,
+                )
+            finally:
+                await runner.close()
+
+    async def test_no_change_shell_turns_count_toward_the_evidence_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(
+                root,
+                agent={
+                    "provider": "no_change_shell",
+                    "max_read_only_turns": 2,
+                },
+            )
+            config.providers["no_change_shell"] = ProviderConfig(
+                type="no_change_shell",
+                model="no-change-shell",
+                max_retries=0,
+            )
+            provider = NoChangeShellUntilSynthesisProvider(
+                config.providers["no_change_shell"]
+            )
+            registry = ProviderRegistry()
+            registry.register("no_change_shell", lambda cfg, key: provider)
+            runner = await build_runner(
+                root,
+                config=config,
+                interactive=False,
+                provider_registry=registry,
+            )
+            try:
+                result = await runner.run("check without changing files")
+
+                self.assertEqual(result.text, "The no-change checks are sufficient.")
+                self.assertEqual(provider.tool_counts[-1], 0)
+                self.assertEqual(provider.calls, 3)
+                self.assertEqual(result.changed_files, [])
             finally:
                 await runner.close()
 

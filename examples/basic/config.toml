@@ -3,6 +3,8 @@ provider = "openai"
 model = "gpt-5.4-mini"
 provider_fallbacks = ["anthropic"]
 max_turns = 60
+max_model_requests = 40
+max_read_only_turns = 8
 max_cost_usd = 15.0
 
 [safety]

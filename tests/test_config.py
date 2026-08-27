@@ -139,6 +139,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_fail_open_resource_limits_must_be_positive(self):
         cases = (
+            ("agent", "max_model_requests", 0),
+            ("agent", "max_read_only_turns", 0),
             ("safety", "max_process_output_chars", 0),
             ("sandbox", "process_cpu_seconds", -1),
             ("sandbox", "process_file_size_bytes", 0),

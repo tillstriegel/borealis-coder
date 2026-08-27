@@ -37,6 +37,8 @@ class AgentConfig:
     provider_fallbacks: list[str] = field(default_factory=list)
     reasoning_effort: str = "medium"
     max_turns: int = 60
+    max_model_requests: int = 40
+    max_read_only_turns: int = 8
     max_input_tokens: int = 180_000
     compact_at_ratio: float = 0.82
     max_output_tokens: int = 16_000
@@ -557,6 +559,10 @@ def _enabled(name: str) -> bool:
 def validate_config(config: Config) -> None:
     if config.agent.max_turns < 1:
         raise ConfigurationError("agent.max_turns must be positive")
+    if config.agent.max_model_requests < 1:
+        raise ConfigurationError("agent.max_model_requests must be positive")
+    if config.agent.max_read_only_turns < 1:
+        raise ConfigurationError("agent.max_read_only_turns must be positive")
     if config.agent.max_time_seconds < 1:
         raise ConfigurationError("agent.max_time_seconds must be positive")
     if not 0.5 <= config.agent.compact_at_ratio < 1.0:

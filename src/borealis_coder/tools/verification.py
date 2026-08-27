@@ -169,7 +169,10 @@ class VerificationPlanner:
 
 class VerifyTool(Tool):
     name = "verify"
-    description = "Run an explicit command or an automatically detected focused verification suite."
+    description = (
+        "Run focused verification after workspace changes or when the user explicitly "
+        "requests it; do not use verification as exploratory inspection."
+    )
     effect = Effect.EXECUTE
     default_risk = "low"
     parameters = object_schema({

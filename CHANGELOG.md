@@ -9,6 +9,15 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
   provider-aware target budgets, durable incremental artifacts, bounded LLM
   summarization, overflow recovery, safe observability, and a fixed release-gate corpus.
 
+### Fixed
+- Read-only and no-change investigations now stop for synthesis after a bounded number
+  of turns, and parent, delegated, and summarizer requests share one run-wide ceiling.
+- Delegated investigations reserve a tool-free final turn and fail clearly when they do
+  not return a textual conclusion.
+- Compaction now reuses artifacts across token and byte triggers, prunes covered file
+  reads, keeps retained tool output below its target, and deduplicates persisted provider
+  messages through a backward-compatible schema migration.
+
 ### Security
 - Compacted user, assistant, and tool history is escaped through one untrusted-data
   boundary implementation. Durable messages are append-only across every write path.

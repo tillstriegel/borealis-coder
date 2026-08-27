@@ -530,7 +530,15 @@ class SessionStoreTests(unittest.TestCase):
             version = legacy._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='version'"
             ).fetchone()[0]
-            self.assertEqual(version, "4")
+            self.assertEqual(version, "5")
+            tables = {
+                row[0]
+                for row in legacy._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            self.assertIn("compaction_provider_messages", tables)
+            self.assertIn("compaction_artifact_message_refs", tables)
         finally:
             legacy.close()
         self.store = SessionStore(self.root / "sessions.sqlite3")
@@ -583,6 +591,125 @@ class SessionStoreTests(unittest.TestCase):
         )
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.append_compaction_artifact(artifact)
+
+    def test_compaction_provider_messages_are_deduplicated_and_transparent(self):
+        provider_messages = [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "content": "evidence"},
+        ]
+
+        def artifact(artifact_id: str, source_hash: str) -> CompactionArtifact:
+            return CompactionArtifact(
+                id=artifact_id,
+                session_id=self.session.id,
+                version=2,
+                strategy="deterministic",
+                source_message_ids=[source_hash],
+                source_hash=source_hash,
+                summary_text="summary",
+                config_fingerprint="config-hash",
+                estimated_tokens_before=100,
+                estimated_tokens_after=25,
+                metadata={
+                    "provider_contexts": [
+                        {
+                            "provider_route": "mock",
+                            "system": "system",
+                            "messages": provider_messages,
+                            "tools": [],
+                        }
+                    ]
+                },
+            )
+
+        self.store.append_compaction_artifact(artifact("cmp-one", "source-one"))
+        self.store.append_compaction_artifact(artifact("cmp-two", "source-two"))
+
+        raw_metadata = [
+            json.loads(row[0])
+            for row in self.store._connection.execute(
+                "SELECT metadata_json FROM compaction_artifacts ORDER BY sequence"
+            ).fetchall()
+        ]
+        self.assertTrue(
+            all(
+                "messages" not in item["provider_contexts"][0]
+                for item in raw_metadata
+            )
+        )
+        message_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM compaction_provider_messages"
+        ).fetchone()[0]
+        reference_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM compaction_artifact_message_refs"
+        ).fetchone()[0]
+        self.assertEqual(message_count, 2)
+        self.assertEqual(reference_count, 4)
+        loaded = self.store.compaction_artifacts(self.session.id)
+        self.assertEqual(
+            loaded[0].metadata["provider_contexts"][0]["messages"],
+            provider_messages,
+        )
+        self.assertEqual(
+            loaded[1].metadata["provider_contexts"][0]["messages"],
+            provider_messages,
+        )
+        self.assertNotIn("provider_context_storage", loaded[0].metadata)
+
+    def test_legacy_inline_provider_context_remains_readable(self):
+        artifact = CompactionArtifact(
+            id="cmp-legacy-inline",
+            session_id=self.session.id,
+            version=2,
+            strategy="deterministic",
+            source_message_ids=["source"],
+            source_hash="source",
+            summary_text="summary",
+            config_fingerprint="config-hash",
+            estimated_tokens_before=100,
+            estimated_tokens_after=25,
+        )
+        self.store.append_compaction_artifact(artifact)
+        legacy_messages = [{"role": "user", "content": "legacy"}]
+        self.store._connection.execute(
+            "UPDATE compaction_artifacts SET metadata_json=? WHERE artifact_id=?",
+            (
+                json.dumps(
+                    {"provider_contexts": [{"messages": legacy_messages}]}
+                ),
+                artifact.id,
+            ),
+        )
+        self.store._connection.commit()
+
+        loaded = self.store.latest_compaction_artifact(self.session.id)
+
+        assert loaded is not None
+        self.assertEqual(
+            loaded.metadata["provider_contexts"][0]["messages"],
+            legacy_messages,
+        )
+        self.store._connection.execute(
+            "UPDATE schema_meta SET value='4' WHERE key='version'"
+        )
+        self.store._connection.commit()
+        path = self.store.path
+        self.store.close()
+        self.store = SessionStore(path)
+
+        migrated_raw = json.loads(
+            self.store._connection.execute(
+                "SELECT metadata_json FROM compaction_artifacts WHERE artifact_id=?",
+                (artifact.id,),
+            ).fetchone()[0]
+        )
+        self.assertNotIn("messages", migrated_raw["provider_contexts"][0])
+        migrated = self.store.latest_compaction_artifact(self.session.id)
+        assert migrated is not None
+        self.assertEqual(
+            migrated.metadata["provider_contexts"][0]["messages"],
+            legacy_messages,
+        )
 
     def test_response_cache_is_bounded_and_tracks_usage(self):
         original = Usage(input_tokens=10, output_tokens=2, requests=1, cost_usd=0.25)
