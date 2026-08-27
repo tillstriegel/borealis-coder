@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import replace
 from typing import Any
 
 from ..models import Effect, Message, ProviderRequest, Role, ToolCall, ToolResult, Usage
-from ..util import json_dumps, truncate_text
+from ..util import json_dumps, new_id, truncate_text
 from .base import Tool, ToolContext, object_schema
 
 
@@ -42,43 +43,96 @@ class DelegateTaskTool(Tool):
         repeated: set[str] = set()
         usage = Usage()
         final = ""
-        for _ in range(int(arguments["max_turns"])):
-            request = ProviderRequest(
-                model=route.model, system=system, messages=messages, tools=schemas,
-                max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
-                reasoning_effort=context.config.agent.reasoning_effort or None,
-                parallel_tool_calls=True,
-                metadata={"parent_session_id": context.session_id, "delegated": True},
+        delegation_id = new_id("delegate")
+        delegated_run_id = f"{context.run_id}.{delegation_id}"
+        delegated_context = replace(
+            context,
+            run_id=delegated_run_id,
+            tool_call_id="",
+            metadata={**context.metadata, "delegated": True, "delegation_id": delegation_id},
+        )
+        await context.events.emit(
+            "delegate.started",
+            session_id=context.session_id,
+            run_id=context.run_id,
+            delegation_id=delegation_id,
+            delegated_run_id=delegated_run_id,
+            parent_tool_call_id=context.tool_call_id,
+        )
+        pending_cancellation: asyncio.CancelledError | None = None
+        try:
+            for _ in range(int(arguments["max_turns"])):
+                request = ProviderRequest(
+                    model=route.model, system=system, messages=messages, tools=schemas,
+                    max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
+                    reasoning_effort=context.config.agent.reasoning_effort or None,
+                    parallel_tool_calls=True,
+                    metadata={"parent_session_id": context.session_id, "delegated": True},
+                )
+                response = await route.provider.with_retries(
+                    lambda request=request: route.provider.complete(request)
+                )
+                usage.add(response.usage)
+                assistant = Message(role=Role.ASSISTANT, content=response.text, tool_calls=response.tool_calls)
+                messages.append(assistant)
+                if response.text:
+                    final = response.text
+                if not response.tool_calls:
+                    break
+                calls: list[ToolCall] = []
+                for call in response.tool_calls:
+                    if call.name not in allowed:
+                        messages.append(Message(role=Role.TOOL, content=f"Tool {call.name} is unavailable to read-only subagents", tool_call_id=call.id, tool_name=call.name, is_error=True))
+                        continue
+                    signature = hashlib.sha256((call.name + json_dumps(call.arguments)).encode()).hexdigest()
+                    if signature in repeated:
+                        messages.append(Message(role=Role.TOOL, content="Identical delegated tool call suppressed", tool_call_id=call.id, tool_name=call.name, is_error=True))
+                        continue
+                    repeated.add(signature)
+                    calls.append(call)
+                results = await asyncio.gather(
+                    *(
+                        registry.execute(
+                            call,
+                            replace(delegated_context, tool_call_id=call.id),
+                        )
+                        for call in calls
+                    )
+                )
+                for call, result in zip(calls, results, strict=True):
+                    messages.append(Message(role=Role.TOOL, content=result.output, tool_call_id=call.id, tool_name=call.name, is_error=result.is_error, metadata=result.metadata))
+        except asyncio.CancelledError as error:
+            pending_cancellation = error
+            await context.events.emit(
+                "delegate.cancelled",
+                session_id=context.session_id,
+                run_id=context.run_id,
+                delegation_id=delegation_id,
+                delegated_run_id=delegated_run_id,
             )
-            response = await route.provider.with_retries(
-                lambda request=request: route.provider.complete(request)
-            )
-            usage.add(response.usage)
-            assistant = Message(role=Role.ASSISTANT, content=response.text, tool_calls=response.tool_calls)
-            messages.append(assistant)
-            if response.text:
-                final = response.text
-            if not response.tool_calls:
-                break
-            calls: list[ToolCall] = []
-            for call in response.tool_calls:
-                if call.name not in allowed:
-                    messages.append(Message(role=Role.TOOL, content=f"Tool {call.name} is unavailable to read-only subagents", tool_call_id=call.id, tool_name=call.name, is_error=True))
-                    continue
-                signature = hashlib.sha256((call.name + json_dumps(call.arguments)).encode()).hexdigest()
-                if signature in repeated:
-                    messages.append(Message(role=Role.TOOL, content="Identical delegated tool call suppressed", tool_call_id=call.id, tool_name=call.name, is_error=True))
-                    continue
-                repeated.add(signature)
-                calls.append(call)
-            results = await asyncio.gather(*(registry.execute(call, context) for call in calls))
-            for call, result in zip(calls, results, strict=True):
-                messages.append(Message(role=Role.TOOL, content=result.output, tool_call_id=call.id, tool_name=call.name, is_error=result.is_error, metadata=result.metadata))
-        if callable(usage_sink):
-            result = usage_sink(usage)
-            if asyncio.iscoroutine(result):
-                await result
+        finally:
+            try:
+                if callable(usage_sink):
+                    result = usage_sink(usage)
+                    if asyncio.iscoroutine(result):
+                        await result
+            except BaseException as error:
+                if pending_cancellation is not None:
+                    raise pending_cancellation from error
+                raise
+        if pending_cancellation is not None:
+            raise pending_cancellation
+        turns = sum(1 for item in messages if item.role == Role.ASSISTANT)
+        await context.events.emit(
+            "delegate.completed",
+            session_id=context.session_id,
+            run_id=context.run_id,
+            delegation_id=delegation_id,
+            delegated_run_id=delegated_run_id,
+            turns=turns,
+            usage=usage.to_dict(),
+        )
         return ToolResult(
             truncate_text(final or "Delegated investigation completed without a textual conclusion.", context.config.context.tool_output_chars),
-            metadata={"usage": usage.to_dict(), "turns": sum(1 for item in messages if item.role == Role.ASSISTANT)},
+            metadata={"usage": usage.to_dict(), "turns": turns, "delegation_id": delegation_id},
         )

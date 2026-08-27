@@ -50,6 +50,20 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(exported["usage"]["total_tokens"], 7)
         self.assertEqual(exported["tool_calls"][0]["status"], "completed")
 
+    def test_run_lease_distinguishes_live_and_interrupted_sessions(self):
+        other = SessionStore(self.root / "sessions.sqlite3")
+        try:
+            self.store.acquire_run_lease(self.session.id)
+            self.store.update_session(self.session.id, status="running")
+
+            self.assertEqual(other.get_session(self.session.id).status, "running")
+
+            self.store.release_run_lease(self.session.id)
+            self.assertEqual(other.get_session(self.session.id).status, "interrupted")
+        finally:
+            self.store.release_run_lease(self.session.id)
+            other.close()
+
     def test_pending_compaction_summary_reports_single_owner(self):
         value = {
             "version": 2,

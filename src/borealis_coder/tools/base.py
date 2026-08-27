@@ -42,6 +42,7 @@ class ToolContext:
     changed_roots: set[Path] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
     mutation_tracking: str = "complete"
+    lifecycle_uncertainty_only: bool = False
 
 
 class MutationScope(StrEnum):

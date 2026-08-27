@@ -41,6 +41,10 @@ from borealis_coder.agent.compaction_eval import (
     evaluate_compaction_release_case,
     load_compaction_corpus,
 )
+from borealis_coder.agent.runner import (
+    _artifact_provider_contexts,
+    _artifact_provider_messages,
+)
 from borealis_coder.config import ProviderConfig
 from borealis_coder.context import PromptContext
 from borealis_coder.errors import (
@@ -92,6 +96,19 @@ def _echo_evidence_with_transcript(prompt: str) -> str:
 
 
 class CompactionBoundaryTests(unittest.TestCase):
+    def test_legacy_artifact_provider_metadata_remains_readable(self):
+        messages = [{"role": "user", "content": "legacy"}]
+        context = {"provider_route": "primary", "messages": messages}
+
+        self.assertEqual(
+            _artifact_provider_contexts({"provider_context": context}),
+            [context],
+        )
+        self.assertEqual(
+            _artifact_provider_messages({"provider_messages": messages}),
+            messages,
+        )
+
     def test_all_history_roles_are_quoted_and_synthetic_context_is_not_user_role(self):
         messages = [
             Message(role=Role.USER, content="user quote"),
@@ -2820,8 +2837,9 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).hexdigest(),
         )
-        self.assertTrue(artifacts[0].metadata["provider_messages"])
-        provider_context = artifacts[0].metadata["provider_context"]
+        self.assertNotIn("provider_messages", artifacts[0].metadata)
+        self.assertNotIn("provider_context", artifacts[0].metadata)
+        provider_context = artifacts[0].metadata["provider_contexts"][0]
         self.assertEqual(provider_context["system"], first.request.system)
         self.assertEqual(provider_context["system_blocks"], first.request.metadata["system_blocks"])
         self.assertEqual(
@@ -3773,7 +3791,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).estimated_total(first_retained),
         )
         self.assertEqual(
-            artifacts[1].metadata["provider_messages"],
+            artifacts[1].metadata["provider_contexts"][0]["messages"],
             [message.to_dict() for message in second_retained],
         )
 
@@ -3855,7 +3873,7 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             len(
                 {
-                    item.metadata["provider_context"][
+                    item.metadata["provider_contexts"][0][
                         "provider_config_fingerprint"
                     ]
                     for item in artifacts

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -19,11 +21,61 @@ _SCHEMA_VERSION = 4
 _EVENT_EXPORT_PAGE_SIZE = 1_000
 
 
+class _SessionRunLease:
+    """A process-bound file lease used to distinguish live and stale runs."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._file: Any | None = None
+
+    def acquire(self) -> bool:
+        ensure_private_directory(self.path.parent)
+        handle = self.path.open("a+b")
+        ensure_private_file(self.path)
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self._file = handle
+        return True
+
+    def release(self) -> None:
+        handle = self._file
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            self._file = None
+
+
 class SessionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         ensure_private_directory(self.path.parent)
         self._lock = threading.RLock()
+        self._run_leases: dict[str, _SessionRunLease] = {}
         self._connection = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         with self._lock:
@@ -35,6 +87,9 @@ class SessionStore:
 
     def close(self) -> None:
         with self._lock:
+            for lease in self._run_leases.values():
+                lease.release()
+            self._run_leases.clear()
             self._connection.close()
             self._secure_files()
 
@@ -291,10 +346,11 @@ class SessionStore:
         return self.get_session(session_id)
 
     def get_session(self, session_id: str) -> SessionInfo:
-        with self._lock:
+        with self._lock, self._connection:
             row = self._connection.execute(
                 "SELECT * FROM sessions WHERE id=?", (session_id,)
             ).fetchone()
+            row = self._reconcile_running_row(row)
         if row is None:
             raise SessionError(f"Unknown session: {session_id}")
         return _session_info(row)
@@ -309,9 +365,57 @@ class SessionStore:
             params.append(str(workspace.resolve()))
         query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(max(1, limit))
-        with self._lock:
+        with self._lock, self._connection:
             rows = self._connection.execute(query, params).fetchall()
+            rows = [self._reconcile_running_row(row) for row in rows]
         return [_session_info(row) for row in rows]
+
+    def acquire_run_lease(self, session_id: str) -> None:
+        with self._lock:
+            if session_id in self._run_leases:
+                raise SessionError(f"Session {session_id} already has a local run lease")
+            exists = self._connection.execute(
+                "SELECT 1 FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if exists is None:
+                raise SessionError(f"Unknown session: {session_id}")
+            lease = _SessionRunLease(self._run_lease_path(session_id))
+            if not lease.acquire():
+                raise SessionError(f"Session {session_id} is already running")
+            self._run_leases[session_id] = lease
+
+    def release_run_lease(self, session_id: str) -> None:
+        with self._lock:
+            lease = self._run_leases.pop(session_id, None)
+            if lease is not None:
+                lease.release()
+
+    def _reconcile_running_row(self, row: sqlite3.Row | None) -> sqlite3.Row | None:
+        if (
+            row is None
+            or row["status"] != "running"
+            or str(row["id"]) in self._run_leases
+        ):
+            return row
+        session_id = str(row["id"])
+        lease = _SessionRunLease(self._run_lease_path(session_id))
+        if not lease.acquire():
+            return row
+        try:
+            self._connection.execute(
+                "UPDATE sessions SET status='interrupted',updated_at=? "
+                "WHERE id=? AND status='running'",
+                (utc_now(), session_id),
+            )
+            return self._connection.execute(
+                "SELECT * FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        finally:
+            lease.release()
+
+    def _run_lease_path(self, session_id: str) -> Path:
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        return self.path.parent / "run-leases" / f"{digest}.lock"
 
     def update_session(
         self,

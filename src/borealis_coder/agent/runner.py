@@ -91,6 +91,7 @@ class CandidateVerificationDecision:
     stop_reason: StopReason
     error_message: str | None
     continue_loop: bool
+    final_answer_safe: bool = False
 
 
 @dataclass(slots=True)
@@ -135,6 +136,26 @@ def _stable_payload_hash(value: Any) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _artifact_provider_contexts(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read canonical v2 contexts and legacy duplicated artifact metadata."""
+
+    contexts = metadata.get("provider_contexts")
+    if isinstance(contexts, list) and all(isinstance(item, dict) for item in contexts):
+        return contexts
+    context = metadata.get("provider_context")
+    if isinstance(context, dict):
+        return [context]
+    return []
+
+
+def _artifact_provider_messages(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    contexts = _artifact_provider_contexts(metadata)
+    if contexts and isinstance(contexts[0].get("messages"), list):
+        return contexts[0]["messages"]
+    messages = metadata.get("provider_messages")
+    return messages if isinstance(messages, list) else []
 
 
 def _incremental_parent_evidence(
@@ -484,6 +505,7 @@ class AgentRunner:
         if lock.locked() and not wait_for_active_run:
             raise SessionError(f"Session {session_id} is already running")
         async with lock:
+            await asyncio.to_thread(self.sessions.acquire_run_lease, session_id)
             self._accepting_steering.add(session_id)
             try:
                 run_id = new_id("run")
@@ -538,6 +560,7 @@ class AgentRunner:
                     )
             finally:
                 self._accepting_steering.discard(session_id)
+                await asyncio.to_thread(self.sessions.release_run_lease, session_id)
 
     async def _run_locked(
         self,
@@ -659,9 +682,11 @@ class AgentRunner:
         repair_cycles = 0
         awaiting_repair = False
         verification_finalization_pending = False
+        verification_final_answer_safe = False
         compacted = False
         provider_overflow_retries = 0
         last_prune_signature: tuple[int, ...] | None = None
+        previous_request_tokens: int | None = None
 
         async def publish_authoritative_result(text: str) -> None:
             if not text:
@@ -732,11 +757,13 @@ class AgentRunner:
                     run_id=run_id,
                     last_prune_signature=last_prune_signature,
                     overflow_retry_count=provider_overflow_retries,
+                    previous_request_tokens=previous_request_tokens,
                 )
                 request = prepared.request
                 estimated = prepared.estimated_tokens
                 compacted = compacted or prepared.compacted
                 last_prune_signature = prepared.prune_signature
+                previous_request_tokens = prepared.estimated_tokens
                 await self.events.emit(
                     "model.started",
                     session_id=session_id,
@@ -896,6 +923,7 @@ class AgentRunner:
                 if not response_tool_calls:
                     if await self._drain_steering(session_id, run_id, messages):
                         verification_finalization_pending = False
+                        verification_final_answer_safe = False
                         continue
                     decision = await self._handle_candidate_verification(
                         context=context,
@@ -923,6 +951,7 @@ class AgentRunner:
                     verification_finalization_pending = decision.finalization_pending
                     stop_reason = decision.stop_reason
                     error_message = decision.error_message
+                    verification_final_answer_safe = decision.final_answer_safe
                     if decision.continue_loop:
                         continue
                     break
@@ -960,6 +989,7 @@ class AgentRunner:
                 ):
                     mutation_revision += 1
                     verification_finalization_pending = False
+                    verification_final_answer_safe = False
                     awaiting_repair = False
                 await self._drain_steering(session_id, run_id, messages)
             if (
@@ -1111,8 +1141,9 @@ class AgentRunner:
             if verification is not None and (
                 context.changed_roots or context.mutation_tracking == "incomplete"
             ):
-                if stop_reason != StopReason.END_TURN or not _verification_is_guaranteed(
-                    verification, context
+                if stop_reason != StopReason.END_TURN or (
+                    not _verification_is_guaranteed(verification, context)
+                    and not verification_final_answer_safe
                 ):
                     final_text = _authoritative_verification_summary(verification, context)
                 terminal_feedback = Message(
@@ -1171,6 +1202,23 @@ class AgentRunner:
             session_id=context.session_id,
             run_id=context.run_id,
         )
+        if context.lifecycle_uncertainty_only and not context.changed_files:
+            verification = {
+                "ok": True,
+                "checks_ok": True,
+                "process_lifecycle_complete": False,
+                "process_lifecycle_guaranteed": False,
+                "steps": [],
+                "mutation_tracking": context.mutation_tracking,
+                "skipped_reason": "no_observed_workspace_changes",
+            }
+            await self.events.emit(
+                "verification.completed",
+                session_id=context.session_id,
+                run_id=context.run_id,
+                **verification,
+            )
+            return verification
         roots = sorted(context.changed_roots or {self.workspace}, key=lambda item: item.as_posix())
         remaining_seconds = self.config.agent.auto_verify_max_seconds
         reports: list[tuple[Path, Any]] = []
@@ -1253,11 +1301,13 @@ class AgentRunner:
             and verified_revision != mutation_revision
         )
         if not needs_verification:
+            final_answer_safe = False
             if awaiting_repair or verification_finalization_pending:
-                authoritative = _authoritative_verification_summary(
-                    verification or {"checks_ok": False, "steps": []}, context
+                final_text, final_answer_safe = _verified_final_answer(
+                    final_text,
+                    verification or {"checks_ok": False, "steps": []},
+                    context,
                 )
-                final_text = authoritative
             return CandidateVerificationDecision(
                 verification,
                 final_text,
@@ -1268,6 +1318,7 @@ class AgentRunner:
                 stop_reason,
                 error_message,
                 False,
+                final_answer_safe,
             )
 
         verification = await self._verify_changes(context, cancel)
@@ -1304,6 +1355,7 @@ class AgentRunner:
             stop_reason,
             error_message,
             continue_loop,
+            False,
         )
 
     async def _prepare_provider_request(
@@ -1323,6 +1375,7 @@ class AgentRunner:
         last_prune_signature: tuple[int, ...] | None,
         settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
         overflow_retry_count: int = 0,
+        previous_request_tokens: int | None = None,
     ) -> PreparedProviderRequest:
         turn_system = prompt_context.text
         turn_system_blocks = prompt_context.system_blocks
@@ -1420,6 +1473,80 @@ class AgentRunner:
         compaction_artifact_id: str | None = None
         compaction_context_hashes: dict[str, str] | None = None
         compaction_metadata: dict[str, Any] | None = None
+        if compaction_reason == "tool_output_volume":
+            incremental = await self._reuse_incremental_compaction(
+                session_id=session_id,
+                durable_messages=messages,
+                base_system=turn_system,
+                base_system_blocks=turn_system_blocks,
+                tools=schemas,
+                prompt_cache_key=prompt_context.cache_routing_key,
+                conversation_cache=conversation_cache,
+                providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
+            if incremental is not None:
+                artifact, request_messages, compaction_context_hashes = incremental
+                compaction_artifact_id = artifact.id
+                turn_system = f"{turn_system}\n\n{artifact.summary_text}"
+                turn_system_blocks = [
+                    *turn_system_blocks,
+                    {"text": artifact.summary_text, "cacheable": False},
+                ]
+                compacted = True
+                context_budget = ContextBudget.calculate(
+                    self.config.agent,
+                    system=turn_system,
+                    tools=schemas,
+                    messages=request_messages,
+                    providers=budget_providers,
+                    overflow_retry_count=overflow_retry_count,
+                )
+                estimated = context_budget.estimated_total(request_messages)
+                tool_tokens = sum(
+                    estimate_tokens(message.content)
+                    for message in request_messages
+                    if message.role == Role.TOOL
+                )
+                reduction = max(0.0, 1.0 - (estimated / raw_estimated)) if raw_estimated else 0.0
+                compaction_metadata = {
+                    "strategy": artifact.strategy,
+                    "artifact_version": artifact.version,
+                    "source_bundle_count": artifact.metadata.get(
+                        "source_bundle_count", 0
+                    ),
+                    "retained_bundle_count": artifact.metadata.get(
+                        "retained_bundle_count", 0
+                    ),
+                    "compacted_bundle_count": artifact.metadata.get(
+                        "compacted_bundle_count", 0
+                    ),
+                    "estimated_tokens_before": raw_estimated,
+                    "target_tokens": context_budget.target_tokens,
+                    "estimated_tokens_after": estimated,
+                    "reduction_percentage": round(reduction * 100, 2),
+                    "provider_overflow_retry_count": overflow_retry_count,
+                    "artifact_reused": True,
+                    "incremental_suffix_reused": True,
+                    "fallback_reason": artifact.metadata.get("fallback_reason"),
+                    "summarization_usage": Usage().to_dict(),
+                    "summarization_latency_ms": 0,
+                }
+                await self.events.emit(
+                    "context.compacted",
+                    session_id=session_id,
+                    run_id=run_id,
+                    compaction_reason=compaction_reason,
+                    tokens_before=metrics.tokens_before,
+                    tokens_after=estimate_request_tokens(
+                        artifact.summary_text, request_messages, []
+                    ),
+                    superseded_reads_removed=metrics.superseded_reads_removed,
+                    tool_output_tokens_retained=tool_tokens,
+                    messages=len(request_messages),
+                    **compaction_metadata,
+                )
+                compaction_reason = None
         if compaction_reason is not None:
             summary_usage = Usage()
             summary_started_ms = monotonic_ms()
@@ -1435,17 +1562,29 @@ class AgentRunner:
             )
             provider_message_target = compaction_budget.message_target_tokens
             if compaction_reason == "tool_output_volume":
+                configured_tool_target = (
+                    int(self.config.context.compact_tool_output_tokens * 0.75)
+                    if self.config.context.compact_tool_output_tokens >= 4_096
+                    else int(metrics.tokens_before * 0.85)
+                )
                 provider_message_target = min(
                     provider_message_target,
-                    max(1_024, int(metrics.tokens_before * 0.85)),
+                    max(1_024, configured_tool_target),
                 )
             elif compaction_reason == "provider_context_overflow":
+                if previous_request_tokens is not None:
+                    overflow_target = (
+                        int(previous_request_tokens * 0.70)
+                        - compaction_budget.system_tokens
+                        - compaction_budget.tool_schema_tokens
+                    )
+                else:
+                    overflow_target = int(
+                        metrics.tokens_before * (0.70**overflow_retry_count)
+                    )
                 provider_message_target = min(
                     provider_message_target,
-                    max(
-                        1_024,
-                        int(metrics.tokens_before * (0.70**overflow_retry_count)),
-                    ),
+                    max(1_024, overflow_target),
                 )
             provider_message_target_bytes = min(
                 compaction_budget.message_target_bytes,
@@ -1730,8 +1869,8 @@ class AgentRunner:
                         config_fingerprint=fingerprint,
                         strategy="deterministic",
                     )
-                if reusable is not None and reusable.metadata.get(
-                    "provider_messages"
+                if reusable is not None and _artifact_provider_messages(
+                    reusable.metadata
                 ) != [message.to_dict() for message in deterministic_messages[1:]]:
                     reusable = None
                 if reusable is not None and reusable.metadata.get(
@@ -1990,6 +2129,132 @@ class AgentRunner:
             request, estimated, compacted, prune_signature, compaction_metadata
         )
 
+    async def _reuse_incremental_compaction(
+        self,
+        *,
+        session_id: str,
+        durable_messages: list[Message],
+        base_system: str,
+        base_system_blocks: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        prompt_cache_key: str,
+        conversation_cache: bool,
+        providers: tuple[str, ...],
+        overflow_retry_count: int,
+    ) -> tuple[CompactionArtifact, list[Message], dict[str, str]] | None:
+        """Reuse the latest exact summary with a small durable message suffix."""
+
+        strategy = (
+            "deterministic"
+            if self.config.agent.deterministic_compaction
+            or self.config.agent.compaction_version == 1
+            else "llm"
+        )
+        compaction_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=base_system,
+            tools=tools,
+            messages=[],
+            providers=providers,
+            overflow_retry_count=overflow_retry_count,
+        )
+        fingerprint = self._compaction_config_fingerprint(
+            compaction_budget,
+            strategy,
+            self.config.agent.compaction_version,
+            system=base_system,
+            system_blocks=base_system_blocks,
+            tools=tools,
+            prompt_cache_key=prompt_cache_key,
+            conversation_cache=conversation_cache,
+        )
+        artifact = await asyncio.to_thread(
+            self.sessions.latest_compaction_artifact,
+            session_id,
+            config_fingerprint=fingerprint,
+            strategy=strategy,
+        )
+        if artifact is None and strategy == "llm":
+            artifact = await asyncio.to_thread(
+                self.sessions.latest_compaction_artifact,
+                session_id,
+                config_fingerprint=fingerprint,
+                strategy="deterministic",
+            )
+        if artifact is None:
+            return None
+
+        position_by_id = {
+            message.id: index for index, message in enumerate(durable_messages)
+        }
+        try:
+            source_positions = [
+                position_by_id[message_id]
+                for message_id in artifact.source_message_ids
+            ]
+        except KeyError:
+            return None
+        if source_positions != sorted(source_positions):
+            return None
+        suffix = durable_messages[source_positions[-1] + 1 :] if source_positions else []
+
+        try:
+            retained = [
+                Message.from_dict(item)
+                for item in _artifact_provider_messages(artifact.metadata)
+            ]
+            carried, _ = prune_provider_messages([*retained, *suffix])
+            validate_tool_call_order(carried)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        tool_tokens = sum(
+            estimate_tokens(message.content)
+            for message in carried
+            if message.role == Role.TOOL
+        )
+        if tool_tokens >= self.config.context.compact_tool_output_tokens:
+            return None
+
+        compacted_system = f"{base_system}\n\n{artifact.summary_text}"
+        carried_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=compacted_system,
+            tools=tools,
+            messages=carried,
+            providers=providers,
+            overflow_retry_count=overflow_retry_count,
+        )
+        estimated = carried_budget.estimated_total(carried)
+        estimated_bytes = estimate_request_bytes(compacted_system, carried, tools)
+        if (
+            estimated >= carried_budget.trigger_tokens
+            or estimated_bytes >= carried_budget.trigger_bytes
+            or not _fits_context_limit(
+                carried,
+                carried_budget,
+                system=compacted_system,
+                tools=tools,
+            )
+        ):
+            return None
+
+        contexts = self._compaction_provider_contexts(
+            session_id=session_id,
+            summary_text=artifact.summary_text,
+            provider_messages=[message.to_dict() for message in carried],
+            base_system=base_system,
+            base_system_blocks=base_system_blocks,
+            tools=tools,
+            prompt_cache_key=prompt_cache_key,
+            conversation_cache=conversation_cache,
+        )
+        hashes = {
+            str(context["provider_route"]): _stable_payload_hash(context)
+            for context in contexts
+        }
+        return artifact, carried, hashes
+
     async def _record_or_reuse_compaction_artifact(
         self,
         *,
@@ -2050,10 +2315,9 @@ class AgentRunner:
         )
         if (
             reusable is not None
-            and reusable.metadata.get("provider_messages") == provider_messages
+            and _artifact_provider_messages(reusable.metadata) == provider_messages
             and reusable.metadata.get("provider_source_hash") == provider_source_hash
-            and reusable.metadata.get("provider_contexts")
-            == reusable_provider_contexts
+            and _artifact_provider_contexts(reusable.metadata) == reusable_provider_contexts
         ):
             return (
                 replace(
@@ -2173,9 +2437,7 @@ class AgentRunner:
                         "compacted_message_ids", []
                     )
                 ],
-                "provider_messages": provider_messages,
                 "provider_source_hash": provider_source_hash,
-                "provider_context": provider_context,
                 "provider_contexts": provider_contexts,
                 "compacted_context_hash": _stable_payload_hash(provider_context),
                 "compacted_context_hashes": {
@@ -3218,7 +3480,13 @@ class AgentRunner:
                     result.metadata["changed_files"] = sorted(changed)
                 workspace_reconciled = True
                 if result.metadata.get("workspace_change_tracking") == "incomplete":
-                    self._mark_workspace_tracking_incomplete(context)
+                    self._mark_workspace_tracking_incomplete(
+                        context,
+                        lifecycle_only=(
+                            not changed
+                            and result.metadata.get("process_lifecycle_complete") is False
+                        ),
+                    )
                 if context.mutation_tracking == "incomplete":
                     result.metadata["workspace_change_tracking"] = "incomplete"
             elif (
@@ -3392,10 +3660,20 @@ class AgentRunner:
             displays.add(display)
             context.changed_files.add(display)
             context.changed_roots.add(root)
+        if changed_paths:
+            context.lifecycle_uncertainty_only = False
         return displays
 
     @staticmethod
-    def _mark_workspace_tracking_incomplete(context: ToolContext) -> None:
+    def _mark_workspace_tracking_incomplete(
+        context: ToolContext,
+        *,
+        lifecycle_only: bool = False,
+    ) -> None:
+        if lifecycle_only and context.mutation_tracking == "complete":
+            context.lifecycle_uncertainty_only = True
+        elif not lifecycle_only:
+            context.lifecycle_uncertainty_only = False
         context.mutation_tracking = "incomplete"
         context.changed_roots.update(context.roots.roots)
 
@@ -3758,6 +4036,81 @@ def _authoritative_verification_summary(
     if mutation_tracking != "complete":
         summary += f"\nMutation tracking: {mutation_tracking}."
     return summary
+
+
+def _verified_final_answer(
+    candidate: str,
+    verification: dict[str, Any],
+    context: ToolContext,
+) -> tuple[str, bool]:
+    """Keep a useful finalizer unless it overstates successful verification."""
+
+    authoritative = _authoritative_verification_summary(verification, context)
+    if not candidate.strip() or not bool(
+        verification.get("checks_ok", verification.get("ok", False))
+    ):
+        return authoritative, False
+
+    candidate_lower = candidate.lower()
+    commands = [
+        str(step.get("command", "")).strip()
+        for step in verification.get("steps", [])
+        if str(step.get("command", "")).strip()
+    ]
+    overclaims = (
+        "fully verified",
+        "everything is verified",
+        "everything was verified",
+        "all tests",
+        "all checks",
+        "tests, lint, and type checks",
+        "tests, lint and type checks",
+        "repair complete",
+    )
+    if any(claim in candidate_lower for claim in overclaims):
+        return authoritative, False
+
+    lifecycle_complete = bool(
+        verification.get(
+            "process_lifecycle_guaranteed",
+            verification.get("process_lifecycle_complete", False),
+        )
+    )
+    if not lifecycle_complete and any(
+        claim in candidate_lower
+        for claim in (
+            "process lifecycle complete",
+            "process lifecycle is complete",
+            "process lifecycle guaranteed",
+            "process lifecycle is guaranteed",
+        )
+    ):
+        return authoritative, False
+
+    mutation_tracking = str(
+        verification.get("mutation_tracking", context.mutation_tracking)
+    )
+    if mutation_tracking != "complete" and any(
+        claim in candidate_lower
+        for claim in (
+            "mutation tracking complete",
+            "mutation tracking is complete",
+        )
+    ):
+        return authoritative, False
+
+    if not commands and (
+        "checks passed" in candidate_lower
+        or "verified successfully" in candidate_lower
+    ) and not (
+        "no automatic verification" in candidate_lower
+        or "no verification commands" in candidate_lower
+    ):
+        return authoritative, False
+
+    if authoritative in candidate:
+        return candidate, True
+    return f"{candidate.rstrip()}\n\nVerification:\n{authoritative}", True
 
 
 def _verification_is_guaranteed(

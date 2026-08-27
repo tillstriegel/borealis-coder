@@ -2789,6 +2789,181 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
+    async def test_lifecycle_only_uncertainty_preserves_an_accurate_answer(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "mock", "auto_verify": True})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(name="inspect", arguments={}),
+                    ]
+                ),
+                ModelResponse(text="The project has 42 lines of code."),
+                ModelResponse(
+                    text=(
+                        "The project has 42 lines of code.\n\n"
+                        "No automatic verification commands were executed.\n"
+                        "Process lifecycle not guaranteed.\n"
+                        "Mutation tracking: incomplete."
+                    )
+                ),
+            )
+            runner.tools.register(
+                FunctionTool(
+                    name="inspect",
+                    description="Inspect without changing files.",
+                    parameters=object_schema({}),
+                    function=lambda _arguments, _context: ToolResult(
+                        "inspection complete",
+                        metadata={
+                            "process_lifecycle_complete": False,
+                            "workspace_change_tracking": "incomplete",
+                        },
+                    ),
+                    effect=Effect.EXECUTE,
+                )
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                ) as verify:
+                    result = await runner.run("count the lines")
+
+                verify.assert_not_awaited()
+                self.assertIn("The project has 42 lines of code.", result.text)
+                self.assertIn("Process lifecycle not guaranteed.", result.text)
+                self.assertIn("Mutation tracking: incomplete.", result.text)
+                assert result.verification is not None
+                self.assertEqual(
+                    result.verification["skipped_reason"],
+                    "no_observed_workspace_changes",
+                )
+                self.assertEqual(result.verification["steps"], [])
+            finally:
+                await runner.close()
+
+    async def test_successful_verification_preserves_a_neutral_substantive_answer(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"provider": "mock", "auto_verify": True})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_file",
+                            arguments={
+                                "path": "result.txt",
+                                "content": "fixed\n",
+                                "expected_sha256": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="Candidate answer."),
+                ModelResponse(text="I fixed the retry handling in result.txt."),
+            )
+            report = VerificationReport(
+                ok=True,
+                steps=[
+                    {
+                        "name": "Focused test",
+                        "command": "pytest -q tests/test_result.py",
+                        "exit_code": 0,
+                        "duration_ms": 1,
+                        "timed_out": False,
+                        "stdout": "passed",
+                        "stderr": "",
+                        "process_lifecycle_complete": True,
+                    }
+                ],
+            )
+            try:
+                with patch(
+                    "borealis_coder.agent.runner.VerificationPlanner.run",
+                    new_callable=AsyncMock,
+                    return_value=report,
+                ):
+                    result = await runner.run("fix retry handling")
+
+                self.assertIn("I fixed the retry handling in result.txt.", result.text)
+                self.assertIn("Focused test: pytest -q tests/test_result.py", result.text)
+            finally:
+                await runner.close()
+
+    async def test_delegated_tools_use_a_distinct_observable_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "example.txt").write_text("example\n")
+            config = make_config(root, agent={"provider": "mock"})
+            runner = await build_runner(root, config=config, interactive=False)
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="delegate_task",
+                            arguments={"task": "read the example", "max_turns": 1},
+                        )
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="read_file",
+                            arguments={
+                                "path": "example.txt",
+                                "start_line": None,
+                                "end_line": None,
+                                "max_chars": None,
+                            },
+                        )
+                    ],
+                    usage=Usage(input_tokens=5, requests=1),
+                ),
+                ModelResponse(text="Delegation finished."),
+            )
+            events = []
+            runner.events.subscribe(events.append)
+            try:
+                result = await runner.run("delegate a read")
+
+                self.assertEqual(result.text, "Delegation finished.")
+                delegated_start = next(
+                    event for event in events if event.type == "delegate.started"
+                )
+                delegated_complete = next(
+                    event for event in events if event.type == "delegate.completed"
+                )
+                self.assertEqual(delegated_start.run_id, result.run_id)
+                self.assertEqual(
+                    delegated_complete.data["delegated_run_id"],
+                    delegated_start.data["delegated_run_id"],
+                )
+                nested_read = next(
+                    event
+                    for event in events
+                    if event.type == "tool.started"
+                    and event.data.get("tool") == "read_file"
+                )
+                self.assertEqual(
+                    nested_read.run_id,
+                    delegated_start.data["delegated_run_id"],
+                )
+                self.assertNotEqual(nested_read.run_id, result.run_id)
+                durable = runner.sessions.tool_calls(result.session_id)
+                self.assertEqual([item["tool_name"] for item in durable], ["delegate_task"])
+            finally:
+                await runner.close()
+
     async def test_candidate_success_claim_is_replaced_when_verification_fails(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

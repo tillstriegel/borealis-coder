@@ -435,9 +435,28 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             root = Path(td)
             config = make_config(
                 root,
-                context={"compact_tool_output_tokens": 10},
+                context={"compact_tool_output_tokens": 5_000},
             )
             runner = await build_runner(root, config=config, interactive=False)
+            (root / "marker.txt").write_text("marker\n")
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.enqueue(
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="read_file",
+                            arguments={
+                                "path": "marker.txt",
+                                "start_line": None,
+                                "end_line": None,
+                                "max_chars": None,
+                            },
+                        )
+                    ]
+                ),
+                ModelResponse(text="done"),
+            )
             session = runner.sessions.create_session(
                 workspace=root, provider="mock", model="deterministic"
             )
@@ -454,7 +473,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                         role=Role.TOOL,
                         tool_name="shell",
                         tool_call_id=call.id,
-                        content=f"successful status output {index} " * 20,
+                        content=f"successful status output {index} " * 500,
                     ),
                 )
             compacted_events = []
@@ -467,11 +486,14 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 result = await runner.run("continue with the current requirements", session_id=session.id)
 
                 self.assertEqual(result.stop_reason.value, "end_turn")
-                self.assertEqual(len(compacted_events), 1)
+                self.assertEqual(len(compacted_events), 2)
                 metrics = compacted_events[0].data
                 self.assertEqual(metrics["compaction_reason"], "tool_output_volume")
                 self.assertGreater(metrics["tokens_before"], metrics["tokens_after"])
-                self.assertGreater(metrics["tool_output_tokens_retained"], 0)
+                self.assertLess(
+                    metrics["tool_output_tokens_retained"],
+                    config.context.compact_tool_output_tokens,
+                )
                 for key in (
                     "strategy",
                     "artifact_version",
@@ -488,7 +510,13 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     self.assertIn(key, metrics)
                 self.assertNotIn("summary", metrics)
-                self.assertEqual(len(runner.sessions.messages(session.id)), 26)
+                artifacts = runner.sessions.compaction_artifacts(session.id)
+                self.assertEqual(len(artifacts), 1)
+                self.assertEqual(len(runner.sessions.messages(session.id)), 28)
+                self.assertTrue(
+                    compacted_events[-1].data["incremental_suffix_reused"]
+                )
+                self.assertTrue(compacted_events[-1].data["artifact_reused"])
             finally:
                 await runner.close()
 
