@@ -17,6 +17,7 @@ from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input import Input
 from prompt_toolkit.output import Output
+from prompt_toolkit.shortcuts import CompleteStyle
 
 _HISTORY_TIMESTAMP = re.compile(r"^# \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 _LIBEDIT_HEADER = "_HiStOrY_V2_"
@@ -127,7 +128,9 @@ class TerminalInput:
         self._session: PromptSession[str] = PromptSession(
             history=history,
             completer=completer,
-            complete_while_typing=False,
+            complete_while_typing=True,
+            complete_style=CompleteStyle.MULTI_COLUMN,
+            reserve_space_for_menu=8,
             input=input,
             output=output,
         )
