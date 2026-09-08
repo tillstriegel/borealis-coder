@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import weakref
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -30,12 +31,17 @@ class ACPServer:
         self.tasks: dict[str, asyncio.Task[Any]] = {}
         self._prompt_tasks: dict[str, list[asyncio.Task[Any]]] = {}
         self.session_locations: dict[str, Path] = {}
+        self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self.initialized = False
         self.client_capabilities: dict[str, Any] = {}
 
     async def serve(self) -> None:
-        await self.connection.serve_stdio()
-        await self.close()
+        try:
+            await self.connection.serve_stdio()
+        finally:
+            await self.close()
 
     async def close(self) -> None:
         for session_id, runner in self.runners.items():
@@ -43,17 +49,20 @@ class ACPServer:
         prompt_tasks = [task for tasks in self._prompt_tasks.values() for task in tasks]
         for task in prompt_tasks:
             task.cancel()
-        if prompt_tasks:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.gather(*prompt_tasks, return_exceptions=True), timeout=5
+        try:
+            if prompt_tasks:
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(5):
+                        await asyncio.gather(*prompt_tasks, return_exceptions=True)
+        finally:
+            try:
+                await asyncio.gather(
+                    *(runner.close() for runner in set(self.runners.values())), return_exceptions=True
                 )
-        await asyncio.gather(
-            *(runner.close() for runner in set(self.runners.values())), return_exceptions=True
-        )
-        self.tasks.clear()
-        self._prompt_tasks.clear()
-        self.runners.clear()
+            finally:
+                self.tasks.clear()
+                self._prompt_tasks.clear()
+                self.runners.clear()
 
     async def handle(self, method: str, params: dict[str, Any]) -> Any:
         if method == "initialize":
@@ -72,6 +81,12 @@ class ACPServer:
         handler = handlers.get(method)
         if handler is None:
             raise ProtocolError(f"Method not found: {method}")
+        if method in {"session/resume", "session/close", "session/delete", "session/prompt"}:
+            session_id = _required_str(params, "sessionId")
+            # Active callers keep the lock alive; unused session IDs need no retained lock.
+            lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+            async with lock:
+                return await handler(params)
         return await handler(params)
 
     def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -112,15 +127,19 @@ class ACPServer:
             approval_callback=lambda request: self._request_permission(None, request),
             additional_roots=additional,
         )
-        route = runner.providers[0]
-        session = await asyncio.to_thread(
-            runner.sessions.create_session,
-            workspace=cwd,
-            provider=route.name,
-            model=route.model,
-            title="New coding session",
-            metadata={"additional_directories": [str(item) for item in additional], "acp": True},
-        )
+        try:
+            route = runner.providers[0]
+            session = await asyncio.to_thread(
+                runner.sessions.create_session,
+                workspace=cwd,
+                provider=route.name,
+                model=route.model,
+                title="New coding session",
+                metadata={"additional_directories": [str(item) for item in additional], "acp": True},
+            )
+        except BaseException:
+            await runner.close()
+            raise
         runner.tool_context.approvals.callback = lambda request: self._request_permission(
             session.id, request
         )
@@ -141,13 +160,14 @@ class ACPServer:
             approval_callback=lambda request: self._request_permission(session_id, request),
             additional_roots=additional,
         )
-        session = await asyncio.to_thread(runner.sessions.get_session, session_id)
-        if Path(session.workspace).resolve() != cwd:
+        try:
+            session = await asyncio.to_thread(runner.sessions.get_session, session_id)
+            if Path(session.workspace).resolve() != cwd:
+                raise ProtocolError("Session cwd does not match the stored workspace")
+            await self._session_close({"sessionId": session_id})
+        except BaseException:
             await runner.close()
-            raise ProtocolError("Session cwd does not match the stored workspace")
-        old = self.runners.pop(session_id, None)
-        if old:
-            await old.close()
+            raise
         self.runners[session_id] = runner
         self.session_locations[session_id] = runner.sessions.path
         self._subscribe(session_id, runner)
@@ -166,16 +186,15 @@ class ACPServer:
             cwd = raw_cwd.resolve()
             if not cwd.is_dir():
                 raise ProtocolError("session/list cwd must be an existing directory")
-        # Session databases are configured globally by default. Use an active runner
-        # when possible; otherwise load config for cwd/current directory.
+        # Use the active database location, but own the connection so session
+        # shutdown cannot close it while the listing runs in another thread.
         runner = next(iter(self.runners.values()), None)
-        temporary_store: SessionStore | None = None
         if runner is not None:
-            store = runner.sessions
+            database_path = runner.sessions.path
         else:
             base = cwd or Path.cwd().resolve()
-            temporary_store = SessionStore(load_config(base).database_path)
-            store = temporary_store
+            database_path = load_config(base).database_path
+        store = SessionStore(database_path)
         try:
             cursor = _decode_cursor(params.get("cursor"))
             sessions = await asyncio.to_thread(
@@ -207,8 +226,7 @@ class ACPServer:
                 result["nextCursor"] = _encode_cursor(cursor + 100)
             return result
         finally:
-            if temporary_store is not None:
-                await asyncio.to_thread(temporary_store.close)
+            await asyncio.to_thread(store.close)
 
     async def _session_close(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = _required_str(params, "sessionId")
@@ -222,11 +240,14 @@ class ACPServer:
         for task in tasks:
             if not task.done():
                 task.cancel()
-        if tasks:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
-        if runner:
-            await runner.close()
+        try:
+            if tasks:
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(5):
+                        await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if runner:
+                await runner.close()
         return {}
 
     async def _session_delete(self, params: dict[str, Any]) -> dict[str, Any]:

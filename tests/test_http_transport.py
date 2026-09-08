@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import subprocess
+import sys
 import threading
 import unittest
 import urllib.error
@@ -158,6 +160,23 @@ class HttpTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaisesRegex(ProviderError, "thread failed"),
         ):
             _ = [item async for item in HttpClient().stream_sse("https://x", payload={})]
+
+    async def test_stream_sse_reports_payload_encoding_errors(self) -> None:
+        client = HttpClient()
+        try:
+            with (
+                patch.object(threading, "excepthook") as thread_errors,
+                patch.object(http_module, "open_same_origin") as send,
+                self.assertRaisesRegex(ProviderError, "not JSON serializable"),
+            ):
+                async with asyncio.timeout(1):
+                    _ = [item async for item in client.stream_sse(
+                        "https://unused.test", payload={"unsupported": object()},
+                    )]
+            thread_errors.assert_not_called()
+            send.assert_not_called()
+        finally:
+            client.close()
 
     async def test_stream_sse_applies_backpressure_to_a_fast_producer(self) -> None:
         class TrackingQueue(asyncio.Queue):
@@ -319,6 +338,331 @@ class HttpTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HttpConnectionReuseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_redirect_cancellation_does_not_abort_a_released_connection(self) -> None:
+        released = threading.Event()
+        finish_release = threading.Event()
+        shutdown = threading.Event()
+
+        class Socket:
+            def shutdown(self, how):
+                shutdown.set()
+
+            def settimeout(self, timeout):
+                pass
+
+        class Response(FakeResponse):
+            will_close = False
+
+            def getheaders(self):
+                return [("Location", "/next")]
+
+            def close(self):
+                pass
+
+        class Connection:
+            sock = Socket()
+
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return Response(b"", status=307)
+
+            def close(self):
+                pass
+
+        client = HttpClient(timeout_seconds=3)
+        origin = ("http", "unused.test", 80)
+        connection = Connection()
+        release = client._pool.release
+        existing = set(threading.enumerate())
+
+        def hold_after_release(*args, **kwargs):
+            release(*args, **kwargs)
+            released.set()
+            finish_release.wait(3)
+
+        with (
+            patch.object(client._pool, "_new_connection", return_value=connection),
+            patch.object(client._pool, "_is_usable", return_value=True),
+            patch.object(client._pool, "release", side_effect=hold_after_release),
+            patch.object(http_module, "_HTTP_JOIN_TIMEOUT_SECONDS", 0.01),
+            patch.object(http_module, "open_same_origin", return_value=FakeResponse()) as redirected,
+        ):
+            stream = client.stream_sse("http://unused.test", payload={})
+            request = asyncio.ensure_future(anext(stream))
+            borrowed = None
+            try:
+                self.assertTrue(await asyncio.to_thread(released.wait, 1))
+                borrowed = client._pool.acquire(origin, 3)
+                self.assertIs(borrowed, connection)
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(request, timeout=1)
+                self.assertFalse(shutdown.is_set(), "Cancellation aborted the next pool borrower")
+                finish_release.set()
+                for thread in threading.enumerate():
+                    if thread.name == "borealis-sse" and thread not in existing:
+                        await asyncio.to_thread(thread.join, 1)
+                        self.assertFalse(thread.is_alive())
+                redirected.assert_not_called()
+            finally:
+                finish_release.set()
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                if borrowed is not None:
+                    release(origin, borrowed, reusable=False)
+                client.close()
+
+    async def test_stream_cancellation_during_connect_sends_no_late_request(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        sent = []
+
+        class Connecting:
+            sock = None
+
+            def connect(self):
+                started.set()
+                release.wait(3)
+
+            def request(self, *args, **kwargs):
+                if self.sock is None:
+                    self.connect()
+                sent.append(args)
+                raise OSError("Fixture connection has no response")
+
+            def close(self):
+                closed.set()
+
+        client = HttpClient(timeout_seconds=3)
+        with (
+            patch.object(client._pool, "_new_connection", return_value=Connecting()),
+            patch.object(http_module, "_HTTP_JOIN_TIMEOUT_SECONDS", 0.01),
+        ):
+            stream = client.stream_sse("http://unused.test", payload={})
+            request = asyncio.ensure_future(anext(stream))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(request, timeout=1)
+                self.assertFalse(release.is_set())
+                release.set()
+                self.assertTrue(await asyncio.to_thread(closed.wait, 1))
+                self.assertEqual(sent, [])
+                self.assertEqual(client._pool._counts, {})
+            finally:
+                release.set()
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                client.close()
+
+    async def test_json_cancellation_releases_stalled_responses_and_allows_reuse(self) -> None:
+        for pooled, headers_first, status in (
+            (True, False, 200), (True, True, 200), (False, True, 200), (False, True, 429),
+        ):
+            with self.subTest(pooled=pooled, headers_first=headers_first, status=status):
+                await self._cancel_stalled_response(pooled, headers_first, status)
+
+    async def test_stream_cancellation_releases_stalled_responses_and_allows_reuse(self) -> None:
+        for pooled, headers_first, status in (
+            (True, False, 200), (True, True, 200), (True, True, 429),
+            (False, True, 200), (False, True, 429),
+        ):
+            with self.subTest(pooled=pooled, headers_first=headers_first, status=status):
+                await self._cancel_stalled_response(pooled, headers_first, status, streamed=True)
+
+    async def _cancel_stalled_response(
+        self, pooled: bool, headers_first: bool, status: int, *, streamed: bool = False,
+    ) -> None:
+        ready = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        existing = set(threading.enumerate())
+
+        class ObservedClient(HttpClient):
+            def _post_json_sync(self, *args, **kwargs):
+                try:
+                    return super()._post_json_sync(*args, **kwargs)
+                finally:
+                    if args[0].endswith("/stalled"):
+                        finished.set()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                stalled = self.path == "/stalled"
+                if stalled:
+                    self.close_connection = True
+                if stalled and not headers_first:
+                    ready.set()
+                    release.wait(5)
+                try:
+                    self.send_response(status if stalled else 200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "2")
+                    if stalled:
+                        self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.flush()
+                    if stalled and headers_first:
+                        ready.set()
+                        release.wait(5)
+                    self.wfile.write(b"{}")
+                except OSError:
+                    self.close_connection = True
+
+            def log_message(self, format: str, *args: object) -> None:
+                return None
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        client = ObservedClient(timeout_seconds=5)
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        request = None
+        try:
+            with patch.object(client, "_pooled_target", wraps=client._pooled_target) as target:
+                if not pooled:
+                    target.return_value = None
+                if streamed:
+                    stream = client.stream_sse(base_url + "/stalled", payload={})
+                    request = asyncio.ensure_future(anext(stream))
+                else:
+                    request = asyncio.create_task(client.post_json(base_url + "/stalled", payload={}))
+                self.assertTrue(await asyncio.to_thread(ready.wait, 2))
+                request.cancel()
+                await asyncio.sleep(0)
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    async with asyncio.timeout(2):
+                        await request
+                self.assertFalse(release.is_set())
+                if streamed:
+                    self.assertFalse(any(
+                        thread.name == "borealis-sse" and thread not in existing
+                        for thread in threading.enumerate()
+                    ), "Cancelled stream worker is still running")
+                else:
+                    self.assertTrue(finished.is_set(), "Cancelled response is still being read")
+                response = await client.post_json(base_url + "/ready", payload={})
+                self.assertEqual(response.data, {})
+        finally:
+            release.set()
+            if request is not None:
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+            client.close()
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+            server_thread.join()
+
+    async def test_cancelled_json_worker_without_a_socket_does_not_hold_shutdown(self) -> None:
+        script = """
+import asyncio, threading
+from borealis_coder.providers.http import HttpClient
+started = threading.Event()
+class ConnectingClient(HttpClient):
+    def _post_json_sync(self, *args, **kwargs):
+        started.set()
+        threading.Event().wait(60)
+async def main():
+    client = ConnectingClient()
+    task = asyncio.create_task(client.post_json('https://unused.test', payload={}))
+    while not started.is_set():
+        await asyncio.sleep(.01)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    client.close()
+asyncio.run(main())
+print('shutdown complete', flush=True)
+"""
+        result = await asyncio.to_thread(
+            subprocess.run, [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=4,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("shutdown complete", result.stdout)
+
+    async def test_json_cancellation_during_connect_sends_no_late_request(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        sent = []
+
+        class Connecting:
+            sock = None
+
+            def connect(self):
+                started.set()
+                release.wait(3)
+
+            def request(self, *args, **kwargs):
+                sent.append(args)
+
+            def close(self):
+                closed.set()
+
+        client = HttpClient(timeout_seconds=3)
+        with (
+            patch.object(client._pool, "_new_connection", return_value=Connecting()),
+            patch.object(http_module, "_HTTP_JOIN_TIMEOUT_SECONDS", 0.01),
+        ):
+            request = asyncio.create_task(client.post_json("http://unused.test", payload={}))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(request, timeout=1)
+                self.assertFalse(release.is_set())
+                release.set()
+                self.assertTrue(await asyncio.to_thread(closed.wait, 1))
+                self.assertEqual(sent, [])
+                self.assertEqual(client._pool._counts, {})
+            finally:
+                release.set()
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                client.close()
+
+    async def test_json_cancellation_releases_a_connection_pool_wait(self) -> None:
+        client = HttpClient(timeout_seconds=3)
+        origin = ("http", "unused.test", 80)
+        acquire = client._pool.acquire
+        leased = [acquire(origin, 3) for _ in range(http_module._MAX_CONNECTIONS_PER_ORIGIN)]
+        waiting = threading.Event()
+        finished = threading.Event()
+
+        def wait_for_connection(*args, **kwargs):
+            waiting.set()
+            try:
+                return acquire(*args, **kwargs)
+            finally:
+                finished.set()
+
+        with patch.object(client._pool, "acquire", side_effect=wait_for_connection):
+            request = asyncio.create_task(client.post_json("http://unused.test", payload={}))
+            try:
+                self.assertTrue(await asyncio.to_thread(waiting.wait, 1))
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(request, timeout=2)
+                self.assertTrue(finished.is_set(), "Cancelled request still waits for a pool slot")
+                self.assertEqual(client._pool._counts, {origin: len(leased)})
+            finally:
+                client.close()
+                for connection in leased:
+                    client._pool.release(origin, connection, reusable=False)
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+
     async def test_direct_json_errors_and_sse_reuse_one_connection(self) -> None:
         client_ports: list[int] = []
         requests: list[tuple[str, str]] = []

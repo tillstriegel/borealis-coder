@@ -125,7 +125,19 @@ storage and privacy exposure.
 JSONL traces rotate automatically by configured bytes and backup count. Complete checkpoints are
 pruned oldest first after a new checkpoint, within count, total-byte, and optional age limits; the
 newest complete recovery point is preserved. Interrupted or malformed checkpoint directories are
-not deleted automatically. Independent trace writers serialize rotation, and an in-progress
+not deleted by retention pruning. Checkpoint creation removes its own partial files when a read
+or write fails and enforces the total byte budget during reads. Fixed-size blob filenames support
+long source paths; existing checkpoint manifests and blobs remain readable.
+Retention scans verify blob checksums in bounded chunks and exclude invalid saved file modes.
+Malformed path and root references are rejected by listing, restore, and retention,
+so they cannot displace an older usable checkpoint.
+Restore validates saved modes before changing any files.
+New checkpoints record the absolute paths of additional workspace roots. Restore
+uses those paths even if the roots are reordered and refuses a missing root before
+changing any files. Older checkpoints still require the original root order.
+Restore rejects paths redirected by a new file or directory symlink before changing
+any files. Symlinks that existed at capture keep their original resolved target.
+Independent trace writers serialize rotation, and an in-progress
 multi-file patch keeps its checkpoint outside retention pruning until commit or rollback finishes.
 
 Preview or apply existing-history maintenance explicitly:

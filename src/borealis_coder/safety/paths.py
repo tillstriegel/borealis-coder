@@ -48,7 +48,9 @@ class WorkspaceRoots:
         must_exist: bool = False,
         kind: str = "any",
     ) -> ResolvedPath:
-        raw = Path(os.path.expandvars(os.path.expanduser(str(value))))
+        """Expand user-supplied strings; preserve literal filesystem Path values."""
+
+        raw = value if isinstance(value, Path) else Path(os.path.expandvars(os.path.expanduser(value)))
         candidate = raw if raw.is_absolute() else self.primary / raw
         # strict=False still resolves existing symlink parents, which prevents writing
         # through an in-workspace symlink to an outside location.
@@ -56,15 +58,16 @@ class WorkspaceRoots:
         root = self._containing_root(candidate)
         if root is None and not self.allow_outside:
             raise PathViolation(f"Path escapes configured workspace roots: {value}")
+        display = self._display_resolved(candidate, root)
         if root is None:
             root = Path(candidate.anchor)
         if must_exist and not candidate.exists():
-            raise PathViolation(f"Path does not exist: {self.display(candidate)}")
+            raise PathViolation(f"Path does not exist: {display}")
         if kind == "file" and candidate.exists() and not candidate.is_file():
-            raise PathViolation(f"Expected a file: {self.display(candidate)}")
+            raise PathViolation(f"Expected a file: {display}")
         if kind == "dir" and candidate.exists() and not candidate.is_dir():
-            raise PathViolation(f"Expected a directory: {self.display(candidate)}")
-        return ResolvedPath(candidate, root, self.display(candidate))
+            raise PathViolation(f"Expected a directory: {display}")
+        return ResolvedPath(candidate, root, display)
 
     def _containing_root(self, candidate: Path) -> Path | None:
         matches: list[Path] = []
@@ -103,6 +106,9 @@ class WorkspaceRoots:
     def display(self, path: Path) -> str:
         resolved = path.resolve(strict=False)
         root = self._containing_root(resolved)
+        return self._display_resolved(resolved, root)
+
+    def _display_resolved(self, resolved: Path, root: Path | None) -> str:
         if root is None:
             return str(resolved)
         relative = resolved.relative_to(root)

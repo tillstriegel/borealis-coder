@@ -9,7 +9,7 @@ from typing import Any
 
 from ..errors import PatchError
 from ..models import Effect, ToolResult
-from ..util import atomic_write_text, sha256_text
+from ..util import atomic_write_text, read_bytes_up_to, sha256_text
 from ._workspace_lock import workspace_transaction
 from .base import MutationScope, Tool, ToolContext, object_schema
 
@@ -57,21 +57,25 @@ class ApplyPatchTool(Tool):
         return "high" if "*** Delete File:" in patch or "+++ /dev/null" in patch else "medium"
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        patches = parse_patch(str(arguments["patch"]))
+        patch_text = str(arguments["patch"])
+        patches = parse_patch(patch_text)
         if not patches:
             raise PatchError("Patch contains no file changes")
-        with workspace_transaction(context.workspace):
-            return self._apply(patches, context)
+        async with workspace_transaction(context.workspace):
+            return self._apply(patches, context, patch_text)
 
-    def _apply(self, patches: list[FilePatch], context: ToolContext) -> ToolResult:
+    def _apply(
+        self, patches: list[FilePatch], context: ToolContext, patch_text: str
+    ) -> ToolResult:
         targets: list[Path] = []
         planned: list[tuple[Path, str, str | None, bytes | None]] = []
         seen: set[Path] = set()
-        for item in patches:
+        normalized_patches: list[FilePatch] | None = None
+        for patch_index, item in enumerate(patches):
             path = item.new_path or item.old_path
             if not path:
                 raise PatchError("File patch has no path")
-            target = context.roots.resolve(_clean_path(path)).path
+            target = context.roots.resolve(Path(path)).path
             context.roots.assert_writable(target, context.config.safety.protected_paths)
             if target in seen:
                 raise PatchError(f"Patch contains duplicate target: {context.roots.display(target)}")
@@ -90,7 +94,7 @@ class ApplyPatchTool(Tool):
             if not target.is_file():
                 operation = "delete" if item.delete else "update"
                 raise PatchError(f"Cannot {operation} missing file: {display}")
-            original_bytes = target.read_bytes()
+            original_bytes = read_bytes_up_to(target, context.config.context.max_file_bytes + 1)
             if len(original_bytes) > context.config.context.max_file_bytes:
                 raise PatchError(
                     f"File exceeds {context.config.context.max_file_bytes} byte edit limit: {display}"
@@ -101,7 +105,16 @@ class ApplyPatchTool(Tool):
                 # complete target; unified deletions still validate their hunks.
                 planned.append((target, "delete", None, original_bytes))
                 continue
-            updated = apply_hunks(original, item.hunks, display)
+            try:
+                updated = apply_hunks(original, item.hunks, display)
+            except PatchError:
+                if "\r\n" not in patch_text:
+                    raise
+                # Keep compatibility with patches whose transport converted LF
+                # lines to CRLF. Prefer exact content whenever it matches.
+                if normalized_patches is None:
+                    normalized_patches = parse_patch(patch_text.replace("\r\n", "\n"))
+                updated = apply_hunks(original, normalized_patches[patch_index].hunks, display)
             if item.delete:
                 if updated != "":
                     raise PatchError(f"Delete patch for {display} did not remove the entire file")
@@ -177,7 +190,7 @@ def _require_preimage(
             f"{operation} target changed before commit"
         )
     try:
-        actual = path.read_bytes()
+        actual = read_bytes_up_to(path, len(expected) + 1)
     except OSError as error:
         raise PatchError(
             f"Stale patch rejected for {display}: target changed"
@@ -190,10 +203,9 @@ def _require_preimage(
 
 
 def parse_patch(text: str) -> list[FilePatch]:
-    normalized = text.replace("\r\n", "\n")
-    if normalized.lstrip().startswith("*** Begin Patch"):
-        return _parse_apply_patch(normalized)
-    return _parse_unified(normalized)
+    if text.lstrip().startswith("*** Begin Patch"):
+        return _parse_apply_patch(text)
+    return _parse_unified(text)
 
 
 def _parse_apply_patch(text: str) -> list[FilePatch]:
@@ -204,9 +216,9 @@ def _parse_apply_patch(text: str) -> list[FilePatch]:
         index += 1
     index += 1
     while index < len(lines):
-        line = lines[index].rstrip("\n")
+        line = lines[index].rstrip("\r\n")
         if line == "*** End Patch":
-            break
+            return result
         if line.startswith("*** Add File: "):
             path = line[len("*** Add File: ") :].strip()
             index += 1
@@ -237,7 +249,7 @@ def _parse_apply_patch(text: str) -> list[FilePatch]:
             index += 1
             continue
         raise PatchError(f"Unexpected apply_patch directive: {line}")
-    return result
+    raise PatchError("Patch envelope is missing *** End Patch")
 
 
 def _parse_update_hunks(lines: list[str], path: str) -> list[Hunk]:
@@ -247,7 +259,7 @@ def _parse_update_hunks(lines: list[str], path: str) -> list[Hunk]:
     hunks: list[Hunk] = []
     index = 0
     while index < len(lines):
-        header = lines[index].rstrip("\n")
+        header = lines[index].rstrip("\r\n")
         match = numbered.match(lines[index])
         if match:
             hunk = Hunk(
@@ -297,9 +309,17 @@ def _parse_unified(text: str) -> list[FilePatch]:
     lines = text.splitlines(keepends=True)
     result: list[FilePatch] = []
     index = 0
+    git_section_has_patch: bool | None = None
     header = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
     while index < len(lines):
         if not lines[index].startswith("--- "):
+            line = lines[index].rstrip("\r\n")
+            if line.startswith("diff --git "):
+                if git_section_has_patch is False:
+                    raise PatchError("Git diff section contains no supported text hunks")
+                git_section_has_patch = False
+            else:
+                _validate_unified_metadata(line)
             index += 1
             continue
         old_path = lines[index][4:].strip().split("\t", 1)[0]
@@ -309,29 +329,13 @@ def _parse_unified(text: str) -> list[FilePatch]:
         new_path = lines[index][4:].strip().split("\t", 1)[0]
         index += 1
         patch = FilePatch(
-            None if old_path == "/dev/null" else old_path,
-            None if new_path == "/dev/null" else new_path,
+            None if old_path == "/dev/null" else _clean_path(old_path),
+            None if new_path == "/dev/null" else _clean_path(new_path),
             delete=new_path == "/dev/null",
         )
-        if old_path == "/dev/null":
-            added: list[str] = []
-            while index < len(lines) and not lines[index].startswith("--- "):
-                match = header.match(lines[index])
-                if match:
-                    index += 1
-                    continue
-                value = lines[index]
-                if value.startswith("+") and not value.startswith("+++"):
-                    added.append(value[1:])
-                elif value.startswith("\\ No newline"):
-                    pass
-                elif value.startswith((" ", "-")):
-                    raise PatchError("New-file patch unexpectedly contains context or removals")
-                index += 1
-            patch.add_content = "".join(added)
-            result.append(patch)
-            continue
-        while index < len(lines) and not lines[index].startswith("--- "):
+        if patch.old_path and patch.new_path and patch.old_path != patch.new_path:
+            raise PatchError("Unified patches cannot rename or copy files")
+        while index < len(lines) and not lines[index].startswith(("--- ", "diff --git ")):
             match = header.match(lines[index])
             if not match:
                 if lines[index].strip():
@@ -347,7 +351,8 @@ def _parse_unified(text: str) -> list[FilePatch]:
                 int(match.group(3)), int(match.group(4) or 1),
             )
             index += 1
-            while index < len(lines) and not lines[index].startswith(("@@ ", "--- ")):
+            old_seen = new_seen = 0
+            while index < len(lines):
                 value = lines[index]
                 if value.startswith("\\ No newline"):
                     if not hunk.lines:
@@ -355,13 +360,48 @@ def _parse_unified(text: str) -> list[FilePatch]:
                     hunk.lines[-1].text = hunk.lines[-1].text.removesuffix("\n")
                     index += 1
                     continue
+                if old_seen == hunk.old_count and new_seen == hunk.new_count:
+                    break
                 if not value or value[0] not in " +-":
                     raise PatchError(f"Invalid hunk line: {value.rstrip()}")
                 hunk.lines.append(HunkLine(value[0], value[1:]))
+                old_seen += value[0] in " -"
+                new_seen += value[0] in " +"
+                if old_seen > hunk.old_count or new_seen > hunk.new_count:
+                    raise PatchError("Hunk body exceeds its declared line counts")
                 index += 1
+            if old_seen != hunk.old_count or new_seen != hunk.new_count:
+                raise PatchError("Hunk body is shorter than its declared line counts")
             patch.hunks.append(hunk)
+        if not patch.hunks:
+            raise PatchError("Unified file patch contains no hunks")
+        if old_path == "/dev/null":
+            patch.add_content = apply_hunks("", patch.hunks, new_path)
         result.append(patch)
+        if git_section_has_patch is not None:
+            git_section_has_patch = True
+    if git_section_has_patch is False:
+        raise PatchError("Git diff section contains no supported text hunks")
     return result
+
+
+def _validate_unified_metadata(line: str) -> None:
+    if line.startswith(("Binary files ", "GIT binary patch")):
+        raise PatchError("Binary patches are not supported")
+    if line.startswith(("old mode ", "new mode ")):
+        raise PatchError("File mode changes are not supported")
+    if line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+        raise PatchError("Unified patches cannot rename or copy files")
+    if line.startswith(("diff --cc ", "diff --combined ")):
+        raise PatchError("Combined merge diffs are not supported")
+    if line.startswith("new file mode ") and line != "new file mode 100644":
+        raise PatchError("New-file patches support only regular non-executable files")
+    if line.startswith("deleted file mode ") and line.rsplit(" ", 1)[-1] not in {"100644", "100755"}:
+        raise PatchError("Delete patches support only regular files")
+    if line.startswith("index "):
+        fields = line.split()
+        if len(fields) == 3 and fields[-1] not in {"100644", "100755"}:
+            raise PatchError("Unified patches support only regular files")
 
 
 def apply_hunks(original: str, hunks: list[Hunk], display: str) -> str:
@@ -387,7 +427,8 @@ def apply_hunks(original: str, hunks: list[Hunk], display: str) -> str:
                 )
             start = matches[0]
         else:
-            start = max(0, hunk.old_start - 1)
+            # An empty old range names the line before the insertion point.
+            start = hunk.old_start if hunk.old_count == 0 else max(0, hunk.old_start - 1)
         if start < cursor or start > len(source):
             label = "located context" if hunk.old_start is None else f"old line {hunk.old_start}"
             raise PatchError(f"Overlapping or reordered hunk in {display}: {label}")
@@ -421,6 +462,8 @@ def apply_hunks(original: str, hunks: list[Hunk], display: str) -> str:
 
 def _clean_path(path: str) -> str:
     path = path.strip()
+    if path.startswith('"'):
+        raise PatchError("Quoted Git paths are not supported; use a patch envelope with literal paths")
     if path.startswith("a/") or path.startswith("b/"):
         return path[2:]
     return path

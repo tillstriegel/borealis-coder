@@ -24,6 +24,7 @@ from .models import AgentResult, Event, Role
 from .safety import ApprovalRequest
 from .terminal import AuroraUI, ConsoleRenderer, ReadlineHistory
 from .terminal_input import TerminalInput, TerminalInputInterrupted
+from .tools._workspace_lock import workspace_transaction
 from .util import truncate_text
 
 ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
@@ -656,7 +657,7 @@ class InteractiveCLI:
         elif command == "/doctor":
             self._print_diagnostics()
         elif command == "/rollback":
-            self._rollback(args)
+            await self._rollback(args)
         elif command == "/paste":
             return False, await self._read_multiline()
         else:
@@ -895,7 +896,7 @@ class InteractiveCLI:
                 item.message,
             )
 
-    def _rollback(self, args: list[str]) -> None:
+    async def _rollback(self, args: list[str]) -> None:
         manager = self._require_runner().tool_context.checkpoints
         if not args:
             values = manager.list()
@@ -908,7 +909,8 @@ class InteractiveCLI:
             ]
             self.ui.panel("Recovery points", rows, tone="warning")
             return
-        checkpoint = manager.restore(args[0])
+        async with workspace_transaction(self.workspace):
+            checkpoint = manager.restore(args[0])
         self.ui.notice(
             "success", "Checkpoint restored", f"{checkpoint.id} · {len(checkpoint.files)} file(s)"
         )

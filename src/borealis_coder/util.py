@@ -5,20 +5,42 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import io
 import json
 import os
 import re
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
 T = TypeVar("T")
+FileSignature = tuple[int, int, int, int, int]
 _TOKEN_ESTIMATE_CHUNK_CHARS = 16_384
+
+
+def file_signature(stat: os.stat_result) -> FileSignature:
+    """Detect replacements and metadata changes without reading file content."""
+
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def read_bytes_up_to(path: Path, limit: int) -> bytes:
+    """Read a bounded prefix without allocating the full limit for small files."""
+
+    with path.open("rb") as handle, io.BytesIO() as output:
+        remaining = limit
+        while remaining > 0:
+            chunk = handle.read(min(65_536, remaining))
+            if not chunk:
+                break
+            output.write(chunk)
+            remaining -= len(chunk)
+        return output.getvalue()
 
 
 def utc_now() -> str:
@@ -72,7 +94,7 @@ def json_loads(value: str | bytes) -> Any:
 
 def atomic_write_bytes(path: Path, data: bytes, *, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    fd, temp_name = tempfile.mkstemp(prefix=".borealis-", dir=str(path.parent))
     temp = Path(temp_name)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -202,3 +224,24 @@ async def cancel_and_wait(task: asyncio.Task[Any] | None) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+async def finish_on_cancellation(operation: Awaitable[T]) -> T:
+    """Finish a critical operation before propagating caller cancellation."""
+
+    task = asyncio.ensure_future(operation)
+    pending_cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as error:
+            pending_cancellation = error
+    try:
+        result = task.result()
+    except BaseException as error:
+        if pending_cancellation is not None:
+            raise pending_cancellation from error
+        raise
+    if pending_cancellation is not None:
+        raise pending_cancellation
+    return result

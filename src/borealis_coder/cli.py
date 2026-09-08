@@ -26,6 +26,7 @@ from .protocol import ACPServer
 from .safety import ApprovalRequest, CheckpointManager, WorkspaceRoots
 from .sessions import SessionStore
 from .terminal import AuroraUI, ConsoleRenderer
+from .tools._workspace_lock import workspace_transaction
 from .util import atomic_write_text, json_dumps
 
 
@@ -273,7 +274,7 @@ async def _main(args: argparse.Namespace) -> int:
     if args.command == "sessions":
         return await _sessions(args)
     if args.command == "rollback":
-        return _rollback(args)
+        return await _rollback(args)
     if args.command == "maintenance":
         return _maintenance(args)
     if args.command == "acp":
@@ -532,7 +533,7 @@ async def _sessions(args: argparse.Namespace) -> int:
     return 0
 
 
-def _rollback(args: argparse.Namespace) -> int:
+async def _rollback(args: argparse.Namespace) -> int:
     workspace = args.workspace.expanduser().resolve()
     config = load_config(workspace, explicit_path=args.config)
     roots = WorkspaceRoots(workspace, allow_outside=config.safety.allow_outside_workspace)
@@ -541,7 +542,8 @@ def _rollback(args: argparse.Namespace) -> int:
         for item in manager.list():
             print(f"{item.id}\t{item.created_at}\t{item.label}\t{len(item.files)} file(s)")
         return 0
-    checkpoint = manager.restore(args.checkpoint_id)
+    async with workspace_transaction(workspace):
+        checkpoint = manager.restore(args.checkpoint_id)
     print(f"restored {checkpoint.id}: {len(checkpoint.files)} file(s)")
     return 0
 

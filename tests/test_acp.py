@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-from borealis_coder.errors import ProtocolError
+from borealis_coder.agent import build_runner
+from borealis_coder.errors import ProtocolError, SessionError
 from borealis_coder.models import Event
 from borealis_coder.protocol import ACPServer
 from borealis_coder.sessions import SessionStore
@@ -28,6 +31,69 @@ class FakeConnection:
 
 
 class ACPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_session_resume_closes_the_unowned_runner(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(root / "data"), "BOREALIS_PROVIDER": "mock"},
+            ):
+                runner = await build_runner(root)
+                server = ACPServer()
+                await server.handle("initialize", {"protocolVersion": 2})
+                try:
+                    with (
+                        patch("borealis_coder.protocol.acp.build_runner", return_value=runner),
+                        self.assertRaises(SessionError),
+                    ):
+                        await server.handle(
+                            "session/resume", {"cwd": str(root), "sessionId": "missing"}
+                        )
+                    self.assertEqual(server.runners, {})
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        runner.sessions.list_sessions()
+                finally:
+                    await runner.close()
+
+    async def test_failed_session_setup_closes_the_unowned_runner(self):
+        for method, store_method in (
+            ("session/new", "create_session"),
+            ("session/resume", "get_session"),
+        ):
+            for error_type in (SessionError, asyncio.CancelledError):
+                with (
+                    self.subTest(method=method, error=error_type.__name__),
+                    tempfile.TemporaryDirectory() as td,
+                ):
+                    root = Path(td)
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "BOREALIS_DATA_DIR": str(root / "data"),
+                            "BOREALIS_PROVIDER": "mock",
+                        },
+                    ):
+                        runner = await build_runner(root)
+                        server = ACPServer()
+                        await server.handle("initialize", {"protocolVersion": 2})
+                        try:
+                            with (
+                                patch(
+                                    "borealis_coder.protocol.acp.build_runner",
+                                    return_value=runner,
+                                ),
+                                patch.object(runner.sessions, store_method, side_effect=error_type),
+                                self.assertRaises(error_type),
+                            ):
+                                await server.handle(
+                                    method, {"cwd": str(root), "sessionId": "missing"}
+                                )
+                            self.assertEqual(server.runners, {})
+                            with self.assertRaises(sqlite3.ProgrammingError):
+                                runner.sessions.list_sessions()
+                        finally:
+                            await runner.close()
+
     async def test_prompt_waits_for_a_finishing_run(self):
         class FinishingRunner:
             def __init__(self):
@@ -57,6 +123,254 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(arguments["wait_for_active_run"])
         updates = [params["update"] for _, params in fake.notifications]
         self.assertEqual([item["sessionUpdate"] for item in updates], ["user_message"])
+
+    async def test_resume_stops_active_prompts_before_closing_the_old_runner(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(root / "data"), "BOREALIS_PROVIDER": "mock"},
+            ):
+                server = ACPServer()
+                server.connection = cast(Any, FakeConnection())
+                await server.handle("initialize", {"protocolVersion": 2})
+                created = await server.handle("session/new", {"cwd": str(root)})
+                session_id = created["sessionId"]
+                old = server.runners[session_id]
+                started = asyncio.Event()
+                stopped = asyncio.Event()
+
+                async def busy(*args, **kwargs):
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        # Prompt cleanup still has access to its open session store.
+                        old.sessions.get_session(session_id)
+                        stopped.set()
+
+                try:
+                    with patch.object(old, "run", side_effect=busy):
+                        await server.handle(
+                            "session/prompt",
+                            {
+                                "sessionId": session_id,
+                                "prompt": [{"type": "text", "text": "work"}],
+                            },
+                        )
+                        await asyncio.wait_for(started.wait(), timeout=2)
+                        task = server.tasks[session_id]
+                        await server.handle(
+                            "session/resume", {"cwd": str(root), "sessionId": session_id}
+                        )
+                    self.assertTrue(task.done())
+                    self.assertTrue(stopped.is_set())
+                    self.assertNotIn(session_id, server.tasks)
+                    self.assertIsNot(server.runners[session_id], old)
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        old.sessions.list_sessions()
+                    self.assertEqual(
+                        server.runners[session_id].sessions.get_session(session_id).id, session_id
+                    )
+                finally:
+                    await server.close()
+
+    async def test_cancelled_session_close_still_closes_the_runner(self):
+        exception_handler = patch.object(asyncio.get_running_loop(), "call_exception_handler")
+        errors = exception_handler.start()
+        self.addCleanup(exception_handler.stop)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(root / "data"), "BOREALIS_PROVIDER": "mock"},
+            ):
+                runner = await build_runner(root)
+                server = ACPServer()
+                server.runners["session_1"] = runner
+                started = asyncio.Event()
+                stopping = asyncio.Event()
+
+                async def work():
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        stopping.set()
+                        await asyncio.Event().wait()
+
+                task = asyncio.create_task(work())
+                server.tasks["session_1"] = task
+                await started.wait()
+                closing = asyncio.create_task(server._session_close({"sessionId": "session_1"}))
+                try:
+                    await asyncio.wait_for(stopping.wait(), timeout=2)
+                    closing.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(closing, timeout=2)
+                    self.assertTrue(task.done())
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        runner.sessions.list_sessions()
+                    errors.assert_not_called()
+                finally:
+                    task.cancel()
+                    closing.cancel()
+                    await asyncio.gather(task, closing, return_exceptions=True)
+                    await runner.close()
+
+    async def test_cancelled_server_close_still_closes_all_runners(self):
+        exception_handler = patch.object(asyncio.get_running_loop(), "call_exception_handler")
+        errors = exception_handler.start()
+        self.addCleanup(exception_handler.stop)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(root / "data"), "BOREALIS_PROVIDER": "mock"},
+            ):
+                runners = [await build_runner(root), await build_runner(root)]
+                server = ACPServer()
+                server.runners = dict(zip(("first", "second"), runners, strict=True))
+                started = asyncio.Event()
+                stopping = asyncio.Event()
+
+                async def work():
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        stopping.set()
+                        await asyncio.Event().wait()
+
+                task = asyncio.create_task(work())
+                server.tasks["first"] = task
+                server._prompt_tasks["first"] = [task]
+                await started.wait()
+                closing = asyncio.create_task(server.close())
+                try:
+                    await asyncio.wait_for(stopping.wait(), timeout=2)
+                    closing.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(closing, timeout=2)
+                    self.assertTrue(task.done())
+                    for runner in runners:
+                        with self.assertRaises(sqlite3.ProgrammingError):
+                            runner.sessions.list_sessions()
+                    self.assertEqual(server.runners, {})
+                    self.assertEqual(server.tasks, {})
+                    self.assertEqual(server._prompt_tasks, {})
+                    errors.assert_not_called()
+                finally:
+                    task.cancel()
+                    closing.cancel()
+                    await asyncio.gather(task, closing, return_exceptions=True)
+                    await asyncio.gather(*(runner.close() for runner in runners))
+
+    async def test_concurrent_resumes_serialize_only_the_same_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(root / "data"), "BOREALIS_PROVIDER": "mock"},
+            ):
+                server = ACPServer()
+                await server.handle("initialize", {"protocolVersion": 2})
+                created = await server.handle("session/new", {"cwd": str(root)})
+                unrelated = await server.handle("session/new", {"cwd": str(root)})
+                session_id = created["sessionId"]
+                old = server.runners[session_id]
+                original_close = old.close
+                entered = asyncio.Event()
+                release = asyncio.Event()
+                replacements = []
+                requests = []
+
+                async def capture_runner(*args, **kwargs):
+                    runner = await build_runner(*args, **kwargs)
+                    replacements.append(runner)
+                    return runner
+
+                async def slow_close():
+                    entered.set()
+                    await release.wait()
+                    await original_close()
+
+                params = {"cwd": str(root), "sessionId": session_id}
+                second_started = asyncio.Event()
+
+                async def second_resume():
+                    second_started.set()
+                    return await server.handle("session/resume", params)
+
+                try:
+                    with (
+                        patch("borealis_coder.protocol.acp.build_runner", capture_runner),
+                        patch.object(old, "close", side_effect=slow_close),
+                    ):
+                        requests.append(asyncio.create_task(server.handle("session/resume", params)))
+                        await asyncio.wait_for(entered.wait(), timeout=2)
+                        await asyncio.wait_for(
+                            server.handle("session/close", unrelated), timeout=2
+                        )
+                        requests.append(asyncio.create_task(second_resume()))
+                        await asyncio.wait_for(second_started.wait(), timeout=2)
+                        self.assertEqual(len(replacements), 1)
+                        release.set()
+                        self.assertEqual(await asyncio.gather(*requests), [{}, {}])
+                    self.assertEqual(len(replacements), 2)
+                    self.assertIs(server.runners[session_id], replacements[1])
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        replacements[0].sessions.list_sessions()
+                    self.assertEqual(len(server._session_locks), 0)
+                finally:
+                    release.set()
+                    for request in requests:
+                        request.cancel()
+                    await asyncio.gather(*requests, return_exceptions=True)
+                    await server.close()
+                    await old.close()
+                    for runner in replacements:
+                        await runner.close()
+
+    async def test_session_listing_owns_its_connection_during_concurrent_close(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.dict(
+                os.environ,
+                {"BOREALIS_DATA_DIR": str(root / "data"), "BOREALIS_PROVIDER": "mock"},
+            ):
+                server = ACPServer()
+                await server.handle("initialize", {"protocolVersion": 2})
+                created = await server.handle("session/new", {"cwd": str(root)})
+                original_list = SessionStore.list_sessions
+                entered = threading.Event()
+                release = threading.Event()
+                queried = []
+
+                def delayed_list(store, **kwargs):
+                    queried.append(store)
+                    entered.set()
+                    if not release.wait(2):
+                        raise TimeoutError("test synchronization timeout")
+                    return original_list(store, **kwargs)
+
+                with patch.object(SessionStore, "list_sessions", delayed_list):
+                    listing = asyncio.create_task(server.handle("session/list", {"cwd": str(root)}))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        await server.handle("session/close", created)
+                        release.set()
+                        result = await asyncio.wait_for(listing, timeout=2)
+                        self.assertEqual(
+                            [item["sessionId"] for item in result["sessions"]],
+                            [created["sessionId"]],
+                        )
+                    finally:
+                        release.set()
+                        await asyncio.gather(listing, return_exceptions=True)
+                        await server.close()
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    queried[0].list_sessions()
 
     async def test_cancel_stops_all_queued_prompt_tasks(self):
         class QueuedRunner:

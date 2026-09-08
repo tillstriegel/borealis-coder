@@ -60,6 +60,10 @@ class Budget:
     def before_turn(self) -> None:
         if self.turns >= self.config.max_turns:
             raise BudgetExceeded("turns", max_turns_recovery_message(self.config.max_turns))
+        self._check_time_and_cost()
+        self.turns += 1
+
+    def _check_time_and_cost(self) -> None:
         if self.elapsed_seconds >= self.config.max_time_seconds:
             raise BudgetExceeded(
                 "time", f"Maximum {self.config.max_time_seconds}s run time reached"
@@ -69,7 +73,6 @@ class Budget:
             raise BudgetExceeded(
                 "cost", f"Maximum ${self.config.max_cost_usd:.2f} model cost reached"
             )
-        self.turns += 1
 
     def retry_current_turn(self) -> None:
         """Keep a failed provider attempt within its current logical model turn."""
@@ -88,6 +91,7 @@ class Budget:
                     self.config.max_model_requests
                 ),
             )
+        self._check_time_and_cost()
         self.model_requests += 1
 
     def add_usage(self, usage: Usage) -> None:

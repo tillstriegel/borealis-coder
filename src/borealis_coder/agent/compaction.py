@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import posixpath
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
+from itertools import pairwise
 from typing import Any
 
 from ..errors import BudgetExceeded, Cancelled, SessionError
@@ -229,8 +231,9 @@ def prune_provider_messages(
     copies: list[Message] = []
     reads_by_revision: dict[
         tuple[str, str],
-        list[tuple[int, tuple[int, int] | None, str]],
+        list[tuple[int, tuple[int, int] | None]],
     ] = {}
+    latest_read_by_content: dict[tuple[str, str, str], int] = {}
     latest_discovery: dict[str, int] = {}
     latest_mutation: dict[str, int] = {}
     for index, message in enumerate(messages):
@@ -242,13 +245,10 @@ def prune_provider_messages(
             if sha:
                 metadata.setdefault("sha256", sha)
             if path and sha and not message.is_error:
-                arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
+                content_hash = _read_slice_identity(message.content)
+                latest_read_by_content[(path, sha, content_hash)] = index
                 reads_by_revision.setdefault((path, sha), []).append(
-                    (
-                        index,
-                        _read_interval(arguments, message.content),
-                        _read_slice_identity(arguments, message.content),
-                    )
+                    (index, _read_interval(message.content))
                 )
         if message.role == Role.TOOL:
             tool_name, arguments = call_details.get(
@@ -273,23 +273,20 @@ def prune_provider_messages(
         if message.tool_name == "read_file":
             path = str(message.metadata.get("path") or "")
             sha = str(message.metadata.get("sha256") or "")
-            arguments = call_details.get(message.tool_call_id or "", ("", {}))[1]
-            interval = _read_interval(arguments, message.content)
-            slice_identity = _read_slice_identity(arguments, message.content)
+            interval = _read_interval(message.content)
+            slice_identity = _read_slice_identity(message.content)
             later_reads = reads_by_revision.get((path, sha), [])
             superseded = bool(
                 path
                 and sha
                 and (
-                    any(
+                    latest_mutation.get(path, -1) > index
+                    or latest_read_by_content.get((path, sha, slice_identity), -1) > index
+                    or any(
                         later_index > index
-                        and (
-                            later_slice_identity == slice_identity
-                            or _interval_covers(later_interval, interval)
-                        )
-                        for later_index, later_interval, later_slice_identity in later_reads
+                        and _interval_covers(later_interval, interval)
+                        for later_index, later_interval in later_reads
                     )
-                    or latest_mutation.get(path, -1) > index
                 )
             )
             if superseded:
@@ -347,24 +344,24 @@ def _read_identity(content: str, metadata: dict[str, Any]) -> tuple[str, str]:
 def _canonical_path(path: str) -> str:
     if not path:
         return ""
-    return posixpath.normpath(path.replace("\\", "/"))
+    if os.name == "nt":
+        path = path.replace("\\", "/")
+    return posixpath.normpath(path)
 
 
-def _read_interval(
-    arguments: dict[str, Any],
-    content: str,
-) -> tuple[int, int] | None:
+def _read_interval(content: str) -> tuple[int, int] | None:
+    if "\n… output truncated …\n" in content:
+        return None
     numbered_lines = [
         int(match)
         for match in re.findall(r"(?m)^\s*(\d+)\t", content)
     ]
-    if numbered_lines:
-        return numbered_lines[0], numbered_lines[-1]
-    start = arguments.get("start_line")
-    end = arguments.get("end_line")
-    if start is not None and end is not None:
-        return int(start), int(end)
-    return None
+    if not numbered_lines or any(
+        following != previous + 1
+        for previous, following in pairwise(numbered_lines)
+    ):
+        return None
+    return numbered_lines[0], numbered_lines[-1]
 
 
 def _interval_covers(
@@ -379,15 +376,7 @@ def _interval_covers(
     )
 
 
-def _read_slice_identity(arguments: dict[str, Any], content: str) -> str:
-    if arguments:
-        return json_dumps(
-            {
-                "start_line": arguments.get("start_line"),
-                "end_line": arguments.get("end_line"),
-                "max_chars": arguments.get("max_chars"),
-            }
-        )
+def _read_slice_identity(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 

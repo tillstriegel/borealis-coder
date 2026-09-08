@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..util import FileSignature, file_signature
+
 
 @dataclass(frozen=True, slots=True)
 class Skill:
@@ -21,11 +23,11 @@ class SkillCatalog:
     def __init__(self, root: Path, directories: list[str]) -> None:
         self.root = root.resolve()
         self.directories = directories
-        self._cache: dict[Path, tuple[int, int, Skill]] = {}
+        self._cache: dict[Path, tuple[FileSignature, Skill]] = {}
 
     def discover(self) -> dict[str, Skill]:
         skills: dict[str, Skill] = {}
-        active: dict[Path, tuple[int, int, Skill]] = {}
+        active: dict[Path, tuple[FileSignature, Skill]] = {}
         for directory in self.directories:
             base = (self.root / directory).resolve(strict=False)
             try:
@@ -46,16 +48,17 @@ class SkillCatalog:
                     stat = resolved.stat()
                 except OSError:
                     continue
-                cached = self._cache.get(resolved)
-                if cached is None or cached[:2] != (stat.st_mtime_ns, stat.st_size):
+                cached = self._cache.get(path)
+                signature = file_signature(stat)
+                if cached is None or cached[0] != signature or cached[1].path != resolved:
                     text = resolved.read_text(encoding="utf-8", errors="replace")
                     metadata, body = _frontmatter(text)
                     name = str(metadata.get("name") or path.parent.name).strip()
                     description = str(metadata.get("description") or _first_paragraph(body)).strip()
                     skill = Skill(name, description, resolved, body, metadata)
-                    cached = (stat.st_mtime_ns, stat.st_size, skill)
-                active[resolved] = cached
-                skill = cached[2]
+                    cached = (signature, skill)
+                active[path] = cached
+                skill = cached[1]
                 if skill.name and skill.name not in skills:
                     skills[skill.name] = skill
         self._cache = active

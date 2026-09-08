@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import asyncio
+import io
+import os
+import subprocess
 import tempfile
+import threading
+import tracemalloc
 import unittest
+from difflib import unified_diff
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from borealis_coder.errors import ToolError, ToolValidationError
-from borealis_coder.models import ToolCall
+from borealis_coder.models import ToolCall, ToolResult
+from borealis_coder.providers.mock import MockProvider
 from borealis_coder.tools import build_builtin_registry, validate_schema
+from borealis_coder.tools.base import FunctionTool, ToolRegistry, object_schema
 from borealis_coder.tools.fetch import _fetch_public_url, _validate_public_url
-from borealis_coder.util import sha256_text
+from borealis_coder.util import sha256_bytes, sha256_text
 from tests.helpers import make_context
 
 
@@ -31,6 +41,69 @@ class SchemaTests(unittest.TestCase):
             validate_schema({"x":1,"y":2}, schema)
 
 
+class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_parallel_calls_keep_their_identity_and_share_run_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            context = make_context(Path(td))
+            entered = 0
+            ready = asyncio.Event()
+
+            async def identify(arguments, call_context):
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    ready.set()
+                await ready.wait()
+                call_context.changed_files.add(call_context.tool_call_id)
+                call_context.metadata[call_context.tool_call_id] = True
+                call_context.mutation_tracking = "incomplete"
+                call_context.lifecycle_uncertainty_only = call_context.tool_call_id == "first"
+                return ToolResult(call_context.tool_call_id)
+
+            registry = ToolRegistry([FunctionTool(
+                name="identify", description="Report the current call", parameters=object_schema({}),
+                function=identify, concurrent=True,
+            )])
+            calls = [ToolCall(id=value, name="identify", arguments={}) for value in ("first", "second")]
+            results = await asyncio.wait_for(
+                asyncio.gather(*(registry.execute(call, context) for call in calls)), timeout=2,
+            )
+
+            self.assertEqual([result.output for result in results], [call.id for call in calls])
+            self.assertEqual(context.changed_files, {"first", "second"})
+            self.assertTrue(context.metadata["first"])
+            self.assertTrue(context.metadata["second"])
+            self.assertEqual(context.mutation_tracking, "incomplete")
+            self.assertFalse(context.lifecycle_uncertainty_only)
+
+    async def test_call_uncertainty_survives_failure_and_cancellation(self):
+        for failure in (ToolError, asyncio.CancelledError):
+            for lifecycle_only in (False, True):
+                with self.subTest(failure=failure, lifecycle_only=lifecycle_only), tempfile.TemporaryDirectory() as td:
+                    context = make_context(Path(td))
+
+                    async def uncertain(arguments, call_context, failure=failure, lifecycle_only=lifecycle_only):
+                        call_context.mutation_tracking = "incomplete"
+                        call_context.lifecycle_uncertainty_only = lifecycle_only
+                        call_context.changed_roots.add(call_context.workspace)
+                        raise failure("interrupted")
+
+                    registry = ToolRegistry([FunctionTool(
+                        name="uncertain", description="Track an interrupted operation",
+                        parameters=object_schema({}), function=uncertain,
+                    )])
+                    call = ToolCall(name="uncertain", arguments={})
+                    if failure is asyncio.CancelledError:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await registry.execute(call, context)
+                    else:
+                        result = await registry.execute(call, context)
+                        self.assertTrue(result.is_error)
+                    self.assertEqual(context.mutation_tracking, "incomplete")
+                    self.assertEqual(context.lifecycle_uncertainty_only, lifecycle_only)
+                    self.assertEqual(context.changed_roots, {context.workspace})
+
+
 class FileToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -38,11 +111,160 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         self.context = make_context(self.root)
         self.registry = build_builtin_registry()
 
+    async def test_small_file_read_does_not_allocate_its_configured_ceiling(self):
+        target = self.root / "small.txt"
+        target.write_bytes(b"x" * 1024)
+        self.context.config.context.max_file_bytes = 25_000_000
+        tracemalloc.start()
+        try:
+            result = await self.call("read_file", {
+                "path": target.name, "start_line": None, "end_line": None, "max_chars": None,
+            })
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual(result.metadata["sha256"], sha256_bytes(b"x" * 1024))
+        self.assertLess(peak, 1_000_000)
+
+    async def test_write_and_delete_stream_large_preimage_hashes(self):
+        payload = b"x" * (2 * 1024 * 1024)
+        digest = sha256_bytes(payload)
+        target = self.root / "large.bin"
+        self.context.config.safety.checkpoints = False
+        self.context.checkpoints.enabled = False
+        for name in ("write_file", "delete_file"):
+            with self.subTest(tool=name):
+                target.write_bytes(payload)
+                arguments = {"path": target.name, "expected_sha256": digest}
+                if name == "write_file":
+                    arguments["content"] = "replacement"
+                tracemalloc.start()
+                try:
+                    result = await self.call(name, arguments)
+                    _, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+                self.assertFalse(result.is_error, result.output)
+                self.assertLess(peak, 1_000_000)
+                if name == "write_file":
+                    self.assertEqual(target.read_text(), "replacement")
+                else:
+                    self.assertFalse(target.exists())
+
+    @unittest.skipIf(os.name == "nt", "Long paths require Windows long-path support")
+    async def test_atomic_write_preserves_legal_long_file_names(self):
+        target = self.root / ("x" * 250 + ".py")
+        target.write_text("before")
+        result = await self.call("write_file", {
+            "path": target.name, "content": "after", "expected_sha256": sha256_text("before"),
+        })
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual(target.read_text(), "after")
+
+    async def test_write_rejects_a_deleted_empty_file(self):
+        target = self.root / "empty.txt"
+        target.touch()
+        observed = await self.call("read_file", {
+            "path": target.name, "start_line": 1, "end_line": None, "max_chars": 100,
+        })
+        self.assertFalse(observed.is_error, observed.output)
+        target.unlink()
+        result = await self.call("write_file", {
+            "path": target.name, "content": "replacement",
+            "expected_sha256": observed.metadata["sha256"],
+        })
+        self.assertTrue(result.is_error, result.output)
+        self.assertIn("Stale write rejected", result.output)
+        self.assertFalse(target.exists())
+
+    async def test_text_edits_enforce_byte_limits_during_reads(self):
+        target = self.root / "bounded.txt"
+        target.write_text("old\n")
+        self.context.config.context.max_file_bytes = 8
+        calls = [
+            ("replace_in_file", {
+                "path": target.name, "old_text": "old", "new_text": "new",
+                "expected_occurrences": 1, "expected_sha256": None,
+            }),
+            ("apply_patch", {
+                "patch": "*** Begin Patch\n*** Update File: bounded.txt\n@@\n-old\n+new\n*** End Patch\n",
+            }),
+        ]
+        reads: list[int | None] = []
+
+        class ObservedFile(io.BytesIO):
+            def read(self, size: int | None = -1):
+                reads.append(size)
+                return super().read(size)
+
+        original_open = Path.open
+
+        def open_file(path, *args, **kwargs):
+            mode = kwargs.get("mode", args[0] if args else "r")
+            if path == target.resolve() and mode == "rb":
+                return ObservedFile(b"old\nmore than the configured byte limit")
+            return original_open(path, *args, **kwargs)
+
+        for name, arguments in calls:
+            with self.subTest(tool=name):
+                reads.clear()
+                with patch.object(Path, "open", new=open_file):
+                    result = await self.call(name, arguments)
+                self.assertTrue(result.is_error, result.output)
+                self.assertEqual(reads, [9])
+                self.assertEqual(target.read_text(), "old\n")
+
     async def asyncTearDown(self):
         self.temp.cleanup()
 
     async def call(self, name, arguments):
         return await self.registry.execute(ToolCall(name=name, arguments=arguments), self.context)
+
+    async def test_context_tools_remain_cancellable_during_blocked_preparation(self):
+        builder = self.context.metadata["context_builder"]
+        provider = MockProvider(self.context.config.providers["mock"])
+        self.context.metadata.update({
+            "provider_routes": [SimpleNamespace(name="mock", model="test", provider=provider)],
+            "tool_registry": self.registry,
+        })
+        cases = (
+            ("repo_map", {"query": "query", "max_chars": 1000}, builder.repo_map, "build", "map"),
+            ("read_skill", {"name": "example"}, builder.skills, "get", None),
+            ("read_instructions", {"path": "."}, builder.instructions, "for_path", []),
+            ("delegate_task", {"task": "inspect", "max_turns": 1}, builder, "system_prompt", "system"),
+        )
+        for name, arguments, owner, method, value in cases:
+            with self.subTest(tool=name):
+                started = threading.Event()
+                release = threading.Event()
+                finished = threading.Event()
+
+                def blocked(*args, started=started, release=release, finished=finished, value=value, **kwargs):
+                    started.set()
+                    try:
+                        if not release.wait(timeout=2):
+                            raise AssertionError("Context preparation blocked the event loop")
+                        return value
+                    finally:
+                        finished.set()
+
+                with patch.object(owner, method, side_effect=blocked):
+                    task = asyncio.create_task(self.call(name, arguments))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                        self.assertFalse(task.done())
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(task, timeout=0.5)
+                        self.assertFalse(finished.is_set())
+                    finally:
+                        release.set()
+                        if not task.done():
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                        self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+        self.assertEqual(provider.calls, 0)
 
     async def test_write_read_replace_stale_and_rollback(self):
         result = await self.call("write_file", {"path":"a.txt","content":"one\n","expected_sha256":None})
@@ -59,6 +281,30 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         checkpoint = replaced.metadata["checkpoint_id"]
         self.context.checkpoints.restore(checkpoint)
         self.assertEqual((self.root/"a.txt").read_text(), "one\n")
+
+    async def test_read_empty_file_returns_hash_and_zero_lines(self):
+        (self.root / "empty.txt").write_bytes(b"")
+        result = await self.call("read_file", {
+            "path": "empty.txt", "start_line": None, "end_line": None, "max_chars": None,
+        })
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual(result.metadata["sha256"], sha256_text(""))
+        self.assertEqual(result.metadata["line_count"], 0)
+
+    async def test_read_past_end_returns_empty_selection(self):
+        (self.root / "short.txt").write_text("one\n", encoding="utf-8")
+        result = await self.call("read_file", {
+            "path": "short.txt", "start_line": 5, "end_line": None, "max_chars": None,
+        })
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual(result.metadata["line_count"], 1)
+        self.assertNotIn("\tone", result.output)
+
+        invalid = await self.call("read_file", {
+            "path": "short.txt", "start_line": 5, "end_line": 2, "max_chars": None,
+        })
+        self.assertTrue(invalid.is_error)
+        self.assertIn("end_line must be >= start_line", invalid.output)
 
     async def test_file_mutations_reject_changes_made_during_checkpoint(self):
         original_create = self.context.checkpoints.create
@@ -143,6 +389,227 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
         result = await self.call("apply_patch", {"patch": delete})
         self.assertFalse(result.is_error, result.output)
         self.assertFalse((self.root/"b.txt").exists())
+
+    async def test_zero_context_patch_insertions_keep_their_position(self):
+        for original, expected in (
+            ("one\ntwo\n", "inserted\none\ntwo\n"),
+            ("one\ntwo\n", "one\ninserted\ntwo\n"),
+            ("one\ntwo\n", "one\ntwo\ninserted\n"),
+            ("", "inserted\n"),
+        ):
+            with self.subTest(expected=expected):
+                target = self.root / "insert.txt"
+                target.write_text(original)
+                diff = "".join(unified_diff(
+                    original.splitlines(keepends=True), expected.splitlines(keepends=True),
+                    "a/insert.txt", "b/insert.txt", n=0,
+                ))
+                result = await self.call("apply_patch", {"patch": diff})
+                self.assertFalse(result.is_error, result.output)
+                self.assertEqual(target.read_text(), expected)
+
+    async def test_unified_patch_preserves_content_that_looks_like_headers(self):
+        target = self.root / "headers.txt"
+        target.write_text("-- original header\nkeep\n")
+        diff = "".join(unified_diff(
+            target.read_text().splitlines(keepends=True),
+            ["++ replacement header\n", "keep\n"],
+            "a/headers.txt", "b/headers.txt", n=0,
+        ))
+        result = await self.call("apply_patch", {"patch": diff})
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual(target.read_text(), "++ replacement header\nkeep\n")
+
+    async def test_unified_added_file_preserves_plus_prefix_and_missing_newline(self):
+        diff = "--- /dev/null\n+++ b/added.txt\n@@ -0,0 +1,1 @@\n+++counter\n\\ No newline at end of file\n"
+        result = await self.call("apply_patch", {"patch": diff})
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual((self.root / "added.txt").read_bytes(), b"++counter")
+
+    async def test_unified_patches_preserve_and_change_line_endings(self):
+        cases = [
+            (old.join(("one", "old", "end", "")), new.join(("one", "new", "end", "")))
+            for old in ("\n", "\r\n") for new in ("\n", "\r\n")
+        ]
+        cases.append(("one\nold\r\nend\n", "one\nnew\r\nend\n"))
+        for original, expected in cases:
+            for header_newline in ("\n", "\r\n"):
+                with self.subTest(original=original, expected=expected, headers=header_newline):
+                    target = self.root / "line-endings.txt"
+                    target.write_bytes(original.encode())
+                    diff = "".join(unified_diff(
+                        original.splitlines(keepends=True), expected.splitlines(keepends=True),
+                        "a/line-endings.txt", "b/line-endings.txt", lineterm=header_newline,
+                    ))
+                    result = await self.call("apply_patch", {"patch": diff})
+                    self.assertFalse(result.is_error, result.output)
+                    self.assertEqual(target.read_bytes(), expected.encode())
+
+    async def test_crlf_patch_transport_updates_lf_and_crlf_files(self):
+        for envelope, newline in (
+            (False, "\n"), (False, "\r\n"), (True, "\n"), (True, "\r\n"),
+        ):
+            with self.subTest(envelope=envelope, newline=newline):
+                target = self.root / "transport.txt"
+                target.write_bytes(f"old{newline}".encode())
+                if envelope:
+                    diff = "*** Begin Patch\n*** Update File: transport.txt\n@@\n-old\n+new\n*** End Patch\n"
+                else:
+                    diff = "--- a/transport.txt\n+++ b/transport.txt\n@@ -1 +1 @@\n-old\n+new\n"
+                result = await self.call("apply_patch", {"patch": diff.replace("\n", "\r\n")})
+                self.assertFalse(result.is_error, result.output)
+                self.assertEqual(target.read_bytes(), f"new{newline}".encode())
+
+    async def test_crlf_add_delete_and_missing_final_newline(self):
+        added = "--- /dev/null\n+++ b/crlf.txt\n@@ -0,0 +1,2 @@\n+one\r\n+two\r\n"
+        result = await self.call("apply_patch", {"patch": added})
+        self.assertFalse(result.is_error, result.output)
+        target = self.root / "crlf.txt"
+        self.assertEqual(target.read_bytes(), b"one\r\ntwo\r\n")
+
+        updated = (
+            "--- a/crlf.txt\n+++ b/crlf.txt\n@@ -1,2 +1,2 @@\n one\r\n-two\r\n"
+            "+three\n\\ No newline at end of file\n"
+        )
+        result = await self.call("apply_patch", {"patch": updated})
+        self.assertFalse(result.is_error, result.output)
+        self.assertEqual(target.read_bytes(), b"one\r\nthree")
+
+        deleted = (
+            "--- a/crlf.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\r\n-three\n"
+            "\\ No newline at end of file\n"
+        )
+        result = await self.call("apply_patch", {"patch": deleted})
+        self.assertFalse(result.is_error, result.output)
+        self.assertFalse(target.exists())
+
+    async def test_truncated_new_file_hunk_prevents_all_changes(self):
+        target = self.root / "existing.txt"
+        target.write_text("old\n")
+        diff = (
+            "--- a/existing.txt\n+++ b/existing.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            "--- /dev/null\n+++ b/added.txt\n@@ -0,0 +1,2 @@\n+partial\n"
+        )
+        result = await self.call("apply_patch", {"patch": diff})
+        self.assertTrue(result.is_error, result.output)
+        self.assertEqual(target.read_text(), "old\n")
+        self.assertFalse((self.root / "added.txt").exists())
+        self.assertEqual(self.context.checkpoints.list(), [])
+
+    async def test_envelope_paths_keep_literal_a_and_b_directories(self):
+        root_file = self.root / "example.txt"
+        root_file.write_text("old\n")
+        for directory in ("a", "b"):
+            with self.subTest(directory=directory):
+                target = self.root / directory / "example.txt"
+                target.parent.mkdir()
+                target.write_text("old\n")
+                diff = f"*** Begin Patch\n*** Update File: {directory}/example.txt\n@@\n-old\n+new\n*** End Patch\n"
+                result = await self.call("apply_patch", {"patch": diff})
+                self.assertFalse(result.is_error, result.output)
+                self.assertEqual(target.read_text(), "new\n")
+                self.assertEqual(root_file.read_text(), "old\n")
+
+    async def test_patch_paths_do_not_expand_environment_variables(self):
+        name = "$BOREALIS_PATH_FIXTURE.txt"
+        target = self.root / name
+        other = self.root / "other.txt"
+        patches = (
+            f"*** Begin Patch\n*** Update File: {name}\n@@\n-before\n+after\n*** End Patch\n",
+            f"--- a/{name}\n+++ b/{name}\n@@ -1 +1 @@\n-before\n+after\n",
+        )
+        with patch.dict(os.environ, {"BOREALIS_PATH_FIXTURE": "other"}):
+            for diff in patches:
+                with self.subTest(patch=diff):
+                    target.write_text("before\n")
+                    other.write_text("before\n")
+
+                    result = await self.call("apply_patch", {"patch": diff})
+
+                    self.assertFalse(result.is_error, result.output)
+                    self.assertEqual(target.read_text(), "after\n")
+                    self.assertEqual(other.read_text(), "before\n")
+                    checkpoint = self.context.checkpoints.list()[0]
+                    self.assertEqual(checkpoint.files[0]["path"], name)
+                    self.context.checkpoints.restore(checkpoint.id)
+                    self.assertEqual(target.read_text(), "before\n")
+                    self.assertEqual(other.read_text(), "before\n")
+
+    async def test_incomplete_patch_envelope_is_rejected(self):
+        result = await self.call("apply_patch", {
+            "patch": "*** Begin Patch\n*** Add File: partial.txt\n+partial\n",
+        })
+        self.assertTrue(result.is_error, result.output)
+        self.assertFalse((self.root / "partial.txt").exists())
+
+    async def test_real_git_diff_applies_multiple_files_with_metadata(self):
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-C", str(self.root), "-c", "core.hooksPath=/dev/null",
+                 "-c", "core.fsmonitor=false", *arguments],
+                check=True, capture_output=True,
+            ).stdout.decode()
+
+        originals = {"first.txt": "one\n", "second.txt": "-- old"}
+        expected = {"first.txt": "one\ninserted\n", "second.txt": "++ new"}
+        git("init", "-q")
+        for name, text in originals.items():
+            (self.root / name).write_text(text)
+        git("add", "--", *originals)
+        for name, text in expected.items():
+            (self.root / name).write_text(text)
+        diff = git("diff", "--no-ext-diff", "--no-textconv", "--unified=0")
+        for name, text in originals.items():
+            (self.root / name).write_text(text)
+        result = await self.call("apply_patch", {"patch": diff})
+        self.assertFalse(result.is_error, result.output)
+        for name, text in expected.items():
+            self.assertEqual((self.root / name).read_text(), text)
+
+    async def test_unsupported_git_sections_reject_the_complete_patch(self):
+        target = self.root / "ok.txt"
+        target.write_text("old\n")
+        valid = (
+            "diff --git a/ok.txt b/ok.txt\nindex 1..2 100644\n"
+            "--- a/ok.txt\n+++ b/ok.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        )
+        unsupported = {
+            "binary": "diff --git a/data.bin b/data.bin\nBinary files a/data.bin and b/data.bin differ\n",
+            "binary payload": "diff --git a/data.bin b/data.bin\nGIT binary patch\nliteral 0\nHcmV?d00001\n",
+            "mode": "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+            "rename": "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n",
+            "copy": "diff --git a/old.txt b/new.txt\nsimilarity index 100%\ncopy from old.txt\ncopy to new.txt\n",
+            "empty addition": "diff --git a/empty b/empty\nnew file mode 100644\nindex 0000000..e69de29\n",
+            "executable addition": "diff --git a/run.sh b/run.sh\nnew file mode 100755\n--- /dev/null\n+++ b/run.sh\n@@ -0,0 +1 @@\n+exit 0\n",
+            "symlink addition": "diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+target\n",
+            "symlink update": "diff --git a/link b/link\nindex 1..2 120000\n--- a/link\n+++ b/link\n@@ -1 +1 @@\n-old\n+new\n",
+            "combined": "diff --cc file.txt\nindex 1,2..3\n",
+        }
+        for name, section in unsupported.items():
+            for first in (True, False):
+                with self.subTest(section=name, first=first):
+                    diff = section + valid if first else valid + section
+                    result = await self.call("apply_patch", {"patch": diff})
+                    self.assertTrue(result.is_error, result.output)
+                    self.assertEqual(target.read_text(), "old\n")
+                    self.assertEqual(self.context.changed_files, set())
+                    self.assertEqual(self.context.checkpoints.list(), [])
+                    self.assertFalse((self.root / "run.sh").exists())
+                    self.assertFalse((self.root / "link").exists())
+
+    async def test_unified_patch_rejects_rename_and_quoted_paths(self):
+        (self.root / "old.txt").write_text("old\n")
+        (self.root / "new.txt").write_text("old\n")
+        for before, after in (("a/old.txt", "b/new.txt"), ('"a/quoted.txt"', '"b/quoted.txt"')):
+            with self.subTest(before=before, after=after):
+                result = await self.call("apply_patch", {
+                    "patch": f"--- {before}\n+++ {after}\n@@ -1 +1 @@\n-old\n+new\n",
+                })
+                self.assertTrue(result.is_error, result.output)
+                self.assertIn("cannot rename" if before == "a/old.txt" else "Quoted Git paths", result.output)
+                self.assertEqual(self.context.checkpoints.list(), [])
+        self.assertEqual((self.root / "old.txt").read_text(), "old\n")
+        self.assertEqual((self.root / "new.txt").read_text(), "old\n")
 
     async def test_make_directory_tracks_new_directories_and_root(self):
         result = await self.call("make_directory", {"path": "parent/child"})

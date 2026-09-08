@@ -6,6 +6,7 @@ import abc
 import asyncio
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -36,6 +37,9 @@ class Provider(abc.ABC):
     def __init__(self, config: ProviderConfig, api_key: str = "") -> None:
         self.config = config
         self.api_key = api_key
+        self._retry_task: ContextVar[asyncio.Task[Any] | None] = ContextVar(
+            "provider_retry_task", default=None,
+        )
 
     @abc.abstractmethod
     async def complete(self, request: ProviderRequest) -> ModelResponse:
@@ -61,7 +65,28 @@ class Provider(abc.ABC):
         route = request.metadata.get("provider_route")
         return route if isinstance(route, str) and route else self.name
 
-    async def with_retries(self, operation: Callable[[], Awaitable[T]]) -> T:
+    async def with_retries(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        failed_usage_collector: Usage | None = None,
+    ) -> T:
+        """Share one retry loop across nested wrappers in the same task."""
+        task = asyncio.current_task()
+        if task is not None and self._retry_task.get() is task:
+            return await operation()
+        token = self._retry_task.set(task)
+        try:
+            return await self._retry_operation(operation, failed_usage_collector=failed_usage_collector)
+        finally:
+            self._retry_task.reset(token)
+
+    async def _retry_operation(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        failed_usage_collector: Usage | None = None,
+    ) -> T:
         attempts = max(0, self.config.max_retries) + 1
         delay = max(0.0, self.config.initial_backoff_seconds)
         last_error: Exception | None = None
@@ -75,6 +100,8 @@ class Provider(abc.ABC):
             except ProviderError as error:
                 last_error = error
                 if error.usage is not None:
+                    if failed_usage_collector is not None:
+                        failed_usage_collector.add(error.usage)
                     prior_usage.add(error.usage)
                 if not error.retryable or attempt + 1 >= attempts:
                     if not prior_usage.is_empty:

@@ -40,6 +40,17 @@ Borealis does not claim that a Python process running directly on the host can s
 - symlinks whose resolved target leaves a root
 - additional roots not explicitly configured by the caller/client
 
+String path inputs expand `~` and environment variables before containment checks.
+Filesystem `Path` objects and patch filenames retain their literal names.
+
+Recursive text search validates each discovered file against the same roots before
+reading it. It skips external symlinks and non-regular files, caps each read at the
+configured file limit, and stops at the configured result or output limit.
+Regular-expression matching runs in a dedicated worker with a configurable per-file
+deadline. Cancellation, timeout, and normal completion terminate and reap the worker.
+The worker uses the installed Python interpreter in isolated mode to match text
+supplied by the tool. Literal search remains in the main process.
+
 Mutation controls add optimistic concurrency:
 
 - `write_file` requires an expected SHA when replacing an existing file.

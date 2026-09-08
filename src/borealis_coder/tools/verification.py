@@ -92,7 +92,7 @@ class VerificationPlanner:
             elif "type-check" in scripts:
                 add("TypeScript types", f"{runner} run type-check", 300)
             if "test" in scripts:
-                add("JavaScript tests", f"{runner} test -- --runInBand" if runner == "npm" else f"{runner} test", 600)
+                add("JavaScript tests", f"{runner} test", 600)
             if "build" in scripts:
                 add("JavaScript build", f"{runner} run build", 600)
         if (self.workspace / "Cargo.toml").is_file() and shutil.which("cargo"):

@@ -127,9 +127,10 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `repo_map_chars` | `28000` | Character budget for the ranked repository map. |
-| `max_file_bytes` | `2000000` | Largest file eligible for text inspection. |
+| `repo_map_chars` | `28000` | Combined character budget for automatic repository maps, including headings. `0` disables automatic source-map discovery; must be non-negative. |
+| `max_file_bytes` | `2000000` | Largest file eligible for text inspection; must be positive. |
 | `max_search_results` | `200` | Search result ceiling. |
+| `regex_timeout_seconds` | `2.0` | Per-file regular-expression matching deadline; must be positive and finite. |
 | `tool_output_chars` | `24000` | Model-facing tool-output ceiling. |
 | `compact_tool_output_tokens` | `40000` | Trigger provider-facing compaction when tool output reaches this estimated-token volume. |
 | `include_git_status` | `true` | Include compact Git status in the initial prompt. |
@@ -245,10 +246,14 @@ metadata, or trace events.
 | `command` / `args` | stdio server process. Use an absolute executable path in ACP-managed sessions. |
 | `env` | Explicit server environment additions. |
 | `url` / `headers` | Streamable HTTP endpoint and headers. |
-| `timeout_seconds` | Initialization and request timeout. |
+| `timeout_seconds` | Initialization and request timeout, including stdio writes. |
 | `enabled` | Disable without deleting configuration. |
 | `allowed_tools` | Optional exact allowlist; empty exposes all discovered tools through local policy. |
 | `read_only_tools` | Exact locally trusted list allowed to use read-only policy. Server annotations cannot reduce local authorization. |
+
+Incoming stdio JSON messages have a 16 MiB limit per line. A message above this
+limit fails the connection. Pending and later requests receive a protocol error,
+and output continues to drain so the server can shut down cleanly.
 
 ## Complete example
 

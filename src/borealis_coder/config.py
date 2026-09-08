@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import asdict, dataclass, field, fields
@@ -119,6 +120,7 @@ class ContextConfig:
     repo_map_chars: int = 28_000
     max_file_bytes: int = 2_000_000
     max_search_results: int = 200
+    regex_timeout_seconds: float = 2.0
     tool_output_chars: int = 24_000
     compact_tool_output_tokens: int = 40_000
     include_git_status: bool = True
@@ -615,6 +617,12 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("sandbox.process_file_size_bytes must be positive")
     if config.context.max_search_results < 1:
         raise ConfigurationError("context.max_search_results must be positive")
+    if not math.isfinite(config.context.regex_timeout_seconds) or config.context.regex_timeout_seconds <= 0:
+        raise ConfigurationError("context.regex_timeout_seconds must be positive and finite")
+    if config.context.repo_map_chars < 0:
+        raise ConfigurationError("context.repo_map_chars cannot be negative")
+    if config.context.max_file_bytes < 1:
+        raise ConfigurationError("context.max_file_bytes must be positive")
     if config.context.tool_output_chars < 1:
         raise ConfigurationError("context.tool_output_chars must be positive")
     if config.context.compact_tool_output_tokens < 1:

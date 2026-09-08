@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -150,7 +150,19 @@ class ToolRegistry:
         return [self._tools[name].schema() for name in sorted(self._tools)]
 
     async def execute(self, call: ToolCall, context: ToolContext) -> ToolResult:
-        context.tool_call_id = call.id
+        call_context = replace(context, tool_call_id=call.id)
+        try:
+            return await self._execute(call, call_context)
+        finally:
+            # Calls own their identity, but uncertainty still accumulates for the
+            # whole run. Mutable file sets and metadata remain shared by replace().
+            if call_context.mutation_tracking == "incomplete":
+                context.lifecycle_uncertainty_only = call_context.lifecycle_uncertainty_only and (
+                    context.mutation_tracking == "complete" or context.lifecycle_uncertainty_only
+                )
+                context.mutation_tracking = "incomplete"
+
+    async def _execute(self, call: ToolCall, context: ToolContext) -> ToolResult:
         tool = self.get(call.name)
         if tool is None:
             return ToolResult(f"Unknown tool: {call.name}", is_error=True)

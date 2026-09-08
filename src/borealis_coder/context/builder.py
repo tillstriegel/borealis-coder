@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import platform
-import subprocess
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
 from ..config import Config
 from ..util import truncate_text
+from .git import repository_status
 from .ignore import IgnoreMatcher
 from .instructions import InstructionLoader
 from .repomap import RepoMap
@@ -95,23 +95,30 @@ class ContextBuilder:
             "# Project skills\nSkills are reusable local guidance. Read a skill through read_skill before relying on it.\n"
             + self.skills.render_catalog()
         )
-        stable_map_chars = max(1_000, int(self.config.context.repo_map_chars * 0.75))
-        repo_snapshot = self.repo_map.snapshot()
+        map_chars = self.config.context.repo_map_chars
+        stable_map_chars = map_chars * 3 // 4
+        focus_chars = map_chars - stable_map_chars
+        if focus_chars < 1_000:
+            stable_map_chars, focus_chars = map_chars, 0
+        map_heading = "# Repository map\n"
+        repo_snapshot = self.repo_map.snapshot() if stable_map_chars > len(map_heading) else []
         status, changed_paths = self._git_status()
-        repository_map = "# Repository map\n" + self.repo_map.render(
-            repo_snapshot,
-            max_chars=stable_map_chars,
-            rank_changed=False,
-        )
+        repository_map = ""
+        if stable_map_chars > len(map_heading):
+            repository_map = map_heading + self.repo_map.render(
+                repo_snapshot,
+                max_chars=stable_map_chars - len(map_heading),
+                rank_changed=False,
+            )
         dynamic_sections = [self._dynamic_environment()]
-        focus_chars = max(0, self.config.context.repo_map_chars - stable_map_chars)
         if query and focus_chars >= 1_000:
+            focus_heading = "# Request focus\n"
             dynamic_sections.append(
-                "# Request focus\n"
+                focus_heading
                 + self.repo_map.render(
                     repo_snapshot,
                     query=query,
-                    max_chars=focus_chars,
+                    max_chars=focus_chars - len(focus_heading),
                     changed_paths=changed_paths,
                 )
             )
@@ -149,33 +156,5 @@ class ContextBuilder:
     def _git_status(self) -> tuple[str, set[str]]:
         if not self.config.context.include_git_status or not (self.workspace / ".git").exists():
             return "", set()
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-C",
-                    str(self.workspace),
-                    "status",
-                    "--short",
-                    "--branch",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return "", set()
-        if result.returncode:
-            return "", set()
-        status = result.stdout.strip()
-        changed = {
-            line[3:].strip().split(" -> ")[-1]
-            for line in status.splitlines()
-            if len(line) > 3 and not line.startswith("##")
-        }
+        status, changed = repository_status(self.workspace)
         return truncate_text(status, 8_000), changed

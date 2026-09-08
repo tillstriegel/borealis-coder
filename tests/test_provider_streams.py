@@ -161,6 +161,75 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         ):
             await provider.with_retries(os_failure)
 
+    async def test_concurrent_provider_requests_keep_independent_retry_budgets(self) -> None:
+        provider = DummyProvider(ProviderConfig(
+            max_retries=1, initial_backoff_seconds=0, max_backoff_seconds=0,
+        ))
+        attempts = {"first": 0, "second": 0}
+        both_started = asyncio.Event()
+
+        async def operation(name):
+            attempts[name] += 1
+            if attempts[name] == 1:
+                if all(attempts.values()):
+                    both_started.set()
+                await both_started.wait()
+                raise ProviderUnavailableError("Temporary failure", retryable=True)
+            return name
+
+        async def request(name):
+            return await provider.with_retries(
+                lambda: provider.with_retries(lambda: operation(name))
+            )
+
+        result = await asyncio.wait_for(asyncio.gather(request("first"), request("second")), timeout=2)
+        self.assertEqual(result, ["first", "second"])
+        self.assertEqual(attempts, {"first": 2, "second": 2})
+
+    async def test_child_task_gets_its_own_provider_retry_budget(self) -> None:
+        provider = DummyProvider(ProviderConfig(
+            max_retries=1, initial_backoff_seconds=0, max_backoff_seconds=0,
+        ))
+        attempts = 0
+        outer_calls = 0
+
+        async def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ProviderUnavailableError("Temporary failure", retryable=True)
+            return "done"
+
+        async def outer():
+            nonlocal outer_calls
+            outer_calls += 1
+            return await asyncio.create_task(provider.with_retries(operation))
+
+        self.assertEqual(await provider.with_retries(outer), "done")
+        self.assertEqual((outer_calls, attempts), (1, 2))
+
+    async def test_cancelled_provider_request_releases_its_retry_scope(self) -> None:
+        provider = DummyProvider(ProviderConfig(
+            max_retries=1, initial_backoff_seconds=0, max_backoff_seconds=0,
+        ))
+
+        async def cancelled():
+            raise asyncio.CancelledError
+
+        with self.assertRaises(asyncio.CancelledError):
+            await provider.with_retries(cancelled)
+        attempts = 0
+
+        async def recovered():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ProviderUnavailableError("Temporary failure", retryable=True)
+            return "done"
+
+        self.assertEqual(await provider.with_retries(recovered), "done")
+        self.assertEqual(attempts, 2)
+
     async def test_openai_responses_stream_complete_and_partial(self) -> None:
         provider = OpenAIProvider(
             ProviderConfig(
@@ -2102,6 +2171,156 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(ProviderError, "generation failed"):
             _ = [item async for item in provider.stream(self.request)]
+
+    async def test_gemini_non_success_statuses_preserve_usage_and_reject_calls(self) -> None:
+        provider = GeminiProvider(ProviderConfig(type="gemini", base_url="https://gemini.test"))
+
+        async def run(streaming: bool):
+            if streaming:
+                return [item async for item in provider.stream(self.request)][-1].response
+            return await provider.complete(self.request)
+
+        for status in ("failed", "cancelled", "in_progress", "queued", "incomplete", "budget_exceeded"):
+            for streaming in (False, True):
+                with self.subTest(status=status, streaming=streaming):
+                    data = {
+                        "status": status,
+                        "steps": [
+                            {"type": "model_output", "content": [{"type": "text", "text": "partial"}]},
+                            {"type": "function_call", "id": "c", "name": "write_file", "arguments": {}},
+                        ],
+                        "usage": {"total_input_tokens": 7, "total_output_tokens": 3},
+                    }
+                    provider.http = FakeHttp(  # type: ignore[assignment]
+                        data=data,
+                        events=[SSEEvent("message", json.dumps({
+                            "event_type": "interaction.completed", "interaction": data,
+                        }))],
+                    )
+
+                    if status in {"incomplete", "budget_exceeded"}:
+                        result = await run(streaming)
+                        assert result is not None
+                        self.assertTrue(result.incomplete)
+                        self.assertEqual(result.text, "partial")
+                        self.assertEqual(result.tool_calls, [])
+                        self.assertIsNone(result.continuation_state)
+                        usage = result.usage
+                    else:
+                        with self.assertRaises(ProviderError) as caught:
+                            await run(streaming)
+                        usage = caught.exception.usage
+                    assert usage is not None
+                    self.assertEqual((usage.input_tokens, usage.output_tokens, usage.requests), (7, 3, 1))
+
+    async def test_gemini_partial_completion_metadata_retains_streamed_steps(self) -> None:
+        provider = GeminiProvider(ProviderConfig(type="gemini", base_url="https://gemini.test"))
+        payloads = [
+            {"event_type": "step.start", "index": 0, "step": {
+                "type": "thought", "summary": [{"type": "text", "text": "First thought."}],
+            }},
+            {"event_type": "step.delta", "index": 0, "delta": {
+                "type": "thought_summary", "content": {"type": "text", "text": "Inspect the file."},
+            }},
+            {"event_type": "step.delta", "index": 0, "delta": {
+                "type": "thought_signature", "signature": "signed-thought",
+            }},
+            {"event_type": "step.start", "index": 1, "step": {
+                "type": "model_output", "content": [{"type": "text", "text": "prefix "}],
+            }},
+            {"event_type": "step.delta", "index": 1, "delta": {"type": "text", "text": "Hello"}},
+            {"event_type": "step.delta", "index": 1, "delta": {"type": "text", "text": " world"}},
+            {"event_type": "step.stop", "index": 1, "usage": {
+                "total_input_tokens": 7, "total_output_tokens": 5, "total_thought_tokens": 2,
+            }},
+            {"event_type": "step.start", "index": 2, "step": {
+                "type": "function_call", "id": "gcall", "name": "read_file", "arguments": {},
+            }},
+            {"event_type": "step.delta", "index": 2, "delta": {
+                "type": "arguments_delta", "arguments": '{"path":',
+            }},
+            {"event_type": "step.delta", "index": 2, "delta": {
+                "type": "arguments_delta", "arguments": '"file.txt"}',
+            }},
+            {"event_type": "interaction.completed", "interaction": {
+                "id": "i1", "status": "requires_action", "model": "gemini-model",
+                "usage": {"total_output_tokens": 8},
+            }},
+        ]
+        provider.http = FakeHttp(  # type: ignore[assignment]
+            events=[SSEEvent("message", json.dumps(item)) for item in payloads]
+        )
+        events = [item async for item in provider.stream(self.request)]
+        result = events[-1].response
+        assert result is not None
+        self.assertEqual(result.text, "prefix Hello world")
+        self.assertEqual(result.tool_calls[0].id, "gcall")
+        self.assertEqual(result.tool_calls[0].arguments, {"path": "file.txt"})
+        self.assertEqual((result.usage.input_tokens, result.usage.output_tokens), (7, 8))
+        self.assertEqual(result.usage.reasoning_tokens, 2)
+        self.assertEqual(
+            "".join(item.data["delta"] for item in events if item.type == "tool_call_delta"),
+            '{"path":"file.txt"}',
+        )
+        state = result.continuation_state
+        assert state is not None
+        self.assertEqual([step["type"] for step in state.items], ["thought", "model_output", "function_call"])
+        self.assertEqual(state.items[0]["signature"], "signed-thought")
+        self.assertEqual(state.items[0], {
+            "type": "thought", "signature": "signed-thought",
+            "summary": [
+                {"type": "text", "text": "First thought."},
+                {"type": "text", "text": "Inspect the file."},
+            ],
+        })
+        self.assertEqual(state.items[2]["arguments"], {"path": "file.txt"})
+
+    async def test_gemini_interrupted_stream_retains_reported_usage(self) -> None:
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                provider = GeminiProvider(ProviderConfig(type="gemini", base_url="https://gemini.test"))
+                payloads = [
+                    {"event_type": "step.delta", "index": 0, "delta": {"type": "text", "text": "partial"}},
+                    {"event_type": "step.stop", "index": 0, "usage": {
+                        "total_input_tokens": 9, "total_output_tokens": 4,
+                    }},
+                ]
+                if failed:
+                    payloads.append({"event_type": "error", "error": {"message": "generation failed"}})
+                provider.http = FakeHttp(  # type: ignore[assignment]
+                    events=[SSEEvent("message", json.dumps(item)) for item in payloads]
+                )
+                if failed:
+                    with self.assertRaisesRegex(ProviderError, "generation failed") as caught:
+                        _ = [item async for item in provider.stream(self.request)]
+                    usage = caught.exception.usage
+                else:
+                    result = [item async for item in provider.stream(self.request)][-1].response
+                    assert result is not None
+                    self.assertTrue(result.incomplete)
+                    self.assertEqual(result.text, "partial")
+                    self.assertEqual(result.tool_calls, [])
+                    usage = result.usage
+                assert usage is not None
+                self.assertEqual((usage.input_tokens, usage.output_tokens), (9, 4))
+
+    async def test_gemini_transport_failure_retains_reported_usage(self) -> None:
+        class BrokenHttp(FakeHttp):
+            async def stream_sse(self, url: str, **kwargs: object) -> AsyncIterator[SSEEvent]:
+                async for event in super().stream_sse(url, **kwargs):
+                    yield event
+                raise ProviderError("connection lost")
+
+        provider = GeminiProvider(ProviderConfig(type="gemini", base_url="https://gemini.test"))
+        provider.http = BrokenHttp(events=[SSEEvent("message", json.dumps({  # type: ignore[assignment]
+            "event_type": "step.stop", "index": 0,
+            "usage": {"total_input_tokens": 9, "total_output_tokens": 4},
+        }))])
+        with self.assertRaisesRegex(ProviderError, "connection lost") as caught:
+            _ = [item async for item in provider.stream(self.request)]
+        usage = caught.exception.usage
+        assert usage is not None
+        self.assertEqual((usage.input_tokens, usage.output_tokens, usage.requests), (9, 4, 1))
 
 
 if __name__ == "__main__":

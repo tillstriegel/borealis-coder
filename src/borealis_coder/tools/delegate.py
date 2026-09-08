@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 from dataclasses import replace
 from typing import Any
 
+from ..errors import BudgetExceeded, ProviderError
 from ..models import Effect, Message, ProviderRequest, Role, ToolCall, ToolResult, Usage
-from ..util import json_dumps, new_id, truncate_text
+from ..util import finish_on_cancellation, json_dumps, new_id, truncate_text
 from .base import Tool, ToolContext, object_schema
 
 
@@ -39,10 +41,20 @@ class DelegateTaskTool(Tool):
         ]
         schemas = [tool.schema() for tool in read_tools]
         allowed = {tool.name for tool in read_tools}
-        system = builder.system_prompt(query=str(arguments["task"])) + "\n\n# Delegated role\nYou are a read-only investigator. Gather precise evidence, do not mutate files, and return a concise conclusion with relevant paths and line references."
+        system = await asyncio.to_thread(builder.system_prompt, query=str(arguments["task"]))
+        system += "\n\n# Delegated role\nYou are a read-only investigator. Gather precise evidence, do not mutate files, and return a concise conclusion with relevant paths and line references."
         messages = [Message(role=Role.USER, content=str(arguments["task"]))]
         repeated: set[str] = set()
         usage = Usage()
+
+        async def record_usage(increment: Usage) -> None:
+            usage.add(increment)
+            if not callable(usage_sink):
+                return
+            result = usage_sink(increment)
+            if asyncio.iscoroutine(result):
+                await finish_on_cancellation(result)
+
         final = ""
         delegation_id = new_id("delegate")
         delegated_run_id = f"{context.run_id}.{delegation_id}"
@@ -60,7 +72,6 @@ class DelegateTaskTool(Tool):
             delegated_run_id=delegated_run_id,
             parent_tool_call_id=context.tool_call_id,
         )
-        pending_cancellation: asyncio.CancelledError | None = None
         try:
             max_turns = int(arguments["max_turns"])
             for turn_index in range(max_turns):
@@ -80,15 +91,42 @@ class DelegateTaskTool(Tool):
                     max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
                     reasoning_effort=context.config.agent.reasoning_effort or None,
                     parallel_tool_calls=not synthesis_turn,
-                    metadata={"parent_session_id": context.session_id, "delegated": True},
+                    metadata={
+                        "parent_session_id": context.session_id, "delegated": True,
+                        "provider_route": route.name,
+                    },
                 )
-                response = await route.provider.with_retries(
-                    lambda request=request: route.provider.complete(request)
+                cancelled_usage = Usage()
+                try:
+                    response = await route.provider.with_retries(
+                        lambda request=request: route.provider.complete(request),
+                        failed_usage_collector=cancelled_usage,
+                    )
+                except asyncio.CancelledError:
+                    if not cancelled_usage.is_empty:
+                        with contextlib.suppress(BudgetExceeded):
+                            await record_usage(cancelled_usage)
+                    raise
+                except ProviderError as error:
+                    if error.usage is not None:
+                        await record_usage(error.usage)
+                    raise
+                await record_usage(response.usage)
+                assistant = Message(
+                    role=Role.ASSISTANT,
+                    content=response.text,
+                    tool_calls=[] if response.incomplete else response.tool_calls,
                 )
-                usage.add(response.usage)
-                assistant = Message(role=Role.ASSISTANT, content=response.text, tool_calls=response.tool_calls)
+                if response.continuation_state is not None and not response.incomplete:
+                    continuation = response.continuation_state.to_metadata(
+                        provider=route.name, model=route.model,
+                    )
+                    if continuation is not None:
+                        assistant.metadata["continuation_state"] = continuation
                 messages.append(assistant)
-                if response.text and not response.tool_calls:
+                if response.incomplete:
+                    break
+                if response.text.strip() and not response.tool_calls:
                     final = response.text
                 if not response.tool_calls:
                     break
@@ -117,8 +155,7 @@ class DelegateTaskTool(Tool):
                 )
                 for call, result in zip(calls, results, strict=True):
                     messages.append(Message(role=Role.TOOL, content=result.output, tool_call_id=call.id, tool_name=call.name, is_error=result.is_error, metadata=result.metadata))
-        except asyncio.CancelledError as error:
-            pending_cancellation = error
+        except asyncio.CancelledError:
             await context.events.emit(
                 "delegate.cancelled",
                 session_id=context.session_id,
@@ -126,18 +163,7 @@ class DelegateTaskTool(Tool):
                 delegation_id=delegation_id,
                 delegated_run_id=delegated_run_id,
             )
-        finally:
-            try:
-                if callable(usage_sink):
-                    result = usage_sink(usage)
-                    if asyncio.iscoroutine(result):
-                        await result
-            except BaseException as error:
-                if pending_cancellation is not None:
-                    raise pending_cancellation from error
-                raise
-        if pending_cancellation is not None:
-            raise pending_cancellation
+            raise
         turns = sum(1 for item in messages if item.role == Role.ASSISTANT)
         await context.events.emit(
             "delegate.completed",

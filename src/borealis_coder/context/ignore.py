@@ -9,6 +9,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..util import FileSignature, file_signature
+
 
 @dataclass(slots=True)
 class IgnoreRule:
@@ -24,7 +26,7 @@ class IgnoreMatcher:
         self.ignored_dirs = set(ignored_dirs or [])
         self.rules: list[IgnoreRule] = []
         self._paths = tuple(self.root / name for name in (".gitignore", ".borealisignore"))
-        self._signature: tuple[tuple[int, int] | None, ...] | None = None
+        self._signature: tuple[FileSignature | None, ...] | None = None
         self._lock = threading.Lock()
         self.refresh()
 
@@ -47,15 +49,15 @@ class IgnoreMatcher:
             self._signature = signature
         return True
 
-    def _current_signature(self) -> tuple[tuple[int, int] | None, ...]:
-        signature: list[tuple[int, int] | None] = []
+    def _current_signature(self) -> tuple[FileSignature | None, ...]:
+        signature: list[FileSignature | None] = []
         for path in self._paths:
             try:
                 stat = path.stat()
             except OSError:
                 signature.append(None)
             else:
-                signature.append((stat.st_mtime_ns, stat.st_size))
+                signature.append(file_signature(stat))
         return tuple(signature)
 
     def ignored(self, path: Path, *, is_dir: bool | None = None) -> bool:
@@ -94,15 +96,18 @@ def repository_files(
             str(root),
             "ls-files",
             "--cached",
+            "-z",
         ]
         if include_untracked:
             args += ["--others", "--exclude-standard"]
         try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
+            result = subprocess.run(args, capture_output=True, timeout=10, check=False)
             if result.returncode == 0:
                 paths = []
-                for line in result.stdout.splitlines():
-                    path = (root / line).resolve(strict=False)
+                for name in os.fsdecode(result.stdout).split("\x00"):
+                    if not name:
+                        continue
+                    path = (root / name).resolve(strict=False)
                     if path.is_file() and not matcher.ignored(path, is_dir=False):
                         paths.append(path)
                 return sorted(set(paths), key=lambda item: item.as_posix())
@@ -116,7 +121,7 @@ def repository_files(
         )
         for name in sorted(files):
             path = current_path / name
-            if not matcher.ignored(path, is_dir=False):
+            if path.is_file() and not matcher.ignored(path, is_dir=False):
                 paths.append(path)
     return paths
 

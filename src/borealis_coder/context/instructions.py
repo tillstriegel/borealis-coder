@@ -22,11 +22,18 @@ class InstructionLoader:
         self.max_chars = max_chars
 
     def discover(self) -> list[InstructionDocument]:
+        return self._discover(target=None)
+
+    def _discover(self, *, target: Path | None) -> list[InstructionDocument]:
         result: list[InstructionDocument] = []
         ignored = {".git", ".borealis", "node_modules", ".venv", "venv", "dist", "build", "target", "__pycache__"}
         for current, dirs, files in os.walk(self.root):
             dirs[:] = sorted(item for item in dirs if item not in ignored)
             current_path = Path(current)
+            if target is not None:
+                remaining = target.relative_to(current_path).parts
+                next_name = os.path.normcase(remaining[0]) if remaining else None
+                dirs[:] = [name for name in dirs if os.path.normcase(name) == next_name]
             for name in self.names:
                 if name not in files:
                     continue
@@ -39,21 +46,16 @@ class InstructionLoader:
                 if not resolved.is_file():
                     continue
                 relative = path.relative_to(self.root).as_posix()
-                content = resolved.read_text(encoding="utf-8", errors="replace")[: self.max_chars]
+                with resolved.open(encoding="utf-8", errors="replace") as handle:
+                    content = handle.read(self.max_chars)
                 result.append(InstructionDocument(path, relative, content, path.parent))
         return sorted(result, key=lambda item: (len(item.path.parts), item.relative_path))
 
     def for_path(self, target: Path) -> list[InstructionDocument]:
         target = target.resolve(strict=False)
-        documents = self.discover()
-        applicable: list[InstructionDocument] = []
-        for item in documents:
-            try:
-                target.relative_to(item.scope)
-            except ValueError:
-                continue
-            applicable.append(item)
-        return sorted(applicable, key=lambda item: len(item.scope.parts))
+        if not target.is_relative_to(self.root):
+            return []
+        return self._discover(target=target)
 
     def root_text(
         self,

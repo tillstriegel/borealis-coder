@@ -268,6 +268,16 @@ class ModelResponse:
     continuation_state: ContinuationState | None = None
     reasoning_summary: str = ""
 
+    @property
+    def incomplete(self) -> bool:
+        """Whether the provider stopped before producing a complete response."""
+        if isinstance(self.stop_reason, dict):
+            return bool(self.stop_reason)
+        return str(self.stop_reason or "").strip().lower() in {
+            "incomplete", "length", "max_tokens", "model_context_window_exceeded",
+            "budget_exceeded",
+        }
+
 
 @dataclass(slots=True)
 class ProviderRequest:

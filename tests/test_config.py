@@ -145,6 +145,13 @@ class ConfigTests(unittest.TestCase):
             ("sandbox", "process_cpu_seconds", -1),
             ("sandbox", "process_file_size_bytes", 0),
             ("context", "max_search_results", 0),
+            ("context", "regex_timeout_seconds", 0),
+            ("context", "regex_timeout_seconds", -1),
+            ("context", "regex_timeout_seconds", float("inf")),
+            ("context", "regex_timeout_seconds", float("nan")),
+            ("context", "max_file_bytes", 0),
+            ("context", "max_file_bytes", -2),
+            ("context", "repo_map_chars", -1),
             ("context", "tool_output_chars", -1),
             ("context", "compact_tool_output_tokens", 0),
         )

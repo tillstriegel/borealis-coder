@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
 
 from ..errors import ToolError
 from ..models import Effect, ToolResult
-from ..util import atomic_write_text, sha256_bytes, sha256_text, truncate_text
+from ..util import atomic_write_text, read_bytes_up_to, sha256_bytes, sha256_text, truncate_text
 from ._workspace_lock import workspace_transaction
 from .base import MutationScope, Tool, ToolContext, nullable, object_schema
 
@@ -28,7 +29,7 @@ class ReadFileTool(Tool):
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         resolved = context.roots.resolve(arguments["path"], must_exist=True, kind="file")
-        data = resolved.path.read_bytes()
+        data = read_bytes_up_to(resolved.path, context.config.context.max_file_bytes + 1)
         if len(data) > context.config.context.max_file_bytes:
             raise ToolError(f"File exceeds {context.config.context.max_file_bytes} byte read limit")
         if b"\x00" in data:
@@ -37,15 +38,16 @@ class ReadFileTool(Tool):
         lines = text.splitlines(keepends=True)
         start = int(arguments.get("start_line") or 1)
         end = int(arguments.get("end_line") or len(lines))
-        if end < start:
+        if arguments.get("end_line") is not None and end < start:
             raise ToolError("end_line must be >= start_line")
         selected = lines[start - 1 : end]
         numbered = "".join(f"{index:>6}\t{line}" for index, line in enumerate(selected, start=start))
         limit = int(arguments.get("max_chars") or context.config.context.tool_output_chars)
         numbered = truncate_text(numbered, limit)
+        digest = sha256_bytes(data)
         return ToolResult(
-            f"path: {resolved.display}\nsha256: {sha256_bytes(data)}\nlines: {len(lines)}\n\n{numbered}",
-            metadata={"path": resolved.display, "sha256": sha256_bytes(data), "line_count": len(lines)},
+            f"path: {resolved.display}\nsha256: {digest}\nlines: {len(lines)}\n\n{numbered}",
+            metadata={"path": resolved.display, "sha256": digest, "line_count": len(lines)},
         )
 
 
@@ -68,7 +70,7 @@ class WriteFileTool(Tool):
             raise ToolError(
                 f"Write would exceed {context.config.context.max_file_bytes} byte file limit"
             )
-        with workspace_transaction(context.workspace):
+        async with workspace_transaction(context.workspace):
             resolved = context.roots.resolve(arguments["path"])
             context.roots.assert_writable(
                 resolved.path, context.config.safety.protected_paths
@@ -81,7 +83,7 @@ class WriteFileTool(Tool):
                     f"Existing file requires expected_sha256 from read_file: {resolved.display}"
                 )
             if expected is not None:
-                actual = sha256_bytes(before or b"")
+                actual = before if before is not None else "missing"
                 if actual != expected:
                     raise ToolError(
                         f"Stale write rejected for {resolved.display}: "
@@ -115,14 +117,14 @@ class ReplaceInFileTool(Tool):
     })
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        with workspace_transaction(context.workspace):
+        async with workspace_transaction(context.workspace):
             resolved = context.roots.resolve(
                 arguments["path"], must_exist=True, kind="file"
             )
             context.roots.assert_writable(
                 resolved.path, context.config.safety.protected_paths
             )
-            data = resolved.path.read_bytes()
+            data = read_bytes_up_to(resolved.path, context.config.context.max_file_bytes + 1)
             if len(data) > context.config.context.max_file_bytes:
                 raise ToolError(
                     f"File exceeds {context.config.context.max_file_bytes} byte edit limit"
@@ -149,7 +151,7 @@ class ReplaceInFileTool(Tool):
             checkpoint = context.checkpoints.create(
                 [resolved.path], label=f"replace_in_file {resolved.display}"
             )
-            _require_preimage(resolved.path, data, resolved.display, "edit")
+            _require_preimage(resolved.path, actual_sha, resolved.display, "edit")
             atomic_write_text(resolved.path, updated)
             context.changed_files.add(resolved.display)
             context.changed_roots.add(resolved.root)
@@ -174,15 +176,14 @@ class DeleteFileTool(Tool):
         return f"Delete file {arguments.get('path')}"
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        with workspace_transaction(context.workspace):
+        async with workspace_transaction(context.workspace):
             resolved = context.roots.resolve(
                 arguments["path"], must_exist=True, kind="file"
             )
             context.roots.assert_writable(
                 resolved.path, context.config.safety.protected_paths
             )
-            before = resolved.path.read_bytes()
-            actual = sha256_bytes(before)
+            actual = _file_digest(resolved.path)
             if actual != arguments["expected_sha256"]:
                 raise ToolError(
                     f"Stale delete rejected: expected {arguments['expected_sha256']}, "
@@ -191,34 +192,39 @@ class DeleteFileTool(Tool):
             checkpoint = context.checkpoints.create(
                 [resolved.path], label=f"delete_file {resolved.display}"
             )
-            _require_preimage(resolved.path, before, resolved.display, "delete")
+            _require_preimage(resolved.path, actual, resolved.display, "delete")
             resolved.path.unlink()
             context.changed_files.add(resolved.display)
             context.changed_roots.add(resolved.root)
         return ToolResult(f"Deleted {resolved.display}", metadata={"path": resolved.display, "checkpoint_id": checkpoint.id if checkpoint else None})
 
 
-def _read_preimage(path: Path, display: str) -> bytes | None:
+def _file_digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _read_preimage(path: Path, display: str) -> str | None:
     if not path.exists():
         return None
     if not path.is_file():
         raise ToolError(f"Target is not a file: {display}")
     try:
-        return path.read_bytes()
+        return _file_digest(path)
     except FileNotFoundError as error:
         raise ToolError(f"Target changed while preparing file operation: {display}") from error
 
 
 def _require_preimage(
     path: Path,
-    expected: bytes | None,
+    expected: str | None,
     display: str,
     operation: str,
 ) -> None:
     if expected is None:
         if not path.exists() and not path.is_symlink():
             return
-        actual_sha = "non-file" if not path.is_file() else sha256_bytes(path.read_bytes())
+        actual_sha = "non-file" if not path.is_file() else _file_digest(path)
         raise ToolError(
             f"Stale {operation} rejected for {display}: "
             f"expected missing, actual {actual_sha}"
@@ -226,16 +232,16 @@ def _require_preimage(
     if not path.is_file():
         raise ToolError(
             f"Stale {operation} rejected for {display}: "
-            f"expected {sha256_bytes(expected)}, actual missing or non-file"
+            f"expected {expected}, actual missing or non-file"
         )
     try:
-        actual = path.read_bytes()
+        actual = _file_digest(path)
     except OSError as error:
         raise ToolError(f"Stale {operation} rejected for {display}: target changed") from error
     if actual != expected:
         raise ToolError(
             f"Stale {operation} rejected for {display}: "
-            f"expected {sha256_bytes(expected)}, actual {sha256_bytes(actual)}"
+            f"expected {expected}, actual {actual}"
         )
 
 

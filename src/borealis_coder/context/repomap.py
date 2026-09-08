@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ast
 import re
-import subprocess
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..util import FileSignature, file_signature, read_bytes_up_to, truncate_text
+from .git import quote_path, repository_status
 from .ignore import IgnoreMatcher, repository_files
 
 
@@ -22,7 +24,7 @@ class FileSummary:
     score: float = 0.0
 
     def render(self) -> str:
-        parts = [self.path]
+        parts = [quote_path(self.path)]
         if self.symbols:
             parts.append("  symbols: " + ", ".join(self.symbols[:30]))
         if self.imports:
@@ -77,7 +79,7 @@ class RepoMap:
         self.root = root.resolve()
         self.matcher = matcher
         self.max_file_bytes = max_file_bytes
-        self._cache: dict[str, tuple[int, int, FileSummary]] = {}
+        self._cache: dict[str, tuple[FileSignature, FileSummary]] = {}
 
     def build(
         self,
@@ -97,7 +99,7 @@ class RepoMap:
         """Collect current source summaries once for one or more map views."""
 
         summaries: list[FileSummary] = []
-        active_paths: set[str] = set()
+        active_cache: dict[str, tuple[FileSignature, FileSummary]] = {}
         for path in repository_files(self.root, self.matcher):
             if path.suffix.lower() not in _EXT_LANG and path.name not in {"Dockerfile", "Makefile"}:
                 continue
@@ -108,15 +110,16 @@ class RepoMap:
             if stat.st_size > self.max_file_bytes:
                 continue
             key = str(path)
-            active_paths.add(key)
+            signature = file_signature(stat)
             cached = self._cache.get(key)
-            if cached is None or cached[:2] != (stat.st_mtime_ns, stat.st_size):
+            if cached is None or cached[0] != signature:
                 summary = self._summarize(path, stat.st_size)
-                self._cache[key] = (stat.st_mtime_ns, stat.st_size, summary)
+                cached = (signature, summary)
             else:
-                summary = cached[2]
+                summary = cached[1]
+            active_cache[key] = cached
             summaries.append(summary)
-        self._cache = {path: cached for path, cached in self._cache.items() if path in active_paths}
+        self._cache = active_cache
         return summaries
 
     def render(
@@ -128,6 +131,8 @@ class RepoMap:
         rank_changed: bool = True,
         changed_paths: set[str] | None = None,
     ) -> str:
+        if max_chars <= 0:
+            return ""
         terms = {item.lower() for item in re.findall(r"[A-Za-z_][\w.-]{2,}", query)}
         changed = (
             (set(self._git_changed()) if changed_paths is None else changed_paths)
@@ -160,24 +165,33 @@ class RepoMap:
         ranked.sort(key=lambda item: (-item.score, item.path))
         ranking = f"query: {query}" if query else "stable path order"
         header = f"Repository map ({len(ranked)} source files; {ranking})"
+        marker = "\n\n… repository map truncated …"
+        if len(header) > max_chars:
+            return truncate_text(header, max_chars, marker=marker)
         chunks = [header]
         used = len(header)
         for summary in ranked:
-            rendered = "\n" + summary.render()
+            rendered = "\n\n" + summary.render()
             if used + len(rendered) > max_chars:
-                chunks.append("\n… repository map truncated …")
-                break
+                while len(chunks) > 1 and used + len(marker) > max_chars:
+                    used -= len(chunks.pop())
+                if used + len(marker) > max_chars:
+                    return (header[:max(0, max_chars - len(marker))] + marker)[:max_chars]
+                return "".join(chunks) + marker
             chunks.append(rendered)
             used += len(rendered)
-        return "\n".join(chunks)
+        return "".join(chunks)
 
     def _summarize(self, path: Path, size: int) -> FileSummary:
         relative = path.relative_to(self.root).as_posix()
         language = _EXT_LANG.get(path.suffix.lower(), path.name)
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            data = read_bytes_up_to(path, self.max_file_bytes + 1)
         except OSError:
             return FileSummary(relative, language, size=size)
+        if len(data) > self.max_file_bytes:
+            return FileSummary(relative, language, size=size)
+        text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
         if path.suffix.lower() in {".py", ".pyi"}:
             symbols, imports = _python_symbols(text, filename=relative)
         else:
@@ -190,33 +204,8 @@ class RepoMap:
         return FileSummary(relative, language, _dedupe(symbols)[:80], _dedupe(imports)[:40], size)
 
     def _git_changed(self) -> list[str]:
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-C",
-                    str(self.root),
-                    "status",
-                    "--porcelain",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return []
-        if result.returncode:
-            return []
-        return [
-            line[3:].strip().split(" -> ")[-1]
-            for line in result.stdout.splitlines()
-            if len(line) > 3
-        ]
+        _, changed = repository_status(self.root)
+        return sorted(changed)
 
 
 def _python_symbols(text: str, *, filename: str = "<unknown>") -> tuple[list[str], list[str]]:
@@ -234,13 +223,21 @@ def _python_symbols(text: str, *, filename: str = "<unknown>") -> tuple[list[str
         return _dedupe(symbols), []
     symbols: list[str] = []
     imports: list[str] = []
-    for node in ast.walk(tree):
+    nodes: deque[ast.AST] = deque(tree.body)
+    while nodes:
+        node = nodes.popleft()
         if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
             symbols.append(node.name)
         elif isinstance(node, ast.Import):
             imports.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imports.append(node.module)
+        # Definitions and imports occur in statement scopes, never expressions.
+        # Keep handler/case containers so nested statements retain breadth-first order.
+        nodes.extend(
+            child for child in ast.iter_child_nodes(node)
+            if isinstance(child, ast.stmt | ast.ExceptHandler | ast.match_case)
+        )
     return _dedupe(symbols), _dedupe(imports)
 
 

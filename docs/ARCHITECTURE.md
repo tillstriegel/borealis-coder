@@ -72,7 +72,27 @@ state still pass through `AgentRunner` and `SessionStore`.
 11. Compacts in-memory context when needed without deleting durable history.
 12. Runs verification after mutations and emits a terminal result.
 
-The loop uses explicit `StopReason` values so callers can distinguish end turn, cancellation, budget exhaustion, tool failure, provider failure, and verification failure.
+Run results carry a `StopReason` (`end_turn`, `max_turns`, `budget`, `cancelled`,
+`error`, or `stuck`) and a separate verification report. Callers inspect
+`verification.checks_ok`, `verification.process_lifecycle_guaranteed`, and
+`mutation_tracking` to assess verification and remaining uncertainty.
+
+Parent and delegated runs share the same incomplete-response check. Delegated
+investigations reject incomplete conclusions and tool calls, and include usage
+reported by failed provider requests in the parent run's accounting. Delegated
+usage is settled after each response before more work begins. Every logical model
+request checks the shared time and cost limits, including at the exact cost ceiling.
+Delegated tool loops preserve provider-selected continuation state with its route
+and model identity, using the same metadata format as the parent loop.
+
+When a tool reaches a budget, the runner records its error and observed workspace
+changes, drains parallel reads, and records calls that did not start. The terminal
+run event follows these durable results so the next run can resume valid history.
+
+Provider-only read pruning compares actual output content and visible line ranges.
+It indexes identical outputs and checks known mutations before scanning covering reads.
+A truncated read cannot prove that it covers an earlier excerpt, even when its
+requested range spans the whole file. Identical truncated outputs still deduplicate.
 
 ### `providers/`
 
@@ -88,6 +108,26 @@ Provider adapters implement a small async streaming interface and convert a norm
 
 Adapters return normalized text deltas, tool calls, usage, finish reasons, and errors. Retry classification and exponential backoff live at the provider boundary; provider fallback lives in the runner.
 
+Nested retry wrappers for the same provider and asyncio task share one retry loop.
+Concurrent and child tasks retain independent retry budgets. The retry scope is
+released after success, failure, or cancellation.
+
+Cancelling a JSON request or event stream stops pool waits and shuts down its active
+socket, including while waiting for direct-response headers or reading a response
+body. The request detaches its socket before returning a connection to the pool.
+A pending DNS or proxy connection may not expose a socket yet; a bounded join and
+daemon worker keep that wait from holding interpreter shutdown open. Direct
+connections check cancellation again before sending after connection setup.
+Streams detach socket ownership before releasing a redirected connection and
+check cancellation before following the redirect. Cleanup waits for the worker's
+bounded join even if the task receives repeated cancellation.
+
+The Gemini adapter reconstructs streamed steps when terminal metadata omits them,
+including function arguments and thought signatures needed for continuation.
+Incomplete and budget-exhausted responses do not expose executable tool calls.
+Failed interactions raise provider errors. Cumulative usage from step-stop events
+and terminal metadata is retained in incomplete responses and provider failures.
+
 ### `tools/`
 
 Every tool provides:
@@ -99,6 +139,10 @@ Every tool provides:
 
 The registry validates calls before policy evaluation. This means malformed or unknown arguments never reach the filesystem or subprocess layer.
 
+Each tool invocation receives its own context with a stable call ID. File-change
+sets and metadata remain shared for the run. Mutation uncertainty accumulates back
+into the run context even if a call fails or is cancelled.
+
 Built-in mutation tools prefer deterministic operations:
 
 - existing-file writes require an observed SHA-256
@@ -106,6 +150,26 @@ Built-in mutation tools prefer deterministic operations:
 - patches are parsed and prevalidated across all target files before any write
 - writes use atomic replacement
 - checkpoints record pre-mutation bytes and metadata
+
+File mutations wait for workspace thread and process locks without blocking the
+event loop. Cancellation while waiting leaves files unchanged and releases local
+lock resources. After acquisition, validation, checkpointing, and commit remain
+within the same transaction.
+CLI and interactive rollback acquire the same lock before restoring a checkpoint.
+The synchronous checkpoint manager expects its mutation caller to hold this lock;
+patch failure recovery already runs inside its existing transaction.
+
+Unified patch hunks use their declared line counts to separate content from file
+headers. Added files receive the same count and content checks as updates.
+Zero-context insertions use the empty-range position, and no-newline markers
+preserve file endings. Git's `a/` and `b/` prefixes are removed only from unified
+headers; envelope paths are literal. Envelopes require `*** End Patch`.
+Hunks preserve their supplied line endings. If exact matching fails for a CRLF
+patch, the engine retries its LF-normalized form for transport compatibility.
+Unsupported Git sections reject the entire patch before mutation. Binary changes,
+mode changes, renames, copies, combined merge diffs, and sections without text hunks
+are not supported. New-file Git patches must describe regular non-executable files.
+Quoted Git paths must be expressed as literal paths in an envelope.
 
 ### `safety/`
 
@@ -121,6 +185,24 @@ The safety subsystem is deliberately independent from prompts and providers.
 - `Redactor` removes configured and pattern-matched secrets from traces and persisted error payloads.
 
 ### `context/`
+
+Repository discovery and status use Git's NUL-delimited filename output. Status
+parsing is shared by prompt context and repository-map ranking; paths retain their
+original characters for matching and are escaped when rendered for the model.
+The filesystem fallback also excludes non-regular files, including named pipes.
+Repository-map, ignore-rule, and skill caches compare device, file identity, size,
+modification time, and change time. This detects preserved-timestamp replacements
+and POSIX in-place edits without reading unchanged content on every cache check.
+Instruction and source reads enforce their limits while loading data. Rendered
+repository maps count headers and separators within their character budget.
+Path-specific instruction lookup walks only ancestor scopes, retaining the same
+ignored-directory and symlink rules as full instruction discovery.
+Bounded binary reads accumulate small chunks, so a large configured ceiling does
+not allocate that ceiling for each small file. Write and delete operations stream
+their SHA-256 checks before checkpointing and again before committing changes.
+The automatic stable map and request focus share `context.repo_map_chars`, including
+their section headings. A zero budget skips source discovery for these maps;
+instruction discovery, skill guidance, and an explicit `repo_map` tool remain available.
 
 `ContextBuilder` creates a compact, task-specific view of the repository. It separates durable repository knowledge from transient model context:
 
@@ -155,15 +237,22 @@ MCP clients support stdio and Streamable HTTP. Connection flow:
 2. Exchange `initialize` and `notifications/initialized`.
 3. Page through `tools/list`.
 4. Convert tool definitions to local strict tools.
-5. Namespace names as `<server>__<tool>`.
+5. Namespace names as `mcp__<server>__<tool>`.
 6. Map MCP safety annotations to Borealis effect categories.
 7. Invoke through `tools/call` while retaining local policy enforcement.
 
 Each server has isolated lifecycle and failure state.
+Stdio requests apply their timeout to both sending and receiving. Incoming JSON
+lines are limited to 16 MiB. Reader failures settle pending requests and reject new
+requests; the client drains remaining output until shutdown to avoid pipe stalls.
 
 ### `protocol/`
 
 The ACP server uses bidirectional newline-delimited JSON-RPC over stdio. It maps ACP sessions to `AgentRunner` instances and durable session IDs. Notifications are rendered from the same event stream used by the CLI, which prevents protocol behavior from diverging from in-process behavior.
+
+Incoming JSON lines are limited to 16 MiB. Transport failure, disconnect, or
+cancellation closes the input pipe, fails pending peer requests, cancels and drains
+request handlers, and closes session runners. Peer request timeouts include writes.
 
 Implemented stable ACP v2 capabilities include session lifecycle, replay, additional roots, MCP configuration, prompt acceptance, cancellation, steering, client permissions, and structured updates.
 

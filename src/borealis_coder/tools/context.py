@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from ..context import ContextBuilder
@@ -21,7 +22,9 @@ class RepoMapTool(Tool):
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         builder: ContextBuilder = context.metadata["context_builder"]
-        output = builder.repo_map.build(query=str(arguments["query"]), max_chars=int(arguments["max_chars"]))
+        output = await asyncio.to_thread(
+            builder.repo_map.build, query=str(arguments["query"]), max_chars=int(arguments["max_chars"]),
+        )
         return ToolResult(output)
 
 
@@ -34,7 +37,7 @@ class ReadSkillTool(Tool):
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         builder: ContextBuilder = context.metadata["context_builder"]
-        skill = builder.skills.get(str(arguments["name"]))
+        skill = await asyncio.to_thread(builder.skills.get, str(arguments["name"]))
         if skill is None:
             return ToolResult(f"Unknown skill: {arguments['name']}", is_error=True)
         return ToolResult(
@@ -53,7 +56,7 @@ class ReadInstructionsTool(Tool):
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         builder: ContextBuilder = context.metadata["context_builder"]
         target = context.roots.resolve(arguments["path"]).path
-        documents = builder.instructions.for_path(target)
+        documents = await asyncio.to_thread(builder.instructions.for_path, target)
         if not documents:
             return ToolResult("No applicable instruction files")
         return ToolResult("\n\n".join(f"## {item.relative_path}\n\n{item.content}" for item in documents))

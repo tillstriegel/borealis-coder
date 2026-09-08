@@ -46,7 +46,14 @@ from ..safety import ApprovalManager
 from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import MutationScope, ToolContext, ToolRegistry, VerificationPlanner
-from ..util import estimate_tokens, json_dumps, monotonic_ms, new_id, truncate_text
+from ..util import (
+    estimate_tokens,
+    finish_on_cancellation,
+    json_dumps,
+    monotonic_ms,
+    new_id,
+    truncate_text,
+)
 from .budget import (
     Budget,
     ContextBudget,
@@ -125,9 +132,6 @@ class ReadOnlyWorkState:
 
 
 _CACHEABLE_STOP_REASONS = frozenset({"completed", "end_turn", "stop", "stop_sequence"})
-_INCOMPLETE_STOP_REASONS = frozenset(
-    {"incomplete", "length", "max_tokens", "model_context_window_exceeded"}
-)
 _TOOL_FINALIZATION_GRACE_SECONDS = 0.5
 _WORKSPACE_SCAN_STOP_GRACE_SECONDS = 0.05
 _IS_WINDOWS = os.name == "nt"
@@ -437,16 +441,13 @@ class AgentRunner:
         self.mcp_manager: MCPManager | None = None
 
     async def close(self) -> None:
-        try:
+        async with contextlib.AsyncExitStack() as cleanup:
+            cleanup.push_async_callback(asyncio.to_thread, self.sessions.close)
+            cleanup.push_async_callback(self.events.flush)
+            for route in reversed(self.providers):
+                cleanup.push_async_callback(route.provider.close)
             if self.mcp_manager is not None:
-                await self.mcp_manager.close()
-            for route in self.providers:
-                await route.provider.close()
-        finally:
-            try:
-                await self.events.flush()
-            finally:
-                await asyncio.to_thread(self.sessions.close)
+                cleanup.push_async_callback(self.mcp_manager.close)
 
     def cancel(self, session_id: str) -> bool:
         event = self._cancel.get(session_id)
@@ -631,8 +632,11 @@ class AgentRunner:
         budget = Budget.start(self.config.agent)
 
         async def usage_sink(usage: Usage) -> None:
-            await asyncio.to_thread(self.sessions.add_usage, session_id, usage)
-            budget.add_usage(usage)
+            async def settle() -> None:
+                await asyncio.to_thread(self.sessions.add_usage, session_id, usage)
+                budget.add_usage(usage)
+
+            await finish_on_cancellation(settle())
 
         async def settled_usage_sink(usage: Usage) -> None:
             budget.add_usage(usage)
@@ -796,13 +800,14 @@ class AgentRunner:
                 )
                 try:
                     budget.before_model_request()
-                    response, used_route = await self._complete_with_fallback(
+                    response, used_route = await self._complete_request(
                         request,
                         session_id,
                         run_id,
                         cancel,
                         assistant_message_id,
                         emit_response_deltas=not buffer_candidate_output,
+                        usage_sink=usage_sink,
                     )
                 except ProviderContextOverflowError as error:
                     if error.usage is not None:
@@ -828,10 +833,9 @@ class AgentRunner:
                         await usage_sink(error.usage)
                     raise
                 provider_overflow_retries = 0
-                await asyncio.to_thread(self.sessions.add_usage, session_id, response.usage)
                 usage_budget_error: BudgetExceeded | None = None
                 try:
-                    budget.add_usage(response.usage)
+                    await usage_sink(response.usage)
                 except BudgetExceeded as error:
                     usage_budget_error = error
                 cumulative_usage = await asyncio.to_thread(self.sessions.usage, session_id)
@@ -851,7 +855,7 @@ class AgentRunner:
                     provider=used_route.name,
                     model=used_route.model,
                 )
-                response_incomplete = _is_incomplete_response(response)
+                response_incomplete = response.incomplete
                 response_tool_calls = [] if response_incomplete else response.tool_calls
                 if verification_finalization_pending or read_only_synthesis_pending:
                     response_tool_calls = []
@@ -2738,6 +2742,32 @@ class AgentRunner:
             added = True
         return added
 
+    async def _complete_request(
+        self,
+        request: ProviderRequest,
+        session_id: str,
+        run_id: str,
+        cancel: asyncio.Event,
+        assistant_message_id: str,
+        *,
+        usage_sink: Callable[[Usage], Awaitable[None]],
+        emit_response_deltas: bool = True,
+    ) -> tuple[ModelResponse, ProviderRoute]:
+        """Preserve reported failed-attempt usage if a request is cancelled."""
+
+        cancelled_usage = Usage()
+        try:
+            return await self._complete_with_fallback(
+                request, session_id, run_id, cancel, assistant_message_id,
+                emit_response_deltas=emit_response_deltas,
+                failed_usage_collector=cancelled_usage,
+            )
+        except (Cancelled, asyncio.CancelledError):
+            if not cancelled_usage.is_empty:
+                with contextlib.suppress(BudgetExceeded):
+                    await usage_sink(cancelled_usage)
+            raise
+
     async def _complete_with_fallback(
         self,
         request: ProviderRequest,
@@ -2747,6 +2777,7 @@ class AgentRunner:
         assistant_message_id: str,
         *,
         emit_response_deltas: bool = True,
+        failed_usage_collector: Usage | None = None,
     ) -> tuple[ModelResponse, ProviderRoute]:
         errors: list[str] = []
         failed_usage = Usage()
@@ -2858,6 +2889,7 @@ class AgentRunner:
                     cancel,
                     assistant_message_id,
                     emit_response_deltas=emit_response_deltas,
+                    failed_usage_collector=failed_usage_collector,
                 )
                 if self.config.cache.response_cache_enabled:
                     response.usage.application_cache_misses += cache_misses
@@ -3079,32 +3111,41 @@ class AgentRunner:
                 )
             if before_model_request is not None:
                 before_model_request()
-            request_task = asyncio.create_task(route.provider.complete(request))
+            cancelled_usage = Usage()
+            request_task = asyncio.create_task(route.provider.with_retries(
+                lambda: route.provider.complete(request),
+                failed_usage_collector=cancelled_usage,
+            ))
             cancel_task = asyncio.create_task(cancel.wait())
+
+            async def record_failed_usage(usage: Usage) -> None:
+                if usage_collector is not None:
+                    usage_collector.add(usage)
+                await usage_sink(usage)
+
             try:
-                done, _ = await asyncio.wait(
-                    {request_task, cancel_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if request_task not in done and cancel_task in done:
-                    request_task.cancel()
-                    raise Cancelled("Run cancelled")
-                response = await request_task
+                try:
+                    done, _ = await asyncio.wait(
+                        {request_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if request_task not in done and cancel_task in done:
+                        raise Cancelled("Run cancelled")
+                    response = await request_task
+                finally:
+                    cancel_task.cancel()
+                    if not request_task.done():
+                        request_task.cancel()
+                    await asyncio.gather(request_task, cancel_task, return_exceptions=True)
+            except (Cancelled, asyncio.CancelledError):
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
+                raise
             except ProviderError as error:
                 if error.usage is not None:
-                    if usage_collector is not None:
-                        usage_collector.add(error.usage)
-                    await usage_sink(error.usage)
+                    await finish_on_cancellation(record_failed_usage(error.usage))
                 raise
-            finally:
-                cancel_task.cancel()
-                if not request_task.done():
-                    request_task.cancel()
-                await asyncio.gather(
-                    request_task,
-                    cancel_task,
-                    return_exceptions=True,
-                )
 
             async def settle_completed_response() -> None:
                 # Cache first so a budget stop can resume without another provider call.
@@ -3162,23 +3203,7 @@ class AgentRunner:
                 if usage_collector is not None:
                     usage_collector.add(response.usage)
 
-            settlement = asyncio.create_task(settle_completed_response())
-            pending_cancellation: asyncio.CancelledError | None = None
-            while not settlement.done():
-                try:
-                    await asyncio.shield(settlement)
-                except asyncio.CancelledError as error:
-                    pending_cancellation = error
-                except BaseException as error:
-                    if pending_cancellation is not None:
-                        raise pending_cancellation from error
-                    raise
-            if pending_cancellation is not None:
-                # Observe settlement errors, but preserve the caller's cancellation.
-                with contextlib.suppress(BaseException):
-                    settlement.result()
-                raise pending_cancellation
-            settlement.result()
+            await finish_on_cancellation(settle_completed_response())
             if cancel.is_set():
                 raise Cancelled("Run cancelled")
             return SummarizerResult(
@@ -3208,6 +3233,7 @@ class AgentRunner:
         assistant_message_id: str,
         *,
         emit_response_deltas: bool = True,
+        failed_usage_collector: Usage | None = None,
     ) -> ModelResponse:
         attempts = max(0, route.provider.config.max_retries) + 1
         delay = max(0.0, route.provider.config.initial_backoff_seconds)
@@ -3334,7 +3360,7 @@ class AgentRunner:
                 if (
                     not completed.text
                     and not completed.tool_calls
-                    and not _is_incomplete_response(completed)
+                    and not completed.incomplete
                 ):
                     usage = replace(completed.usage)
                     raise ProviderUnavailableError(
@@ -3345,10 +3371,17 @@ class AgentRunner:
                 if not failed_usage.is_empty:
                     completed.usage = failed_usage.add(completed.usage)
                 return completed
-            except (ProviderUnavailableError, ProviderRateLimitError) as error:
+            except ProviderError as error:
                 if error.usage is not None:
+                    if failed_usage_collector is not None:
+                        failed_usage_collector.add(error.usage)
                     failed_usage.add(error.usage)
-                if actionable_emitted or not error.retryable or attempt + 1 >= attempts:
+                if (
+                    not isinstance(error, (ProviderUnavailableError, ProviderRateLimitError))
+                    or actionable_emitted
+                    or not error.retryable
+                    or attempt + 1 >= attempts
+                ):
                     if not failed_usage.is_empty:
                         error.usage = failed_usage
                     raise
@@ -3367,7 +3400,7 @@ class AgentRunner:
                     delay_seconds=retry_delay,
                     error=str(error),
                 )
-                await asyncio.sleep(retry_delay)
+                await self._await_until_cancelled(asyncio.sleep(retry_delay), cancel)
                 delay = max(0.25, delay * 2)
         raise ProviderUnavailableError(
             f"Provider {route.name} exhausted retries",
@@ -3399,7 +3432,10 @@ class AgentRunner:
                 read_tasks = [asyncio.create_task(run_read(call)) for call in reads]
                 try:
                     read_messages = await asyncio.gather(*read_tasks)
-                except BaseException:
+                except BaseException as error:
+                    if isinstance(error, BudgetExceeded):
+                        for task in read_tasks:
+                            task.cancel()
                     await asyncio.gather(*read_tasks, return_exceptions=True)
                     raise
                 messages.update(
@@ -3412,16 +3448,27 @@ class AgentRunner:
                 self._check_cancel(cancel)
                 messages[call.id] = await self._execute_one(call, context, cancel)
         except (asyncio.CancelledError, Cancelled):
-            await self._record_missing_cancelled_calls(calls, context)
+            await self._record_unstarted_calls(calls, context)
+            raise
+        except BudgetExceeded as error:
+            await self._record_unstarted_calls(
+                calls,
+                context,
+                reason=f"Run stopped before tool execution: {error}",
+                budget_kind=error.kind,
+            )
             raise
         return [messages[call.id] for call in calls]
 
-    async def _record_missing_cancelled_calls(
+    async def _record_unstarted_calls(
         self,
         calls: list[ToolCall],
         context: ToolContext,
+        *,
+        reason: str = "Run cancelled before tool execution",
+        budget_kind: str | None = None,
     ) -> None:
-        """Close advertised calls that cancellation prevented from starting."""
+        """Close advertised calls that a stopped run prevented from starting."""
 
         durable_messages = await asyncio.to_thread(
             self.sessions.messages,
@@ -3436,10 +3483,12 @@ class AgentRunner:
             if call.id in result_ids:
                 continue
             result = ToolResult(
-                "Run cancelled before tool execution",
+                reason,
                 is_error=True,
                 metadata={"cancelled": True, "not_started": True},
             )
+            if budget_kind is not None:
+                result.metadata["budget_kind"] = budget_kind
             try:
                 await asyncio.to_thread(
                     self.sessions.start_tool_call,
@@ -3518,12 +3567,18 @@ class AgentRunner:
         mutation_scope = (
             tool.effective_mutation_scope if tool is not None else MutationScope.NONE
         )
+        budget_error: BudgetExceeded | None = None
         try:
             if mutation_scope == MutationScope.WORKSPACE:
                 workspace_before = await self._await_until_cancelled(
                     self._workspace_snapshot(), cancel
                 )
             result = await self._await_until_cancelled(self.tools.execute(call, context), cancel)
+        except BudgetExceeded as error:
+            budget_error = error
+            result = ToolResult(
+                str(error), is_error=True, metadata={"budget_kind": error.kind},
+            )
         except (asyncio.CancelledError, Cancelled):
             cancelled_result = ToolResult(
                 "Run cancelled",
@@ -3642,6 +3697,18 @@ class AgentRunner:
                 )
             )
             raise
+        if budget_error is not None:
+            await self.events.emit(
+                "tool.completed",
+                session_id=context.session_id,
+                run_id=context.run_id,
+                tool_call_id=call.id,
+                tool=call.name,
+                is_error=True,
+                output=cancellation_message.content,
+                metadata=cancellation_message.metadata,
+            )
+            raise budget_error
         return cancellation_message
 
     @staticmethod
@@ -4236,13 +4303,6 @@ def _is_cacheable_response(response: ModelResponse) -> bool:
     return bool(
         response.text and not response.tool_calls and stop_reason in _CACHEABLE_STOP_REASONS
     )
-
-
-def _is_incomplete_response(response: ModelResponse) -> bool:
-    if isinstance(response.stop_reason, dict):
-        return bool(response.stop_reason)
-    stop_reason = str(response.stop_reason or "").strip().lower()
-    return stop_reason in _INCOMPLETE_STOP_REASONS
 
 
 def _require_read_only_conclusion(*, pending: bool, text: str) -> None:

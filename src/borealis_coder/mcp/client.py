@@ -17,8 +17,14 @@ from .. import __version__
 from ..config import MCPServerConfig
 from ..errors import ProtocolError
 from ..network import open_same_origin
+from ..safety.sandbox import (
+    _finish_process_io,
+    _kill_supervised_process_group,
+    _terminate_process,
+)
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
+MAX_STDIO_MESSAGE_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -61,8 +67,9 @@ class MCPClient(ABC):
     async def list_tools(self) -> list[MCPToolDefinition]:
         tools: list[MCPToolDefinition] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         while True:
-            params = {"cursor": cursor} if cursor else {}
+            params = {"cursor": cursor} if cursor is not None else {}
             result = await self.request("tools/list", params)
             if not isinstance(result, dict):
                 raise ProtocolError(f"MCP server {self.name} returned invalid tools/list result")
@@ -75,8 +82,13 @@ class MCPClient(ABC):
                     annotations=dict(item.get("annotations") or {}),
                 ))
             cursor = result.get("nextCursor")
-            if not cursor:
+            if cursor is None:
                 return tools
+            if not isinstance(cursor, str):
+                raise ProtocolError(f"MCP server {self.name} returned an invalid pagination cursor")
+            if cursor in seen_cursors:
+                raise ProtocolError(f"MCP server {self.name} repeated a pagination cursor")
+            seen_cursors.add(cursor)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = await self.request("tools/call", {"name": name, "arguments": arguments})
@@ -98,6 +110,7 @@ class StdioMCPClient(MCPClient):
         self._stderr_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._counter = 0
+        self._reader_error: str | None = None
 
     async def start(self) -> None:
         if not self.config.command:
@@ -108,7 +121,9 @@ class StdioMCPClient(MCPClient):
             self.config.command, *self.config.args, cwd=str(self.workspace), env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, start_new_session=os.name == "posix",
+            limit=MAX_STDIO_MESSAGE_BYTES,
         )
+        self._reader_error = None
         self._reader_task = asyncio.create_task(self._reader_loop(), name=f"mcp:{self.name}:reader")
         self._stderr_task = asyncio.create_task(self._drain_stderr(), name=f"mcp:{self.name}:stderr")
         await asyncio.wait_for(self.initialize(), timeout=self.config.timeout_seconds)
@@ -116,15 +131,22 @@ class StdioMCPClient(MCPClient):
     async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         if self.process is None or self.process.stdin is None:
             raise ProtocolError(f"MCP server {self.name} is not running")
+        if self._reader_error is not None:
+            raise ProtocolError(self._reader_error)
         self._counter += 1
         request_id = self._counter
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
         try:
-            return await asyncio.wait_for(future, timeout=self.config.timeout_seconds)
+            async with asyncio.timeout(self.config.timeout_seconds):
+                await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
+                return await future
         finally:
             self._pending.pop(request_id, None)
+            future.cancel()
+            if not future.cancelled():
+                # The reader can fail while the same request is still writing.
+                future.exception()
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         await self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})
@@ -139,53 +161,77 @@ class StdioMCPClient(MCPClient):
 
     async def _reader_loop(self) -> None:
         assert self.process and self.process.stdout
+        failure = f"MCP server {self.name} closed its stdout"
         try:
             while line := await self.process.stdout.readline():
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if "id" not in message:
+                if not isinstance(message, dict) or "method" in message:
                     continue
-                future = self._pending.get(message["id"])
+                request_id = message.get("id")
+                if not isinstance(request_id, str | int) or isinstance(request_id, bool):
+                    continue
+                future = self._pending.get(request_id)
                 if future is None or future.done():
                     continue
                 if "error" in message:
                     error = message["error"]
-                    future.set_exception(ProtocolError(f"MCP {self.name} error {error.get('code')}: {error.get('message')}"))
+                    if isinstance(error, dict):
+                        future.set_exception(ProtocolError(f"MCP {self.name} error {error.get('code')}: {error.get('message')}"))
+                    else:
+                        future.set_exception(ProtocolError(f"MCP {self.name} returned an invalid error response"))
                 else:
                     future.set_result(message.get("result"))
+        except (OSError, ValueError) as error:
+            failure = f"MCP server {self.name} failed to read a response: {error}"
         finally:
+            self._reader_error = failure
             for future in self._pending.values():
                 if not future.done():
-                    future.set_exception(ProtocolError(f"MCP server {self.name} closed its stdout"))
+                    future.set_exception(ProtocolError(failure))
+        # Keep a failed server from blocking on its pipe before close can reap it.
+        with contextlib.suppress(OSError):
+            while await self.process.stdout.read(65_536):
+                pass
 
     async def _drain_stderr(self) -> None:
         if self.process is None or self.process.stderr is None:
             return
-        while await self.process.stderr.readline():
+        while await self.process.stderr.read(65_536):
             pass
 
     async def close(self) -> None:
-        if self.process is None:
+        process = self.process
+        if process is None:
             return
-        if self.process.stdin:
-            self.process.stdin.close()
+        process_task = asyncio.create_task(process.wait())
+        process_stopped = False
         try:
-            await asyncio.wait_for(self.process.wait(), timeout=2)
-        except TimeoutError:
-            self.process.terminate()
+            if process.stdin:
+                process.stdin.close()
             try:
-                await asyncio.wait_for(self.process.wait(), timeout=2)
+                await asyncio.wait_for(asyncio.shield(process_task), timeout=2)
             except TimeoutError:
-                self.process.kill()
-                await self.process.wait()
-        for task in (self._reader_task, self._stderr_task):
-            if task:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        self.process = None
+                await _terminate_process(process)
+                process_stopped = True
+        finally:
+            # The group remains ours even when its original server has exited.
+            # Descendants may otherwise keep running or hold the pipes open.
+            try:
+                if not process_stopped:
+                    if os.name == "posix":
+                        _kill_supervised_process_group(process)
+                    elif process.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            process.kill()
+            finally:
+                tasks = [task for task in (self._reader_task, self._stderr_task) if task]
+                try:
+                    await _finish_process_io(process, process_task, tasks, drain=False)
+                finally:
+                    self.process = None
 
 
 class HttpMCPClient(MCPClient):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import (
+    ProviderRoute,
     build_runner,
     compact_messages,
     compact_messages_with_summary,
@@ -20,9 +22,10 @@ from borealis_coder.agent import (
     prune_provider_messages,
 )
 from borealis_coder.config import ProviderConfig, SafetyConfig, SandboxConfig
-from borealis_coder.errors import BudgetExceeded, Cancelled
+from borealis_coder.errors import BudgetExceeded, Cancelled, ProviderUnavailableError
 from borealis_coder.models import Message, ModelResponse, Role, ToolCall, Usage
 from borealis_coder.providers.base import Provider
+from borealis_coder.providers.gemini import GeminiProvider
 from borealis_coder.providers.mock import MockProvider
 from borealis_coder.providers.registry import ProviderRegistry
 from borealis_coder.safety import (
@@ -77,6 +80,35 @@ class SteeringProvider(Provider):
 
 
 class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runner_close_releases_all_resources_when_one_close_fails(self):
+        for failing in ("mcp", "provider"):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                runner = await build_runner(root, config=make_config(root), interactive=False)
+                backup = MockProvider(runner.providers[0].provider.config)
+                runner.providers.append(ProviderRoute("backup", "mock", backup))
+                assert runner.mcp_manager is not None
+                with (
+                    patch.object(
+                        runner.mcp_manager, "close",
+                        side_effect=RuntimeError("mcp close failed") if failing == "mcp" else None,
+                    ) as close_mcp,
+                    patch.object(
+                        runner.providers[0].provider, "close",
+                        side_effect=RuntimeError("provider close failed") if failing == "provider" else None,
+                    ) as close_primary,
+                    patch.object(backup, "close") as close_backup,
+                    patch.object(runner.events, "flush", wraps=runner.events.flush) as flush,
+                    patch.object(runner.sessions, "close", wraps=runner.sessions.close) as close_store,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, f"{failing} close failed"):
+                        await runner.close()
+                    close_mcp.assert_awaited_once()
+                    close_primary.assert_awaited_once()
+                    close_backup.assert_awaited_once()
+                    flush.assert_awaited_once()
+                    close_store.assert_called_once()
+
     async def test_runner_factory_closes_owned_resources_after_provider_failure(self):
         class TrackingStore:
             def __init__(self, _path):
@@ -617,6 +649,122 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(retained_reads), 1)
         self.assertEqual(retained_reads[0].metadata["path"], "src/example.py")
 
+    async def test_truncated_whole_file_read_preserves_earlier_middle_slice(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            marker = "IMPORTANT_MIDDLE_CONTEXT"
+            (root / "large.txt").write_text(
+                "".join(
+                    f"{marker if line == 50 else 'padding'}: {'x' * 100}\n"
+                    for line in range(1, 101)
+                )
+            )
+            context = make_context(root)
+            registry = build_builtin_registry()
+            messages = []
+            for start, end in ((45, 55), (None, None), (None, None)):
+                call = ToolCall(
+                    name="read_file",
+                    arguments={
+                        "path": "large.txt", "start_line": start,
+                        "end_line": end, "max_chars": 2_000,
+                    },
+                )
+                result = await registry.execute(call, context)
+                self.assertFalse(result.is_error, result.output)
+                messages.extend([
+                    Message(role=Role.ASSISTANT, tool_calls=[call]),
+                    Message(
+                        role=Role.TOOL, tool_name=call.name, tool_call_id=call.id,
+                        content=result.output, metadata=result.metadata,
+                    ),
+                ])
+
+            self.assertIn(marker, messages[1].content)
+            self.assertNotIn(marker, messages[3].content)
+            pruned, metrics = prune_provider_messages(messages)
+            self.assertIn(marker, pruned[1].content)
+            self.assertEqual(metrics.superseded_reads_removed, 1)
+            self.assertIn("[superseded read:", pruned[3].content)
+
+    async def test_changed_output_limit_does_not_supersede_more_complete_read(self):
+        for smaller_limit in (2_000, 20):
+            with self.subTest(limit=smaller_limit), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                marker = "IMPORTANT_MIDDLE_CONTEXT"
+                (root / "large.txt").write_text(
+                    "".join(
+                        f"{marker if line == 50 else 'padding'}: {'x' * 100}\n"
+                        for line in range(1, 101)
+                    )
+                )
+                context = make_context(root)
+                registry = build_builtin_registry()
+                messages = []
+                for limit in (24_000, smaller_limit):
+                    context.config.context.tool_output_chars = limit
+                    call = ToolCall(
+                        name="read_file",
+                        arguments={
+                            "path": "large.txt", "start_line": 1,
+                            "end_line": 100, "max_chars": None,
+                        },
+                    )
+                    result = await registry.execute(call, context)
+                    self.assertFalse(result.is_error, result.output)
+                    messages.extend([
+                        Message(role=Role.ASSISTANT, tool_calls=[call]),
+                        Message(
+                            role=Role.TOOL, tool_name=call.name, tool_call_id=call.id,
+                            content=result.output, metadata=result.metadata,
+                        ),
+                    ])
+
+                self.assertIn(marker, messages[1].content)
+                self.assertNotIn(marker, messages[3].content)
+                pruned, metrics = prune_provider_messages(messages)
+                self.assertIn(marker, pruned[1].content)
+                self.assertEqual(metrics.superseded_reads_removed, 0)
+
+    @unittest.skipIf(os.name == "nt", "Backslashes are path separators on Windows")
+    async def test_literal_backslash_mutation_does_not_supersede_another_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "folder/file.txt"
+            source.parent.mkdir()
+            source.write_text("IMPORTANT_ORIGINAL_CONTEXT\n")
+            context = make_context(root)
+            registry = build_builtin_registry()
+            calls = [
+                ToolCall(name="read_file", arguments={
+                    "path": "folder/file.txt", "start_line": None,
+                    "end_line": None, "max_chars": None,
+                }),
+                ToolCall(name="write_file", arguments={
+                    "path": r"folder\file.txt", "content": "Unrelated file.\n",
+                    "expected_sha256": None,
+                }),
+            ]
+            messages = []
+            for call in calls:
+                result = await registry.execute(call, context)
+                self.assertFalse(result.is_error, result.output)
+                messages.extend([
+                    Message(role=Role.ASSISTANT, tool_calls=[call]),
+                    Message(role=Role.TOOL, tool_name=call.name, tool_call_id=call.id,
+                            content=result.output, metadata=result.metadata),
+                ])
+
+            self.assertEqual(source.read_text(), "IMPORTANT_ORIGINAL_CONTEXT\n")
+            self.assertEqual((root / r"folder\file.txt").read_text(), "Unrelated file.\n")
+            pruned, metrics = prune_provider_messages(messages)
+            self.assertIn("IMPORTANT_ORIGINAL_CONTEXT", pruned[1].content)
+            self.assertEqual(metrics.superseded_reads_removed, 0)
+
+            with patch("borealis_coder.agent.compaction.os", SimpleNamespace(name="nt")):
+                _, windows_metrics = prune_provider_messages(messages)
+            self.assertEqual(windows_metrics.superseded_reads_removed, 1)
+
     def test_failed_shell_with_changed_files_invalidates_stale_reads(self):
         sha = "a" * 64
         read_call = ToolCall(
@@ -880,6 +1028,109 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 usage_sink.assert_awaited_once_with(usage)
             finally:
                 await runner.close()
+
+    async def test_llm_compaction_retries_recover_with_complete_usage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = await build_runner(
+                root, config=make_config(root, agent={"deterministic_compaction": False}),
+                interactive=False,
+            )
+            provider = runner.providers[0].provider
+            assert isinstance(provider, MockProvider)
+            provider.config.max_retries = 1
+            provider.config.initial_backoff_seconds = 0
+            provider.config.max_backoff_seconds = 0
+            requests = []
+            usage_sink = AsyncMock()
+            collected = Usage()
+
+            def handler(request, call):
+                if call == 1:
+                    raise ProviderUnavailableError(
+                        "Temporary summary failure", retryable=True,
+                        usage=Usage(cost_usd=0.1, requests=1),
+                    )
+                return ModelResponse(text="Recovered summary", usage=Usage(cost_usd=0.2, requests=1))
+
+            provider.handler = handler
+            try:
+                summarize = runner._summarizer(
+                    usage_sink, asyncio.Event(), collected,
+                    before_model_request=lambda: requests.append("summary"),
+                )
+                assert summarize is not None
+                result = await summarize("Old conversation")
+
+                self.assertEqual(result.text, "Recovered summary")
+                self.assertEqual(provider.calls, 2)
+                self.assertEqual(requests, ["summary"])
+                self.assertEqual(collected.requests, 2)
+                self.assertAlmostEqual(collected.cost_usd, 0.3)
+                usage_sink.assert_awaited_once_with(collected)
+            finally:
+                await runner.close()
+
+    async def test_native_summary_retries_preserve_usage_on_cancellation_and_exhaustion(self):
+        for outcome in ("task", "session", "exhausted"):
+            for over_budget in (False, True):
+                with self.subTest(outcome=outcome, over_budget=over_budget), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    runner = await build_runner(
+                        root, config=make_config(root, agent={"deterministic_compaction": False}),
+                        interactive=False,
+                    )
+                    delay = 0 if outcome == "exhausted" else 30
+                    provider = GeminiProvider(ProviderConfig(
+                        type="gemini", base_url="https://gemini.test", max_retries=1,
+                        initial_backoff_seconds=delay, max_backoff_seconds=delay,
+                    ))
+                    runner.providers = [ProviderRoute("gemini", "test-model", provider)]
+                    failed = asyncio.Event()
+                    cancel = asyncio.Event()
+                    recorded = Usage()
+                    collected = Usage()
+
+                    async def fail(*args, failed=failed, **kwargs):
+                        failed.set()
+                        raise ProviderUnavailableError(
+                            "Billed summary failure", retryable=True,
+                            usage=Usage(cost_usd=0.1, requests=1),
+                        )
+
+                    async def sink(usage, recorded=recorded, over_budget=over_budget):
+                        recorded.add(usage)
+                        if over_budget:
+                            raise BudgetExceeded("cost", "Summary exceeded the cost limit")
+
+                    request = AsyncMock(side_effect=fail)
+                    provider.http.post_json = request
+                    summarize = runner._summarizer(sink, cancel, collected)
+                    assert summarize is not None
+                    task = asyncio.ensure_future(summarize("Old conversation"))
+                    try:
+                        await asyncio.wait_for(failed.wait(), timeout=2)
+                        if outcome == "task":
+                            task.cancel()
+                            expected = asyncio.CancelledError
+                        elif outcome == "session":
+                            cancel.set()
+                            expected = Cancelled
+                        else:
+                            expected = BudgetExceeded if over_budget else ProviderUnavailableError
+                        with self.assertRaises(expected):
+                            await asyncio.wait_for(task, timeout=2)
+
+                        attempts = 2 if outcome == "exhausted" else 1
+                        self.assertEqual(request.await_count, attempts)
+                        self.assertEqual(recorded.requests, attempts)
+                        self.assertAlmostEqual(recorded.cost_usd, attempts * 0.1)
+                        self.assertEqual(collected.to_dict(), recorded.to_dict())
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                        await runner.close()
 
     async def test_runner_cancels_in_flight_llm_compaction(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1555,6 +1806,45 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(report.ok)
             self.assertTrue(report.steps[0]["blocked"])
+
+    @unittest.skipUnless(shutil.which("node") and shutil.which("npm"), "Node and npm are required")
+    async def test_verification_runs_the_project_npm_test_script(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "package.json").write_text(json_dumps({
+                "private": True, "scripts": {"test": "node --test"},
+            }))
+            (root / "example.test.mjs").write_text(
+                "import { test } from 'node:test';\n"
+                "import assert from 'node:assert/strict';\n"
+                "test('addition', () => {\n"
+                "  assert.equal(2 + 3, 5);\n"
+                "  console.log('BOREALIS_VERIFICATION_PASSED');\n"
+                "});\n"
+            )
+            (root / "user.npmrc").write_text("")
+            (root / "global.npmrc").write_text("")
+            npm_environment = {
+                "NPM_CONFIG_CACHE": str(root / "npm-cache"),
+                "NPM_CONFIG_USERCONFIG": str(root / "user.npmrc"),
+                "NPM_CONFIG_GLOBALCONFIG": str(root / "global.npmrc"),
+                "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+            }
+            config = make_config(root, safety={"network": True})
+            config.safety.env_allowlist.extend(npm_environment)
+            context = make_context(root, config)
+            version = await context.process.run(["node", "--version"], cwd=root, timeout=10)
+            try:
+                node_major = int(version.stdout.strip().removeprefix("v").split(".")[0])
+            except ValueError:
+                self.skipTest("Could not determine the installed Node version")
+            if node_major < 18:
+                self.skipTest("The built-in Node test runner requires Node 18 or newer")
+            with patch.dict(os.environ, npm_environment):
+                report = await VerificationPlanner(root).run(context)
+            self.assertTrue(report.ok, report.render())
+            self.assertEqual(len(report.steps), 1)
+            self.assertIn("BOREALIS_VERIFICATION_PASSED", report.steps[0]["stdout"])
 
     async def test_docker_driver_mounts_additional_roots_and_hardens_container(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as extra:

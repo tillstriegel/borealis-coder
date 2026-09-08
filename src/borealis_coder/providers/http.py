@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import http.client
 import json
 import select
@@ -22,7 +23,7 @@ from .. import __version__
 from ..errors import ProviderError
 from ..network import open_same_origin, same_origin_redirect_url
 from ..safety.redaction import Redactor
-from ..util import json_dumps
+from ..util import finish_on_cancellation, json_dumps
 from .base import classify_provider_error
 
 
@@ -42,9 +43,65 @@ class SSEEvent:
 
 
 _SSE_BUFFER_SIZE = 64
-_SSE_JOIN_TIMEOUT_SECONDS = 1.0
+_HTTP_JOIN_TIMEOUT_SECONDS = 1.0
 _MAX_CONNECTIONS_PER_ORIGIN = 4
 _Origin = tuple[str, str, int]
+
+
+class _HttpRequest:
+    """Own one request's socket until it is returned to the connection pool."""
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._connection: http.client.HTTPConnection | None = None
+        self._socket: socket.socket | None = None
+        self._response: Any = None
+
+    def check_cancelled(self) -> None:
+        if self.cancelled.is_set():
+            raise RuntimeError("HTTP request was cancelled")
+
+    def attach_connection(self, connection: http.client.HTTPConnection) -> None:
+        with self._lock:
+            self.check_cancelled()
+            self._connection = connection
+            self._socket = connection.sock
+
+    def attach_response(self, response: Any) -> None:
+        # urllib responses (including HTTPError wrappers) retain their socket
+        # through HTTPResponse.fp. Keep it before read() can clear that field.
+        stream = getattr(response, "fp", None)
+        if isinstance(stream, http.client.HTTPResponse):
+            stream = stream.fp
+        response_socket = getattr(getattr(stream, "raw", None), "_sock", None)
+        with self._lock:
+            self.check_cancelled()
+            self._response = response
+            if isinstance(response_socket, socket.socket):
+                self._socket = response_socket
+
+    def detach(self) -> None:
+        with self._lock:
+            self._connection = None
+            self._socket = None
+            self._response = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self.cancelled.set()
+            active_socket = self._socket or (
+                self._connection.sock if self._connection is not None else None
+            )
+            if active_socket is not None:
+                # Hold the ownership lock so shutdown cannot race with pool reuse.
+                with contextlib.suppress(OSError):
+                    active_socket.shutdown(socket.SHUT_RDWR)
+            elif self._response is not None:
+                close = getattr(self._response, "close", None)
+                if close is not None:
+                    with contextlib.suppress(Exception):
+                        close()
 
 
 class _ConnectionPool:
@@ -176,13 +233,43 @@ class HttpClient:
         payload: Any,
         timeout_seconds: int | None = None,
     ) -> HttpResponse:
-        return await asyncio.to_thread(
-            self._post_json_sync,
-            url,
-            headers or {},
-            payload,
-            timeout_seconds or self.timeout_seconds,
-        )
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[HttpResponse] = loop.create_future()
+        request = _HttpRequest()
+
+        def deliver(response: HttpResponse | None, error: BaseException | None) -> None:
+            if future.done():
+                return
+            if error is not None:
+                future.set_exception(error)
+            else:
+                assert response is not None
+                future.set_result(response)
+
+        def worker() -> None:
+            response = None
+            error = None
+            try:
+                response = self._post_json_sync(
+                    url, headers or {}, payload, timeout_seconds or self.timeout_seconds,
+                    control=request,
+                )
+            except BaseException as failure:
+                error = failure
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(deliver, response, error)
+
+        context = contextvars.copy_context()
+        thread = threading.Thread(target=context.run, args=(worker,), name="borealis-json", daemon=True)
+        thread.start()
+        try:
+            return await future
+        except asyncio.CancelledError:
+            request.cancel()
+            # A DNS lookup or proxy connection may not expose a socket yet. Its
+            # daemon worker must not hold interpreter shutdown past this grace.
+            await finish_on_cancellation(asyncio.to_thread(thread.join, _HTTP_JOIN_TIMEOUT_SECONDS))
+            raise
 
     def _post_json_sync(
         self,
@@ -190,7 +277,10 @@ class HttpClient:
         headers: dict[str, str],
         payload: Any,
         timeout_seconds: int,
+        *,
+        control: _HttpRequest,
     ) -> HttpResponse:
+        control.check_cancelled()
         request_headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -205,14 +295,21 @@ class HttpClient:
                 request_headers,
                 body,
                 timeout_seconds,
+                control=control,
             )
         origin, target = pooled_target
-        connection = self._pool.acquire(origin, timeout_seconds)
+        connection = self._pool.acquire(origin, timeout_seconds, cancel=control.cancelled)
+        response: http.client.HTTPResponse | None = None
         reusable = False
         redirect_request: urllib.request.Request | None = None
         try:
+            control.attach_connection(connection)
+            if connection.sock is None:
+                connection.connect()
+            control.attach_connection(connection)
             connection.request("POST", target, body=body, headers=request_headers)
             response = connection.getresponse()
+            control.attach_response(response)
             raw = response.read()
             response_headers = {key.lower(): value for key, value in response.getheaders()}
             reusable = not response.will_close and not _connection_close_requested(request_headers)
@@ -239,10 +336,15 @@ class HttpClient:
                 self.redactor.text(f"Provider connection failed: {error}"),
             ) from error
         finally:
-            self._pool.release(origin, connection, reusable=reusable)
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                control.detach()
+                self._pool.release(origin, connection, reusable=reusable and not control.cancelled.is_set())
         if redirect_request is None:
             raise ProviderError("Provider returned an unusable HTTP redirect")
-        return self._json_urlopen_request(redirect_request, timeout_seconds)
+        return self._json_urlopen_request(redirect_request, timeout_seconds, control=control)
 
     def _post_json_urlopen(
         self,
@@ -250,25 +352,32 @@ class HttpClient:
         headers: dict[str, str],
         body: bytes,
         timeout_seconds: int,
+        *,
+        control: _HttpRequest,
     ) -> HttpResponse:
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        return self._json_urlopen_request(request, timeout_seconds)
+        return self._json_urlopen_request(request, timeout_seconds, control=control)
 
     def _json_urlopen_request(
         self,
         request: urllib.request.Request,
         timeout_seconds: int,
+        *,
+        control: _HttpRequest,
     ) -> HttpResponse:
+        control.check_cancelled()
         try:
             with open_same_origin(
                 request, timeout=timeout_seconds, context=self.ssl_context
             ) as response:
+                control.attach_response(response)
                 raw = response.read()
                 response_headers = {key.lower(): value for key, value in response.headers.items()}
                 data = self._decode(raw, response_headers)
                 return HttpResponse(response.status, response_headers, data, raw)
         except urllib.error.HTTPError as error:
             try:
+                control.attach_response(error)
                 raw = error.read()
             finally:
                 error.close()
@@ -278,6 +387,8 @@ class HttpClient:
                 None,
                 self.redactor.text(f"Provider connection failed: {error.reason}"),
             ) from error
+        finally:
+            control.detach()
 
     async def stream_sse(
         self,
@@ -292,11 +403,8 @@ class HttpClient:
             maxsize=_SSE_BUFFER_SIZE
         )
         slots = threading.BoundedSemaphore(_SSE_BUFFER_SIZE)
-        stop = threading.Event()
-        response_lock = threading.Lock()
-        active_response: Any = None
-        active_connection: http.client.HTTPConnection | None = None
-        active_socket: socket.socket | None = None
+        control = _HttpRequest()
+        stop = control.cancelled
 
         def enqueue(item: SSEEvent | BaseException | None) -> bool:
             while not stop.is_set():
@@ -318,20 +426,20 @@ class HttpClient:
             return False
 
         def worker() -> None:
-            nonlocal active_connection, active_response, active_socket
-            request_headers = {
-                "Accept": "text/event-stream",
-                "Content-Type": "application/json",
-                "User-Agent": f"borealis-coder/{__version__}",
-                **(headers or {}),
-            }
-            body = json_dumps(payload).encode("utf-8")
             origin: _Origin | None = None
             connection: http.client.HTTPConnection | None = None
             response: Any = None
             completed = False
             reusable = False
             try:
+                control.check_cancelled()
+                request_headers = {
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                    "User-Agent": f"borealis-coder/{__version__}",
+                    **(headers or {}),
+                }
+                body = json_dumps(payload).encode("utf-8")
                 request_timeout = timeout_seconds or self.timeout_seconds
                 pooled_target = self._pooled_target(url)
                 if pooled_target is None:
@@ -353,12 +461,13 @@ class HttpClient:
                         request_timeout,
                         cancel=stop,
                     )
-                    with response_lock:
-                        active_connection = connection
+                    control.attach_connection(connection)
+                    if connection.sock is None:
+                        connection.connect()
+                    control.attach_connection(connection)
                     connection.request("POST", target, body=body, headers=request_headers)
-                    with response_lock:
-                        active_socket = connection.sock
                     response = connection.getresponse()
+                    control.attach_response(response)
                     if 300 <= response.status < 400:
                         raw = response.read()
                         response_headers = {
@@ -381,12 +490,11 @@ class HttpClient:
                             request_headers
                         )
                         response.close()
-                        self._pool.release(origin, connection, reusable=reusable)
+                        control.detach()
+                        self._pool.release(origin, connection, reusable=reusable and not stop.is_set())
                         connection = None
                         origin = None
-                        with response_lock:
-                            active_connection = None
-                            active_socket = None
+                        control.check_cancelled()
                         response = open_same_origin(
                             redirect_request,
                             timeout=request_timeout,
@@ -400,8 +508,7 @@ class HttpClient:
                         )
                         raise self._http_error(response.status, raw)
 
-                with response_lock:
-                    active_response = response
+                control.attach_response(response)
                 event_name = "message"
                 event_id: str | None = None
                 data_lines: list[str] = []
@@ -442,10 +549,13 @@ class HttpClient:
                     )
             except urllib.error.HTTPError as error:
                 try:
+                    control.attach_response(error)
                     raw = error.read()
+                    enqueue(self._http_error(error.code, raw))
+                except BaseException as failure:
+                    enqueue(failure)
                 finally:
                     error.close()
-                enqueue(self._http_error(error.code, raw))
             except urllib.error.URLError as error:
                 enqueue(
                     classify_provider_error(
@@ -456,17 +566,11 @@ class HttpClient:
             except BaseException as error:
                 enqueue(error)
             finally:
-                with response_lock:
-                    if active_response is response:
-                        active_response = None
-                    if active_connection is connection:
-                        active_connection = None
-                    if active_socket is not None:
-                        active_socket = None
                 close = getattr(response, "close", None)
                 if close is not None:
                     with contextlib.suppress(Exception):
                         close()
+                control.detach()
                 if connection is not None and origin is not None:
                     self._pool.release(
                         origin,
@@ -489,22 +593,8 @@ class HttpClient:
                     raise classify_provider_error(None, str(item)) from item
                 yield item
         finally:
-            stop.set()
-            with response_lock:
-                response = active_response
-                connection = active_connection
-                socket_handle = active_socket or (
-                    connection.sock if connection is not None else None
-                )
-            if socket_handle is not None:
-                with contextlib.suppress(Exception):
-                    socket_handle.shutdown(socket.SHUT_RDWR)
-            else:
-                close = getattr(response, "close", None)
-                if close is not None:
-                    with contextlib.suppress(Exception):
-                        close()
-            await asyncio.to_thread(thread.join, _SSE_JOIN_TIMEOUT_SECONDS)
+            control.cancel()
+            await finish_on_cancellation(asyncio.to_thread(thread.join, _HTTP_JOIN_TIMEOUT_SECONDS))
 
     def _pooled_target(self, url: str) -> tuple[_Origin, str] | None:
         try:

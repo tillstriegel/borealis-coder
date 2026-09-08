@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import stat
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -12,42 +14,56 @@ from typing import Any
 from ..errors import ProtocolError
 
 JsonHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
+MAX_STDIO_MESSAGE_BYTES = 16 * 1024 * 1024
 
 
 class JsonRpcConnection:
     def __init__(self, handler: JsonHandler) -> None:
         self.handler = handler
         self._write_lock = asyncio.Lock()
+        self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str | int, asyncio.Future[Any]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._counter = 10_000
         self.closed = False
 
     async def serve_stdio(self) -> None:
-        reader = asyncio.StreamReader()
+        reader = asyncio.StreamReader(limit=MAX_STDIO_MESSAGE_BYTES)
         protocol = asyncio.StreamReaderProtocol(reader)
         loop = asyncio.get_running_loop()
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
-        while not self.closed:
-            line = await reader.readline()
-            if not line:
-                break
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError as error:
-                await self.send_error(None, -32700, f"Parse error: {error}")
-                continue
-            task = asyncio.create_task(self._dispatch(message))
-            self._dispatch_tasks.add(task)
-            task.add_done_callback(self._finish_dispatch)
-        self.closed = True
-        for task in self._dispatch_tasks:
-            task.cancel()
-        if self._dispatch_tasks:
-            await asyncio.gather(*self._dispatch_tasks, return_exceptions=True)
-        for future in self._pending.values():
-            if not future.done():
-                future.set_exception(ProtocolError("JSON-RPC connection closed"))
+        transport: asyncio.BaseTransport | None = None
+        try:
+            transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
+            while not self.closed:
+                try:
+                    line = await reader.readline()
+                except ValueError as error:
+                    raise ProtocolError(
+                        f"JSON-RPC message exceeds the {MAX_STDIO_MESSAGE_BYTES}-byte limit"
+                    ) from error
+                if not line:
+                    break
+                try:
+                    message = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    await self.send_error(None, -32700, f"Parse error: {error}")
+                    continue
+                task = asyncio.create_task(self._dispatch(message))
+                self._dispatch_tasks.add(task)
+                task.add_done_callback(self._finish_dispatch)
+        finally:
+            self.closed = True
+            if transport is not None:
+                transport.close()
+            if self._writer is not None:
+                self._writer.transport.abort()
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(ProtocolError("JSON-RPC connection closed"))
+            for task in self._dispatch_tasks:
+                task.cancel()
+            if self._dispatch_tasks:
+                await asyncio.gather(*self._dispatch_tasks, return_exceptions=True)
 
     async def _dispatch(self, message: Any) -> None:
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
@@ -63,7 +79,10 @@ class JsonRpcConnection:
             if future and not future.done():
                 if "error" in message:
                     error = message["error"]
-                    future.set_exception(ProtocolError(f"Peer error {error.get('code')}: {error.get('message')}"))
+                    if isinstance(error, dict):
+                        future.set_exception(ProtocolError(f"Peer error {error.get('code')}: {error.get('message')}"))
+                    else:
+                        future.set_exception(ProtocolError("Peer returned an invalid error response"))
                 else:
                     future.set_result(message.get("result"))
             return
@@ -93,15 +112,22 @@ class JsonRpcConnection:
         await self._write({"jsonrpc": "2.0", "method": method, "params": params})
 
     async def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> Any:
+        if self.closed:
+            raise ProtocolError("JSON-RPC connection closed")
         self._counter += 1
         request_id = self._counter
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         try:
-            return await asyncio.wait_for(future, timeout=timeout) if timeout else await future
+            async with asyncio.timeout(timeout or None):
+                await self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+                return await future
         finally:
             self._pending.pop(request_id, None)
+            future.cancel()
+            if not future.cancelled():
+                # Connection shutdown can race with the request write.
+                future.exception()
 
     async def send_result(self, request_id: Any, result: Any) -> None:
         await self._write({"jsonrpc": "2.0", "id": request_id, "result": result})
@@ -115,7 +141,31 @@ class JsonRpcConnection:
     async def _write(self, value: dict[str, Any]) -> None:
         data = json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
         async with self._write_lock:
-            await asyncio.to_thread(_write_stdout, data)
+            if self.closed:
+                raise ProtocolError("JSON-RPC connection closed")
+            if self._writer is None:
+                # Keep Windows stdio and regular-file redirection on their
+                # existing path. POSIX pipe transports support async flow control.
+                if os.name == "nt" or stat.S_ISREG(os.fstat(sys.stdout.fileno()).st_mode):
+                    await asyncio.to_thread(_write_stdout, data)
+                    return
+                loop = asyncio.get_running_loop()
+                transport, protocol = await loop.connect_write_pipe(
+                    lambda: asyncio.streams.FlowControlMixin(loop=loop), sys.stdout.buffer
+                )
+                # drain() must flush the whole frame, including small replies.
+                transport.set_write_buffer_limits(high=0)
+                self._writer = asyncio.StreamWriter(transport, protocol, None, loop)
+                if self.closed:
+                    transport.abort()
+                    raise ProtocolError("JSON-RPC connection closed")
+            # A previous timed-out request may still have a complete frame
+            # queued. Drain it before adding more bytes to the same stream.
+            await self._writer.drain()
+            if self.closed:
+                raise ProtocolError("JSON-RPC connection closed")
+            self._writer.write(data.encode("utf-8"))
+            await self._writer.drain()
 
 
 def _write_stdout(data: str) -> None:
