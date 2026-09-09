@@ -517,7 +517,7 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             compacted_events = []
             runner.events.subscribe(
                 lambda event: compacted_events.append(event)
-                if event.type == "context.compacted"
+                if event.type in {"context.compacted", "context.reused"}
                 else None
             )
             try:
@@ -525,6 +525,8 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.stop_reason.value, "end_turn")
                 self.assertEqual(len(compacted_events), 2)
+                self.assertEqual(compacted_events[0].type, "context.compacted")
+                self.assertEqual(compacted_events[1].type, "context.reused")
                 metrics = compacted_events[0].data
                 self.assertEqual(metrics["compaction_reason"], "estimated_tokens")
                 self.assertGreater(metrics["tokens_before"], metrics["tokens_after"])

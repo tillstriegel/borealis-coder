@@ -152,7 +152,10 @@ async def evaluate_compaction_release_case(
     started = time.perf_counter()
     prompt_context = PromptContext(stable="Compaction v2 release evaluation.")
     fixed_tokens = estimate_tokens(prompt_context.text) + 512
-    effective_target_ratio = min(0.70, 0.82 * 0.85)
+    defaults = AgentConfig()
+    effective_target_ratio = min(
+        defaults.compaction_target_ratio, defaults.compact_at_ratio * 0.85
+    )
     desired_total_target = target_tokens + fixed_tokens
     max_input_tokens = (
         math.ceil(desired_total_target / effective_target_ratio) + 1 + 512

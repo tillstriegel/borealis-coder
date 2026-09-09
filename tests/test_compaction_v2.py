@@ -2858,8 +2858,8 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 ).encode("utf-8")
             ).hexdigest(),
         )
-        compacted = [event for event in events if event.type == "context.compacted"]
-        self.assertTrue(any(event.data.get("artifact_reused") for event in compacted))
+        reused = [event for event in events if event.type == "context.reused"]
+        self.assertTrue(any(event.data.get("artifact_reused") for event in reused))
 
     async def test_summary_is_reused_after_one_time_artifact_write_failure(self):
         with tempfile.TemporaryDirectory() as td:

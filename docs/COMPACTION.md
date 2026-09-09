@@ -45,6 +45,10 @@ Borealis records an unavailable marker when durable structured evidence does not
 
 `ContextBudget` starts with the configured model input limit. It reserves output tokens, system and tool-schema tokens, the largest framing allowance across every configured provider route, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input. A sole current user request bypasses proactive compaction when the complete request still fits the hard input limit because there is no historical bundle to remove. Provider-overflow retries never use this bypass. Bundle selection does not reserve continuation metadata that it may remove. Borealis recalculates the reserve from retained messages and tightens the artifact again when needed.
 
+The default post-compaction target is 40% of available input, below the 82% trigger. Request preparation reconstructs a compatible summary plus retained messages and new messages, then prunes that working view before checking token, byte, and tool-output thresholds. Already omitted history does not trigger compaction.
+
+When tool output reaches `context.compact_tool_output_tokens` (40,000 by default), the summary and retained messages target 25% of that threshold (10,000 tokens by default), also bounded by the overall request target. This leaves room for another large parallel tool batch. The recent-bundle count is an upper bound: older bundles are removed until the target fits, and oversized diagnostics in the last bundle use the existing bounded-tail fallback. Tool calls and results remain paired. Custom thresholds below 4,096 tokens retain the compatibility fallback because mandatory summary state can exceed such small thresholds.
+
 After a provider overflow, Borealis increases the safety margin and retries with a smaller provider-message target. `compaction_max_overflow_retries` is a strict upper bound. The reduction order is historical excerpts, retained bundles, and diagnostic output. The final fallback preserves mandatory state and the latest actionable bundle or returns a context-budget error before another provider call.
 
 ## Durable reuse
@@ -91,4 +95,4 @@ The release gates are:
 3. Set `deterministic_compaction = false` only after both the structural gate and an independent completion-quality gate pass for the configured summarizer provider.
 4. Remove v1 after the compatibility release.
 
-`context.compacted` and `context.compaction_shadow` events contain sizes, counts, strategy, artifact version, reuse state, overflow retry count, fallback reason, usage, and latency. They do not contain summary text.
+`context.compacted` reports a fresh artifact. `context.reused` reports reuse without another terminal compaction notice. Compaction events compare the estimated live request before and after compaction; `durable_estimated_tokens` separately reports the full transcript size. Events also include summary tokens, remaining token and tool-output headroom, counts, strategy, artifact version, overflow retry count, fallback reason, usage, and latency. `context.compaction_shadow` reports compatibility comparisons. These events do not contain summary text.

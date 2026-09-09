@@ -52,7 +52,7 @@ class AgentConfig:
     auto_verify_max_repair_cycles: int = 1
     deterministic_compaction: bool = True
     compaction_version: int = 2
-    compaction_target_ratio: float = 0.70
+    compaction_target_ratio: float = 0.40
     compaction_safety_margin_tokens: int = 2_048
     compaction_provider_framing_tokens: int = 512
     compaction_max_overflow_retries: int = 2

@@ -692,6 +692,7 @@ class CLITests(unittest.TestCase):
                         data={"tool": "write", "is_error": True, "metadata": {}},
                     )
                 )
+                await renderer.handle(Event(type="context.reused", data={"artifact_reused": True}))
                 await renderer.handle(Event(type="context.compacted"))
                 await renderer.handle(Event(type="model.route_failed", data={"provider": "x"}))
                 await renderer.handle(
@@ -731,6 +732,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("final", out)
         self.assertTrue(out.endswith("\n"))
         self.assertIn('"event"', err)
+        self.assertEqual(err.count("compacted conversation context"), 1)
         self.assertIn("→ read", err)
         self.assertIn("✓ read", err)
         self.assertIn("✗ write", err)

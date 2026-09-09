@@ -68,6 +68,7 @@ from .compaction import (
     CompactionError,
     CompactionEvidence,
     CompactionSizeError,
+    ContextPruneMetrics,
     SummarizerResult,
     compact_messages,
     compact_messages_v1,
@@ -1501,14 +1502,44 @@ class AgentRunner:
             providers=budget_providers,
             overflow_retry_count=overflow_retry_count,
         )
+        # Measure the provider view, including an existing summary, before
+        # deciding whether to compact. Durable history is only the source.
+        source_messages = request_messages
+        source_metrics = metrics
+        incremental = None
+        live_system = turn_system
+        if not overflow_retry_count:
+            incremental = await self._reuse_incremental_compaction(
+                session_id=session_id,
+                durable_messages=messages,
+                base_system=turn_system,
+                base_system_blocks=turn_system_blocks,
+                tools=schemas,
+                prompt_cache_key=prompt_context.cache_routing_key,
+                conversation_cache=conversation_cache,
+                providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
+        if incremental is not None:
+            prior_artifact, request_messages, _, metrics = incremental
+            live_system = f"{turn_system}\n\n{prior_artifact.summary_text}"
+            context_budget = ContextBudget.calculate(
+                self.config.agent,
+                system=live_system,
+                tools=schemas,
+                messages=request_messages,
+                providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
         estimated = context_budget.estimated_total(request_messages)
+        live_estimated_before = estimated
         estimated_bytes = estimate_request_bytes(
-            turn_system,
+            live_system,
             request_messages,
             schemas,
         )
         tool_output_over_budget = (
-            metrics.tool_output_tokens_before
+            metrics.tool_output_tokens_retained
             >= self.config.context.compact_tool_output_tokens
         )
         compaction_reason: str | None = None
@@ -1563,85 +1594,74 @@ class AgentRunner:
         compaction_artifact_id: str | None = None
         compaction_context_hashes: dict[str, str] | None = None
         compaction_metadata: dict[str, Any] | None = None
-        if compaction_reason in {
-            "estimated_tokens",
-            "estimated_bytes",
-            "tool_output_volume",
-        }:
-            incremental = await self._reuse_incremental_compaction(
-                session_id=session_id,
-                durable_messages=messages,
-                base_system=turn_system,
-                base_system_blocks=turn_system_blocks,
+        if compaction_reason is None and incremental is not None:
+            artifact, request_messages, compaction_context_hashes, _ = incremental
+            compaction_artifact_id = artifact.id
+            turn_system = f"{turn_system}\n\n{artifact.summary_text}"
+            turn_system_blocks = [
+                *turn_system_blocks,
+                {"text": artifact.summary_text, "cacheable": False},
+            ]
+            compacted = True
+            context_budget = ContextBudget.calculate(
+                self.config.agent,
+                system=turn_system,
                 tools=schemas,
-                prompt_cache_key=prompt_context.cache_routing_key,
-                conversation_cache=conversation_cache,
+                messages=request_messages,
                 providers=budget_providers,
                 overflow_retry_count=overflow_retry_count,
             )
-            if incremental is not None:
-                artifact, request_messages, compaction_context_hashes = incremental
-                compaction_artifact_id = artifact.id
-                turn_system = f"{turn_system}\n\n{artifact.summary_text}"
-                turn_system_blocks = [
-                    *turn_system_blocks,
-                    {"text": artifact.summary_text, "cacheable": False},
-                ]
-                compacted = True
-                context_budget = ContextBudget.calculate(
-                    self.config.agent,
-                    system=turn_system,
-                    tools=schemas,
-                    messages=request_messages,
-                    providers=budget_providers,
-                    overflow_retry_count=overflow_retry_count,
-                )
-                estimated = context_budget.estimated_total(request_messages)
-                tool_tokens = sum(
-                    estimate_tokens(message.content)
-                    for message in request_messages
-                    if message.role == Role.TOOL
-                )
-                reduction = max(0.0, 1.0 - (estimated / raw_estimated)) if raw_estimated else 0.0
-                compaction_metadata = {
-                    "strategy": artifact.strategy,
-                    "artifact_version": artifact.version,
-                    "source_bundle_count": artifact.metadata.get(
-                        "source_bundle_count", 0
-                    ),
-                    "retained_bundle_count": artifact.metadata.get(
-                        "retained_bundle_count", 0
-                    ),
-                    "compacted_bundle_count": artifact.metadata.get(
-                        "compacted_bundle_count", 0
-                    ),
-                    "estimated_tokens_before": raw_estimated,
-                    "target_tokens": context_budget.target_tokens,
-                    "estimated_tokens_after": estimated,
-                    "reduction_percentage": round(reduction * 100, 2),
-                    "provider_overflow_retry_count": overflow_retry_count,
-                    "artifact_reused": True,
-                    "incremental_suffix_reused": True,
-                    "fallback_reason": artifact.metadata.get("fallback_reason"),
-                    "summarization_usage": Usage().to_dict(),
-                    "summarization_latency_ms": 0,
-                }
-                await self.events.emit(
-                    "context.compacted",
-                    session_id=session_id,
-                    run_id=run_id,
-                    compaction_reason=compaction_reason,
-                    tokens_before=metrics.tokens_before,
-                    tokens_after=estimate_request_tokens(
-                        artifact.summary_text, request_messages, []
-                    ),
-                    superseded_reads_removed=metrics.superseded_reads_removed,
-                    tool_output_tokens_retained=tool_tokens,
-                    messages=len(request_messages),
-                    **compaction_metadata,
-                )
-                compaction_reason = None
+            estimated = context_budget.estimated_total(request_messages)
+            tool_tokens = sum(
+                estimate_tokens(message.content)
+                for message in request_messages
+                if message.role == Role.TOOL
+            )
+            compaction_metadata = {
+                "strategy": artifact.strategy,
+                "artifact_version": artifact.version,
+                "source_bundle_count": artifact.metadata.get(
+                    "source_bundle_count", 0
+                ),
+                "retained_bundle_count": artifact.metadata.get(
+                    "retained_bundle_count", 0
+                ),
+                "compacted_bundle_count": artifact.metadata.get(
+                    "compacted_bundle_count", 0
+                ),
+                "estimated_tokens_before": live_estimated_before,
+                "durable_estimated_tokens": raw_estimated,
+                "summary_tokens": estimate_tokens(artifact.summary_text),
+                "token_headroom": context_budget.trigger_tokens - estimated,
+                "tool_output_headroom": (
+                    self.config.context.compact_tool_output_tokens - tool_tokens
+                ),
+                "target_tokens": context_budget.target_tokens,
+                "estimated_tokens_after": estimated,
+                "reduction_percentage": 0.0,
+                "provider_overflow_retry_count": overflow_retry_count,
+                "artifact_reused": True,
+                "incremental_suffix_reused": True,
+                "fallback_reason": artifact.metadata.get("fallback_reason"),
+                "summarization_usage": Usage().to_dict(),
+                "summarization_latency_ms": 0,
+            }
+            await self.events.emit(
+                "context.reused",
+                session_id=session_id,
+                run_id=run_id,
+                compaction_reason=compaction_reason,
+                tokens_before=metrics.tokens_before,
+                tokens_after=estimate_request_tokens(
+                    artifact.summary_text, request_messages, []
+                ),
+                superseded_reads_removed=metrics.superseded_reads_removed,
+                tool_output_tokens_retained=tool_tokens,
+                messages=len(request_messages),
+                **compaction_metadata,
+            )
         if compaction_reason is not None:
+            request_messages = source_messages
             summary_usage = Usage()
             summary_started_ms = monotonic_ms()
             # Old continuation metadata may be compacted away. Do not reserve it
@@ -1656,10 +1676,12 @@ class AgentRunner:
             )
             provider_message_target = compaction_budget.message_target_tokens
             if tool_output_over_budget:
+                # Leave room for a large parallel tool batch before the next
+                # trigger. Tiny custom thresholds retain the legacy fallback.
                 configured_tool_target = (
-                    int(self.config.context.compact_tool_output_tokens * 0.75)
+                    int(self.config.context.compact_tool_output_tokens * 0.25)
                     if self.config.context.compact_tool_output_tokens >= 4_096
-                    else int(metrics.tokens_before * 0.85)
+                    else int(source_metrics.tokens_before * 0.85)
                 )
                 provider_message_target = min(
                     provider_message_target,
@@ -2128,8 +2150,8 @@ class AgentRunner:
                     artifact_message.content, request_messages, []
                 )
                 reduction = (
-                    max(0.0, 1.0 - (tokens_after / raw_estimated))
-                    if raw_estimated
+                    1.0 - (tokens_after / live_estimated_before)
+                    if live_estimated_before
                     else 0.0
                 )
                 compaction_metadata = {
@@ -2146,8 +2168,15 @@ class AgentRunner:
                     "compacted_bundle_count": artifact_message.metadata.get(
                         "compacted_bundles", 0
                     ),
-                    "estimated_tokens_before": raw_estimated,
+                    "estimated_tokens_before": live_estimated_before,
+                    "durable_estimated_tokens": raw_estimated,
                     "target_tokens": context_budget.target_tokens,
+                    "message_target_tokens": provider_message_target,
+                    "summary_tokens": estimate_tokens(artifact_message.content),
+                    "token_headroom": context_budget.trigger_tokens - tokens_after,
+                    "tool_output_headroom": (
+                        self.config.context.compact_tool_output_tokens - tool_tokens
+                    ),
                     "estimated_tokens_after": tokens_after,
                     "reduction_percentage": round(reduction * 100, 2),
                     "provider_overflow_retry_count": overflow_retry_count,
@@ -2164,7 +2193,7 @@ class AgentRunner:
                     "summarization_latency_ms": monotonic_ms() - summary_started_ms,
                 }
                 await self.events.emit(
-                    "context.compacted",
+                    "context.reused" if reused else "context.compacted",
                     session_id=session_id,
                     run_id=run_id,
                     compaction_reason=compaction_reason,
@@ -2236,8 +2265,8 @@ class AgentRunner:
         conversation_cache: bool,
         providers: tuple[str, ...],
         overflow_retry_count: int,
-    ) -> tuple[CompactionArtifact, list[Message], dict[str, str]] | None:
-        """Reuse the latest exact summary with a small durable message suffix."""
+    ) -> tuple[CompactionArtifact, list[Message], dict[str, str], ContextPruneMetrics] | None:
+        """Reconstruct the working view; the caller checks its size limits."""
 
         strategy = (
             "deterministic"
@@ -2298,40 +2327,9 @@ class AgentRunner:
                 Message.from_dict(item)
                 for item in _artifact_provider_messages(artifact.metadata)
             ]
-            carried, _ = prune_provider_messages([*retained, *suffix])
+            carried, metrics = prune_provider_messages([*retained, *suffix])
             validate_tool_call_order(carried)
         except (KeyError, TypeError, ValueError):
-            return None
-
-        tool_tokens = sum(
-            estimate_tokens(message.content)
-            for message in carried
-            if message.role == Role.TOOL
-        )
-        if tool_tokens >= self.config.context.compact_tool_output_tokens:
-            return None
-
-        compacted_system = f"{base_system}\n\n{artifact.summary_text}"
-        carried_budget = ContextBudget.calculate(
-            self.config.agent,
-            system=compacted_system,
-            tools=tools,
-            messages=carried,
-            providers=providers,
-            overflow_retry_count=overflow_retry_count,
-        )
-        estimated = carried_budget.estimated_total(carried)
-        estimated_bytes = estimate_request_bytes(compacted_system, carried, tools)
-        if (
-            estimated >= carried_budget.trigger_tokens
-            or estimated_bytes >= carried_budget.trigger_bytes
-            or not _fits_context_limit(
-                carried,
-                carried_budget,
-                system=compacted_system,
-                tools=tools,
-            )
-        ):
             return None
 
         contexts = self._compaction_provider_contexts(
@@ -2348,7 +2346,7 @@ class AgentRunner:
             str(context["provider_route"]): _stable_payload_hash(context)
             for context in contexts
         }
-        return artifact, carried, hashes
+        return artifact, carried, hashes, metrics
 
     async def _record_or_reuse_compaction_artifact(
         self,
