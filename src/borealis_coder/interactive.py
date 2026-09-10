@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.document import Document
-from prompt_toolkit.patch_stdout import patch_stdout
 
 from . import __version__
 from .agent import AgentRunner, build_runner
@@ -23,7 +22,7 @@ from .errors import BorealisError, ConfigurationError, SessionError
 from .models import AgentResult, Event, Role
 from .safety import ApprovalRequest
 from .terminal import AuroraUI, ConsoleRenderer, ReadlineHistory
-from .terminal_input import TerminalInput, TerminalInputInterrupted
+from .terminal_input import LineBufferedStdout, TerminalInput, TerminalInputInterrupted
 from .tools._workspace_lock import workspace_transaction
 from .util import truncate_text
 
@@ -117,7 +116,11 @@ class InteractiveCLI:
                     self.runner = None
         original_status_stream = self.renderer._status_stream
         try:
-            with patch_stdout(raw=True):
+            with (
+                LineBufferedStdout() as output,
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(output),
+            ):
                 self.renderer._status_stream = sys.stdout
                 self._input = TerminalInput(
                     history_file,

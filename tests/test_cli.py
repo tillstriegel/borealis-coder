@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import create_app_session
 from prompt_toolkit.document import Document
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
@@ -27,6 +29,7 @@ from borealis_coder.safety.checkpoints import CheckpointManager
 from borealis_coder.safety.paths import WorkspaceRoots
 from borealis_coder.terminal_input import (
     CompatibleFileHistory,
+    LineBufferedStdout,
     TerminalInput,
     TerminalInputInterrupted,
     read_history_entries,
@@ -1471,6 +1474,69 @@ class CLITests(unittest.TestCase):
         output = __import__("asyncio").run(exercise())
         self.assertEqual(output.count("first-middle-last"), 1)
         self.assertEqual(output.count("tool-output"), 1)
+
+    def test_interactive_response_lines_survive_prompt_redraws(self) -> None:
+        class RecordingOutput(DummyOutput):
+            def __init__(self) -> None:
+                self.writes: list[str] = []
+
+            def write_raw(self, data: str) -> None:
+                self.writes.append(data)
+
+        async def exercise() -> list[str]:
+            output = RecordingOutput()
+            with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+                prompt: PromptSession[str] = PromptSession()
+                task = asyncio.create_task(prompt.prompt_async("Follow-up: "))
+                try:
+                    with (
+                        LineBufferedStdout() as stream,
+                        redirect_stdout(stream),
+                        redirect_stderr(stream),
+                    ):
+                        renderer = cli.ConsoleRenderer()
+                        for chunk in ("response-first", "-middle", "-last"):
+                            await renderer.handle(
+                                Event(type="model.text_delta", data={"text": chunk})
+                            )
+                            # Allow the real stdout worker to flush and redraw
+                            # between chunks, as it does for a slower response.
+                            await asyncio.sleep(0.25)
+                        await renderer.handle(Event(
+                            type="model.completed",
+                            data={"text": "response-first-middle-last"},
+                        ))
+                        for _ in range(100):
+                            if any("-last" in value for value in output.writes):
+                                break
+                            await asyncio.sleep(0.01)
+                    pipe.send_text("next\n")
+                    self.assertEqual(await task, "next")
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            return output.writes
+
+        writes = asyncio.run(exercise())
+        self.assertEqual(
+            [value for value in writes if "response-first" in value or "-last" in value],
+            ["response-first-middle-last\n"],
+        )
+
+    def test_interactive_stdout_preserves_unfinished_line_on_close(self) -> None:
+        class RecordingOutput(DummyOutput):
+            def __init__(self) -> None:
+                self.writes: list[str] = []
+
+            def write_raw(self, data: str) -> None:
+                self.writes.append(data)
+
+        output = RecordingOutput()
+        with create_app_session(output=output), LineBufferedStdout() as stream:
+            stream.write("unfinished response")
+            stream.flush()
+        self.assertEqual("".join(output.writes), "unfinished response\n")
 
     def test_interactive_pauses_live_pulse_while_follow_up_prompt_is_active(
         self,

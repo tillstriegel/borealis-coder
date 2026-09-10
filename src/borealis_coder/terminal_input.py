@@ -17,12 +17,36 @@ from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input import Input
 from prompt_toolkit.output import Output
+from prompt_toolkit.patch_stdout import StdoutProxy
 from prompt_toolkit.shortcuts import CompleteStyle
 
 _HISTORY_TIMESTAMP = re.compile(r"^# \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 _LIBEDIT_HEADER = "_HiStOrY_V2_"
 _LIBEDIT_ESCAPE = re.compile(r"\\([0-7]{3})")
 _MAX_HISTORY_ENTRIES = 1_000
+
+
+class LineBufferedStdout(StdoutProxy):
+    """Keep unfinished lines out of prompt-toolkit redraws."""
+
+    def __init__(self) -> None:
+        super().__init__(raw=True)
+        self._line_open = False
+
+    def write(self, data: str) -> int:
+        if data:
+            self._line_open = not data.endswith("\n")
+        return super().write(data)
+
+    def flush(self) -> None:
+        # StdoutProxy already queues complete lines in write(). Flushing a
+        # partial line lets the next prompt redraw overwrite response chunks.
+        pass
+
+    def close(self) -> None:
+        if not self.closed and self._line_open:
+            self.write("\n")
+        super().close()
 
 
 class TerminalInputInterrupted(Exception):
