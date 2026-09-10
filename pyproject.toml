@@ -9,7 +9,7 @@ description = "A provider-portable, policy-first, resumable AI coding harness."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-authors = [{ name = "Borealis Coder contributors" }]
+authors = [{ name = "Till Striegel" }]
 keywords = ["ai", "coding-agent", "agent", "mcp", "acp", "llm", "developer-tools"]
 classifiers = [
   "Development Status :: 4 - Beta",
