@@ -184,7 +184,7 @@ applies on append, checkpoint retention applies after a complete new checkpoint 
 | `app_name` | OpenRouter app-attribution title (`X-Title`). Ignored by other built-ins. |
 | `model_fallbacks` | OpenRouter backup model slugs tried after the primary model. |
 | `provider_preferences` | OpenRouter provider-routing object, e.g. `allow_fallbacks`, `only`, `order`, `data_collection`, or `zdr`. |
-| `extra_body` | Provider-specific top-level request fields. Primarily an escape hatch for OpenRouter extensions; request identity, content, tools, and output limits cannot be overridden; use their dedicated settings. |
+| `extra_body` | Provider-specific top-level request fields. Primarily an escape hatch for OpenRouter extensions; request identity, content (including Responses `instructions`), tools, continuation references, response schemas, and output limits cannot be overridden; use their dedicated settings. |
 | `context_tokens` | Optional endpoint context-window limit; includes output reserve. |
 | `input_token_limit` | Optional independent endpoint input limit. |
 | `output_token_limit` | Optional endpoint maximum output; clamps the request reserve. |

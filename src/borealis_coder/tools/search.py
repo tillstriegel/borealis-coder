@@ -113,9 +113,8 @@ class GrepTool(Tool):
             context.config.context.max_search_results,
         )
         files = list(files)
-        def snapshot() -> str:
+        def snapshot(current_files: list[Path]) -> str:
             entries = []
-            current_files = list(_walk_files(resolved.path, context)) if is_directory else files
             for path in current_files:
                 try:
                     stat = path.stat()
@@ -125,7 +124,7 @@ class GrepTool(Tool):
             scope = {k: v for k, v in arguments.items() if k != "cursor"}
             return hashlib.sha256(json_dumps([scope, context.config.context.ignored_dirs, context.config.context.max_file_bytes, entries]).encode()).hexdigest()
 
-        identity = snapshot()
+        identity = snapshot(files)
         offset = 0
         if arguments.get("cursor"):
             try:
@@ -201,7 +200,7 @@ class GrepTool(Tool):
                         output_chars += len(row) + 1
                 if truncated:
                     break
-        if snapshot() != identity:
+        if snapshot(list(_walk_files(resolved.path, context)) if is_directory else files) != identity:
             return ToolResult("Search scope changed during collection; restart the search.", is_error=True)
         if truncated:
             next_cursor = base64.urlsafe_b64encode(json_dumps({"snapshot": identity, "offset": offset + match_count}).encode()).decode()

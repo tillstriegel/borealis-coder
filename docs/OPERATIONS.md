@@ -70,9 +70,11 @@ Large tool output is retained in session-owned `output_artifacts` before preview
 
 Tool previews reserve room for their artifact reference within `tool_output_chars`. Small previews use a compact ID; if the ceiling cannot hold even the ID, the reference remains in tool-result metadata and can be found through history search.
 
+HTTP fetches read at most their collection limit plus one byte. If that extra byte exists, retained evidence is marked partial even when its text fits the preview. `observed_bytes` counts bytes actually collected, not a claimed total response size.
+
 Use `read_artifact` with an artifact ID and a character offset/limit, or a literal `query` to find text deep inside a retained result. `search_history` finds original message references, tool-result events, and artifacts after compaction or restart. Retrieval is bounded to the owning session and workspace, accepts no file paths, and does not produce edit authorization or a current-file hash.
 
-`grep` reports scanned files, skipped reasons, exclusions, scope, completion, and content identities in its visible result. Continue using `next_cursor`. Pagination rechecks the scope's file identities; changed files require a restart. A result with skipped files is not an exhaustive negative. Directory enumeration failures report incomplete coverage explicitly. Pagination rescans the scope; it does not keep a background index.
+`grep` reports scanned files, skipped reasons, exclusions, scope, completion, and content identities in its visible result. Continue using `next_cursor`. The baseline snapshot describes exactly the enumerated scan list. Completion checks a fresh enumeration; additions, removals, or changes require a restart. A result with skipped files is not an exhaustive negative. Directory enumeration failures report incomplete coverage explicitly. Pagination rescans the scope; it does not keep a background index.
 
 ## Logging and observability
 

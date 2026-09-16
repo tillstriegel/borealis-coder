@@ -281,10 +281,12 @@ def bound_tool_output(result: ToolResult, context: ToolContext, limit: int) -> T
     result.output = context.events.redactor.text(result.output)
     artifact = result.metadata.get("output_artifact")
     store = context.metadata.get("session_store")
-    if len(result.output) > limit and store is not None and artifact is None:
+    if (len(result.output) > limit or result.metadata.get("collection_status") == "partial") and store is not None and artifact is None:
         artifact = store.save_output_artifact(
             context.session_id, context.workspace, result.output,
             source=context.tool_call_id, redactor=context.events.redactor,
+            status=result.metadata.get("collection_status", "complete"),
+            observed_bytes=result.metadata.get("observed_bytes"),
         )
         result.metadata["output_artifact"] = artifact
     reference = ""

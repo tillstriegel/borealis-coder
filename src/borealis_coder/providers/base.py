@@ -74,6 +74,7 @@ class Provider(abc.ABC):
         failed_usage_collector: Usage | None = None,
         request: ProviderRequest | None = None,
         check_usage: Callable[[Usage], None] | None = None,
+        on_usage: Callable[[Usage], None] | None = None,
     ) -> T:
         """Share one retry loop across nested wrappers in the same task."""
         task = asyncio.current_task()
@@ -82,7 +83,7 @@ class Provider(abc.ABC):
         model_token = self.request_model.set(request.model if request else self.request_model.get())
         token = self._retry_task.set(task)
         try:
-            return await self._retry_operation(operation, failed_usage_collector=failed_usage_collector, check_usage=check_usage)
+            return await self._retry_operation(operation, failed_usage_collector=failed_usage_collector, check_usage=check_usage, on_usage=on_usage)
         finally:
             self._retry_task.reset(token)
             self.request_model.reset(model_token)
@@ -93,6 +94,7 @@ class Provider(abc.ABC):
         *,
         failed_usage_collector: Usage | None = None,
         check_usage: Callable[[Usage], None] | None = None,
+        on_usage: Callable[[Usage], None] | None = None,
     ) -> T:
         attempts = max(0, self.config.max_retries) + 1
         delay = max(0.0, self.config.initial_backoff_seconds)
@@ -105,13 +107,18 @@ class Provider(abc.ABC):
                 result = await operation()
                 if isinstance(result, ModelResponse):
                     self.normalize_cost(result.usage, model=self.response_billing_model(result.model))
+                    if on_usage is not None:
+                        on_usage(result.usage)
                 if isinstance(result, ModelResponse) and not prior_usage.is_empty:
                     result.usage = prior_usage.add(result.usage)
                 return result
             except asyncio.CancelledError:
                 # This attempt was dispatched but returned no terminal usage.
+                incomplete = Usage(requests=1, cost_status="incomplete")
+                if on_usage is not None:
+                    on_usage(incomplete)
                 if failed_usage_collector is not None:
-                    failed_usage_collector.add(Usage(requests=1, cost_status="incomplete"))
+                    failed_usage_collector.add(incomplete)
                 raise
             except ProviderError as error:
                 last_error = error
@@ -119,6 +126,8 @@ class Provider(abc.ABC):
                     error.usage = Usage(cost_status="incomplete")
                 if error.usage is not None:
                     self.normalize_cost(error.usage)
+                    if on_usage is not None:
+                        on_usage(error.usage)
                     if failed_usage_collector is not None:
                         failed_usage_collector.add(error.usage)
                     prior_usage.add(error.usage)
@@ -130,6 +139,8 @@ class Provider(abc.ABC):
                 last_error = error
                 incomplete = Usage(cost_status="incomplete")
                 prior_usage.add(incomplete)
+                if on_usage is not None:
+                    on_usage(incomplete)
                 if failed_usage_collector is not None:
                     failed_usage_collector.add(incomplete)
                 if attempt + 1 >= attempts:

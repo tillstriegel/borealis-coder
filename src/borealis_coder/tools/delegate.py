@@ -51,16 +51,28 @@ class DelegateTaskTool(Tool):
         budget = context.metadata.get("budget")
         reservation = 0.0
         usage_recorded = False
+        cancelled_usage = Usage()
+
+        def observe_usage(increment: Usage) -> None:
+            cancelled_usage.add(increment)
+            if budget:
+                budget.hold_usage(cancelled_usage)
 
         async def record_usage(increment: Usage) -> None:
             nonlocal reservation, usage_recorded
             usage_recorded = True
             usage.add(increment)
-            if callable(usage_sink):
-                held, reservation = reservation, 0.0
-                result = usage_sink(increment, reservation=held) if budget else usage_sink(increment)
-                if asyncio.iscoroutine(result):
-                    await finish_on_cancellation(result)
+            async def settle() -> None:
+                nonlocal reservation
+                if budget:
+                    budget.release_cost(reservation)
+                    budget.release_usage(cancelled_usage)
+                    reservation = 0.0
+                if callable(usage_sink):
+                    result = usage_sink(increment)
+                    if asyncio.iscoroutine(result):
+                        await result
+            await finish_on_cancellation(settle())
             await context.events.emit("delegate.usage", session_id=context.session_id, run_id=context.run_id,
                                       provider=route.name, model=route.model, usage=increment.to_dict())
 
@@ -115,9 +127,9 @@ class DelegateTaskTool(Tool):
                 try:
                     response = await route.provider.with_retries(
                         lambda request=request: route.provider.complete(request),
-                        failed_usage_collector=cancelled_usage,
+                        on_usage=observe_usage,
                         request=request,
-                        check_usage=budget.check_unsettled if budget else None,
+                        check_usage=(lambda _, observed=cancelled_usage: budget.check_unsettled(observed)) if budget else None,
                     )
                     await record_usage(response.usage)
                 except asyncio.CancelledError:
@@ -137,9 +149,15 @@ class DelegateTaskTool(Tool):
                         overflow_retries += 1
                         continue
                     raise
+                except Exception:
+                    if not usage_recorded and not cancelled_usage.is_empty:
+                        with contextlib.suppress(BudgetExceeded):
+                            await record_usage(cancelled_usage)
+                    raise
                 finally:
                     if budget:
                         budget.release_cost(reservation)
+                        budget.release_usage(cancelled_usage)
                 overflow_retries = 0
                 turn_index += 1
                 assistant = Message(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from ..config import AgentConfig
 from ..errors import BudgetExceeded
@@ -50,6 +50,7 @@ class Budget:
     model_requests: int = 0
     usage: Usage | None = None
     pending_cost_usd: float = 0.0
+    _held_usage: dict[int, tuple[float, bool]] = field(default_factory=dict, repr=False)
 
     @classmethod
     def start(cls, config: AgentConfig) -> Budget:
@@ -100,9 +101,8 @@ class Budget:
         self._check_time_and_cost()
         if self.config.max_cost_usd <= 0 or provider.name == "mock":
             return 0.0
+        self.check_unsettled(Usage())
         assert self.usage is not None
-        if self.usage.cost_status == "incomplete" or (not self.usage.is_empty and self.usage.cost_status == "unknown"):
-            raise BudgetExceeded("cost", "Strict dollar budget cannot continue with unreconciled usage")
         models = [request.model, *(provider.config.model_fallbacks if provider.name == "openrouter" else [])]
         candidates = [provider.prices(model) for model in models]
         rates = provider.prices(request.model)
@@ -122,19 +122,31 @@ class Budget:
         self.pending_cost_usd += estimate
         return estimate
 
+    def hold_usage(self, usage: Usage) -> None:
+        """Expose a logical request's observed charges until its sink takes over."""
+        previous, _ = self._held_usage.get(id(usage), (0.0, False))
+        self.pending_cost_usd += usage.cost_usd - previous
+        self._held_usage[id(usage)] = (usage.cost_usd, not usage.is_empty and usage.cost_status in {"unknown", "incomplete"})
+
+    def release_usage(self, usage: Usage) -> None:
+        held, _ = self._held_usage.pop(id(usage), (0.0, False))
+        self.release_cost(held)
+
     def check_unsettled(self, usage: Usage) -> None:
         """Check retry/fallback usage not yet settled by the single accounting sink."""
         self._check_time_and_cost()
-        if self.config.max_cost_usd <= 0 or usage.is_empty:
+        if self.config.max_cost_usd <= 0:
             return
-        if usage.cost_status in {"unknown", "incomplete"}:
-            raise BudgetExceeded("cost", "Strict dollar budget cannot retry with unreconciled usage")
         assert self.usage is not None
-        if self.usage.cost_usd + self.pending_cost_usd + usage.cost_usd > self.config.max_cost_usd:
+        if (any(incomplete for _, incomplete in self._held_usage.values())
+                or any(not item.is_empty and item.cost_status in {"unknown", "incomplete"} for item in (self.usage, usage))):
+            raise BudgetExceeded("cost", "Strict dollar budget cannot retry with unreconciled usage")
+        unheld_cost = 0.0 if id(usage) in self._held_usage else usage.cost_usd
+        if self.usage.cost_usd + self.pending_cost_usd + unheld_cost > self.config.max_cost_usd:
             raise BudgetExceeded("cost", "Retry or fallback cost exceeds the remaining dollar budget")
 
     def release_cost(self, reservation: float) -> None:
-        self.pending_cost_usd = max(0.0, self.pending_cost_usd - reservation)
+        self.pending_cost_usd = max(0.0, round(self.pending_cost_usd - reservation, 12))
 
     def add_usage(self, usage: Usage) -> None:
         assert self.usage is not None
@@ -346,7 +358,12 @@ def prepare_route_request(request: ProviderRequest, provider: Provider, config: 
         validate_tool_call_order,
     )
 
-    reserved_fields = {"model", "models", "messages", "input", "system", "tools", "max_tokens", "max_output_tokens", "max_completion_tokens"}
+    reserved_fields = {
+        "model", "models", "messages", "input", "system", "instructions",
+        "tools", "functions", "tool_choice", "function_call", "parallel_tool_calls",
+        "response_format", "text", "previous_response_id", "conversation",
+        "max_tokens", "max_output_tokens", "max_completion_tokens",
+    }
     if reserved_fields.intersection(provider.config.extra_body):
         raise BudgetExceeded("context", "extra_body overrides request fields that must be validated; use route/model settings instead")
     effective, limits = resolve_route_limits(config, provider, request.model, request.max_output_tokens, overflow_retry_count=overflow_retry_count)

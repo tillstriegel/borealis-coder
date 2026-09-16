@@ -30,14 +30,14 @@ class FetchUrlTool(Tool):
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         max_chars = int(arguments["max_chars"])
-        body, status, content_type, final_url = await asyncio.to_thread(
+        body, status, content_type, final_url, collection = await asyncio.to_thread(
             _fetch_public_url,
             str(arguments["url"]),
             max_chars * 4,
         )
         return bound_tool_output(ToolResult(
             body,
-            metadata={"status": status, "content_type": content_type, "url": final_url},
+            metadata={"status": status, "content_type": content_type, "url": final_url, **collection},
         ), context, max_chars)
 
 
@@ -47,7 +47,7 @@ def _fetch_public_url(
     *,
     timeout: int = 30,
     max_redirects: int = 5,
-) -> tuple[str, int, str, str]:
+) -> tuple[str, int, str, str, dict[str, Any]]:
     current = url
     for redirect_count in range(max_redirects + 1):
         normalized, parsed, addresses = _resolve_public_url(current)
@@ -70,7 +70,11 @@ def _fetch_public_url(
         if status >= 400:
             body = data[:4096].decode(charset, errors="replace")
             raise ToolError(f"HTTP {status}: {body}")
-        return data.decode(charset, errors="replace"), status, content_type, normalized
+        partial = len(data) > max_bytes
+        return data[:max_bytes].decode(charset, errors="replace"), status, content_type, normalized, {
+            "collection_status": "partial" if partial else "complete",
+            "observed_bytes": len(data),
+        }
     raise ToolError(f"Too many redirects (maximum {max_redirects})")
 
 
@@ -136,7 +140,7 @@ def _request_once(
             headers={"Host": host_header, "User-Agent": "Borealis-Coder/0.1"},
         )
         response = connection.getresponse()
-        data = response.read(max_bytes)
+        data = response.read(max_bytes + 1)
         content_type = response.headers.get("Content-Type", "")
         charset = response.headers.get_content_charset() or "utf-8"
         return data, response.status, content_type, charset, response.headers.get("Location")
