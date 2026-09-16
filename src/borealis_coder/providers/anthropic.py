@@ -64,6 +64,9 @@ class AnthropicProvider(Provider):
             payload["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
         return payload
 
+    def request_bytes(self, request: ProviderRequest) -> int:
+        return max(len(json_dumps(self._payload(request, stream=stream)).encode("utf-8")) for stream in (False, True))
+
     async def complete(self, request: ProviderRequest) -> ModelResponse:
         async def operation() -> ModelResponse:
             url = self.config.base_url.rstrip("/") + "/messages"
@@ -78,15 +81,16 @@ class AnthropicProvider(Provider):
                 cache_ttl=str(request.metadata.get("prompt_cache_ttl") or "5m"),
             )
 
-        return await self.with_retries(operation)
+        return await self.with_retries(operation, request=request)
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
+        self.request_model.set(request.model)
         url = self.config.base_url.rstrip("/") + "/messages"
         payload = self._payload(request, stream=True)
         text_parts: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
         completed_call_indexes: set[int] = set()
-        usage = Usage(requests=1)
+        usage = Usage(requests=1, cost_status="incomplete")
         message_id: str | None = None
         model: str | None = None
         stop_reason: str | None = None
@@ -101,6 +105,7 @@ class AnthropicProvider(Provider):
                 message_id = message.get("id")
                 model = message.get("model")
                 initial = message.get("usage") or {}
+                usage.native_usage.update(initial)
                 uncached = int(initial.get("input_tokens", 0) or 0)
                 usage.cached_input_tokens = int(initial.get("cache_read_input_tokens", 0) or 0)
                 usage.cache_write_tokens = int(initial.get("cache_creation_input_tokens", 0) or 0)
@@ -143,6 +148,9 @@ class AnthropicProvider(Provider):
                 delta = data.get("delta") or {}
                 stop_reason = delta.get("stop_reason") or stop_reason
                 delta_usage = data.get("usage") or {}
+                usage.native_usage.update(delta_usage)
+                if "input_tokens" in usage.native_usage and "output_tokens" in usage.native_usage:
+                    usage.cost_status = "unknown"
                 usage.output_tokens = int(
                     delta_usage.get("output_tokens", 0) or usage.output_tokens
                 )
@@ -252,6 +260,8 @@ class AnthropicProvider(Provider):
                 cached_input_tokens=cached,
                 cache_write_tokens=cache_write,
                 requests=1,
+                native_usage=dict(usage_data),
+                cost_status="unknown" if {"input_tokens", "output_tokens"} <= usage_data.keys() else "incomplete",
             ),
             cache_write_multiplier=2.0 if cache_ttl == "1h" else 1.25,
         )

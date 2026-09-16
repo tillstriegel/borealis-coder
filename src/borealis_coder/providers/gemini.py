@@ -73,6 +73,9 @@ class GeminiProvider(Provider):
             }
         return payload
 
+    def request_bytes(self, request: ProviderRequest) -> int:
+        return max(len(json_dumps(self._payload(request, stream=stream)).encode("utf-8")) for stream in (False, True))
+
     async def complete(self, request: ProviderRequest) -> ModelResponse:
         async def operation() -> ModelResponse:
             response = await self.http.post_json(
@@ -82,9 +85,10 @@ class GeminiProvider(Provider):
                 raise ProviderError("Gemini returned a non-object response")
             return self._parse(response.data, retain_raw=True)
 
-        return await self.with_retries(operation)
+        return await self.with_retries(operation, request=request)
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
+        self.request_model.set(request.model)
         payload = self._payload(request, stream=True)
         steps: dict[int, dict[str, Any]] = {}
         text_parts: dict[int, list[str]] = {}
@@ -315,6 +319,8 @@ class GeminiProvider(Provider):
                 cached_input_tokens=int(usage_data.get("total_cached_tokens", 0) or 0),
                 reasoning_tokens=int(usage_data.get("total_thought_tokens", 0) or 0),
                 requests=1,
+                native_usage=dict(usage_data),
+                cost_status="unknown" if {"total_input_tokens", "total_output_tokens"} <= usage_data.keys() else "incomplete",
             )
         )
 

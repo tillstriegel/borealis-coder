@@ -697,7 +697,7 @@ def _result_footer(result) -> str:  # type: ignore[no-untyped-def]
         f"stop={result.stop_reason.value}",
         f"turns={result.turns}",
         f"tokens={result.usage.total_tokens}",
-        f"cost=${result.usage.cost_usd:.4f}",
+        f"cost={result.usage.cost_label}",
     ]
     if result.changed_files:
         parts.append(f"changed={len(result.changed_files)}")

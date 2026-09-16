@@ -12,8 +12,7 @@ from typing import Any
 
 from ..errors import ToolError
 from ..models import Effect, ToolResult
-from ..util import truncate_text
-from .base import MutationScope, Tool, ToolContext, object_schema
+from .base import MutationScope, Tool, ToolContext, bound_tool_output, object_schema
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
@@ -36,10 +35,10 @@ class FetchUrlTool(Tool):
             str(arguments["url"]),
             max_chars * 4,
         )
-        return ToolResult(
-            truncate_text(body, max_chars),
+        return bound_tool_output(ToolResult(
+            body,
             metadata={"status": status, "content_type": content_type, "url": final_url},
-        )
+        ), context, max_chars)
 
 
 def _fetch_public_url(

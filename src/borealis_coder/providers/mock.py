@@ -23,6 +23,10 @@ class MockProvider(Provider):
     def enqueue(self, *responses: ModelResponse) -> None:
         self.responses.extend(responses)
 
+    def request_bytes(self, request: ProviderRequest) -> int:
+        from ..agent.budget import estimate_request_bytes
+        return estimate_request_bytes(request.system, request.messages, request.tools)
+
     async def complete(self, request: ProviderRequest) -> ModelResponse:
         self.calls += 1
         if self.handler:
@@ -32,6 +36,8 @@ class MockProvider(Provider):
         else:
             response = self._default_response(request)
         response.usage.requests = max(1, response.usage.requests)
+        if response.usage.cost_status == "unknown":
+            response.usage.cost_status = "known"
         return response
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:

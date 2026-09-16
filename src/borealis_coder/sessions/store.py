@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -17,7 +18,7 @@ from ..errors import SessionError
 from ..models import CompactionArtifact, Event, Message, SessionInfo, Usage
 from ..util import ensure_private_directory, ensure_private_file, json_dumps, new_id, utc_now
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _DEDUPLICATED_PROVIDER_CONTEXT_STORAGE = "deduplicated-v1"
 _EVENT_EXPORT_PAGE_SIZE = 1_000
 
@@ -163,6 +164,7 @@ class SessionStore:
                 reasoning_tokens INTEGER NOT NULL DEFAULT 0,
                 requests INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0,
+                cost_status TEXT NOT NULL DEFAULT 'unknown',
                 cache_savings_usd REAL NOT NULL DEFAULT 0,
                 application_cache_hits INTEGER NOT NULL DEFAULT 0,
                 application_cache_misses INTEGER NOT NULL DEFAULT 0,
@@ -182,6 +184,13 @@ class SessionStore:
             );
             CREATE INDEX IF NOT EXISTS idx_response_cache_expiry
                 ON response_cache(expires_at);
+            CREATE TABLE IF NOT EXISTS output_artifacts (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY(session_id, artifact_id)
+            );
             CREATE TABLE IF NOT EXISTS key_values (
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 key TEXT NOT NULL,
@@ -251,6 +260,8 @@ class SessionStore:
                 version = 4
             if version < 5:
                 self._migrate_compaction_v5()
+            if version < 6:
+                self._migrate_cache_v3()
             conn.execute(
                 "UPDATE schema_meta SET value=? WHERE key='version'", (str(_SCHEMA_VERSION),)
             )
@@ -292,6 +303,7 @@ class SessionStore:
             row["name"] for row in self._connection.execute("PRAGMA table_info(usage)").fetchall()
         }
         additions = {
+            "cost_status": "TEXT NOT NULL DEFAULT 'unknown'",
             "cache_savings_usd": "REAL NOT NULL DEFAULT 0",
             "application_cache_hits": "INTEGER NOT NULL DEFAULT 0",
             "application_cache_misses": "INTEGER NOT NULL DEFAULT 0",
@@ -1090,6 +1102,9 @@ class SessionStore:
         return self.usage(session_id)
 
     def _add_usage_locked(self, session_id: str, usage: Usage) -> None:
+        aggregate = self.usage(session_id)
+        aggregate.add(usage)
+        self._connection.execute("UPDATE usage SET cost_status=? WHERE session_id=?", (aggregate.cost_status, session_id))
         cursor = self._connection.execute(
             """UPDATE usage SET
                 input_tokens=input_tokens+?, output_tokens=output_tokens+?,
@@ -1216,6 +1231,7 @@ class SessionStore:
             reasoning_tokens=row["reasoning_tokens"],
             requests=row["requests"],
             cost_usd=row["cost_usd"],
+            cost_status=row["cost_status"],
             cache_savings_usd=row["cache_savings_usd"],
             application_cache_hits=row["application_cache_hits"],
             application_cache_misses=row["application_cache_misses"],
@@ -1291,6 +1307,154 @@ class SessionStore:
                     (excess,),
                 )
 
+    def task_state(self, session_id: str, messages: list[Message] | None = None) -> dict[str, Any]:
+        """References are durable; original instruction text remains in messages."""
+        messages = self.messages(session_id) if messages is None else messages
+        instructions = [m for m in messages if m.role.value == "user"
+                        and not m.metadata.get("recovery_continuation")
+                        and not m.metadata.get("internal")
+                        and not m.metadata.get("authoritative_verification")]
+        superseded: dict[str, str] = {}
+        for index, message in enumerate(instructions):
+            # Only an explicit user source reference changes durable status.
+            # Free-form revocations remain ordered user instructions, never guesses.
+            for match in re.finditer(r"(?im)^(?:revoke|supersede) user:(\d+)(?=[.:\s]|$)", message.content):
+                target = int(match.group(1)) - 1
+                if 0 <= target < index:
+                    superseded[instructions[target].id] = message.id
+        objective = instructions[0].id if instructions else None
+        while objective in superseded:
+            objective = superseded[objective]
+        state = {"version": 1, "objective_source": objective,
+                 "instruction_sources": [m.id for m in instructions], "superseded": superseded}
+        if self.get_value(session_id, "task_state") != state:
+            self.set_value(session_id, "task_state", state)
+        return {**state, "instructions": [{"source": m.id, "text": m.content,
+                                           "status": "superseded" if m.id in superseded else "active",
+                                           "superseded_by": superseded.get(m.id)} for m in instructions],
+                "plan": self.get_value(session_id, "plan", []),
+                "acceptance_criteria": self.get_value(session_id, "acceptance_criteria", [])}
+
+    def save_output_artifact(
+        self, session_id: str, workspace: Path, content: str, *,
+        source: str, redactor: Any, status: str = "complete",
+        max_bytes: int = 2_000_000, session_max_bytes: int = 20_000_000,
+        observed_bytes: int | None = None, collection_status: str | None = None,
+    ) -> dict[str, Any]:
+        """Store permitted evidence once. Hash and size describe retained UTF-8 data."""
+        self.authorize_workspace(session_id, workspace)
+        data = redactor.text(content).encode("utf-8")
+        collection_status = collection_status or status
+        with self._lock, self._connection:
+            count = self._connection.execute("SELECT COUNT(*) FROM output_artifacts WHERE session_id=?", (session_id,)).fetchone()[0]
+            if count >= 1000:
+                return {"artifact_id": None, "status": "quota_exhausted", "stored_bytes": 0,
+                        "observed_bytes": observed_bytes if observed_bytes is not None else len(data),
+                        "collection_status": collection_status}
+            used = self._connection.execute(
+                "SELECT COALESCE(SUM(length(CAST(content AS BLOB))),0) FROM output_artifacts WHERE session_id=?",
+                (session_id,),
+            ).fetchone()[0]
+            limit = max(0, min(max_bytes, session_max_bytes - used))
+            retained = data[:limit].decode("utf-8", errors="ignore")
+            if len(data) > limit:
+                status = "quota_limited"
+            metadata = {
+                "artifact_id": new_id("out"), "source": source,
+                "sha256": hashlib.sha256(retained.encode()).hexdigest(),
+                "stored_bytes": len(retained.encode()), "observed_bytes": observed_bytes if observed_bytes is not None else len(data),
+                "status": status,
+                "collection_status": collection_status,
+            }
+            self._connection.execute(
+                "INSERT INTO output_artifacts VALUES(?,?,?,?)",
+                (session_id, metadata["artifact_id"], retained, json_dumps(metadata)),
+            )
+        return metadata
+
+    def authorize_workspace(self, session_id: str, workspace: Path) -> None:
+        if Path(self.get_session(session_id).workspace).resolve() != workspace.resolve():
+            raise SessionError("Session does not belong to this workspace")
+
+    def read_output_artifact(
+        self, session_id: str, workspace: Path, artifact_id: str, *,
+        offset: int = 0, limit: int = 8000, query: str = "",
+    ) -> dict[str, Any]:
+        self.authorize_workspace(session_id, workspace)
+        if offset < 0 or not 1 <= limit <= 16_000:
+            raise SessionError("Invalid artifact range")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT content, metadata_json FROM output_artifacts WHERE session_id=? AND artifact_id=?",
+                (session_id, artifact_id),
+            ).fetchone()
+        if row is None:
+            raise SessionError("Artifact missing or unavailable in this session")
+        content = row["content"]
+        if query:
+            found = content.find(query, offset)
+            if found < 0:
+                return {**json.loads(row["metadata_json"]), "match": False, "next_offset": None}
+            offset = found
+        end = min(len(content), offset + limit)
+        return {**json.loads(row["metadata_json"]), "offset": offset,
+                "next_offset": end if end < len(content) else None,
+                "content": content[offset:end]}
+
+    def search_tool_history(
+        self, session_id: str, workspace: Path, query: str, *, after: int = 0,
+    ) -> list[dict[str, Any]]:
+        self.authorize_workspace(session_id, workspace)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sequence,payload_json FROM events WHERE session_id=? AND sequence>? "
+                "AND type='tool.completed' AND instr(payload_json,?)>0 ORDER BY sequence LIMIT 20",
+                (session_id, after, query),
+            ).fetchall()
+        results = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            data = payload.get("data", {})
+            output = str(data.get("output", ""))
+            offset = max(0, output.find(query))
+            results.append({"sequence": row["sequence"], "source": data.get("tool_call_id"),
+                            "preview": output[offset:offset + 1000], "metadata": data.get("metadata", {})})
+        return results
+
+    def search_output_artifacts(
+        self, session_id: str, workspace: Path, query: str, *, after: str = "",
+    ) -> list[dict[str, Any]]:
+        self.authorize_workspace(session_id, workspace)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT metadata_json, instr(content,?) - 1 AS offset, "
+                "substr(content,max(1,instr(content,?)),500) AS preview FROM output_artifacts "
+                "WHERE session_id=? AND artifact_id>? AND (instr(content,?)>0 OR instr(metadata_json,?)>0) "
+                "ORDER BY artifact_id LIMIT 20", (query, query, session_id, after, query, query),
+            ).fetchall()
+        return [{**json.loads(row["metadata_json"]), "offset": max(0, row["offset"]), "preview": row["preview"]} for row in rows]
+
+    def search_history(
+        self, session_id: str, workspace: Path, query: str, *, after: int = 0, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        self.authorize_workspace(session_id, workspace)
+        if query.startswith("user:") and query[5:].isdigit():
+            instructions = self.task_state(session_id)["instructions"]
+            index = int(query[5:]) - 1
+            if 0 <= index < len(instructions):
+                item = instructions[index]
+                return [{"source": query, "message_id": item["source"], "preview": item["text"][:8000]}]
+            return []
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sequence,message_id,payload_json FROM messages "
+                "WHERE session_id=? AND sequence>? AND instr(payload_json,?)>0 ORDER BY sequence LIMIT ?",
+                (session_id, max(0, after), query, min(20, max(1, limit))),
+            ).fetchall()
+        return [{"sequence": row["sequence"], "message_id": row["message_id"],
+                 "preview": json.loads(row["payload_json"]).get("content", "")[:500]}
+                for row in rows]
+
     def set_value(self, session_id: str, key: str, value: Any) -> None:
         with self._lock, self._connection:
             self._connection.execute(
@@ -1307,7 +1471,13 @@ class SessionStore:
 
     def export(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)
+        with self._lock:
+            artifacts = self._connection.execute("SELECT content,metadata_json FROM output_artifacts WHERE session_id=? ORDER BY artifact_id", (session_id,)).fetchall()
         return {
+            "task_state": self.get_value(session_id, "task_state"),
+            "plan": self.get_value(session_id, "plan", []),
+            "acceptance_criteria": self.get_value(session_id, "acceptance_criteria", []),
+            "output_artifacts": [{**json.loads(row["metadata_json"]), "content": row["content"]} for row in artifacts],
             "session": {
                 "id": session.id,
                 "workspace": session.workspace,

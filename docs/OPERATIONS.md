@@ -66,6 +66,12 @@ borealis sessions export SESSION_ID --output session.json
 
 Checkpoint files live under the data directory and are bounded by configuration. They are recovery aids, not an archival backup system.
 
+Large tool output is retained in session-owned `output_artifacts` before preview truncation. Shell, Git, and verification share capture before native process-output truncation. Artifacts contain redacted permitted content, a stable ID, retained-content SHA-256, retained and observed byte sizes, and collection/completeness status. The fixed limits are 2 MB per artifact and 20 MB and 1,000 artifacts per session. Quota-limited, interrupted, missing, and partial output is labelled; an artifact never implies a fresh file read. Session deletion removes its artifacts, and session export includes them.
+
+Use `read_artifact` with an artifact ID and a character offset/limit, or a literal `query` to find text deep inside a retained result. `search_history` finds original message references, tool-result events, and artifacts after compaction or restart. Retrieval is bounded to the owning session and workspace, accepts no file paths, and does not produce edit authorization or a current-file hash.
+
+`grep` reports scanned files, skipped reasons, exclusions, scope, completion, and content identities in its visible result. Continue using `next_cursor`. Pagination rechecks the scope's file identities; changed files require a restart. A result with skipped files is not an exhaustive negative. Directory enumeration failures report incomplete coverage explicitly. Pagination rescans the scope; it does not keep a background index.
+
 ## Logging and observability
 
 Three evidence streams are available:

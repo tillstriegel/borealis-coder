@@ -8,9 +8,10 @@ import hashlib
 from dataclasses import replace
 from typing import Any
 
-from ..errors import BudgetExceeded, ProviderError
+from ..agent.budget import prepare_route_request
+from ..errors import BudgetExceeded, ProviderContextOverflowError, ProviderError
 from ..models import Effect, Message, ProviderRequest, Role, ToolCall, ToolResult, Usage
-from ..util import finish_on_cancellation, json_dumps, new_id, truncate_text
+from ..util import finish_on_cancellation, json_dumps, new_id
 from .base import Tool, ToolContext, object_schema
 
 
@@ -42,20 +43,29 @@ class DelegateTaskTool(Tool):
         schemas = [tool.schema() for tool in read_tools]
         allowed = {tool.name for tool in read_tools}
         system = await asyncio.to_thread(builder.system_prompt, query=str(arguments["task"]))
-        system += "\n\n# Delegated role\nYou are a read-only investigator. Gather precise evidence, do not mutate files, and return a concise conclusion with relevant paths and line references."
+        system += "\n\n# Delegated role\nYou are a read-only investigator. Gather precise evidence, do not mutate files, and return a concise handoff with findings, relevant paths and line references, unresolved questions, and completion status."
         messages = [Message(role=Role.USER, content=str(arguments["task"]))]
         repeated: set[str] = set()
         usage = Usage()
 
+        budget = context.metadata.get("budget")
+        reservation = 0.0
+        usage_recorded = False
+
         async def record_usage(increment: Usage) -> None:
+            nonlocal reservation, usage_recorded
+            usage_recorded = True
             usage.add(increment)
-            if not callable(usage_sink):
-                return
-            result = usage_sink(increment)
-            if asyncio.iscoroutine(result):
-                await finish_on_cancellation(result)
+            if callable(usage_sink):
+                held, reservation = reservation, 0.0
+                result = usage_sink(increment, reservation=held) if budget else usage_sink(increment)
+                if asyncio.iscoroutine(result):
+                    await finish_on_cancellation(result)
+            await context.events.emit("delegate.usage", session_id=context.session_id, run_id=context.run_id,
+                                      provider=route.name, model=route.model, usage=increment.to_dict())
 
         final = ""
+        sources: list[dict[str, Any]] = []
         delegation_id = new_id("delegate")
         delegated_run_id = f"{context.run_id}.{delegation_id}"
         delegated_context = replace(
@@ -73,6 +83,7 @@ class DelegateTaskTool(Tool):
             parent_tool_call_id=context.tool_call_id,
         )
         try:
+            overflow_retries = 0
             max_turns = int(arguments["max_turns"])
             for turn_index in range(max_turns):
                 synthesis_turn = turn_index == max_turns - 1
@@ -96,22 +107,41 @@ class DelegateTaskTool(Tool):
                         "provider_route": route.name,
                     },
                 )
+                request = prepare_route_request(request, route.provider, context.config.agent, overflow_retry_count=overflow_retries)
+                reservation = budget.reserve_cost(route.provider, request) if budget else 0.0
                 cancelled_usage = Usage()
+                usage_recorded = False
                 try:
                     response = await route.provider.with_retries(
                         lambda request=request: route.provider.complete(request),
                         failed_usage_collector=cancelled_usage,
+                        request=request,
+                        check_usage=budget.check_unsettled if budget else None,
                     )
+                    await record_usage(response.usage)
                 except asyncio.CancelledError:
-                    if not cancelled_usage.is_empty:
+                    if cancelled_usage.is_empty:
+                        cancelled_usage = Usage(requests=1, cost_status="incomplete")
+                    if not usage_recorded and not cancelled_usage.is_empty:
+                        with contextlib.suppress(BudgetExceeded):
+                            await record_usage(cancelled_usage)
+                    raise
+                except BudgetExceeded:
+                    if not usage_recorded and not cancelled_usage.is_empty:
                         with contextlib.suppress(BudgetExceeded):
                             await record_usage(cancelled_usage)
                     raise
                 except ProviderError as error:
                     if error.usage is not None:
                         await record_usage(error.usage)
+                    if isinstance(error, ProviderContextOverflowError) and overflow_retries < context.config.agent.compaction_max_overflow_retries:
+                        overflow_retries += 1
+                        continue
                     raise
-                await record_usage(response.usage)
+                finally:
+                    if budget:
+                        budget.release_cost(reservation)
+                overflow_retries = 0
                 assistant = Message(
                     role=Role.ASSISTANT,
                     content=response.text,
@@ -154,6 +184,7 @@ class DelegateTaskTool(Tool):
                     )
                 )
                 for call, result in zip(calls, results, strict=True):
+                    sources.append({"tool_call_id": call.id, **{key: result.metadata[key] for key in ("path", "sha256", "output_artifact") if key in result.metadata}})
                     messages.append(Message(role=Role.TOOL, content=result.output, tool_call_id=call.id, tool_name=call.name, is_error=result.is_error, metadata=result.metadata))
         except asyncio.CancelledError:
             await context.events.emit(
@@ -176,11 +207,11 @@ class DelegateTaskTool(Tool):
         )
         if not final:
             return ToolResult(
-                "Delegated investigation ended without the required textual conclusion.",
+                "Delegated investigation ended without the required textual conclusion. Incomplete; evidence references: " + json_dumps(sources),
                 is_error=True,
                 metadata={"usage": usage.to_dict(), "turns": turns, "delegation_id": delegation_id},
             )
         return ToolResult(
-            truncate_text(final, context.config.context.tool_output_chars),
+            "Delegation complete. Findings and source references:\n" + final + ("\nEvidence references (search_history/read_artifact): " + json_dumps(sources) if sources else ""),
             metadata={"usage": usage.to_dict(), "turns": turns, "delegation_id": delegation_id},
         )

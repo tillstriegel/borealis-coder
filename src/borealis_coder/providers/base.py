@@ -37,6 +37,8 @@ class Provider(abc.ABC):
     def __init__(self, config: ProviderConfig, api_key: str = "") -> None:
         self.config = config
         self.api_key = api_key
+        self.billing_model = config.model
+        self.request_model: ContextVar[str] = ContextVar("request_model", default=config.model)
         self._retry_task: ContextVar[asyncio.Task[Any] | None] = ContextVar(
             "provider_retry_task", default=None,
         )
@@ -70,36 +72,48 @@ class Provider(abc.ABC):
         operation: Callable[[], Awaitable[T]],
         *,
         failed_usage_collector: Usage | None = None,
+        request: ProviderRequest | None = None,
+        check_usage: Callable[[Usage], None] | None = None,
     ) -> T:
         """Share one retry loop across nested wrappers in the same task."""
         task = asyncio.current_task()
         if task is not None and self._retry_task.get() is task:
             return await operation()
+        model_token = self.request_model.set(request.model if request else self.request_model.get())
         token = self._retry_task.set(task)
         try:
-            return await self._retry_operation(operation, failed_usage_collector=failed_usage_collector)
+            return await self._retry_operation(operation, failed_usage_collector=failed_usage_collector, check_usage=check_usage)
         finally:
             self._retry_task.reset(token)
+            self.request_model.reset(model_token)
 
     async def _retry_operation(
         self,
         operation: Callable[[], Awaitable[T]],
         *,
         failed_usage_collector: Usage | None = None,
+        check_usage: Callable[[Usage], None] | None = None,
     ) -> T:
         attempts = max(0, self.config.max_retries) + 1
         delay = max(0.0, self.config.initial_backoff_seconds)
         last_error: Exception | None = None
         prior_usage = Usage()
         for attempt in range(attempts):
+            if check_usage is not None:
+                check_usage(prior_usage)
             try:
                 result = await operation()
+                if isinstance(result, ModelResponse):
+                    self.normalize_cost(result.usage, model=result.model or self.request_model.get())
                 if isinstance(result, ModelResponse) and not prior_usage.is_empty:
                     result.usage = prior_usage.add(result.usage)
                 return result
             except ProviderError as error:
                 last_error = error
+                if error.usage is None and isinstance(error, ProviderUnavailableError):
+                    error.usage = Usage(cost_status="incomplete")
                 if error.usage is not None:
+                    self.normalize_cost(error.usage)
                     if failed_usage_collector is not None:
                         failed_usage_collector.add(error.usage)
                     prior_usage.add(error.usage)
@@ -109,6 +123,10 @@ class Provider(abc.ABC):
                     raise
             except (TimeoutError, OSError) as error:
                 last_error = error
+                incomplete = Usage(cost_status="incomplete")
+                prior_usage.add(incomplete)
+                if failed_usage_collector is not None:
+                    failed_usage_collector.add(incomplete)
                 if attempt + 1 >= attempts:
                     raise ProviderUnavailableError(
                         str(error),
@@ -127,21 +145,56 @@ class Provider(abc.ABC):
         usage: Usage,
         *,
         cache_write_multiplier: float = 1.0,
+        model: str | None = None,
     ) -> Usage:
-        cache_write_rate = self.config.cache_write_input_cost_per_million
-        if not cache_write_rate:
-            cache_write_rate = self.config.input_cost_per_million * cache_write_multiplier
-        input_cost = (
-            usage.uncached_input_tokens * self.config.input_cost_per_million
-            + usage.cached_input_tokens * self.config.cached_input_cost_per_million
-            + usage.cache_write_tokens * cache_write_rate
-        ) / 1_000_000
-        usage.cost_usd = input_cost + (
-            usage.output_tokens * self.config.output_cost_per_million / 1_000_000
-        )
-        baseline_input_cost = usage.input_tokens * self.config.input_cost_per_million / 1_000_000
-        usage.cache_savings_usd = baseline_input_cost - input_cost
+        if usage.cost_status == "known":
+            return usage
+        rates = self.prices(model if model is not None else self.request_model.get())
+        if rates is None:
+            if usage.cost_status != "incomplete":
+                usage.cost_status = "unknown"
+            return usage
+        input_rate, output_rate, cached_rate, write_rate = rates
+        cached_rate = input_rate if cached_rate is None else cached_rate
+        write_rate = input_rate * cache_write_multiplier if write_rate is None else write_rate
+        input_cost = (usage.uncached_input_tokens * input_rate
+                      + usage.cached_input_tokens * cached_rate
+                      + usage.cache_write_tokens * write_rate) / 1_000_000
+        usage.cost_usd = input_cost + usage.output_tokens * output_rate / 1_000_000
+        usage.cache_savings_usd = usage.input_tokens * input_rate / 1_000_000 - input_cost
+        if usage.cost_status != "incomplete":
+            usage.cost_status = "estimated"
         return usage
+
+    def request_bytes(self, request: ProviderRequest) -> int | None:
+        """Return serialized request bytes when this adapter supports local counting."""
+        return None
+
+    def normalize_cost(self, usage: Usage, *, model: str | None = None) -> Usage:
+        # Third-party providers may still supply the legacy numeric contract.
+        # A positive charge is evidence of cost, but not of its calculation method.
+        if usage.cost_status == "unknown":
+            if usage.cost_usd > 0:
+                usage.cost_status = "estimated"
+            else:
+                self.price_usage(usage, model=model)
+        return usage
+
+    def prices(self, model: str) -> tuple[float, float, float | None, float | None] | None:
+        override = self.config.model_prices.get(model)
+        if override is not None:
+            values = [override.get(key) for key in (
+                "input_cost_per_million", "output_cost_per_million",
+                "cached_input_cost_per_million", "cache_write_input_cost_per_million",
+            )]
+        elif not self.billing_model or model == self.billing_model:
+            values = [self.config.input_cost_per_million, self.config.output_cost_per_million,
+                      self.config.cached_input_cost_per_million, self.config.cache_write_input_cost_per_million]
+        else:
+            return None
+        if values[0] is None or values[1] is None:
+            return None
+        return values[0], values[1], values[2], values[3]
 
 
 def classify_provider_error(status: int | None, message: str, details: Any = None) -> ProviderError:

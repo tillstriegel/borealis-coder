@@ -22,6 +22,8 @@ from ..safety import (
     ProcessDriver,
     WorkspaceRoots,
 )
+from ..safety.redaction import StreamingRedactor
+from ..safety.sandbox import ProcessResult, output_capture
 from ..util import json_dumps, truncate_text
 
 
@@ -43,6 +45,58 @@ class ToolContext:
     metadata: dict[str, Any] = field(default_factory=dict)
     mutation_tracking: str = "complete"
     lifecycle_uncertainty_only: bool = False
+
+    async def run_process(self, command: str | list[str], **kwargs: Any) -> ProcessResult:
+        """Capture permitted process output before the driver trims its preview."""
+        store = self.metadata.get("session_store")
+        if store is None:
+            return await self.process.run(command, **kwargs)
+        captured: list[str] = []
+        captured_chars = 0
+        observed_bytes = 0
+        capture_seen = False
+        capture_limited = False
+        redactors = {name: StreamingRedactor(self.events.redactor) for name in ("stdout", "stderr")}
+
+        def capture(stream: str, text: str) -> None:
+            nonlocal captured_chars, observed_bytes, capture_seen, capture_limited
+            observed_bytes += len(text.encode("utf-8"))
+            capture_seen = True
+            available = max(0, 2_000_000 - captured_chars)
+            capture_limited |= len(text) > available
+            if not available:
+                return
+            text = text[:available]
+            captured_chars += len(text)
+            redacted = redactors[stream].feed(text)
+            if redacted:
+                captured.append(redacted)
+
+        token = output_capture.set(capture)
+        status = "interrupted"
+        artifact = None
+        try:
+            result = await self.process.run(command, **kwargs)
+            status = "complete" if result.stream_complete and not result.timed_out else "partial"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            status = "collection_failed"
+            raise
+        finally:
+            output_capture.reset(token)
+            if capture_seen and (captured_chars > min(self.config.context.tool_output_chars, self.config.safety.max_process_output_chars) or status != "complete"):
+                for redactor in redactors.values():
+                    captured.append(redactor.flush(mask_incomplete=status != "complete" or capture_limited))
+                artifact = store.save_output_artifact(
+                    self.session_id, self.workspace, "".join(captured), source=self.tool_call_id,
+                    redactor=self.events.redactor, status="quota_limited" if capture_limited else status,
+                    observed_bytes=observed_bytes, collection_status=status,
+                )
+                await self.events.emit("tool.artifact", session_id=self.session_id, run_id=self.run_id,
+                                       tool_call_id=self.tool_call_id, artifact=artifact)
+        result.output_artifact = artifact
+        return result
 
 
 class MutationScope(StrEnum):
@@ -91,7 +145,9 @@ class Tool:
         return {
             "name": self.name,
             "description": self.description,
-            "parameters": self.parameters,
+            # New nullable fields are required on the provider wire, while local
+            # validation can still accept legacy calls that omit them.
+            "parameters": {**self.parameters, "required": list(self.parameters.get("properties", {}))},
         }
 
 
@@ -210,7 +266,7 @@ class ToolRegistry:
                 metadata={"error_type": type(error).__name__, "unexpected": True},
             )
         duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-        result.output = truncate_text(result.output, context.config.context.tool_output_chars)
+        result = bound_tool_output(result, context, context.config.context.tool_output_chars)
         result.metadata.setdefault("duration_ms", duration_ms)
         await context.events.emit(
             "tool.completed", session_id=context.session_id, run_id=context.run_id,
@@ -218,6 +274,24 @@ class ToolRegistry:
             output=result.output, metadata=result.metadata,
         )
         return result
+
+
+def bound_tool_output(result: ToolResult, context: ToolContext, limit: int) -> ToolResult:
+    """Retain permitted content before reducing the provider-facing preview."""
+    result.output = context.events.redactor.text(result.output)
+    artifact = result.metadata.get("output_artifact")
+    store = context.metadata.get("session_store")
+    if len(result.output) > limit and store is not None and artifact is None:
+        artifact = store.save_output_artifact(
+            context.session_id, context.workspace, result.output,
+            source=context.tool_call_id, redactor=context.events.redactor,
+        )
+        result.metadata["output_artifact"] = artifact
+    reference = "\nHistorical output artifact (read_artifact): " + json_dumps(artifact) if artifact is not None else ""
+    if reference and result.output.endswith(reference):
+        result.output = result.output[:-len(reference)]
+    result.output = truncate_text(result.output, limit) + reference
+    return result
 
 
 def object_schema(

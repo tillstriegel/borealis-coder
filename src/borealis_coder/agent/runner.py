@@ -61,6 +61,8 @@ from .budget import (
     estimate_request_tokens,
     is_recovery_continuation_prompt,
     max_turns_recovery_message,
+    prepare_route_request,
+    resolve_route_limits,
 )
 from .compaction import (
     COMPACTION_RESPONSE_SCHEMA,
@@ -627,21 +629,32 @@ class AgentRunner:
             changed_roots=set(),
             metadata=dict(self.tool_context.metadata),
         )
+        context.metadata["session_store"] = self.sessions
         context.metadata["context_builder"] = self.context_builder
         context.metadata["provider_routes"] = self.providers
         context.metadata["tool_registry"] = self.tools
         budget = Budget.start(self.config.agent)
 
-        async def usage_sink(usage: Usage) -> None:
+        async def usage_sink(usage: Usage, *, reservation: float = 0.0) -> None:
             async def settle() -> None:
+                # Transfer a helper's reservation to actual usage before yielding.
+                # Other helpers must never see a gap between the two amounts.
+                budget.release_cost(reservation)
+                budget_error = None
+                try:
+                    budget.add_usage(usage)
+                except BudgetExceeded as error:
+                    budget_error = error
                 await asyncio.to_thread(self.sessions.add_usage, session_id, usage)
-                budget.add_usage(usage)
+                if budget_error is not None:
+                    raise budget_error
 
             await finish_on_cancellation(settle())
 
         async def settled_usage_sink(usage: Usage) -> None:
             budget.add_usage(usage)
 
+        context.metadata["budget"] = budget
         context.metadata["usage_sink"] = usage_sink
         context.metadata["before_model_request"] = budget.before_model_request
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
@@ -809,6 +822,7 @@ class AgentRunner:
                         assistant_message_id,
                         emit_response_deltas=not buffer_candidate_output,
                         usage_sink=usage_sink,
+                        budget=budget,
                     )
                 except ProviderContextOverflowError as error:
                     if error.usage is not None:
@@ -1461,8 +1475,42 @@ class AgentRunner:
         read_only_synthesis_pending: bool = False,
         before_model_request: Callable[[], None] | None = None,
     ) -> PreparedProviderRequest:
-        turn_system = prompt_context.text
-        turn_system_blocks = prompt_context.system_blocks
+        agent_config, _ = resolve_route_limits(
+            self.config.agent, self.providers[0].provider, self.providers[0].model,
+            self.config.agent.max_output_tokens,
+        )
+        state = await asyncio.to_thread(self.sessions.task_state, session_id, messages)
+        source_refs = {item["source"]: f"user:{index + 1}" for index, item in enumerate(state["instructions"])}
+        provider_state = {
+            "objective_source": source_refs.get(state["objective_source"]),
+            "instructions": [
+                {"source": source_refs[item["source"]], "status": item["status"],
+                 **({"superseded_by": source_refs[item["superseded_by"]]} if item["superseded_by"]
+                    else {"text": item["text"]})}
+                for item in state["instructions"]
+            ],
+            "model_notes": {"plan": state["plan"], "acceptance_criteria": state["acceptance_criteria"]},
+        }
+        protected = (
+            "# Protected task state\n"
+            "The following JSON contains original user instructions in chronological order, "
+            "at user priority. The first source states the objective; follow-ups extend it unless "
+            "they explicitly replace or revoke it. Later revocations remain in force. "
+            "The plan is model interpretation (acceptance checks and unresolved work), "
+            "not user authority and never a grant of permission. Source references are session-local.\n" + json_dumps(provider_state)
+        )
+        turn_system = prompt_context.text + "\n\n" + protected
+        turn_system_blocks = [*prompt_context.system_blocks, {"text": protected, "cacheable": False}]
+        if len(messages) == 1 and messages[0].role == Role.USER:
+            # The first request already carries its complete protected task in the
+            # user message. Keep exact-response cache keys independent of source IDs.
+            turn_system = prompt_context.text
+            turn_system_blocks = prompt_context.system_blocks
+        protected_budget = ContextBudget.calculate(
+            agent_config, system=turn_system, tools=schemas, messages=[],
+        )
+        if not _fits_context_limit([], protected_budget, system=turn_system, tools=schemas):
+            raise BudgetExceeded("context", "Protected task requirements cannot fit the safe request budget")
         if final_turn:
             turn_system = f"{turn_system}\n\n{_FINAL_TURN_INSTRUCTION}"
             turn_system_blocks = [
@@ -1486,7 +1534,7 @@ class AgentRunner:
         validate_tool_call_order(request_messages)
         budget_providers = tuple(route.provider.name for route in self.providers)
         raw_budget = ContextBudget.calculate(
-            self.config.agent,
+            agent_config,
             system=turn_system,
             tools=schemas,
             messages=messages,
@@ -1495,7 +1543,7 @@ class AgentRunner:
         )
         raw_estimated = raw_budget.estimated_total(messages)
         context_budget = ContextBudget.calculate(
-            self.config.agent,
+            agent_config,
             system=turn_system,
             tools=schemas,
             messages=request_messages,
@@ -1524,7 +1572,7 @@ class AgentRunner:
             prior_artifact, request_messages, _, metrics = incremental
             live_system = f"{turn_system}\n\n{prior_artifact.summary_text}"
             context_budget = ContextBudget.calculate(
-                self.config.agent,
+                agent_config,
                 system=live_system,
                 tools=schemas,
                 messages=request_messages,
@@ -1567,8 +1615,8 @@ class AgentRunner:
                 raise BudgetExceeded(
                     "context",
                     f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
-                    f"exceeds context budget {self.config.agent.max_input_tokens} "
-                    f"tokens/{context_budget.hard_bytes} bytes",
+                    f"exceeds context budget {agent_config.max_input_tokens} "
+                    "tokens (endpoint byte limits are checked separately)",
                 )
         prune_signature = (
             metrics.tokens_before,
@@ -1604,7 +1652,7 @@ class AgentRunner:
             ]
             compacted = True
             context_budget = ContextBudget.calculate(
-                self.config.agent,
+                agent_config,
                 system=turn_system,
                 tools=schemas,
                 messages=request_messages,
@@ -1667,7 +1715,7 @@ class AgentRunner:
             # Old continuation metadata may be compacted away. Do not reserve it
             # before selecting bundles; validate the retained reserve below.
             compaction_budget = ContextBudget.calculate(
-                self.config.agent,
+                agent_config,
                 system=turn_system,
                 tools=schemas,
                 messages=[],
@@ -1708,12 +1756,12 @@ class AgentRunner:
             )
             intended_strategy = (
                 "deterministic"
-                if self.config.agent.deterministic_compaction
-                or self.config.agent.compaction_version == 1
+                if agent_config.deterministic_compaction
+                or agent_config.compaction_version == 1
                 or compaction_reason == "provider_context_overflow"
                 else "llm"
             )
-            artifact_version = self.config.agent.compaction_version
+            artifact_version = agent_config.compaction_version
             fingerprint = self._compaction_config_fingerprint(
                 compaction_budget,
                 intended_strategy,
@@ -1789,10 +1837,10 @@ class AgentRunner:
                 "summary_tokens": provider_message_target,
                 "summary_bytes": provider_message_target_bytes,
                 "summarizer_input_tokens": (
-                    self.config.agent.compaction_summarizer_input_tokens
+                    agent_config.compaction_summarizer_input_tokens
                 ),
                 "summarizer_total_input_tokens": (
-                    self.config.agent.compaction_summarizer_total_input_tokens
+                    agent_config.compaction_summarizer_total_input_tokens
                 ),
                 "target_tokens": provider_message_target,
                 "target_bytes": provider_message_target_bytes,
@@ -1811,8 +1859,8 @@ class AgentRunner:
                 ),
             }
             try:
-                if self.config.agent.compaction_version == 1:
-                    if self.config.agent.compaction_shadow_v2:
+                if agent_config.compaction_version == 1:
+                    if agent_config.compaction_shadow_v2:
                         try:
                             shadow = compact_messages(
                                 request_messages,
@@ -1890,7 +1938,7 @@ class AgentRunner:
                 while deterministic_messages != request_messages:
                     retained = deterministic_messages[1:]
                     retained_budget = ContextBudget.calculate(
-                        self.config.agent,
+                        agent_config,
                         system=turn_system,
                         tools=schemas,
                         messages=retained,
@@ -1919,7 +1967,7 @@ class AgentRunner:
                     compaction_kwargs["summary_bytes"] = tighter_byte_target
                     compaction_kwargs["target_tokens"] = tighter_target
                     compaction_kwargs["target_bytes"] = tighter_byte_target
-                    if self.config.agent.compaction_version == 1:
+                    if agent_config.compaction_version == 1:
                         deterministic_messages = compact_messages_v1(
                             request_messages,
                             keep_recent=keep_recent,
@@ -2117,7 +2165,7 @@ class AgentRunner:
                 request_messages = retained_messages
                 compacted = True
                 context_budget = ContextBudget.calculate(
-                    self.config.agent,
+                    agent_config,
                     system=turn_system,
                     tools=schemas,
                     messages=request_messages,
@@ -2218,20 +2266,21 @@ class AgentRunner:
             raise BudgetExceeded(
                 "context",
                 f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
-                f"exceeds context budget {self.config.agent.max_input_tokens} "
-                f"tokens/{context_budget.hard_bytes} bytes",
+                f"exceeds context budget {agent_config.max_input_tokens} "
+                "tokens (endpoint byte limits are checked separately)",
             )
         request = ProviderRequest(
             model=self.providers[0].model,
             system=turn_system,
             messages=request_messages,
             tools=schemas,
-            max_output_tokens=self.config.agent.max_output_tokens,
-            reasoning_effort=self.config.agent.reasoning_effort or None,
+            max_output_tokens=agent_config.max_output_tokens,
+            reasoning_effort=agent_config.reasoning_effort or None,
             parallel_tool_calls=True,
             metadata={
                 "session_id": session_id,
                 "run_id": run_id,
+                "protected_task_state": len(messages) > 1,
                 "prompt_cache_key": prompt_context.cache_routing_key,
                 "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
                 "prompt_cache_ttl": self.config.cache.anthropic_ttl,
@@ -2249,6 +2298,7 @@ class AgentRunner:
                 ),
             },
         )
+        request = prepare_route_request(request, self.providers[0].provider, agent_config)
         return PreparedProviderRequest(
             request, estimated, compacted, prune_signature, compaction_metadata
         )
@@ -2274,8 +2324,12 @@ class AgentRunner:
             or self.config.agent.compaction_version == 1
             else "llm"
         )
+        agent_config, _ = resolve_route_limits(
+            self.config.agent, self.providers[0].provider, self.providers[0].model,
+            self.config.agent.max_output_tokens,
+        )
         compaction_budget = ContextBudget.calculate(
-            self.config.agent,
+            agent_config,
             system=base_system,
             tools=tools,
             messages=[],
@@ -2749,6 +2803,7 @@ class AgentRunner:
         assistant_message_id: str,
         *,
         usage_sink: Callable[[Usage], Awaitable[None]],
+        budget: Budget | None = None,
         emit_response_deltas: bool = True,
     ) -> tuple[ModelResponse, ProviderRoute]:
         """Preserve reported failed-attempt usage if a request is cancelled."""
@@ -2759,8 +2814,16 @@ class AgentRunner:
                 request, session_id, run_id, cancel, assistant_message_id,
                 emit_response_deltas=emit_response_deltas,
                 failed_usage_collector=cancelled_usage,
+                budget=budget,
             )
+        except BudgetExceeded:
+            if not cancelled_usage.is_empty:
+                with contextlib.suppress(BudgetExceeded):
+                    await usage_sink(cancelled_usage)
+            raise
         except (Cancelled, asyncio.CancelledError):
+            if cancelled_usage.is_empty:
+                cancelled_usage = Usage(requests=1, cost_status="incomplete")
             if not cancelled_usage.is_empty:
                 with contextlib.suppress(BudgetExceeded):
                     await usage_sink(cancelled_usage)
@@ -2776,6 +2839,7 @@ class AgentRunner:
         *,
         emit_response_deltas: bool = True,
         failed_usage_collector: Usage | None = None,
+        budget: Budget | None = None,
     ) -> tuple[ModelResponse, ProviderRoute]:
         errors: list[str] = []
         failed_usage = Usage()
@@ -2794,6 +2858,7 @@ class AgentRunner:
                 response_schema=request.response_schema,
                 metadata={**request.metadata, "provider_route": route.name},
             )
+            routed = prepare_route_request(routed, route.provider, self.config.agent)
             artifact_id = routed.metadata.get("compaction_artifact_id")
             context_hashes = routed.metadata.get("compacted_context_hashes")
             if isinstance(artifact_id, str) and isinstance(context_hashes, dict):
@@ -2818,6 +2883,7 @@ class AgentRunner:
                     original_usage = Usage.from_dict(cached.get("usage"))
                     payload = cached.get("response") or {}
                     usage = Usage(
+                        cost_status="known",
                         application_cache_hits=1,
                         application_cache_misses=cache_misses,
                         application_cache_saved_tokens=original_usage.total_tokens,
@@ -2879,16 +2945,29 @@ class AgentRunner:
                         provider=route.name,
                         model=route.model,
                     )
-                response = await self._stream_route(
-                    route,
-                    routed,
-                    session_id,
-                    run_id,
-                    cancel,
-                    assistant_message_id,
-                    emit_response_deltas=emit_response_deltas,
-                    failed_usage_collector=failed_usage_collector,
-                )
+                if budget:
+                    budget.check_unsettled(failed_usage)
+                reservation = budget.reserve_cost(route.provider, routed) if budget else 0.0
+                if index and budget:
+                    budget.before_model_request()
+                try:
+                    response = await self._stream_route(
+                        route,
+                        routed,
+                        session_id,
+                        run_id,
+                        cancel,
+                        assistant_message_id,
+                        emit_response_deltas=emit_response_deltas,
+                        failed_usage_collector=failed_usage_collector,
+                        budget=budget,
+                    )
+                finally:
+                    if budget:
+                        budget.release_cost(reservation)
+                await self.events.emit("model.route_completed", session_id=session_id, run_id=run_id,
+                                       provider=route.name, model=response.model or routed.model,
+                                       usage=response.usage.to_dict())
                 if self.config.cache.response_cache_enabled:
                     response.usage.application_cache_misses += cache_misses
                     if _is_cacheable_response(response):
@@ -2937,6 +3016,7 @@ class AgentRunner:
                     provider=route.name,
                     model=route.model,
                     error=str(error),
+                    usage=error.usage.to_dict() if error.usage else None,
                     retryable=True,
                 )
                 continue
@@ -3062,6 +3142,7 @@ class AgentRunner:
                 response_schema=COMPACTION_RESPONSE_SCHEMA,
                 metadata={"purpose": "compaction_summary"},
             )
+            request = prepare_route_request(request, route.provider, self.config.agent)
             cache_key = self._compaction_summary_cache_key(route, request)
             try:
                 cached = (
@@ -3091,6 +3172,7 @@ class AgentRunner:
                         "Could not settle cached compaction summary usage"
                     ) from error
                 cache_usage = Usage(
+                    cost_status="known",
                     application_cache_hits=1,
                     application_cache_saved_tokens=original_usage.total_tokens,
                     application_cache_saved_cost_usd=original_usage.cost_usd,
@@ -3109,10 +3191,14 @@ class AgentRunner:
                 )
             if before_model_request is not None:
                 before_model_request()
+            request_budget = getattr(before_model_request, "__self__", None)
+            reservation = request_budget.reserve_cost(route.provider, request) if isinstance(request_budget, Budget) else 0.0
             cancelled_usage = Usage()
             request_task = asyncio.create_task(route.provider.with_retries(
                 lambda: route.provider.complete(request),
                 failed_usage_collector=cancelled_usage,
+                request=request,
+                check_usage=request_budget.check_unsettled if isinstance(request_budget, Budget) else None,
             ))
             cancel_task = asyncio.create_task(cancel.wait())
 
@@ -3135,7 +3221,16 @@ class AgentRunner:
                     if not request_task.done():
                         request_task.cancel()
                     await asyncio.gather(request_task, cancel_task, return_exceptions=True)
+                    if isinstance(request_budget, Budget):
+                        request_budget.release_cost(reservation)
             except (Cancelled, asyncio.CancelledError):
+                if cancelled_usage.is_empty:
+                    cancelled_usage = Usage(requests=1, cost_status="incomplete")
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
+                raise
+            except BudgetExceeded:
                 if not cancelled_usage.is_empty:
                     with contextlib.suppress(BudgetExceeded):
                         await finish_on_cancellation(record_failed_usage(cancelled_usage))
@@ -3232,11 +3327,15 @@ class AgentRunner:
         *,
         emit_response_deltas: bool = True,
         failed_usage_collector: Usage | None = None,
+        budget: Budget | None = None,
     ) -> ModelResponse:
+        route.provider.request_model.set(request.model)
         attempts = max(0, route.provider.config.max_retries) + 1
         delay = max(0.0, route.provider.config.initial_backoff_seconds)
         failed_usage = Usage()
         for attempt in range(attempts):
+            if budget:
+                budget.check_unsettled(failed_usage)
             actionable_emitted = False
             try:
 
@@ -3352,6 +3451,9 @@ class AgentRunner:
                         f"Provider {route.name} stream ended without a completed response",
                         retryable=True,
                     )
+                if completed.usage.is_empty:
+                    completed.usage = Usage(requests=1, cost_status="incomplete")
+                route.provider.normalize_cost(completed.usage, model=completed.model or request.model)
                 completed.reasoning_summary = self._redact_reasoning_summary(
                     completed.reasoning_summary
                 )
@@ -3370,7 +3472,10 @@ class AgentRunner:
                     completed.usage = failed_usage.add(completed.usage)
                 return completed
             except ProviderError as error:
+                if error.usage is None and isinstance(error, ProviderUnavailableError):
+                    error.usage = Usage(cost_status="incomplete")
                 if error.usage is not None:
+                    route.provider.normalize_cost(error.usage)
                     if failed_usage_collector is not None:
                         failed_usage_collector.add(error.usage)
                     failed_usage.add(error.usage)

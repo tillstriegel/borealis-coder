@@ -2219,7 +2219,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(root, agent={"provider": "cost", "max_cost_usd": 1.0})
-            config.providers["cost"] = ProviderConfig(type="cost", model="cost", max_retries=0)
+            config.providers["cost"] = ProviderConfig(type="cost", model="cost", max_retries=0, input_cost_per_million=0, output_cost_per_million=0)
             registry = ProviderRegistry()
             registry.register("cost", lambda cfg, key: CostProvider(cfg, key))
             runner = await build_runner(
@@ -2752,6 +2752,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 type="defiant_final_turn",
                 model="defiant",
                 max_retries=0,
+                input_cost_per_million=0,
+                output_cost_per_million=0,
             )
             provider = DefiantFinalTurnProvider(config.providers["defiant"])
             provider.final_cost_usd = 2.0
@@ -3067,7 +3069,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     if message.role == Role.TOOL
                     and message.tool_name == "delegate_task"
                 )
-                self.assertEqual(delegate_result.content, "The file contains example.")
+                self.assertIn("The file contains example.", delegate_result.content)
                 self.assertFalse(delegate_result.is_error)
             finally:
                 await runner.close()

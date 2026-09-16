@@ -58,18 +58,15 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
             allowed = await self.search(path="external.txt")
             self.assertIn("private contents", allowed.output)
 
-    async def test_result_limit_stops_directory_discovery(self):
+    async def test_result_limit_leaves_a_stable_continuation(self):
         (self.root / "first.txt").write_text("needle", encoding="utf-8")
-
-        def walk(*args, **kwargs):
-            yield str(self.root), [], ["first.txt"]
-            raise AssertionError("Search continued walking after reaching its limit")
-
-        with patch("borealis_coder.tools.search.os.walk", side_effect=walk):
-            result = await self.search(max_results=1)
-
+        (self.root / "second.txt").write_text("needle", encoding="utf-8")
+        result = await self.search(max_results=1)
         self.assertEqual(result.metadata["matches"], 1)
         self.assertTrue(result.metadata["truncated"])
+        continued = await self.search(max_results=1, cursor=result.metadata["next_cursor"])
+        self.assertIn("second.txt:1:needle", continued.output)
+        self.assertNotIn("first.txt:1:needle", continued.output)
 
     async def test_discovered_file_names_do_not_expand_environment_variables(self):
         (self.root / "$BOREALIS_PATH_FIXTURE.txt").write_text("needle", encoding="utf-8")
@@ -77,7 +74,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"BOREALIS_PATH_FIXTURE": "other"}):
             result = await self.search()
 
-        self.assertEqual(result.output, "$BOREALIS_PATH_FIXTURE.txt:1:needle")
+        self.assertIn("$BOREALIS_PATH_FIXTURE.txt:1:needle", result.output)
         self.assertEqual(result.metadata["matches"], 1)
         self.assertEqual(result.metadata["files_scanned"], 2)
 
@@ -96,7 +93,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(Path, "open", return_value=BoundedStream(b"needle" * 1000)):
             result = await self.search(path="large.txt")
 
-        self.assertEqual(result.output, "No matches")
+        self.assertIn("No matches in the portion examined", result.output)
         self.assertEqual(result.metadata["files_scanned"], 0)
 
         with (
@@ -112,13 +109,13 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         result = await self.search()
 
         self.assertLessEqual(len(result.output), 128)
-        self.assertIn("needle", result.output)
-        self.assertTrue(result.metadata["truncated"])
+        self.assertIn("Search coverage", result.output)
+        self.assertEqual(result.metadata["matches"], 1)
 
     async def test_binary_files_are_skipped(self):
         (self.root / "binary.txt").write_bytes(b"needle\x00binary")
         result = await self.search()
-        self.assertEqual(result.output, "No matches")
+        self.assertIn("No matches in the portion examined", result.output)
         self.assertEqual(result.metadata["files_scanned"], 0)
 
     async def test_regex_honors_large_configured_result_limits(self):
@@ -156,13 +153,13 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
                 case_sensitive=False, context_lines=1, max_results=2,
             )
 
-        self.assertEqual(result.output, (
+        self.assertIn((
             "a.txt:1-prefix\na.txt:2:ITEM:café café\na.txt:3-suffix\n"
-            "b.txt:1-ignore\nb.txt:2:item:abc abc\nb.txt:3-tail\n… result limit reached …"
-        ))
+            "b.txt:1-ignore\nb.txt:2:item:abc abc\nb.txt:3-tail"
+        ), result.output)
         self.assertEqual(result.metadata["matches"], 2)
         self.assertEqual(result.metadata["files_scanned"], 2)
-        self.assertTrue(result.metadata["truncated"])
+        self.assertFalse(result.metadata["truncated"])
         self.assertEqual(len(processes), 1)
         self.assertIsNotNone(processes[0].returncode)
 
@@ -232,4 +229,4 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         os.mkfifo(self.root / "pipe.txt")
         with patch.object(Path, "open", side_effect=AssertionError("Opened a named pipe")):
             result = await self.search()
-        self.assertEqual(result.output, "No matches")
+        self.assertIn("No matches in the portion examined", result.output)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -16,8 +18,8 @@ from typing import Any
 
 from ..errors import PathViolation, ToolError
 from ..models import Effect, ToolResult
-from ..util import finish_on_cancellation, read_bytes_up_to, truncate_text
-from .base import Tool, ToolContext, nullable, object_schema
+from ..util import finish_on_cancellation, json_dumps, read_bytes_up_to
+from .base import Tool, ToolContext, bound_tool_output, nullable, object_schema
 
 
 class _RegexMatcher:
@@ -87,6 +89,7 @@ class GrepTool(Tool):
     effect = Effect.READ
     concurrent = True
     parameters = object_schema({
+        "cursor": nullable("string", maxLength=512),
         "pattern": {"type": "string", "minLength": 1},
         "path": {"type": "string"},
         "glob": nullable("string"),
@@ -94,7 +97,7 @@ class GrepTool(Tool):
         "case_sensitive": {"type": "boolean"},
         "context_lines": {"type": "integer", "minimum": 0, "maximum": 10},
         "max_results": {"type": "integer", "minimum": 1, "maximum": 2000},
-    })
+    }, required=["pattern", "path", "glob", "regex", "case_sensitive", "context_lines", "max_results"])
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         resolved = context.roots.resolve(arguments["path"] or ".", must_exist=True)
@@ -109,64 +112,120 @@ class GrepTool(Tool):
             int(arguments["max_results"]),
             context.config.context.max_search_results,
         )
+        files = list(files)
+        def snapshot() -> str:
+            entries = []
+            current_files = list(_walk_files(resolved.path, context)) if is_directory else files
+            for path in current_files:
+                try:
+                    stat = path.stat()
+                    entries.append((str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino))
+                except OSError:
+                    entries.append((str(path), "unreadable"))
+            scope = {k: v for k, v in arguments.items() if k != "cursor"}
+            return hashlib.sha256(json_dumps([scope, context.config.context.ignored_dirs, context.config.context.max_file_bytes, entries]).encode()).hexdigest()
+
+        identity = snapshot()
+        offset = 0
+        if arguments.get("cursor"):
+            try:
+                cursor = json.loads(base64.urlsafe_b64decode(arguments["cursor"]))
+                offset = int(cursor["offset"])
+                if cursor["snapshot"] != identity or offset < 0:
+                    raise ValueError()
+            except (ValueError, KeyError, TypeError):
+                return ToolResult("Search continuation is stale or invalid; restart the search.", is_error=True)
         rows: list[str] = []
         output_chars = 0
         output_limit = context.config.context.tool_output_chars
         file_limit = context.config.context.max_file_bytes
         match_count = 0
+        seen = 0
         scanned = 0
+        skipped: dict[str, int] = {}
+        truncated = False
+        next_cursor = None
+        identities: dict[str, str] = {}
         async with _regex_matcher(
-            pattern, flags, enabled=bool(arguments["regex"]), max_matches=max_results,
+            pattern, flags, enabled=bool(arguments["regex"]), max_matches=file_limit,
         ) as matcher:
             for path in files:
                 await asyncio.sleep(0)
                 rel = path.relative_to(resolved.path).as_posix() if is_directory else path.name
                 if file_glob and not (fnmatch.fnmatch(rel, file_glob) or fnmatch.fnmatch(path.name, file_glob)):
+                    skipped["glob_excluded"] = skipped.get("glob_excluded", 0) + 1
                     continue
                 try:
                     candidate = context.roots.resolve(path, must_exist=True, kind="file")
                     data = read_bytes_up_to(candidate.path, file_limit + 1)
                 except (OSError, PathViolation):
+                    skipped["unreadable_or_unauthorized"] = skipped.get("unreadable_or_unauthorized", 0) + 1
                     continue
-                if len(data) > file_limit or b"\x00" in data:
+                reason = "size" if len(data) > file_limit else "unsupported_content" if b"\x00" in data else ""
+                text = ""
+                try:
+                    text = data.decode("utf-8") if not reason else ""
+                except UnicodeDecodeError:
+                    reason = "unsupported_content"
+                if reason:
+                    skipped[reason] = skipped.get(reason, 0) + 1
                     continue
                 scanned += 1
                 display = candidate.display
-                lines = data.decode("utf-8", errors="replace").splitlines()
-                emitted_context: set[int] = set()
+                lines = text.splitlines()
                 indices = (
-                    await matcher.search(lines, max_results - match_count, context.config.context.regex_timeout_seconds)
+                    await matcher.search(lines, len(lines), context.config.context.regex_timeout_seconds)
                     if matcher is not None else range(len(lines))
                 )
+                emitted_context: set[int] = set()
                 for index in indices:
                     if index % 256 == 0:
                         await asyncio.sleep(0)
                     if expression is not None and not expression.search(lines[index]):
                         continue
+                    seen += 1
+                    if seen <= offset:
+                        continue
+                    if match_count >= max_results or (rows and output_chars >= max(1, output_limit - 2000)):
+                        truncated = True
+                        break
                     match_count += 1
-                    start = max(0, index - context_lines)
-                    end = min(len(lines), index + context_lines + 1)
-                    for ctx_index in range(start, end):
+                    identities[display] = hashlib.sha256(data).hexdigest()
+                    for ctx_index in range(max(0, index - context_lines), min(len(lines), index + context_lines + 1)):
+                        if ctx_index in emitted_context:
+                            continue
+                        emitted_context.add(ctx_index)
                         marker = ":" if ctx_index == index else "-"
-                        if ctx_index not in emitted_context:
-                            row = f"{display}:{ctx_index + 1}{marker}{lines[ctx_index]}"
-                            output_chars += len(row) + bool(rows)
-                            rows.append(row)
-                            if output_chars > output_limit:
-                                return ToolResult(
-                                    truncate_text("\n".join(rows), output_limit),
-                                    metadata={"matches": match_count, "files_scanned": scanned, "truncated": True},
-                                )
-                            emitted_context.add(ctx_index)
-                    if match_count >= max_results:
-                        rows.append("… result limit reached …")
-                        return ToolResult(truncate_text("\n".join(rows), output_limit), metadata={"matches": match_count, "files_scanned": scanned, "truncated": True})
-        return ToolResult("\n".join(rows) or "No matches", metadata={"matches": match_count, "files_scanned": scanned})
+                        row = f"{display}:{ctx_index + 1}{marker}{lines[ctx_index]}"
+                        rows.append(row)
+                        output_chars += len(row) + 1
+                if truncated:
+                    break
+        if snapshot() != identity:
+            return ToolResult("Search scope changed during collection; restart the search.", is_error=True)
+        if truncated:
+            next_cursor = base64.urlsafe_b64encode(json_dumps({"snapshot": identity, "offset": offset + match_count}).encode()).decode()
+        incomplete_skips = sum(v for k, v in skipped.items() if k != "glob_excluded")
+        metadata = {"matches": match_count, "files_scanned": scanned, "skipped": skipped,
+                    "truncated": truncated, "complete": not truncated and not incomplete_skips,
+                    "scope": arguments["path"], "glob": file_glob,
+                    "excluded_directories": context.config.context.ignored_dirs,
+                    "next_cursor": next_cursor, "snapshot": identity, "content_sha256": identities}
+        negative = "No matches in the completed search scope" if metadata["complete"] else "No matches in the portion examined"
+        body = ("\n".join(rows) or negative) + ("\nContent SHA-256: " + json_dumps(identities) if identities else "")
+        coverage = {k: v for k, v in metadata.items() if k != "content_sha256"}
+        preview_truncated = len(body) + len(json_dumps(coverage)) + 64 > output_limit
+        metadata["preview_truncated"] = coverage["preview_truncated"] = preview_truncated
+        return bound_tool_output(ToolResult("Search coverage: " + json_dumps(coverage) + "\n" + body,
+                                            metadata=metadata), context, output_limit)
 
 
 def _walk_files(root: Path, context: ToolContext) -> Iterator[Path]:
     ignored = set(context.config.context.ignored_dirs)
-    for current, dirs, files in os.walk(root):
+    def on_error(error: OSError) -> None:
+        raise ToolError("Search could not enumerate part of the requested scope; coverage is incomplete") from error
+
+    for current, dirs, files in os.walk(root, onerror=on_error):
         dirs[:] = sorted(item for item in dirs if item not in ignored)
         for name in sorted(files):
             yield Path(current) / name
