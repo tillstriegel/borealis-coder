@@ -85,7 +85,8 @@ class DelegateTaskTool(Tool):
         try:
             overflow_retries = 0
             max_turns = int(arguments["max_turns"])
-            for turn_index in range(max_turns):
+            turn_index = 0
+            while turn_index < max_turns:
                 synthesis_turn = turn_index == max_turns - 1
                 if callable(before_model_request):
                     before_model_request()
@@ -120,8 +121,6 @@ class DelegateTaskTool(Tool):
                     )
                     await record_usage(response.usage)
                 except asyncio.CancelledError:
-                    if cancelled_usage.is_empty:
-                        cancelled_usage = Usage(requests=1, cost_status="incomplete")
                     if not usage_recorded and not cancelled_usage.is_empty:
                         with contextlib.suppress(BudgetExceeded):
                             await record_usage(cancelled_usage)
@@ -142,6 +141,7 @@ class DelegateTaskTool(Tool):
                     if budget:
                         budget.release_cost(reservation)
                 overflow_retries = 0
+                turn_index += 1
                 assistant = Message(
                     role=Role.ASSISTANT,
                     content=response.text,

@@ -2822,8 +2822,6 @@ class AgentRunner:
                     await usage_sink(cancelled_usage)
             raise
         except (Cancelled, asyncio.CancelledError):
-            if cancelled_usage.is_empty:
-                cancelled_usage = Usage(requests=1, cost_status="incomplete")
             if not cancelled_usage.is_empty:
                 with contextlib.suppress(BudgetExceeded):
                     await usage_sink(cancelled_usage)
@@ -2844,193 +2842,203 @@ class AgentRunner:
         errors: list[str] = []
         failed_usage = Usage()
         cache_misses = 0
-        for index, route in enumerate(self.providers):
-            self._check_cancel(cancel)
-            routed = ProviderRequest(
-                model=route.model,
-                system=request.system,
-                messages=request.messages,
-                tools=request.tools,
-                max_output_tokens=request.max_output_tokens,
-                temperature=request.temperature,
-                reasoning_effort=request.reasoning_effort,
-                parallel_tool_calls=request.parallel_tool_calls,
-                response_schema=request.response_schema,
-                metadata={**request.metadata, "provider_route": route.name},
-            )
-            routed = prepare_route_request(routed, route.provider, self.config.agent)
-            artifact_id = routed.metadata.get("compaction_artifact_id")
-            context_hashes = routed.metadata.get("compacted_context_hashes")
-            if isinstance(artifact_id, str) and isinstance(context_hashes, dict):
-                await self.events.emit(
-                    "context.compaction_route_started",
-                    session_id=session_id,
-                    run_id=run_id,
-                    provider=route.name,
+        held_failed_cost = 0.0
+        try:
+            for index, route in enumerate(self.providers):
+                self._check_cancel(cancel)
+                routed = ProviderRequest(
                     model=route.model,
-                    compaction_artifact_id=artifact_id,
-                    compacted_context_hash=context_hashes.get(route.name),
+                    system=request.system,
+                    messages=request.messages,
+                    tools=request.tools,
+                    max_output_tokens=request.max_output_tokens,
+                    temperature=request.temperature,
+                    reasoning_effort=request.reasoning_effort,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    response_schema=request.response_schema,
+                    metadata={**request.metadata, "provider_route": route.name},
                 )
-            try:
-                cache_key = self._response_cache_key(route, routed)
-                cached = None
-                if self.config.cache.response_cache_enabled:
-                    cached = await asyncio.to_thread(
-                        self.sessions.get_cached_response,
-                        cache_key,
-                    )
-                if cached is not None:
-                    original_usage = Usage.from_dict(cached.get("usage"))
-                    payload = cached.get("response") or {}
-                    usage = Usage(
-                        cost_status="known",
-                        application_cache_hits=1,
-                        application_cache_misses=cache_misses,
-                        application_cache_saved_tokens=original_usage.total_tokens,
-                        application_cache_saved_cost_usd=original_usage.cost_usd,
-                    )
-                    response = ModelResponse(
-                        text=str(payload.get("text") or ""),
-                        reasoning_summary=self._redact_reasoning_summary(
-                            str(payload.get("reasoning_summary") or "")
-                        ),
-                        usage=usage,
-                        stop_reason=payload.get("stop_reason"),
-                        model=str(payload.get("model") or route.model),
-                        raw={"application_cache": True},
-                        continuation_state=ContinuationState.from_metadata(
-                            payload.get("continuation_state"),
-                            provider=route.name,
-                            model=route.model,
-                        ),
-                    )
+                routed = prepare_route_request(routed, route.provider, self.config.agent)
+                artifact_id = routed.metadata.get("compaction_artifact_id")
+                context_hashes = routed.metadata.get("compacted_context_hashes")
+                if isinstance(artifact_id, str) and isinstance(context_hashes, dict):
                     await self.events.emit(
-                        "model.cache_hit",
+                        "context.compaction_route_started",
                         session_id=session_id,
                         run_id=run_id,
                         provider=route.name,
                         model=route.model,
-                        saved_tokens=usage.application_cache_saved_tokens,
-                        saved_cost_usd=usage.application_cache_saved_cost_usd,
+                        compaction_artifact_id=artifact_id,
+                        compacted_context_hash=context_hashes.get(route.name),
                     )
-                    if emit_response_deltas and response.reasoning_summary:
-                        await self.events.emit(
-                            "model.reasoning_delta",
-                            session_id=session_id,
-                            run_id=run_id,
-                            message_id=assistant_message_id,
-                            text=response.reasoning_summary,
-                            provider=route.name,
-                            model=route.model,
-                        )
-                    if emit_response_deltas and response.text:
-                        await self.events.emit(
-                            "model.text_delta",
-                            session_id=session_id,
-                            run_id=run_id,
-                            message_id=assistant_message_id,
-                            text=response.text,
-                            provider=route.name,
-                            model=route.model,
-                        )
-                    if not failed_usage.is_empty:
-                        response.usage = failed_usage.add(response.usage)
-                    return response, route
-                if self.config.cache.response_cache_enabled:
-                    cache_misses += 1
-                    await self.events.emit(
-                        "model.cache_miss",
-                        session_id=session_id,
-                        run_id=run_id,
-                        provider=route.name,
-                        model=route.model,
-                    )
-                if budget:
-                    budget.check_unsettled(failed_usage)
-                reservation = budget.reserve_cost(route.provider, routed) if budget else 0.0
-                if index and budget:
-                    budget.before_model_request()
                 try:
-                    response = await self._stream_route(
-                        route,
-                        routed,
-                        session_id,
-                        run_id,
-                        cancel,
-                        assistant_message_id,
-                        emit_response_deltas=emit_response_deltas,
-                        failed_usage_collector=failed_usage_collector,
-                        budget=budget,
-                    )
-                finally:
-                    if budget:
-                        budget.release_cost(reservation)
-                await self.events.emit("model.route_completed", session_id=session_id, run_id=run_id,
-                                       provider=route.name, model=response.model or routed.model,
-                                       usage=response.usage.to_dict())
-                if self.config.cache.response_cache_enabled:
-                    response.usage.application_cache_misses += cache_misses
-                    if _is_cacheable_response(response):
-                        cached_response: dict[str, Any] = {
-                            "text": response.text,
-                            "reasoning_summary": response.reasoning_summary,
-                            "stop_reason": response.stop_reason,
-                            "model": response.model or route.model,
-                        }
-                        if response.continuation_state is not None:
-                            continuation = response.continuation_state.to_metadata(
+                    cache_key = self._response_cache_key(route, routed)
+                    cached = None
+                    if self.config.cache.response_cache_enabled:
+                        cached = await asyncio.to_thread(
+                            self.sessions.get_cached_response,
+                            cache_key,
+                        )
+                    if cached is not None:
+                        original_usage = Usage.from_dict(cached.get("usage"))
+                        payload = cached.get("response") or {}
+                        usage = Usage(
+                            cost_status="known",
+                            application_cache_hits=1,
+                            application_cache_misses=cache_misses,
+                            application_cache_saved_tokens=original_usage.total_tokens,
+                            application_cache_saved_cost_usd=original_usage.cost_usd,
+                        )
+                        response = ModelResponse(
+                            text=str(payload.get("text") or ""),
+                            reasoning_summary=self._redact_reasoning_summary(
+                                str(payload.get("reasoning_summary") or "")
+                            ),
+                            usage=usage,
+                            stop_reason=payload.get("stop_reason"),
+                            model=str(payload.get("model") or route.model),
+                            raw={"application_cache": True},
+                            continuation_state=ContinuationState.from_metadata(
+                                payload.get("continuation_state"),
+                                provider=route.name,
+                                model=route.model,
+                            ),
+                        )
+                        await self.events.emit(
+                            "model.cache_hit",
+                            session_id=session_id,
+                            run_id=run_id,
+                            provider=route.name,
+                            model=route.model,
+                            saved_tokens=usage.application_cache_saved_tokens,
+                            saved_cost_usd=usage.application_cache_saved_cost_usd,
+                        )
+                        if emit_response_deltas and response.reasoning_summary:
+                            await self.events.emit(
+                                "model.reasoning_delta",
+                                session_id=session_id,
+                                run_id=run_id,
+                                message_id=assistant_message_id,
+                                text=response.reasoning_summary,
                                 provider=route.name,
                                 model=route.model,
                             )
-                            if continuation is not None:
-                                cached_response["continuation_state"] = continuation
-                        await asyncio.to_thread(
-                            self.sessions.put_cached_response,
-                            cache_key,
+                        if emit_response_deltas and response.text:
+                            await self.events.emit(
+                                "model.text_delta",
+                                session_id=session_id,
+                                run_id=run_id,
+                                message_id=assistant_message_id,
+                                text=response.text,
+                                provider=route.name,
+                                model=route.model,
+                            )
+                        if not failed_usage.is_empty:
+                            response.usage = failed_usage.add(response.usage)
+                        return response, route
+                    if self.config.cache.response_cache_enabled:
+                        cache_misses += 1
+                        await self.events.emit(
+                            "model.cache_miss",
+                            session_id=session_id,
+                            run_id=run_id,
                             provider=route.name,
                             model=route.model,
-                            response=cached_response,
-                            usage=response.usage,
-                            ttl_seconds=self.config.cache.response_cache_ttl_seconds,
-                            max_entries=self.config.cache.response_cache_max_entries,
                         )
-                if not failed_usage.is_empty:
-                    response.usage = failed_usage.add(response.usage)
-                if index:
+                    if budget:
+                        # Failed-route charges are already held in pending cost.
+                        # Recheck their completeness without counting them twice.
+                        budget.check_unsettled(replace(failed_usage, cost_usd=0.0))
+                    reservation = budget.reserve_cost(route.provider, routed) if budget else 0.0
+                    try:
+                        if index and budget:
+                            budget.before_model_request()
+                        response = await self._stream_route(
+                            route,
+                            routed,
+                            session_id,
+                            run_id,
+                            cancel,
+                            assistant_message_id,
+                            emit_response_deltas=emit_response_deltas,
+                            failed_usage_collector=failed_usage_collector,
+                            budget=budget,
+                        )
+                    finally:
+                        if budget:
+                            budget.release_cost(reservation)
+                    await self.events.emit("model.route_completed", session_id=session_id, run_id=run_id,
+                                           provider=route.name, model=response.model or routed.model,
+                                           usage=response.usage.to_dict())
+                    if self.config.cache.response_cache_enabled:
+                        response.usage.application_cache_misses += cache_misses
+                        if _is_cacheable_response(response):
+                            cached_response: dict[str, Any] = {
+                                "text": response.text,
+                                "reasoning_summary": response.reasoning_summary,
+                                "stop_reason": response.stop_reason,
+                                "model": response.model or route.model,
+                            }
+                            if response.continuation_state is not None:
+                                continuation = response.continuation_state.to_metadata(
+                                    provider=route.name,
+                                    model=route.model,
+                                )
+                                if continuation is not None:
+                                    cached_response["continuation_state"] = continuation
+                            await asyncio.to_thread(
+                                self.sessions.put_cached_response,
+                                cache_key,
+                                provider=route.name,
+                                model=route.model,
+                                response=cached_response,
+                                usage=response.usage,
+                                ttl_seconds=self.config.cache.response_cache_ttl_seconds,
+                                max_entries=self.config.cache.response_cache_max_entries,
+                            )
+                    if not failed_usage.is_empty:
+                        response.usage = failed_usage.add(response.usage)
+                    if index:
+                        await self.events.emit(
+                            "model.fallback_succeeded",
+                            session_id=session_id,
+                            run_id=run_id,
+                            provider=route.name,
+                            model=route.model,
+                        )
+                    return response, route
+                except (ProviderUnavailableError, ProviderRateLimitError) as error:
+                    errors.append(f"{route.name}/{route.model}: {error}")
+                    if error.usage is not None:
+                        failed_usage.add(error.usage)
+                        if budget:
+                            budget.pending_cost_usd += error.usage.cost_usd
+                            held_failed_cost += error.usage.cost_usd
                     await self.events.emit(
-                        "model.fallback_succeeded",
+                        "model.route_failed",
                         session_id=session_id,
                         run_id=run_id,
                         provider=route.name,
                         model=route.model,
+                        error=str(error),
+                        usage=error.usage.to_dict() if error.usage else None,
+                        retryable=True,
                     )
-                return response, route
-            except (ProviderUnavailableError, ProviderRateLimitError) as error:
-                errors.append(f"{route.name}/{route.model}: {error}")
-                if error.usage is not None:
-                    failed_usage.add(error.usage)
-                await self.events.emit(
-                    "model.route_failed",
-                    session_id=session_id,
-                    run_id=run_id,
-                    provider=route.name,
-                    model=route.model,
-                    error=str(error),
-                    usage=error.usage.to_dict() if error.usage else None,
-                    retryable=True,
-                )
-                continue
-            except ProviderError as error:
-                if not failed_usage.is_empty:
-                    if error.usage is not None:
-                        failed_usage.add(error.usage)
-                    error.usage = failed_usage
-                raise
-        raise ProviderUnavailableError(
-            "All provider routes failed: " + "; ".join(errors),
-            retryable=False,
-            usage=failed_usage if not failed_usage.is_empty else None,
-        )
+                    continue
+                except ProviderError as error:
+                    if not failed_usage.is_empty:
+                        if error.usage is not None:
+                            failed_usage.add(error.usage)
+                        error.usage = failed_usage
+                    raise
+            raise ProviderUnavailableError(
+                "All provider routes failed: " + "; ".join(errors),
+                retryable=False,
+                usage=failed_usage if not failed_usage.is_empty else None,
+            )
+        finally:
+            if budget:
+                budget.release_cost(held_failed_cost)
 
     def _response_cache_key(
         self,
@@ -3224,8 +3232,8 @@ class AgentRunner:
                     if isinstance(request_budget, Budget):
                         request_budget.release_cost(reservation)
             except (Cancelled, asyncio.CancelledError):
-                if cancelled_usage.is_empty:
-                    cancelled_usage = Usage(requests=1, cost_status="incomplete")
+                if request_task.done() and not request_task.cancelled() and request_task.exception() is None:
+                    cancelled_usage = request_task.result().usage
                 if not cancelled_usage.is_empty:
                     with contextlib.suppress(BudgetExceeded):
                         await finish_on_cancellation(record_failed_usage(cancelled_usage))
@@ -3337,11 +3345,11 @@ class AgentRunner:
             if budget:
                 budget.check_unsettled(failed_usage)
             actionable_emitted = False
+            completed: ModelResponse | None = None
             try:
 
                 async def consume() -> ModelResponse | None:
-                    nonlocal actionable_emitted
-                    completed: ModelResponse | None = None
+                    nonlocal actionable_emitted, completed
                     pending_reasoning: list[str] = []
                     reasoning_redactor = StreamingRedactor(self.events.redactor)
                     reasoning_committed = False
@@ -3380,6 +3388,8 @@ class AgentRunner:
 
                     try:
                         async for item in stream:
+                            if item.type == "completed" and item.response is not None:
+                                completed = item.response
                             self._check_cancel(cancel)
                             if item.type == "reasoning_summary_delta" and item.text:
                                 text = reasoning_redactor.feed(item.text)
@@ -3453,7 +3463,7 @@ class AgentRunner:
                     )
                 if completed.usage.is_empty:
                     completed.usage = Usage(requests=1, cost_status="incomplete")
-                route.provider.normalize_cost(completed.usage, model=completed.model or request.model)
+                route.provider.normalize_cost(completed.usage, model=route.provider.response_billing_model(completed.model))
                 completed.reasoning_summary = self._redact_reasoning_summary(
                     completed.reasoning_summary
                 )
@@ -3471,6 +3481,12 @@ class AgentRunner:
                 if not failed_usage.is_empty:
                     completed.usage = failed_usage.add(completed.usage)
                 return completed
+            except (Cancelled, asyncio.CancelledError):
+                usage = completed.usage if completed is not None else Usage(requests=1, cost_status="incomplete")
+                route.provider.normalize_cost(usage, model=route.provider.response_billing_model(completed.model if completed else None))
+                if failed_usage_collector is not None:
+                    failed_usage_collector.add(usage)
+                raise
             except ProviderError as error:
                 if error.usage is None and isinstance(error, ProviderUnavailableError):
                     error.usage = Usage(cost_status="incomplete")

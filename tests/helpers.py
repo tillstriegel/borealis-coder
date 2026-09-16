@@ -17,7 +17,7 @@ from borealis_coder.tools import ToolContext
 
 def make_config(root: Path, **sections):
     base = {
-        "agent": {"provider": "mock", "auto_verify": False, "max_cost_usd": 0},
+        "agent": {"provider": "mock", "auto_verify": False},
         "storage": {"directory": str(root / ".data")},
         "safety": {"approval": "never"},
     }

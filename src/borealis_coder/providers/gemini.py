@@ -321,7 +321,8 @@ class GeminiProvider(Provider):
                 requests=1,
                 native_usage=dict(usage_data),
                 cost_status="unknown" if {"total_input_tokens", "total_output_tokens"} <= usage_data.keys() else "incomplete",
-            )
+            ),
+            model=self.response_billing_model(data.get("model")),
         )
 
 

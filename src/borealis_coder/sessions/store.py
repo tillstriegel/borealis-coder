@@ -1408,8 +1408,9 @@ class SessionStore:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT sequence,payload_json FROM events WHERE session_id=? AND sequence>? "
-                "AND type='tool.completed' AND instr(payload_json,?)>0 ORDER BY sequence LIMIT 20",
-                (session_id, after, query),
+                "AND type='tool.completed' AND (instr(json_extract(payload_json,'$.data.output'),?)>0 "
+                "OR json_extract(payload_json,'$.data.tool_call_id')=?) ORDER BY sequence LIMIT 20",
+                (session_id, after, query, query),
             ).fetchall()
         results = []
         for row in rows:
@@ -1448,8 +1449,9 @@ class SessionStore:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT sequence,message_id,payload_json FROM messages "
-                "WHERE session_id=? AND sequence>? AND instr(payload_json,?)>0 ORDER BY sequence LIMIT ?",
-                (session_id, max(0, after), query, min(20, max(1, limit))),
+                "WHERE session_id=? AND sequence>? AND (instr(json_extract(payload_json,'$.content'),?)>0 "
+                "OR message_id=?) ORDER BY sequence LIMIT ?",
+                (session_id, max(0, after), query, query, min(20, max(1, limit))),
             ).fetchall()
         return [{"sequence": row["sequence"], "message_id": row["message_id"],
                  "preview": json.loads(row["payload_json"]).get("content", "")[:500]}

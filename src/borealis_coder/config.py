@@ -44,7 +44,7 @@ class AgentConfig:
     compact_at_ratio: float = 0.82
     max_output_tokens: int = 16_000
     max_time_seconds: int = 3_600
-    max_cost_usd: float = 25.0
+    max_cost_usd: float = 0.0
     parallel_reads: int = 8
     max_repeated_calls: int = 3
     auto_verify: bool = True

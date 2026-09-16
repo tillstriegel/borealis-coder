@@ -175,6 +175,7 @@ class AnthropicProvider(Provider):
         self.price_usage(
             usage,
             cache_write_multiplier=_cache_write_multiplier(request),
+            model=self.response_billing_model(model),
         )
         result = ModelResponse(
             text="".join(text_parts),
@@ -264,6 +265,7 @@ class AnthropicProvider(Provider):
                 cost_status="unknown" if {"input_tokens", "output_tokens"} <= usage_data.keys() else "incomplete",
             ),
             cache_write_multiplier=2.0 if cache_ttl == "1h" else 1.25,
+            model=self.response_billing_model(data.get("model")),
         )
         return ModelResponse(
             text="".join(text),

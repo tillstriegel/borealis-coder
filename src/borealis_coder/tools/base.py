@@ -287,10 +287,18 @@ def bound_tool_output(result: ToolResult, context: ToolContext, limit: int) -> T
             source=context.tool_call_id, redactor=context.events.redactor,
         )
         result.metadata["output_artifact"] = artifact
-    reference = "\nHistorical output artifact (read_artifact): " + json_dumps(artifact) if artifact is not None else ""
-    if reference and result.output.endswith(reference):
-        result.output = result.output[:-len(reference)]
-    result.output = truncate_text(result.output, limit) + reference
+    reference = ""
+    if artifact is not None:
+        candidates = ["\nHistorical output artifact (read_artifact): " + json_dumps(artifact)]
+        if artifact.get("artifact_id"):
+            candidates += ["\nread_artifact: " + artifact["artifact_id"], artifact["artifact_id"]]
+        for previous in candidates:
+            if result.output.endswith(previous):
+                result.output = result.output[:-len(previous)]
+                break
+        reference = next((item for item in candidates if len(item) <= limit), "")
+    body_limit = max(0, limit - len(reference))
+    result.output = (truncate_text(result.output, body_limit) if body_limit else "") + reference
     return result
 
 

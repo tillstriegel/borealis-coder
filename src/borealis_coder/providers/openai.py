@@ -27,20 +27,21 @@ class OpenAIProvider(Provider):
 
     @property
     def api_style(self) -> str:
-        return self.config.api_style or "responses"
+        style = self.config.api_style or "responses"
+        return "chat" if style == "chat_completions" else style
 
     def request_bytes(self, request: ProviderRequest) -> int:
         build = self._chat_payload if self.api_style == "chat" else self._responses_payload
         return max(len(json_dumps(build(request, stream=stream)).encode("utf-8")) for stream in (False, True))
 
     async def complete(self, request: ProviderRequest) -> ModelResponse:
-        if self.api_style in {"chat", "chat_completions"}:
+        if self.api_style == "chat":
             return await self.with_retries(lambda: self._complete_chat(request), request=request)
         return await self.with_retries(lambda: self._complete_responses(request), request=request)
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         self.request_model.set(request.model)
-        if self.api_style in {"chat", "chat_completions"}:
+        if self.api_style == "chat":
             async for event in self._stream_chat(request):
                 yield event
         else:
@@ -439,10 +440,8 @@ class OpenAIProvider(Provider):
                         ),
                     )
                 )
-        if data.get("model"):
-            self.request_model.set(str(data["model"]))
         usage_data = data.get("usage") or {}
-        usage = self._usage_from_responses(usage_data)
+        usage = self._usage_from_responses(usage_data, model=data.get("model"))
         raw: dict[str, Any] | None = data if retain_raw else None
         state = _extract_encrypted_reasoning_state(data)
         return ModelResponse(
@@ -694,10 +693,8 @@ class OpenAIProvider(Provider):
             model = data.get("model") or model
             response_id = data.get("id") or response_id
             if data.get("usage"):
-                if model:
-                    self.request_model.set(str(model))
                 usage_data = data["usage"]
-                usage = self._usage_from_chat(usage_data)
+                usage = self._usage_from_chat(usage_data, model=model)
             for choice in data.get("choices", []) or []:
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta") or {}
@@ -777,10 +774,8 @@ class OpenAIProvider(Provider):
                     raw_arguments=str(raw_arguments),
                 )
             )
-        if data.get("model"):
-            self.request_model.set(str(data["model"]))
         usage_data = data.get("usage") or {}
-        usage = self._usage_from_chat(usage_data)
+        usage = self._usage_from_chat(usage_data, model=data.get("model"))
         content = message.get("content") or message.get("refusal") or ""
         if isinstance(content, list):
             content = "".join(
@@ -797,7 +792,7 @@ class OpenAIProvider(Provider):
             reasoning_summary=_extract_chat_reasoning_summary(message),
         )
 
-    def _usage_from_responses(self, usage_data: dict[str, Any]) -> Usage:
+    def _usage_from_responses(self, usage_data: dict[str, Any], *, model: str | None = None) -> Usage:
         details = usage_data.get("input_tokens_details") or {}
         output_details = usage_data.get("output_tokens_details") or {}
         return self.price_usage(
@@ -813,9 +808,10 @@ class OpenAIProvider(Provider):
                 cost_status="known" if isinstance(usage_data.get("cost"), (int, float)) else "unknown" if {"input_tokens", "output_tokens"} <= usage_data.keys() else "incomplete",
             ),
             cache_write_multiplier=1.25 if self.name == "openai" else 1.0,
+            model=self.response_billing_model(model),
         )
 
-    def _usage_from_chat(self, usage_data: dict[str, Any]) -> Usage:
+    def _usage_from_chat(self, usage_data: dict[str, Any], *, model: str | None = None) -> Usage:
         details = usage_data.get("prompt_tokens_details") or {}
         output_details = usage_data.get("completion_tokens_details") or {}
         return self.price_usage(
@@ -831,6 +827,7 @@ class OpenAIProvider(Provider):
                 cost_status="known" if isinstance(usage_data.get("cost"), (int, float)) else "unknown" if {"prompt_tokens", "completion_tokens"} <= usage_data.keys() else "incomplete",
             ),
             cache_write_multiplier=1.25 if self.name == "openai" else 1.0,
+            model=self.response_billing_model(model),
         )
 
     def _explicit_cache_system_blocks(
@@ -880,7 +877,7 @@ class OpenAICompatibleProvider(OpenAIProvider):
 
     @property
     def api_style(self) -> str:
-        return self.config.api_style or "chat"
+        return super().api_style if self.config.api_style else "chat"
 
 
 def _cache_content_blocks(

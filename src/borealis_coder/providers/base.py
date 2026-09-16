@@ -104,10 +104,15 @@ class Provider(abc.ABC):
             try:
                 result = await operation()
                 if isinstance(result, ModelResponse):
-                    self.normalize_cost(result.usage, model=result.model or self.request_model.get())
+                    self.normalize_cost(result.usage, model=self.response_billing_model(result.model))
                 if isinstance(result, ModelResponse) and not prior_usage.is_empty:
                     result.usage = prior_usage.add(result.usage)
                 return result
+            except asyncio.CancelledError:
+                # This attempt was dispatched but returned no terminal usage.
+                if failed_usage_collector is not None:
+                    failed_usage_collector.add(Usage(requests=1, cost_status="incomplete"))
+                raise
             except ProviderError as error:
                 last_error = error
                 if error.usage is None and isinstance(error, ProviderUnavailableError):
@@ -179,6 +184,13 @@ class Provider(abc.ABC):
             else:
                 self.price_usage(usage, model=model)
         return usage
+
+    def response_billing_model(self, reported_model: str | None) -> str:
+        # Snapshots do not replace the priced alias. Explicit overrides and known
+        # server-side fallback models retain their own billing identity.
+        if reported_model and (reported_model in self.config.model_prices or reported_model in self.config.model_fallbacks):
+            return reported_model
+        return self.request_model.get()
 
     def prices(self, model: str) -> tuple[float, float, float | None, float | None] | None:
         override = self.config.model_prices.get(model)
