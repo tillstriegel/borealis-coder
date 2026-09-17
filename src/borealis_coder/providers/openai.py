@@ -544,6 +544,8 @@ class OpenAIProvider(Provider):
         except ProviderError as error:
             if not request.reasoning_effort or not _reasoning_controls_unsupported(error):
                 raise
+            if error.usage is not None:
+                prior_usage.add(error.usage)
         else:
             if _has_actionable_output(response):
                 return response
@@ -551,8 +553,10 @@ class OpenAIProvider(Provider):
                 raise ProviderUnavailableError(
                     "OpenAI-compatible provider returned an empty response",
                     retryable=True,
+                    usage=response.usage,
                 )
             prior_usage.add(response.usage)
+        self.before_recovery_request()
         try:
             response = await self._complete_chat_once(replace(request, reasoning_effort=None))
         except ProviderError as error:
@@ -570,12 +574,14 @@ class OpenAIProvider(Provider):
 
     async def _complete_chat_once(self, request: ProviderRequest) -> ModelResponse:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
-        response = await self.http.post_json(
-            url, headers=self._headers(), payload=self._chat_payload(request)
-        )
-        if not isinstance(response.data, dict):
-            raise ProviderError("OpenAI-compatible provider returned a non-object response")
-        return self._parse_chat(response.data, retain_raw=True)
+        payload = self._chat_payload(request)
+        with self.request_attempt() as record:
+            response = await self.http.post_json(url, headers=self._headers(), payload=payload)
+            if not isinstance(response.data, dict):
+                raise ProviderError("OpenAI-compatible provider returned a non-object response")
+            result = self._parse_chat(response.data, retain_raw=True)
+            record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
+            return result
 
     async def _stream_chat(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         actionable_output_emitted = False
@@ -617,11 +623,14 @@ class OpenAIProvider(Provider):
                 or not _reasoning_controls_unsupported(error)
             ):
                 raise
+            if error.usage is not None:
+                prior_usage.add(error.usage)
             empty_response = True
         if request.reasoning_effort and not actionable_output_emitted and empty_response:
             pending_reasoning.clear()
             fallback = replace(request, reasoning_effort=None)
             fallback_output_emitted = False
+            self.before_recovery_request()
             try:
                 async for event in self._stream_chat_once(fallback):
                     if event.type == "reasoning_summary_delta" and not fallback_output_emitted:
@@ -636,7 +645,7 @@ class OpenAIProvider(Provider):
                             yield event
                             return
                         if not _has_actionable_output(event.response):
-                            usage = _copy_usage(prior_usage).add(event.response.usage)
+                            usage = event.response.usage
                             event.response.reasoning_summary = ""
                             raise ProviderUnavailableError(
                                 "OpenAI-compatible provider returned an empty response "
@@ -670,86 +679,88 @@ class OpenAIProvider(Provider):
     ) -> AsyncIterator[ProviderStreamEvent]:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         payload = self._chat_payload(request, stream=True)
-        text_parts: list[str] = []
-        reasoning_summary_parts: list[str] = []
-        reasoning_summary_key: tuple[str, str] | None = None
-        calls: dict[int, dict[str, Any]] = {}
-        usage = Usage(requests=1, cost_status="incomplete")
-        model: str | None = None
-        response_id: str | None = None
-        finish_reason: str | None = None
-        async for item in self.http.stream_sse(url, headers=self._headers(), payload=payload):
-            if item.data == "[DONE]":
-                continue
-            try:
-                data = json.loads(item.data)
-            except json.JSONDecodeError:
-                continue
-            if data.get("error") or str(data.get("type") or "").lower() == "error":
-                _raise_in_band_failure(
-                    data,
-                    default_message="Chat Completions stream failed",
-                )
-            model = data.get("model") or model
-            response_id = data.get("id") or response_id
-            if data.get("usage"):
-                usage_data = data["usage"]
-                usage = self._usage_from_chat(usage_data, model=model)
-            for choice in data.get("choices", []) or []:
-                finish_reason = choice.get("finish_reason") or finish_reason
-                delta = choice.get("delta") or {}
-                for key, summary in _chat_reasoning_summaries(delta):
-                    if reasoning_summary_key is not None and key != reasoning_summary_key:
-                        separator = _reasoning_summary_separator(
-                            reasoning_summary_parts,
-                            summary,
+        with self.request_attempt() as record:
+            text_parts: list[str] = []
+            reasoning_summary_parts: list[str] = []
+            reasoning_summary_key: tuple[str, str] | None = None
+            calls: dict[int, dict[str, Any]] = {}
+            usage = Usage(requests=1, cost_status="incomplete")
+            model: str | None = None
+            response_id: str | None = None
+            finish_reason: str | None = None
+            async for item in self.http.stream_sse(url, headers=self._headers(), payload=payload):
+                if item.data == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(item.data)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("error") or str(data.get("type") or "").lower() == "error":
+                    _raise_in_band_failure(
+                        data,
+                        default_message="Chat Completions stream failed",
+                    )
+                model = data.get("model") or model
+                response_id = data.get("id") or response_id
+                if data.get("usage"):
+                    usage_data = data["usage"]
+                    usage = self._usage_from_chat(usage_data, model=model)
+                for choice in data.get("choices", []) or []:
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = choice.get("delta") or {}
+                    for key, summary in _chat_reasoning_summaries(delta):
+                        if reasoning_summary_key is not None and key != reasoning_summary_key:
+                            separator = _reasoning_summary_separator(
+                                reasoning_summary_parts,
+                                summary,
+                            )
+                            if separator:
+                                summary = separator + summary
+                        reasoning_summary_key = key
+                        reasoning_summary_parts.append(summary)
+                        yield ProviderStreamEvent(
+                            type="reasoning_summary_delta",
+                            text=summary,
                         )
-                        if separator:
-                            summary = separator + summary
-                    reasoning_summary_key = key
-                    reasoning_summary_parts.append(summary)
-                    yield ProviderStreamEvent(
-                        type="reasoning_summary_delta",
-                        text=summary,
-                    )
-                content = delta.get("content") or delta.get("refusal")
-                if content:
-                    text = str(content)
-                    text_parts.append(text)
-                    yield ProviderStreamEvent(type="text_delta", text=text)
-                for call_delta in delta.get("tool_calls", []) or []:
-                    index = int(call_delta.get("index", 0))
-                    call = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
-                    call["id"] = call_delta.get("id") or call["id"]
-                    function = call_delta.get("function") or {}
-                    call["name"] = function.get("name") or call["name"]
-                    call["arguments"] += str(function.get("arguments") or "")
-                    yield ProviderStreamEvent(
-                        type="tool_call_delta",
-                        data={
-                            "index": index,
-                            "id": call["id"],
-                            "name": call["name"],
-                            "delta": function.get("arguments", ""),
-                        },
-                    )
-        response_complete = finish_reason is not None and not _is_incomplete_stop_reason(
-            finish_reason
-        )
-        completed_calls = calls if response_complete else {}
-        result = ModelResponse(
-            text="".join(text_parts),
-            tool_calls=[
-                self._call_from_partial(item)
-                for _, item in sorted(completed_calls.items())
-            ],
-            usage=usage,
-            stop_reason=finish_reason or "incomplete",
-            response_id=response_id,
-            model=model,
-            reasoning_summary="".join(reasoning_summary_parts),
-        )
-        yield ProviderStreamEvent(type="completed", response=result)
+                    content = delta.get("content") or delta.get("refusal")
+                    if content:
+                        text = str(content)
+                        text_parts.append(text)
+                        yield ProviderStreamEvent(type="text_delta", text=text)
+                    for call_delta in delta.get("tool_calls", []) or []:
+                        index = int(call_delta.get("index", 0))
+                        call = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        call["id"] = call_delta.get("id") or call["id"]
+                        function = call_delta.get("function") or {}
+                        call["name"] = function.get("name") or call["name"]
+                        call["arguments"] += str(function.get("arguments") or "")
+                        yield ProviderStreamEvent(
+                            type="tool_call_delta",
+                            data={
+                                "index": index,
+                                "id": call["id"],
+                                "name": call["name"],
+                                "delta": function.get("arguments", ""),
+                            },
+                        )
+            response_complete = finish_reason is not None and not _is_incomplete_stop_reason(
+                finish_reason
+            )
+            completed_calls = calls if response_complete else {}
+            result = ModelResponse(
+                text="".join(text_parts),
+                tool_calls=[
+                    self._call_from_partial(item)
+                    for _, item in sorted(completed_calls.items())
+                ],
+                usage=usage,
+                stop_reason=finish_reason or "incomplete",
+                response_id=response_id,
+                model=model,
+                reasoning_summary="".join(reasoning_summary_parts),
+            )
+            record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
+            yield ProviderStreamEvent(type="completed", response=result)
 
     def _parse_chat(self, data: dict[str, Any], *, retain_raw: bool) -> ModelResponse:
         choices = data.get("choices") or []
@@ -1016,7 +1027,7 @@ def _attach_usage_to_error(error: ProviderError, usage: Usage) -> None:
 
 
 def _copy_usage(usage: Usage) -> Usage:
-    return replace(usage)
+    return replace(usage, attempt_usage=list(usage.attempt_usage))
 
 
 def _raise_in_band_failure(

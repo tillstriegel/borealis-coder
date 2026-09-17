@@ -5,7 +5,8 @@ from __future__ import annotations
 import abc
 import asyncio
 import random
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -31,12 +32,21 @@ class ProviderStreamEvent:
     response: ModelResponse | None = None
 
 
+@dataclass
+class _UsageObservation:
+    on_usage: Callable[[Usage], None] | None
+    check_usage: Callable[[], None] | None
+    before_recovery: Callable[[], None] | None = None
+    handled: bool = False
+
+
 class Provider(abc.ABC):
     name = "provider"
 
     def __init__(self, config: ProviderConfig, api_key: str = "") -> None:
         self.config = config
         self.api_key = api_key
+        self._usage_observation: ContextVar[_UsageObservation | None] = ContextVar("provider_usage_observation", default=None)
         self.billing_model = config.model
         self.request_model: ContextVar[str] = ContextVar("request_model", default=config.model)
         self._retry_task: ContextVar[asyncio.Task[Any] | None] = ContextVar(
@@ -67,6 +77,59 @@ class Provider(abc.ABC):
         route = request.metadata.get("provider_route")
         return route if isinstance(route, str) and route else self.name
 
+    @contextmanager
+    def observe_requests(
+        self, on_usage: Callable[[Usage], None] | None,
+        check_usage: Callable[[], None] | None,
+        before_recovery: Callable[[], None] | None = None,
+    ) -> Iterator[_UsageObservation]:
+        existing = self._usage_observation.get()
+        observation = existing or _UsageObservation(on_usage, check_usage, before_recovery)
+        token = self._usage_observation.set(observation)
+        try:
+            yield observation
+        finally:
+            self._usage_observation.reset(token)
+
+    def before_recovery_request(self) -> None:
+        observation = self._usage_observation.get()
+        if observation is not None:
+            if observation.check_usage is not None:
+                observation.check_usage()
+            if observation.before_recovery is not None:
+                observation.before_recovery()
+
+    @contextmanager
+    def request_attempt(self) -> Iterator[Callable[[Usage], None]]:
+        """Report a wire attempt before returning control to an aggregate wrapper."""
+        observation = self._usage_observation.get()
+        if observation is not None:
+            observation.handled = True
+        recorded = False
+
+        def record(usage: Usage) -> None:
+            nonlocal recorded
+            if recorded:
+                return
+            recorded = True
+            if observation is not None and observation.on_usage is not None:
+                observation.on_usage(usage)
+
+        try:
+            yield record
+        except (TimeoutError, OSError) as error:
+            usage = Usage(requests=1, cost_status="incomplete")
+            record(usage)
+            raise ProviderUnavailableError(str(error), retryable=True, usage=usage) from error
+        except ProviderError as error:
+            if error.usage is None:
+                error.usage = Usage(cost_status="incomplete")
+            record(self.normalize_cost(error.usage))
+            raise
+        finally:
+            if not recorded:
+                record(Usage(requests=1, cost_status="incomplete"))
+
     async def with_retries(
         self,
         operation: Callable[[], Awaitable[T]],
@@ -75,6 +138,7 @@ class Provider(abc.ABC):
         request: ProviderRequest | None = None,
         check_usage: Callable[[Usage], None] | None = None,
         on_usage: Callable[[Usage], None] | None = None,
+        before_recovery: Callable[[], None] | None = None,
     ) -> T:
         """Share one retry loop across nested wrappers in the same task."""
         task = asyncio.current_task()
@@ -83,7 +147,7 @@ class Provider(abc.ABC):
         model_token = self.request_model.set(request.model if request else self.request_model.get())
         token = self._retry_task.set(task)
         try:
-            return await self._retry_operation(operation, failed_usage_collector=failed_usage_collector, check_usage=check_usage, on_usage=on_usage)
+            return await self._retry_operation(operation, failed_usage_collector=failed_usage_collector, check_usage=check_usage, on_usage=on_usage, before_recovery=before_recovery)
         finally:
             self._retry_task.reset(token)
             self.request_model.reset(model_token)
@@ -95,6 +159,7 @@ class Provider(abc.ABC):
         failed_usage_collector: Usage | None = None,
         check_usage: Callable[[Usage], None] | None = None,
         on_usage: Callable[[Usage], None] | None = None,
+        before_recovery: Callable[[], None] | None = None,
     ) -> T:
         attempts = max(0, self.config.max_retries) + 1
         delay = max(0.0, self.config.initial_backoff_seconds)
@@ -103,52 +168,54 @@ class Provider(abc.ABC):
         for attempt in range(attempts):
             if check_usage is not None:
                 check_usage(prior_usage)
-            try:
-                result = await operation()
-                if isinstance(result, ModelResponse):
-                    self.normalize_cost(result.usage, model=self.response_billing_model(result.model))
-                    if on_usage is not None:
-                        on_usage(result.usage)
-                if isinstance(result, ModelResponse) and not prior_usage.is_empty:
-                    result.usage = prior_usage.add(result.usage)
-                return result
-            except asyncio.CancelledError:
-                # This attempt was dispatched but returned no terminal usage.
-                incomplete = Usage(requests=1, cost_status="incomplete")
-                if on_usage is not None:
-                    on_usage(incomplete)
-                if failed_usage_collector is not None:
-                    failed_usage_collector.add(incomplete)
-                raise
-            except ProviderError as error:
-                last_error = error
-                if error.usage is None and isinstance(error, ProviderUnavailableError):
-                    error.usage = Usage(cost_status="incomplete")
-                if error.usage is not None:
-                    self.normalize_cost(error.usage)
-                    if on_usage is not None:
-                        on_usage(error.usage)
+            with self.observe_requests(on_usage, (lambda: check_usage(prior_usage)) if check_usage else None,
+                                       before_recovery) as observation:
+                try:
+                    result = await operation()
+                    if isinstance(result, ModelResponse):
+                        self.normalize_cost(result.usage, model=self.response_billing_model(result.model))
+                        if on_usage is not None and not observation.handled:
+                            on_usage(result.usage)
+                    if isinstance(result, ModelResponse) and not prior_usage.is_empty:
+                        result.usage = prior_usage.add(result.usage)
+                    return result
+                except asyncio.CancelledError:
+                    # This attempt was dispatched but returned no terminal usage.
+                    incomplete = Usage(requests=1, cost_status="incomplete")
+                    if on_usage is not None and not observation.handled:
+                        on_usage(incomplete)
                     if failed_usage_collector is not None:
-                        failed_usage_collector.add(error.usage)
-                    prior_usage.add(error.usage)
-                if not error.retryable or attempt + 1 >= attempts:
-                    if not prior_usage.is_empty:
-                        error.usage = prior_usage
+                        failed_usage_collector.add(incomplete)
                     raise
-            except (TimeoutError, OSError) as error:
-                last_error = error
-                incomplete = Usage(cost_status="incomplete")
-                prior_usage.add(incomplete)
-                if on_usage is not None:
-                    on_usage(incomplete)
-                if failed_usage_collector is not None:
-                    failed_usage_collector.add(incomplete)
-                if attempt + 1 >= attempts:
-                    raise ProviderUnavailableError(
-                        str(error),
-                        retryable=True,
-                        usage=prior_usage if not prior_usage.is_empty else None,
-                    ) from error
+                except ProviderError as error:
+                    last_error = error
+                    if error.usage is None and isinstance(error, ProviderUnavailableError):
+                        error.usage = Usage(cost_status="incomplete")
+                    if error.usage is not None:
+                        self.normalize_cost(error.usage)
+                        if on_usage is not None and not observation.handled:
+                            on_usage(error.usage)
+                        if failed_usage_collector is not None:
+                            failed_usage_collector.add(error.usage)
+                        prior_usage.add(error.usage)
+                    if not error.retryable or attempt + 1 >= attempts:
+                        if not prior_usage.is_empty:
+                            error.usage = prior_usage
+                        raise
+                except (TimeoutError, OSError) as error:
+                    last_error = error
+                    incomplete = Usage(cost_status="incomplete")
+                    prior_usage.add(incomplete)
+                    if on_usage is not None and not observation.handled:
+                        on_usage(incomplete)
+                    if failed_usage_collector is not None:
+                        failed_usage_collector.add(incomplete)
+                    if attempt + 1 >= attempts:
+                        raise ProviderUnavailableError(
+                            str(error),
+                            retryable=True,
+                            usage=prior_usage if not prior_usage.is_empty else None,
+                        ) from error
             sleep_for = min(self.config.max_backoff_seconds, delay)
             sleep_for *= random.uniform(0.8, 1.2)
             await asyncio.sleep(sleep_for)

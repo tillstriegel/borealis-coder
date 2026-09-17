@@ -3221,6 +3221,7 @@ class AgentRunner:
             request_task = asyncio.create_task(route.provider.with_retries(
                 lambda: route.provider.complete(request),
                 on_usage=observe_usage,
+                before_recovery=before_model_request,
                 request=request,
                 check_usage=(lambda _: request_budget.check_unsettled(cancelled_usage)) if isinstance(request_budget, Budget) else None,
             ))
@@ -3380,190 +3381,198 @@ class AgentRunner:
 
             def record_attempt(usage: Usage) -> None:
                 nonlocal recorded
-                if recorded:
+                if recorded or observation.handled:
                     return
                 recorded = True
+                record_usage(usage)
+
+            def record_usage(usage: Usage) -> None:
                 if usage_collector is not None:
                     usage_collector.add(usage)
                     if budget:
                         budget.hold_usage(usage_collector)
-            try:
+            with route.provider.observe_requests(
+                record_usage,
+                (lambda: budget.check_unsettled(usage_collector if usage_collector is not None else failed_usage)) if budget else None,
+                budget.before_model_request if budget else None,
+            ) as observation:
+                try:
 
-                async def consume() -> ModelResponse | None:
-                    nonlocal actionable_emitted, completed
-                    pending_reasoning: list[str] = []
-                    reasoning_redactor = StreamingRedactor(self.events.redactor)
-                    reasoning_committed = False
-                    stream = route.provider.stream(request).__aiter__()
+                    async def consume() -> ModelResponse | None:
+                        nonlocal actionable_emitted, completed
+                        pending_reasoning: list[str] = []
+                        reasoning_redactor = StreamingRedactor(self.events.redactor)
+                        reasoning_committed = False
+                        stream = route.provider.stream(request).__aiter__()
 
-                    async def emit_reasoning(text: str) -> None:
-                        if not emit_response_deltas or not text:
-                            return
-                        await self.events.emit(
-                            "model.reasoning_delta",
-                            session_id=session_id,
-                            run_id=run_id,
-                            message_id=assistant_message_id,
-                            text=text,
-                            provider=route.name,
-                            model=route.model,
-                        )
-
-                    async def commit_reasoning() -> None:
-                        nonlocal reasoning_committed
-                        if reasoning_committed:
-                            return
-                        pending_reasoning.append(
-                            reasoning_redactor.flush(mask_incomplete=True)
-                        )
-                        for text in pending_reasoning:
-                            await emit_reasoning(text)
-                        pending_reasoning.clear()
-                        reasoning_committed = True
-
-                    async def flush_committed_reasoning() -> None:
-                        if reasoning_committed:
-                            await emit_reasoning(
-                                reasoning_redactor.flush(mask_incomplete=True)
+                        async def emit_reasoning(text: str) -> None:
+                            if not emit_response_deltas or not text:
+                                return
+                            await self.events.emit(
+                                "model.reasoning_delta",
+                                session_id=session_id,
+                                run_id=run_id,
+                                message_id=assistant_message_id,
+                                text=text,
+                                provider=route.name,
+                                model=route.model,
                             )
 
-                    try:
-                        async for item in stream:
-                            if item.type == "completed" and item.response is not None:
-                                completed = item.response
-                                if completed.usage.is_empty:
-                                    completed.usage = Usage(requests=1, cost_status="incomplete")
-                                route.provider.normalize_cost(completed.usage, model=route.provider.response_billing_model(completed.model))
-                                record_attempt(completed.usage)
-                            self._check_cancel(cancel)
-                            if item.type == "reasoning_summary_delta" and item.text:
-                                text = reasoning_redactor.feed(item.text)
-                                if reasoning_committed:
-                                    await emit_reasoning(text)
-                                else:
-                                    pending_reasoning.append(text)
-                                continue
+                        async def commit_reasoning() -> None:
+                            nonlocal reasoning_committed
+                            if reasoning_committed:
+                                return
+                            pending_reasoning.append(
+                                reasoning_redactor.flush(mask_incomplete=True)
+                            )
+                            for text in pending_reasoning:
+                                await emit_reasoning(text)
+                            pending_reasoning.clear()
+                            reasoning_committed = True
 
-                            if item.type == "text_delta" and item.text:
-                                await commit_reasoning()
-                                actionable_emitted = True
-                                if emit_response_deltas:
+                        async def flush_committed_reasoning() -> None:
+                            if reasoning_committed:
+                                await emit_reasoning(
+                                    reasoning_redactor.flush(mask_incomplete=True)
+                                )
+
+                        try:
+                            async for item in stream:
+                                if item.type == "completed" and item.response is not None:
+                                    completed = item.response
+                                    if completed.usage.is_empty:
+                                        completed.usage = Usage(requests=1, cost_status="incomplete")
+                                    route.provider.normalize_cost(completed.usage, model=route.provider.response_billing_model(completed.model))
+                                    record_attempt(completed.usage)
+                                self._check_cancel(cancel)
+                                if item.type == "reasoning_summary_delta" and item.text:
+                                    text = reasoning_redactor.feed(item.text)
+                                    if reasoning_committed:
+                                        await emit_reasoning(text)
+                                    else:
+                                        pending_reasoning.append(text)
+                                    continue
+
+                                if item.type == "text_delta" and item.text:
+                                    await commit_reasoning()
+                                    actionable_emitted = True
+                                    if emit_response_deltas:
+                                        await self.events.emit(
+                                            "model.text_delta",
+                                            session_id=session_id,
+                                            run_id=run_id,
+                                            message_id=assistant_message_id,
+                                            text=item.text,
+                                            provider=route.name,
+                                            model=route.model,
+                                        )
+                                elif item.type == "tool_call_delta":
+                                    await commit_reasoning()
+                                    actionable_emitted = True
                                     await self.events.emit(
-                                        "model.text_delta",
+                                        "model.tool_call_delta",
                                         session_id=session_id,
                                         run_id=run_id,
-                                        message_id=assistant_message_id,
-                                        text=item.text,
                                         provider=route.name,
                                         model=route.model,
+                                        **item.data,
                                     )
-                            elif item.type == "tool_call_delta":
-                                await commit_reasoning()
-                                actionable_emitted = True
-                                await self.events.emit(
-                                    "model.tool_call_delta",
-                                    session_id=session_id,
-                                    run_id=run_id,
-                                    provider=route.name,
-                                    model=route.model,
-                                    **item.data,
-                                )
-                            elif item.type == "completed" and item.response is not None:
-                                if item.response.text or item.response.tool_calls:
-                                    await commit_reasoning()
-                                else:
-                                    await flush_committed_reasoning()
-                                completed = item.response
-                    finally:
-                        await flush_committed_reasoning()
-                        close = getattr(stream, "aclose", None)
-                        if close is not None:
-                            with contextlib.suppress(Exception):
-                                await close()
-                    return completed
+                                elif item.type == "completed" and item.response is not None:
+                                    if item.response.text or item.response.tool_calls:
+                                        await commit_reasoning()
+                                    else:
+                                        await flush_committed_reasoning()
+                                    completed = item.response
+                        finally:
+                            await flush_committed_reasoning()
+                            close = getattr(stream, "aclose", None)
+                            if close is not None:
+                                with contextlib.suppress(Exception):
+                                    await close()
+                        return completed
 
-                stream_task = asyncio.create_task(consume())
-                cancel_task = asyncio.create_task(cancel.wait())
-                try:
-                    done, _ = await asyncio.wait(
-                        {stream_task, cancel_task},
-                        return_when=asyncio.FIRST_COMPLETED,
+                    stream_task = asyncio.create_task(consume())
+                    cancel_task = asyncio.create_task(cancel.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {stream_task, cancel_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if cancel_task in done and cancel.is_set():
+                            raise Cancelled("Run cancelled")
+                        completed = await stream_task
+                    finally:
+                        cancel_task.cancel()
+                        if not stream_task.done():
+                            stream_task.cancel()
+                        await asyncio.gather(
+                            stream_task,
+                            cancel_task,
+                            return_exceptions=True,
+                        )
+                    if completed is None:
+                        raise ProviderUnavailableError(
+                            f"Provider {route.name} stream ended without a completed response",
+                            retryable=True,
+                        )
+                    if completed.usage.is_empty:
+                        completed.usage = Usage(requests=1, cost_status="incomplete")
+                    route.provider.normalize_cost(completed.usage, model=route.provider.response_billing_model(completed.model))
+                    completed.reasoning_summary = self._redact_reasoning_summary(
+                        completed.reasoning_summary
                     )
-                    if cancel_task in done and cancel.is_set():
-                        raise Cancelled("Run cancelled")
-                    completed = await stream_task
-                finally:
-                    cancel_task.cancel()
-                    if not stream_task.done():
-                        stream_task.cancel()
-                    await asyncio.gather(
-                        stream_task,
-                        cancel_task,
-                        return_exceptions=True,
-                    )
-                if completed is None:
-                    raise ProviderUnavailableError(
-                        f"Provider {route.name} stream ended without a completed response",
-                        retryable=True,
-                    )
-                if completed.usage.is_empty:
-                    completed.usage = Usage(requests=1, cost_status="incomplete")
-                route.provider.normalize_cost(completed.usage, model=route.provider.response_billing_model(completed.model))
-                completed.reasoning_summary = self._redact_reasoning_summary(
-                    completed.reasoning_summary
-                )
-                if (
-                    not completed.text
-                    and not completed.tool_calls
-                    and not completed.incomplete
-                ):
-                    usage = replace(completed.usage)
-                    raise ProviderUnavailableError(
-                        f"Provider {route.name} returned an empty response",
-                        retryable=True,
-                        usage=usage if not usage.is_empty else None,
-                    )
-                if not failed_usage.is_empty:
-                    completed.usage = failed_usage.add(completed.usage)
-                return completed
-            except (Cancelled, asyncio.CancelledError):
-                usage = completed.usage if completed is not None else Usage(requests=1, cost_status="incomplete")
-                route.provider.normalize_cost(usage, model=route.provider.response_billing_model(completed.model if completed else None))
-                record_attempt(usage)
-                raise
-            except ProviderError as error:
-                if error.usage is None and isinstance(error, ProviderUnavailableError):
-                    error.usage = Usage(cost_status="incomplete")
-                if error.usage is not None:
-                    route.provider.normalize_cost(error.usage)
-                    record_attempt(error.usage)
-                    failed_usage.add(error.usage)
-                if (
-                    not isinstance(error, (ProviderUnavailableError, ProviderRateLimitError))
-                    or actionable_emitted
-                    or not error.retryable
-                    or attempt + 1 >= attempts
-                ):
+                    if (
+                        not completed.text
+                        and not completed.tool_calls
+                        and not completed.incomplete
+                    ):
+                        usage = replace(completed.usage)
+                        raise ProviderUnavailableError(
+                            f"Provider {route.name} returned an empty response",
+                            retryable=True,
+                            usage=usage if not usage.is_empty else None,
+                        )
                     if not failed_usage.is_empty:
-                        error.usage = failed_usage
+                        completed.usage = failed_usage.add(completed.usage)
+                    return completed
+                except (Cancelled, asyncio.CancelledError):
+                    usage = completed.usage if completed is not None else Usage(requests=1, cost_status="incomplete")
+                    route.provider.normalize_cost(usage, model=route.provider.response_billing_model(completed.model if completed else None))
+                    record_attempt(usage)
                     raise
-                retry_delay = min(
-                    route.provider.config.max_backoff_seconds,
-                    max(0.25, delay),
-                )
-                await self.events.emit(
-                    "model.retrying",
-                    session_id=session_id,
-                    run_id=run_id,
-                    provider=route.name,
-                    model=route.model,
-                    attempt=attempt + 2,
-                    max_attempts=attempts,
-                    delay_seconds=retry_delay,
-                    error=str(error),
-                )
-                await self._await_until_cancelled(asyncio.sleep(retry_delay), cancel)
-                delay = max(0.25, delay * 2)
+                except ProviderError as error:
+                    if error.usage is None and isinstance(error, ProviderUnavailableError):
+                        error.usage = Usage(cost_status="incomplete")
+                    if error.usage is not None:
+                        route.provider.normalize_cost(error.usage)
+                        record_attempt(error.usage)
+                        failed_usage.add(error.usage)
+                    if (
+                        not isinstance(error, (ProviderUnavailableError, ProviderRateLimitError))
+                        or actionable_emitted
+                        or not error.retryable
+                        or attempt + 1 >= attempts
+                    ):
+                        if not failed_usage.is_empty:
+                            error.usage = failed_usage
+                        raise
+                    retry_delay = min(
+                        route.provider.config.max_backoff_seconds,
+                        max(0.25, delay),
+                    )
+                    await self.events.emit(
+                        "model.retrying",
+                        session_id=session_id,
+                        run_id=run_id,
+                        provider=route.name,
+                        model=route.model,
+                        attempt=attempt + 2,
+                        max_attempts=attempts,
+                        delay_seconds=retry_delay,
+                        error=str(error),
+                    )
+                    await self._await_until_cancelled(asyncio.sleep(retry_delay), cancel)
+                    delay = max(0.25, delay * 2)
         raise ProviderUnavailableError(
             f"Provider {route.name} exhausted retries",
             retryable=False,

@@ -128,6 +128,7 @@ class DelegateTaskTool(Tool):
                     response = await route.provider.with_retries(
                         lambda request=request: route.provider.complete(request),
                         on_usage=observe_usage,
+                        before_recovery=before_model_request if callable(before_model_request) else None,
                         request=request,
                         check_usage=(lambda _, observed=cancelled_usage: budget.check_unsettled(observed)) if budget else None,
                     )

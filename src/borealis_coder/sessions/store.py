@@ -1324,7 +1324,9 @@ class SessionStore:
         for index, message in enumerate(instructions):
             # Only an explicit user source reference changes durable status.
             # Free-form revocations remain ordered user instructions, never guesses.
-            for match in re.finditer(r"(?im)^(?:revoke|supersede) user:(\d+)(?=[.:\s]|$)", message.content):
+            # Only a leading, unquoted command has destructive meaning. Examples
+            # elsewhere in a message remain ordinary chronological instructions.
+            for match in re.finditer(r"\A(?:revoke|supersede) user:(\d+)(?=[.:](?:\s|$)|\r?\n|[ \t]*$)", message.content.strip("\r\n"), re.IGNORECASE):
                 target = int(match.group(1)) - 1
                 if 0 <= target < index:
                     superseded[instructions[target].id] = message.id
@@ -1408,9 +1410,11 @@ class SessionStore:
                 "content": content[offset:end]}
 
     def search_tool_history(
-        self, session_id: str, workspace: Path, query: str, *, after: int = 0,
+        self, session_id: str, workspace: Path, query: str, *, after: int = 0, offset: int = 0,
     ) -> list[dict[str, Any]]:
         self.authorize_workspace(session_id, workspace)
+        if offset < 0:
+            raise SessionError("History offset must be nonnegative")
         with self._lock:
             rows = self._connection.execute(
                 "SELECT sequence,payload_json FROM events WHERE session_id=? AND sequence>? "
@@ -1423,9 +1427,12 @@ class SessionStore:
             payload = json.loads(row["payload_json"])
             data = payload.get("data", {})
             output = str(data.get("output", ""))
-            offset = max(0, output.find(query))
+            start = min(offset, len(output)) if data.get("tool_call_id") == query else max(0, output.find(query))
+            end = min(len(output), start + 1000)
             results.append({"sequence": row["sequence"], "source": data.get("tool_call_id"),
-                            "preview": output[offset:offset + 1000], "metadata": data.get("metadata", {})})
+                            "preview": output[start:end], "offset": start,
+                            "next_offset": end if end < len(output) else None,
+                            "total_chars": len(output), "metadata": data.get("metadata", {})})
         return results
 
     def search_output_artifacts(

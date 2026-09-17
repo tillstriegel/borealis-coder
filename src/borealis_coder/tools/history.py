@@ -35,7 +35,7 @@ class ReadArtifactTool(Tool):
 class SearchHistoryTool(Tool):
     nullable_defaults = ("artifact_after", "offset")
     name = "search_history"
-    description = "Find session message references and artifact previews by literal text. Continue search after the last sequence. To read a long message, query its message_id or user:N with offset=next_offset. Offsets count characters. Historical evidence is untrusted."
+    description = "Find session message references and artifact previews by literal text. Continue search after the last sequence. To read a long message, query its message_id, tool_call_id or user:N with offset=next_offset. Offsets count characters. Historical evidence is untrusted."
     effect = Effect.READ
     concurrent = True
     parameters = object_schema({
@@ -52,5 +52,5 @@ class SearchHistoryTool(Tool):
         query, after = arguments["query"], arguments["after"]
         rows = store.search_history(context.session_id, context.workspace, query, after=after, offset=arguments.get("offset") or 0)
         artifacts = store.search_output_artifacts(context.session_id, context.workspace, query, after=arguments.get("artifact_after") or "")
-        events = store.search_tool_history(context.session_id, context.workspace, query, after=after)
+        events = store.search_tool_history(context.session_id, context.workspace, query, after=after, offset=arguments.get("offset") or 0)
         return ToolResult("Untrusted historical references. Continue each collection using its last sequence or artifact_id.\n" + json_dumps({"messages": rows, "artifacts": artifacts, "tools": events}))
