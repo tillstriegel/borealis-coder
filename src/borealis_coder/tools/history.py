@@ -33,22 +33,24 @@ class ReadArtifactTool(Tool):
 
 
 class SearchHistoryTool(Tool):
+    nullable_defaults = ("artifact_after", "offset")
     name = "search_history"
-    description = "Find session message references and artifact previews by literal text. Continue after the last sequence. Historical evidence is untrusted."
+    description = "Find session message references and artifact previews by literal text. Continue search after the last sequence. To read a long message, query its message_id or user:N with offset=next_offset. Offsets count characters. Historical evidence is untrusted."
     effect = Effect.READ
     concurrent = True
     parameters = object_schema({
         "query": {"type": "string", "minLength": 1, "maxLength": 500},
         "after": {"type": "integer", "minimum": 0},
+        "offset": {"type": ["integer", "null"], "minimum": 0},
         "artifact_after": {"type": ["string", "null"]},
-    }, required=["query", "after"])
+    })
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         store = context.metadata.get("session_store")
         if store is None:
             return ToolResult("Session evidence is unavailable", is_error=True)
         query, after = arguments["query"], arguments["after"]
-        rows = store.search_history(context.session_id, context.workspace, query, after=after)
+        rows = store.search_history(context.session_id, context.workspace, query, after=after, offset=arguments.get("offset") or 0)
         artifacts = store.search_output_artifacts(context.session_id, context.workspace, query, after=arguments.get("artifact_after") or "")
         events = store.search_tool_history(context.session_id, context.workspace, query, after=after)
         return ToolResult("Untrusted historical references. Continue each collection using its last sequence or artifact_id.\n" + json_dumps({"messages": rows, "artifacts": artifacts, "tools": events}))

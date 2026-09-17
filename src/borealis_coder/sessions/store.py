@@ -1134,6 +1134,12 @@ class SessionStore:
         )
         if cursor.rowcount == 0:
             raise SessionError(f"Unknown session: {session_id}")
+        for attempt in usage.attempt_usage:
+            event = Event(type="model.attempt_usage", session_id=session_id, data=attempt)
+            self._connection.execute(
+                "INSERT INTO events(event_id,session_id,run_id,type,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+                (event.id, session_id, None, event.type, json_dumps(event.to_dict()), event.created_at),
+            )
 
     def put_pending_compaction_summary(
         self,
@@ -1437,24 +1443,39 @@ class SessionStore:
 
     def search_history(
         self, session_id: str, workspace: Path, query: str, *, after: int = 0, limit: int = 20,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         self.authorize_workspace(session_id, workspace)
+        if not query or len(query) > 500 or offset < 0:
+            raise SessionError("History query must contain 1-500 characters and offset must be nonnegative")
+
+        def excerpt(content: str, *, exact: bool) -> dict[str, Any]:
+            start = min(offset, len(content))
+            if not exact:
+                match = content.find(query, start)
+                start = max(start, match - max(0, (500 - len(query)) // 2))
+            end = min(len(content), start + (8000 if exact else 500))
+            return {"preview": content[start:end], "offset": start,
+                    "next_offset": end if end < len(content) else None,
+                    "total_chars": len(content)}
+
         if query.startswith("user:") and query[5:].isdigit():
             instructions = self.task_state(session_id)["instructions"]
             index = int(query[5:]) - 1
             if 0 <= index < len(instructions):
                 item = instructions[index]
-                return [{"source": query, "message_id": item["source"], "preview": item["text"][:8000]}]
+                return [{"source": query, "message_id": item["source"],
+                         **excerpt(item["text"], exact=True)}]
             return []
         with self._lock:
             rows = self._connection.execute(
                 "SELECT sequence,message_id,payload_json FROM messages "
-                "WHERE session_id=? AND sequence>? AND (instr(json_extract(payload_json,'$.content'),?)>0 "
+                "WHERE session_id=? AND sequence>? AND (instr(substr(json_extract(payload_json,'$.content'),?),?)>0 "
                 "OR message_id=?) ORDER BY sequence LIMIT ?",
-                (session_id, max(0, after), query, query, min(20, max(1, limit))),
+                (session_id, max(0, after), offset + 1, query, query, min(20, max(1, limit))),
             ).fetchall()
         return [{"sequence": row["sequence"], "message_id": row["message_id"],
-                 "preview": json.loads(row["payload_json"]).get("content", "")[:500]}
+                 **excerpt(json.loads(row["payload_json"]).get("content", ""), exact=row["message_id"] == query)}
                 for row in rows]
 
     def set_value(self, session_id: str, key: str, value: Any) -> None:

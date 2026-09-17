@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
 from ..config import AgentConfig
-from ..errors import BudgetExceeded
+from ..errors import BudgetExceeded, RouteContextExceeded
 from ..models import Message, ProviderRequest, Usage
 from ..providers.base import Provider
 from ..util import estimate_tokens, json_dumps, monotonic_ms
@@ -372,6 +372,7 @@ def prepare_route_request(request: ProviderRequest, provider: Provider, config: 
     messages, _ = prune_provider_messages(request.messages)
     system = request.system
     byte_limit = limits["request_byte_limit"]
+    capacity_error = RouteContextExceeded if context_limit < config.max_input_tokens or byte_limit else BudgetExceeded
 
     def fits(items: list[Message], prompt: str) -> bool:
         current = ContextBudget.calculate(effective, system=prompt, tools=budget_tools, messages=items, provider=provider.name)
@@ -389,7 +390,7 @@ def prepare_route_request(request: ProviderRequest, provider: Provider, config: 
         return True
 
     if not fits([], system):
-        raise BudgetExceeded("context", "Protected task state, instructions and tool schemas exceed the route budget")
+        raise capacity_error("context", "Protected task state, instructions and tool schemas exceed the route budget")
     compacted = False
     if not fits(messages, system):
         # Scoped helpers have only their own user instructions, never the parent transcript.
@@ -399,20 +400,20 @@ def prepare_route_request(request: ProviderRequest, provider: Provider, config: 
         budget = ContextBudget.calculate(effective, system=system, tools=budget_tools, messages=messages, provider=provider.name)
         available = context_limit - output - budget.safety_margin_tokens - budget.provider_framing_tokens - budget.system_tokens - budget.tool_schema_tokens
         if available <= 0 or not fits([], system):
-            raise BudgetExceeded("context", "Protected task requirements cannot fit the safe route budget")
+            raise capacity_error("context", "Protected task requirements cannot fit the safe route budget")
         try:
             messages = compact_messages(messages, force=True, keep_recent=1,
                                         target_tokens=max(1, int(available * 0.8)),
                                         target_bytes=max(1, byte_limit - estimate_request_bytes(system, [], budget_tools)) if byte_limit else 0)
         except CompactionError as error:
-            raise BudgetExceeded("context", "Route context cannot be compacted within its safe budget") from error
+            raise capacity_error("context", "Route context cannot be compacted within its safe budget") from error
         if messages and messages[0].metadata.get("compacted"):
             system += "\n\n" + messages[0].content
             messages = messages[1:]
         compacted = True
     validate_tool_call_order(messages)
     if not fits(messages, system):
-        raise BudgetExceeded("context", "Prepared request exceeds the actual model/endpoint limits")
+        raise capacity_error("context", "Prepared request exceeds the actual model/endpoint limits")
     metadata = dict(request.metadata)
     if compacted:
         metadata.pop("system_blocks", None)

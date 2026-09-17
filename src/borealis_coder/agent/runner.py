@@ -16,7 +16,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
 
-from ..config import Config
+from ..config import AgentConfig, Config
 from ..context import ContextBuilder, PromptContext
 from ..errors import (
     BudgetExceeded,
@@ -25,6 +25,7 @@ from ..errors import (
     ProviderError,
     ProviderRateLimitError,
     ProviderUnavailableError,
+    RouteContextExceeded,
     SessionError,
 )
 from ..events import EventBus
@@ -748,22 +749,8 @@ class AgentRunner:
                     hit_rate=session_usage.provider_cache_hit_rate,
                     action="stable-prefix-only; shorter compaction window",
                 )
-            while True:
-                self._check_cancel(cancel)
-                budget.before_turn()
-                final_turn = budget.turns == self.config.agent.max_turns
-                read_only_synthesis_pending = read_only_work.synthesis_pending
-                tools_disabled = (
-                    final_turn
-                    or verification_finalization_pending
-                    or read_only_synthesis_pending
-                )
-                schemas = [] if tools_disabled else self.tools.schemas()
-                await self._emit_read_only_synthesis_event(
-                    read_only_work,
-                    session_id=session_id,
-                    run_id=run_id,
-                )
+            async def prepare_route(route: ProviderRoute) -> ProviderRequest:
+                nonlocal compacted, last_prune_signature, previous_request_tokens
                 prepared = await self._prepare_provider_request(
                     prompt_context=prompt_context,
                     messages=messages,
@@ -780,10 +767,10 @@ class AgentRunner:
                     run_id=run_id,
                     last_prune_signature=last_prune_signature,
                     overflow_retry_count=provider_overflow_retries,
-                    previous_request_tokens=previous_request_tokens,
+                    previous_request_tokens=prior_request_tokens,
+                    route=route,
                     before_model_request=budget.before_model_request,
                 )
-                request = prepared.request
                 estimated = prepared.estimated_tokens
                 compacted = compacted or prepared.compacted
                 last_prune_signature = prepared.prune_signature
@@ -794,9 +781,29 @@ class AgentRunner:
                     run_id=run_id,
                     turn=budget.turns,
                     estimated_input_tokens=estimated,
-                    provider=self.providers[0].name,
-                    model=self.providers[0].model,
+                    provider=route.name,
+                    model=route.model,
                 )
+                return prepared.request
+
+            while True:
+                self._check_cancel(cancel)
+                budget.before_turn()
+                final_turn = budget.turns == self.config.agent.max_turns
+                read_only_synthesis_pending = read_only_work.synthesis_pending
+                tools_disabled = (
+                    final_turn
+                    or verification_finalization_pending
+                    or read_only_synthesis_pending
+                )
+                schemas = [] if tools_disabled else self.tools.schemas()
+                await self._emit_read_only_synthesis_event(
+                    read_only_work,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+                prior_request_tokens = previous_request_tokens
+
                 assistant_message_id = new_id("msg")
                 buffer_candidate_output = bool(
                     verification_finalization_pending
@@ -808,9 +815,8 @@ class AgentRunner:
                     )
                 )
                 try:
-                    budget.before_model_request()
                     response, used_route = await self._complete_request(
-                        request,
+                        prepare_route,
                         session_id,
                         run_id,
                         cancel,
@@ -1469,11 +1475,14 @@ class AgentRunner:
         previous_request_tokens: int | None = None,
         read_only_synthesis_pending: bool = False,
         before_model_request: Callable[[], None] | None = None,
+        route: ProviderRoute | None = None,
     ) -> PreparedProviderRequest:
+        route = route or self.providers[0]
         agent_config, _ = resolve_route_limits(
-            self.config.agent, self.providers[0].provider, self.providers[0].model,
+            self.config.agent, route.provider, route.model,
             self.config.agent.max_output_tokens,
         )
+        capacity_error = RouteContextExceeded if agent_config.max_input_tokens < self.config.agent.max_input_tokens else BudgetExceeded
         state = await asyncio.to_thread(self.sessions.task_state, session_id, messages)
         source_refs = {item["source"]: f"user:{index + 1}" for index, item in enumerate(state["instructions"])}
         provider_state = {
@@ -1505,7 +1514,7 @@ class AgentRunner:
             agent_config, system=turn_system, tools=schemas, messages=[],
         )
         if not _fits_context_limit([], protected_budget, system=turn_system, tools=schemas):
-            raise BudgetExceeded("context", "Protected task requirements cannot fit the safe request budget")
+            raise capacity_error("context", "Protected task requirements cannot fit the safe request budget")
         if final_turn:
             turn_system = f"{turn_system}\n\n{_FINAL_TURN_INSTRUCTION}"
             turn_system_blocks = [
@@ -1527,7 +1536,7 @@ class AgentRunner:
 
         request_messages, metrics = prune_provider_messages(messages)
         validate_tool_call_order(request_messages)
-        budget_providers = tuple(route.provider.name for route in self.providers)
+        budget_providers = tuple(item.provider.name for item in self.providers)
         raw_budget = ContextBudget.calculate(
             agent_config,
             system=turn_system,
@@ -1555,6 +1564,7 @@ class AgentRunner:
             incremental = await self._reuse_incremental_compaction(
                 session_id=session_id,
                 durable_messages=messages,
+                agent_config=agent_config,
                 base_system=turn_system,
                 base_system_blocks=turn_system_blocks,
                 tools=schemas,
@@ -1607,7 +1617,7 @@ class AgentRunner:
             ):
                 compaction_reason = None
             else:
-                raise BudgetExceeded(
+                raise capacity_error(
                     "context",
                     f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
                     f"exceeds context budget {agent_config.max_input_tokens} "
@@ -1977,7 +1987,7 @@ class AgentRunner:
                             **compaction_kwargs,
                         )
             except CompactionSizeError as error:
-                raise BudgetExceeded("context", str(error)) from error
+                raise capacity_error("context", str(error)) from error
             compacted_messages = deterministic_messages
             if deterministic_messages != request_messages:
                 deterministic_artifact = deterministic_messages[0]
@@ -2133,7 +2143,7 @@ class AgentRunner:
                         )
                     )
                 except CompactionSizeError as error:
-                    raise BudgetExceeded("context", str(error)) from error
+                    raise capacity_error("context", str(error)) from error
                 validate_tool_call_order(retained_messages)
                 artifact_message, reused = await self._record_or_reuse_compaction_artifact(
                     session_id=session_id,
@@ -2258,14 +2268,14 @@ class AgentRunner:
             system=turn_system,
             tools=schemas,
         ):
-            raise BudgetExceeded(
+            raise capacity_error(
                 "context",
                 f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
                 f"exceeds context budget {agent_config.max_input_tokens} "
                 "tokens (endpoint byte limits are checked separately)",
             )
         request = ProviderRequest(
-            model=self.providers[0].model,
+            model=route.model,
             system=turn_system,
             messages=request_messages,
             tools=schemas,
@@ -2275,6 +2285,7 @@ class AgentRunner:
             metadata={
                 "session_id": session_id,
                 "run_id": run_id,
+                "provider_route": route.name,
                 "protected_task_state": len(messages) > 1,
                 "prompt_cache_key": prompt_context.cache_routing_key,
                 "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
@@ -2293,7 +2304,7 @@ class AgentRunner:
                 ),
             },
         )
-        request = prepare_route_request(request, self.providers[0].provider, agent_config)
+        request = prepare_route_request(request, route.provider, self.config.agent)
         return PreparedProviderRequest(
             request, estimated, compacted, prune_signature, compaction_metadata
         )
@@ -2303,6 +2314,7 @@ class AgentRunner:
         *,
         session_id: str,
         durable_messages: list[Message],
+        agent_config: AgentConfig,
         base_system: str,
         base_system_blocks: list[dict[str, Any]],
         tools: list[dict[str, Any]],
@@ -2318,10 +2330,6 @@ class AgentRunner:
             if self.config.agent.deterministic_compaction
             or self.config.agent.compaction_version == 1
             else "llm"
-        )
-        agent_config, _ = resolve_route_limits(
-            self.config.agent, self.providers[0].provider, self.providers[0].model,
-            self.config.agent.max_output_tokens,
         )
         compaction_budget = ContextBudget.calculate(
             agent_config,
@@ -2791,7 +2799,7 @@ class AgentRunner:
 
     async def _complete_request(
         self,
-        request: ProviderRequest,
+        request: ProviderRequest | Callable[[ProviderRoute], Awaitable[ProviderRequest]],
         session_id: str,
         run_id: str,
         cancel: asyncio.Event,
@@ -2830,7 +2838,7 @@ class AgentRunner:
 
     async def _complete_with_fallback(
         self,
-        request: ProviderRequest,
+        request: ProviderRequest | Callable[[ProviderRoute], Awaitable[ProviderRequest]],
         session_id: str,
         run_id: str,
         cancel: asyncio.Event,
@@ -2845,19 +2853,32 @@ class AgentRunner:
         cache_misses = 0
         for index, route in enumerate(self.providers):
             self._check_cancel(cancel)
-            routed = ProviderRequest(
-                model=route.model,
-                system=request.system,
-                messages=request.messages,
-                tools=request.tools,
-                max_output_tokens=request.max_output_tokens,
-                temperature=request.temperature,
-                reasoning_effort=request.reasoning_effort,
-                parallel_tool_calls=request.parallel_tool_calls,
-                response_schema=request.response_schema,
-                metadata={**request.metadata, "provider_route": route.name},
-            )
-            routed = prepare_route_request(routed, route.provider, self.config.agent)
+            try:
+                if callable(request):
+                    routed = await request(route)
+                else:
+                    routed = ProviderRequest(
+                        model=route.model,
+                        system=request.system,
+                        messages=request.messages,
+                        tools=request.tools,
+                        max_output_tokens=request.max_output_tokens,
+                        temperature=request.temperature,
+                        reasoning_effort=request.reasoning_effort,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        response_schema=request.response_schema,
+                        metadata={**request.metadata, "provider_route": route.name},
+                    )
+                    routed = prepare_route_request(routed, route.provider, self.config.agent)
+            except RouteContextExceeded as error:
+                if index == len(self.providers) - 1:
+                    raise
+                errors.append(f"{route.name}/{route.model}: {error}")
+                await self.events.emit(
+                    "model.route_failed", session_id=session_id, run_id=run_id,
+                    provider=route.name, model=route.model, error=str(error), retryable=True,
+                )
+                continue
             artifact_id = routed.metadata.get("compaction_artifact_id")
             context_hashes = routed.metadata.get("compacted_context_hashes")
             if isinstance(artifact_id, str) and isinstance(context_hashes, dict):
@@ -2946,7 +2967,7 @@ class AgentRunner:
                     )
                 reservation = budget.reserve_cost(route.provider, routed) if budget else 0.0
                 try:
-                    if index and budget:
+                    if budget and (index or callable(request)):
                         budget.before_model_request()
                     response = await self._stream_route(
                         route,

@@ -132,6 +132,8 @@ class Tool:
             return MutationScope.EXTERNAL
         return MutationScope.NONE
 
+    nullable_defaults: tuple[str, ...] = ()
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         raise NotImplementedError
 
@@ -145,9 +147,7 @@ class Tool:
         return {
             "name": self.name,
             "description": self.description,
-            # New nullable fields are required on the provider wire, while local
-            # validation can still accept legacy calls that omit them.
-            "parameters": {**self.parameters, "required": list(self.parameters.get("properties", {}))},
+            "parameters": self.parameters,
         }
 
 
@@ -228,6 +228,7 @@ class ToolRegistry:
             tool_call_id=call.id, tool=call.name, arguments=call.arguments,
         )
         try:
+            call.arguments = {**dict.fromkeys(tool.nullable_defaults), **call.arguments}
             validate_schema(call.arguments, tool.parameters, path="$arguments")
             decision = context.policy.decide(
                 tool_name=tool.name,

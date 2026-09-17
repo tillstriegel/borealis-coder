@@ -194,6 +194,11 @@ class Provider(abc.ABC):
                 usage.cost_status = "estimated"
             else:
                 self.price_usage(usage, model=model)
+        if usage.native_usage and not usage.attempt_usage:
+            usage.attempt_usage.append({
+                "provider": self.name, "model": model or self.request_model.get(),
+                "native_usage": dict(usage.native_usage),
+            })
         return usage
 
     def response_billing_model(self, reported_model: str | None) -> str:

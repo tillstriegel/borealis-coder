@@ -84,6 +84,7 @@ async def _regex_matcher(
 
 
 class GrepTool(Tool):
+    nullable_defaults = ("cursor",)
     name = "grep"
     description = "Search text files using literal or regular-expression matching."
     effect = Effect.READ
@@ -97,7 +98,7 @@ class GrepTool(Tool):
         "case_sensitive": {"type": "boolean"},
         "context_lines": {"type": "integer", "minimum": 0, "maximum": 10},
         "max_results": {"type": "integer", "minimum": 1, "maximum": 2000},
-    }, required=["pattern", "path", "glob", "regex", "case_sensitive", "context_lines", "max_results"])
+    })
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         resolved = context.roots.resolve(arguments["path"] or ".", must_exist=True)
@@ -113,6 +114,13 @@ class GrepTool(Tool):
             context.config.context.max_search_results,
         )
         files = list(files)
+
+        def in_scope(path: Path) -> bool:
+            rel = path.relative_to(resolved.path).as_posix() if is_directory else path.name
+            return not file_glob or fnmatch.fnmatch(rel, file_glob) or fnmatch.fnmatch(path.name, file_glob)
+
+        excluded = sum(not in_scope(path) for path in files)
+        files = [path for path in files if in_scope(path)]
         def snapshot(current_files: list[Path]) -> str:
             entries = []
             for path in current_files:
@@ -141,7 +149,7 @@ class GrepTool(Tool):
         match_count = 0
         seen = 0
         scanned = 0
-        skipped: dict[str, int] = {}
+        skipped: dict[str, int] = {"glob_excluded": excluded} if excluded else {}
         truncated = False
         next_cursor = None
         identities: dict[str, str] = {}
@@ -150,10 +158,6 @@ class GrepTool(Tool):
         ) as matcher:
             for path in files:
                 await asyncio.sleep(0)
-                rel = path.relative_to(resolved.path).as_posix() if is_directory else path.name
-                if file_glob and not (fnmatch.fnmatch(rel, file_glob) or fnmatch.fnmatch(path.name, file_glob)):
-                    skipped["glob_excluded"] = skipped.get("glob_excluded", 0) + 1
-                    continue
                 try:
                     candidate = context.roots.resolve(path, must_exist=True, kind="file")
                     data = read_bytes_up_to(candidate.path, file_limit + 1)
@@ -200,7 +204,7 @@ class GrepTool(Tool):
                         output_chars += len(row) + 1
                 if truncated:
                     break
-        if snapshot(list(_walk_files(resolved.path, context)) if is_directory else files) != identity:
+        if snapshot([path for path in _walk_files(resolved.path, context) if in_scope(path)] if is_directory else files) != identity:
             return ToolResult("Search scope changed during collection; restart the search.", is_error=True)
         if truncated:
             next_cursor = base64.urlsafe_b64encode(json_dumps({"snapshot": identity, "offset": offset + match_count}).encode()).decode()

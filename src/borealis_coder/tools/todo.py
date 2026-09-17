@@ -9,6 +9,7 @@ from .base import MutationScope, Tool, ToolContext, object_schema
 
 
 class UpdatePlanTool(Tool):
+    nullable_defaults = ("acceptance_criteria",)
     name = "update_plan"
     description = "Replace the durable execution plan and mark item status. Optional acceptance criteria are model notes, never user authority or permission."
     effect = Effect.CONTROL
@@ -25,7 +26,7 @@ class UpdatePlanTool(Tool):
                 "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "blocked"]},
             }),
         }
-    }, required=["items"])
+    })
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         items = list(arguments["items"])

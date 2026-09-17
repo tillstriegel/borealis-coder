@@ -88,6 +88,10 @@ class BudgetExceeded(BorealisError):
         self.kind = kind
 
 
+class RouteContextExceeded(BudgetExceeded):
+    """A route-specific capacity limit prevents preparing this request."""
+
+
 class Cancelled(BorealisError):
     """The current run was cancelled."""
 
