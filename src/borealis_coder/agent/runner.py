@@ -16,7 +16,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
 
-from ..config import Config
+from ..config import AgentConfig, Config
 from ..context import ContextBuilder, PromptContext
 from ..errors import (
     BudgetExceeded,
@@ -25,6 +25,7 @@ from ..errors import (
     ProviderError,
     ProviderRateLimitError,
     ProviderUnavailableError,
+    RouteContextExceeded,
     SessionError,
 )
 from ..events import EventBus
@@ -61,6 +62,8 @@ from .budget import (
     estimate_request_tokens,
     is_recovery_continuation_prompt,
     max_turns_recovery_message,
+    prepare_route_request,
+    resolve_route_limits,
 )
 from .compaction import (
     COMPACTION_RESPONSE_SCHEMA,
@@ -627,21 +630,27 @@ class AgentRunner:
             changed_roots=set(),
             metadata=dict(self.tool_context.metadata),
         )
+        context.metadata["session_store"] = self.sessions
         context.metadata["context_builder"] = self.context_builder
         context.metadata["provider_routes"] = self.providers
         context.metadata["tool_registry"] = self.tools
         budget = Budget.start(self.config.agent)
 
-        async def usage_sink(usage: Usage) -> None:
-            async def settle() -> None:
-                await asyncio.to_thread(self.sessions.add_usage, session_id, usage)
+        async def usage_sink(usage: Usage, *, reservation: float = 0.0) -> None:
+            budget.release_cost(reservation)
+            budget_error = None
+            try:
                 budget.add_usage(usage)
-
-            await finish_on_cancellation(settle())
+            except BudgetExceeded as error:
+                budget_error = error
+            await finish_on_cancellation(asyncio.to_thread(self.sessions.add_usage, session_id, usage))
+            if budget_error is not None:
+                raise budget_error
 
         async def settled_usage_sink(usage: Usage) -> None:
             budget.add_usage(usage)
 
+        context.metadata["budget"] = budget
         context.metadata["usage_sink"] = usage_sink
         context.metadata["before_model_request"] = budget.before_model_request
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
@@ -740,22 +749,8 @@ class AgentRunner:
                     hit_rate=session_usage.provider_cache_hit_rate,
                     action="stable-prefix-only; shorter compaction window",
                 )
-            while True:
-                self._check_cancel(cancel)
-                budget.before_turn()
-                final_turn = budget.turns == self.config.agent.max_turns
-                read_only_synthesis_pending = read_only_work.synthesis_pending
-                tools_disabled = (
-                    final_turn
-                    or verification_finalization_pending
-                    or read_only_synthesis_pending
-                )
-                schemas = [] if tools_disabled else self.tools.schemas()
-                await self._emit_read_only_synthesis_event(
-                    read_only_work,
-                    session_id=session_id,
-                    run_id=run_id,
-                )
+            async def prepare_route(route: ProviderRoute) -> ProviderRequest:
+                nonlocal compacted, last_prune_signature, previous_request_tokens
                 prepared = await self._prepare_provider_request(
                     prompt_context=prompt_context,
                     messages=messages,
@@ -772,10 +767,10 @@ class AgentRunner:
                     run_id=run_id,
                     last_prune_signature=last_prune_signature,
                     overflow_retry_count=provider_overflow_retries,
-                    previous_request_tokens=previous_request_tokens,
+                    previous_request_tokens=prior_request_tokens,
+                    route=route,
                     before_model_request=budget.before_model_request,
                 )
-                request = prepared.request
                 estimated = prepared.estimated_tokens
                 compacted = compacted or prepared.compacted
                 last_prune_signature = prepared.prune_signature
@@ -786,9 +781,29 @@ class AgentRunner:
                     run_id=run_id,
                     turn=budget.turns,
                     estimated_input_tokens=estimated,
-                    provider=self.providers[0].name,
-                    model=self.providers[0].model,
+                    provider=route.name,
+                    model=route.model,
                 )
+                return prepared.request
+
+            while True:
+                self._check_cancel(cancel)
+                budget.before_turn()
+                final_turn = budget.turns == self.config.agent.max_turns
+                read_only_synthesis_pending = read_only_work.synthesis_pending
+                tools_disabled = (
+                    final_turn
+                    or verification_finalization_pending
+                    or read_only_synthesis_pending
+                )
+                schemas = [] if tools_disabled else self.tools.schemas()
+                await self._emit_read_only_synthesis_event(
+                    read_only_work,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+                prior_request_tokens = previous_request_tokens
+
                 assistant_message_id = new_id("msg")
                 buffer_candidate_output = bool(
                     verification_finalization_pending
@@ -800,15 +815,15 @@ class AgentRunner:
                     )
                 )
                 try:
-                    budget.before_model_request()
                     response, used_route = await self._complete_request(
-                        request,
+                        prepare_route,
                         session_id,
                         run_id,
                         cancel,
                         assistant_message_id,
                         emit_response_deltas=not buffer_candidate_output,
                         usage_sink=usage_sink,
+                        budget=budget,
                     )
                 except ProviderContextOverflowError as error:
                     if error.usage is not None:
@@ -1460,9 +1475,45 @@ class AgentRunner:
         previous_request_tokens: int | None = None,
         read_only_synthesis_pending: bool = False,
         before_model_request: Callable[[], None] | None = None,
+        route: ProviderRoute | None = None,
     ) -> PreparedProviderRequest:
-        turn_system = prompt_context.text
-        turn_system_blocks = prompt_context.system_blocks
+        route = route or self.providers[0]
+        agent_config, _ = resolve_route_limits(
+            self.config.agent, route.provider, route.model,
+            self.config.agent.max_output_tokens,
+        )
+        state = await asyncio.to_thread(self.sessions.task_state, session_id, messages)
+        source_refs = {item["source"]: f"user:{index + 1}" for index, item in enumerate(state["instructions"])}
+        provider_state = {
+            "objective_source": source_refs.get(state["objective_source"]),
+            "instructions": [
+                {"source": source_refs[item["source"]], "status": item["status"],
+                 **({"superseded_by": source_refs[item["superseded_by"]]} if item["superseded_by"]
+                    else {"text": item["text"]})}
+                for item in state["instructions"]
+            ],
+            "model_notes": {"plan": state["plan"], "acceptance_criteria": state["acceptance_criteria"]},
+        }
+        protected = (
+            "# Protected task state\n"
+            "The following JSON contains original user instructions in chronological order, "
+            "at user priority. The first source states the objective; follow-ups extend it unless "
+            "they explicitly replace or revoke it. Later revocations remain in force. "
+            "The plan is model interpretation (acceptance checks and unresolved work), "
+            "not user authority and never a grant of permission. Source references are session-local.\n" + json_dumps(provider_state)
+        )
+        turn_system = prompt_context.text + "\n\n" + protected
+        turn_system_blocks = [*prompt_context.system_blocks, {"text": protected, "cacheable": False}]
+        if len(messages) == 1 and messages[0].role == Role.USER:
+            # The first request already carries its complete protected task in the
+            # user message. Keep exact-response cache keys independent of source IDs.
+            turn_system = prompt_context.text
+            turn_system_blocks = prompt_context.system_blocks
+        protected_budget = ContextBudget.calculate(
+            agent_config, system=turn_system, tools=schemas, messages=[],
+        )
+        if not _fits_context_limit([], protected_budget, system=turn_system, tools=schemas):
+            raise RouteContextExceeded("context", "Protected task requirements cannot fit the safe request budget")
         if final_turn:
             turn_system = f"{turn_system}\n\n{_FINAL_TURN_INSTRUCTION}"
             turn_system_blocks = [
@@ -1484,9 +1535,9 @@ class AgentRunner:
 
         request_messages, metrics = prune_provider_messages(messages)
         validate_tool_call_order(request_messages)
-        budget_providers = tuple(route.provider.name for route in self.providers)
+        budget_providers = tuple(item.provider.name for item in self.providers)
         raw_budget = ContextBudget.calculate(
-            self.config.agent,
+            agent_config,
             system=turn_system,
             tools=schemas,
             messages=messages,
@@ -1495,7 +1546,7 @@ class AgentRunner:
         )
         raw_estimated = raw_budget.estimated_total(messages)
         context_budget = ContextBudget.calculate(
-            self.config.agent,
+            agent_config,
             system=turn_system,
             tools=schemas,
             messages=request_messages,
@@ -1512,6 +1563,7 @@ class AgentRunner:
             incremental = await self._reuse_incremental_compaction(
                 session_id=session_id,
                 durable_messages=messages,
+                agent_config=agent_config,
                 base_system=turn_system,
                 base_system_blocks=turn_system_blocks,
                 tools=schemas,
@@ -1524,7 +1576,7 @@ class AgentRunner:
             prior_artifact, request_messages, _, metrics = incremental
             live_system = f"{turn_system}\n\n{prior_artifact.summary_text}"
             context_budget = ContextBudget.calculate(
-                self.config.agent,
+                agent_config,
                 system=live_system,
                 tools=schemas,
                 messages=request_messages,
@@ -1564,11 +1616,11 @@ class AgentRunner:
             ):
                 compaction_reason = None
             else:
-                raise BudgetExceeded(
+                raise RouteContextExceeded(
                     "context",
                     f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
-                    f"exceeds context budget {self.config.agent.max_input_tokens} "
-                    f"tokens/{context_budget.hard_bytes} bytes",
+                    f"exceeds context budget {agent_config.max_input_tokens} "
+                    "tokens (endpoint byte limits are checked separately)",
                 )
         prune_signature = (
             metrics.tokens_before,
@@ -1604,7 +1656,7 @@ class AgentRunner:
             ]
             compacted = True
             context_budget = ContextBudget.calculate(
-                self.config.agent,
+                agent_config,
                 system=turn_system,
                 tools=schemas,
                 messages=request_messages,
@@ -1667,7 +1719,7 @@ class AgentRunner:
             # Old continuation metadata may be compacted away. Do not reserve it
             # before selecting bundles; validate the retained reserve below.
             compaction_budget = ContextBudget.calculate(
-                self.config.agent,
+                agent_config,
                 system=turn_system,
                 tools=schemas,
                 messages=[],
@@ -1708,12 +1760,12 @@ class AgentRunner:
             )
             intended_strategy = (
                 "deterministic"
-                if self.config.agent.deterministic_compaction
-                or self.config.agent.compaction_version == 1
+                if agent_config.deterministic_compaction
+                or agent_config.compaction_version == 1
                 or compaction_reason == "provider_context_overflow"
                 else "llm"
             )
-            artifact_version = self.config.agent.compaction_version
+            artifact_version = agent_config.compaction_version
             fingerprint = self._compaction_config_fingerprint(
                 compaction_budget,
                 intended_strategy,
@@ -1789,10 +1841,10 @@ class AgentRunner:
                 "summary_tokens": provider_message_target,
                 "summary_bytes": provider_message_target_bytes,
                 "summarizer_input_tokens": (
-                    self.config.agent.compaction_summarizer_input_tokens
+                    agent_config.compaction_summarizer_input_tokens
                 ),
                 "summarizer_total_input_tokens": (
-                    self.config.agent.compaction_summarizer_total_input_tokens
+                    agent_config.compaction_summarizer_total_input_tokens
                 ),
                 "target_tokens": provider_message_target,
                 "target_bytes": provider_message_target_bytes,
@@ -1811,8 +1863,8 @@ class AgentRunner:
                 ),
             }
             try:
-                if self.config.agent.compaction_version == 1:
-                    if self.config.agent.compaction_shadow_v2:
+                if agent_config.compaction_version == 1:
+                    if agent_config.compaction_shadow_v2:
                         try:
                             shadow = compact_messages(
                                 request_messages,
@@ -1890,7 +1942,7 @@ class AgentRunner:
                 while deterministic_messages != request_messages:
                     retained = deterministic_messages[1:]
                     retained_budget = ContextBudget.calculate(
-                        self.config.agent,
+                        agent_config,
                         system=turn_system,
                         tools=schemas,
                         messages=retained,
@@ -1919,7 +1971,7 @@ class AgentRunner:
                     compaction_kwargs["summary_bytes"] = tighter_byte_target
                     compaction_kwargs["target_tokens"] = tighter_target
                     compaction_kwargs["target_bytes"] = tighter_byte_target
-                    if self.config.agent.compaction_version == 1:
+                    if agent_config.compaction_version == 1:
                         deterministic_messages = compact_messages_v1(
                             request_messages,
                             keep_recent=keep_recent,
@@ -1934,7 +1986,7 @@ class AgentRunner:
                             **compaction_kwargs,
                         )
             except CompactionSizeError as error:
-                raise BudgetExceeded("context", str(error)) from error
+                raise RouteContextExceeded("context", str(error)) from error
             compacted_messages = deterministic_messages
             if deterministic_messages != request_messages:
                 deterministic_artifact = deterministic_messages[0]
@@ -2090,7 +2142,7 @@ class AgentRunner:
                         )
                     )
                 except CompactionSizeError as error:
-                    raise BudgetExceeded("context", str(error)) from error
+                    raise RouteContextExceeded("context", str(error)) from error
                 validate_tool_call_order(retained_messages)
                 artifact_message, reused = await self._record_or_reuse_compaction_artifact(
                     session_id=session_id,
@@ -2117,7 +2169,7 @@ class AgentRunner:
                 request_messages = retained_messages
                 compacted = True
                 context_budget = ContextBudget.calculate(
-                    self.config.agent,
+                    agent_config,
                     system=turn_system,
                     tools=schemas,
                     messages=request_messages,
@@ -2215,23 +2267,25 @@ class AgentRunner:
             system=turn_system,
             tools=schemas,
         ):
-            raise BudgetExceeded(
+            raise RouteContextExceeded(
                 "context",
                 f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
-                f"exceeds context budget {self.config.agent.max_input_tokens} "
-                f"tokens/{context_budget.hard_bytes} bytes",
+                f"exceeds context budget {agent_config.max_input_tokens} "
+                "tokens (endpoint byte limits are checked separately)",
             )
         request = ProviderRequest(
-            model=self.providers[0].model,
+            model=route.model,
             system=turn_system,
             messages=request_messages,
             tools=schemas,
-            max_output_tokens=self.config.agent.max_output_tokens,
-            reasoning_effort=self.config.agent.reasoning_effort or None,
+            max_output_tokens=agent_config.max_output_tokens,
+            reasoning_effort=agent_config.reasoning_effort or None,
             parallel_tool_calls=True,
             metadata={
                 "session_id": session_id,
                 "run_id": run_id,
+                "provider_route": route.name,
+                "protected_task_state": len(messages) > 1,
                 "prompt_cache_key": prompt_context.cache_routing_key,
                 "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
                 "prompt_cache_ttl": self.config.cache.anthropic_ttl,
@@ -2249,6 +2303,7 @@ class AgentRunner:
                 ),
             },
         )
+        request = prepare_route_request(request, route.provider, self.config.agent)
         return PreparedProviderRequest(
             request, estimated, compacted, prune_signature, compaction_metadata
         )
@@ -2258,6 +2313,7 @@ class AgentRunner:
         *,
         session_id: str,
         durable_messages: list[Message],
+        agent_config: AgentConfig,
         base_system: str,
         base_system_blocks: list[dict[str, Any]],
         tools: list[dict[str, Any]],
@@ -2275,7 +2331,7 @@ class AgentRunner:
             else "llm"
         )
         compaction_budget = ContextBudget.calculate(
-            self.config.agent,
+            agent_config,
             system=base_system,
             tools=tools,
             messages=[],
@@ -2742,13 +2798,14 @@ class AgentRunner:
 
     async def _complete_request(
         self,
-        request: ProviderRequest,
+        request: ProviderRequest | Callable[[ProviderRoute], Awaitable[ProviderRequest]],
         session_id: str,
         run_id: str,
         cancel: asyncio.Event,
         assistant_message_id: str,
         *,
         usage_sink: Callable[[Usage], Awaitable[None]],
+        budget: Budget | None = None,
         emit_response_deltas: bool = True,
     ) -> tuple[ModelResponse, ProviderRoute]:
         """Preserve reported failed-attempt usage if a request is cancelled."""
@@ -2758,42 +2815,69 @@ class AgentRunner:
             return await self._complete_with_fallback(
                 request, session_id, run_id, cancel, assistant_message_id,
                 emit_response_deltas=emit_response_deltas,
-                failed_usage_collector=cancelled_usage,
+                usage_collector=cancelled_usage,
+                budget=budget,
             )
-        except (Cancelled, asyncio.CancelledError):
+        except ProviderError as error:
             if not cancelled_usage.is_empty:
-                with contextlib.suppress(BudgetExceeded):
-                    await usage_sink(cancelled_usage)
+                error.usage = cancelled_usage
             raise
+        except (Exception, asyncio.CancelledError):
+            async def settle_cancelled_usage() -> None:
+                if budget:
+                    budget.release_usage(cancelled_usage)
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await usage_sink(cancelled_usage)
+            await finish_on_cancellation(settle_cancelled_usage())
+            raise
+        finally:
+            if budget:
+                budget.release_usage(cancelled_usage)
 
     async def _complete_with_fallback(
         self,
-        request: ProviderRequest,
+        request: ProviderRequest | Callable[[ProviderRoute], Awaitable[ProviderRequest]],
         session_id: str,
         run_id: str,
         cancel: asyncio.Event,
         assistant_message_id: str,
         *,
         emit_response_deltas: bool = True,
-        failed_usage_collector: Usage | None = None,
+        usage_collector: Usage | None = None,
+        budget: Budget | None = None,
     ) -> tuple[ModelResponse, ProviderRoute]:
         errors: list[str] = []
         failed_usage = Usage()
         cache_misses = 0
         for index, route in enumerate(self.providers):
             self._check_cancel(cancel)
-            routed = ProviderRequest(
-                model=route.model,
-                system=request.system,
-                messages=request.messages,
-                tools=request.tools,
-                max_output_tokens=request.max_output_tokens,
-                temperature=request.temperature,
-                reasoning_effort=request.reasoning_effort,
-                parallel_tool_calls=request.parallel_tool_calls,
-                response_schema=request.response_schema,
-                metadata={**request.metadata, "provider_route": route.name},
-            )
+            try:
+                if callable(request):
+                    routed = await request(route)
+                else:
+                    routed = ProviderRequest(
+                        model=route.model,
+                        system=request.system,
+                        messages=request.messages,
+                        tools=request.tools,
+                        max_output_tokens=request.max_output_tokens,
+                        temperature=request.temperature,
+                        reasoning_effort=request.reasoning_effort,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        response_schema=request.response_schema,
+                        metadata={**request.metadata, "provider_route": route.name},
+                    )
+                    routed = prepare_route_request(routed, route.provider, self.config.agent)
+            except RouteContextExceeded as error:
+                if index == len(self.providers) - 1:
+                    raise
+                errors.append(f"{route.name}/{route.model}: {error}")
+                await self.events.emit(
+                    "model.route_failed", session_id=session_id, run_id=run_id,
+                    provider=route.name, model=route.model, error=str(error), retryable=True,
+                )
+                continue
             artifact_id = routed.metadata.get("compaction_artifact_id")
             context_hashes = routed.metadata.get("compacted_context_hashes")
             if isinstance(artifact_id, str) and isinstance(context_hashes, dict):
@@ -2818,6 +2902,7 @@ class AgentRunner:
                     original_usage = Usage.from_dict(cached.get("usage"))
                     payload = cached.get("response") or {}
                     usage = Usage(
+                        cost_status="known",
                         application_cache_hits=1,
                         application_cache_misses=cache_misses,
                         application_cache_saved_tokens=original_usage.total_tokens,
@@ -2879,16 +2964,27 @@ class AgentRunner:
                         provider=route.name,
                         model=route.model,
                     )
-                response = await self._stream_route(
-                    route,
-                    routed,
-                    session_id,
-                    run_id,
-                    cancel,
-                    assistant_message_id,
-                    emit_response_deltas=emit_response_deltas,
-                    failed_usage_collector=failed_usage_collector,
-                )
+                reservation = budget.reserve_cost(route.provider, routed) if budget else 0.0
+                try:
+                    if budget and (index or callable(request)):
+                        budget.before_model_request()
+                    response = await self._stream_route(
+                        route,
+                        routed,
+                        session_id,
+                        run_id,
+                        cancel,
+                        assistant_message_id,
+                        emit_response_deltas=emit_response_deltas,
+                        usage_collector=usage_collector,
+                        budget=budget,
+                    )
+                finally:
+                    if budget:
+                        budget.release_cost(reservation)
+                await self.events.emit("model.route_completed", session_id=session_id, run_id=run_id,
+                                       provider=route.name, model=response.model or routed.model,
+                                       usage=response.usage.to_dict())
                 if self.config.cache.response_cache_enabled:
                     response.usage.application_cache_misses += cache_misses
                     if _is_cacheable_response(response):
@@ -2937,6 +3033,7 @@ class AgentRunner:
                     provider=route.name,
                     model=route.model,
                     error=str(error),
+                    usage=error.usage.to_dict() if error.usage else None,
                     retryable=True,
                 )
                 continue
@@ -3062,6 +3159,7 @@ class AgentRunner:
                 response_schema=COMPACTION_RESPONSE_SCHEMA,
                 metadata={"purpose": "compaction_summary"},
             )
+            request = prepare_route_request(request, route.provider, self.config.agent)
             cache_key = self._compaction_summary_cache_key(route, request)
             try:
                 cached = (
@@ -3091,6 +3189,7 @@ class AgentRunner:
                         "Could not settle cached compaction summary usage"
                     ) from error
                 cache_usage = Usage(
+                    cost_status="known",
                     application_cache_hits=1,
                     application_cache_saved_tokens=original_usage.total_tokens,
                     application_cache_saved_cost_usd=original_usage.cost_usd,
@@ -3109,14 +3208,27 @@ class AgentRunner:
                 )
             if before_model_request is not None:
                 before_model_request()
+            request_budget = getattr(before_model_request, "__self__", None)
+            reservation = request_budget.reserve_cost(route.provider, request) if isinstance(request_budget, Budget) else 0.0
             cancelled_usage = Usage()
+
+            def observe_usage(usage: Usage) -> None:
+                cancelled_usage.add(usage)
+                if isinstance(request_budget, Budget):
+                    request_budget.hold_usage(cancelled_usage)
+
             request_task = asyncio.create_task(route.provider.with_retries(
                 lambda: route.provider.complete(request),
-                failed_usage_collector=cancelled_usage,
+                on_usage=observe_usage,
+                before_recovery=before_model_request,
+                request=request,
+                check_usage=(lambda _: request_budget.check_unsettled(cancelled_usage)) if isinstance(request_budget, Budget) else None,
             ))
             cancel_task = asyncio.create_task(cancel.wait())
 
             async def record_failed_usage(usage: Usage) -> None:
+                if isinstance(request_budget, Budget):
+                    request_budget.release_usage(cancelled_usage)
                 if usage_collector is not None:
                     usage_collector.add(usage)
                 await usage_sink(usage)
@@ -3135,7 +3247,14 @@ class AgentRunner:
                     if not request_task.done():
                         request_task.cancel()
                     await asyncio.gather(request_task, cancel_task, return_exceptions=True)
+                    if isinstance(request_budget, Budget):
+                        request_budget.release_cost(reservation)
             except (Cancelled, asyncio.CancelledError):
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
+                raise
+            except BudgetExceeded:
                 if not cancelled_usage.is_empty:
                     with contextlib.suppress(BudgetExceeded):
                         await finish_on_cancellation(record_failed_usage(cancelled_usage))
@@ -3144,6 +3263,16 @@ class AgentRunner:
                 if error.usage is not None:
                     await finish_on_cancellation(record_failed_usage(error.usage))
                 raise
+            except Exception:
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
+                raise
+
+            async def transfer_usage(usage: Usage, sink: Callable[[Usage], Awaitable[None]] = usage_sink) -> None:
+                if isinstance(request_budget, Budget):
+                    request_budget.release_usage(cancelled_usage)
+                await sink(usage)
 
             async def settle_completed_response() -> None:
                 # Cache first so a budget stop can resume without another provider call.
@@ -3164,7 +3293,7 @@ class AgentRunner:
                     except Exception as cache_error:
                         if usage_collector is not None:
                             usage_collector.add(response.usage)
-                        await usage_sink(response.usage)
+                        await transfer_usage(response.usage)
                         raise SessionError(
                             "Could not persist the pending compaction summary"
                         ) from cache_error
@@ -3182,7 +3311,7 @@ class AgentRunner:
                         # This run incurred the provider charge even if another
                         # process settled the durable cache entry first.
                         if settled_usage_sink is not None:
-                            await settled_usage_sink(response.usage)
+                            await transfer_usage(response.usage, settled_usage_sink)
                     else:
                         try:
                             await asyncio.to_thread(
@@ -3191,17 +3320,21 @@ class AgentRunner:
                                 cache_key,
                             )
                         except Exception as error:
-                            await usage_sink(response.usage)
+                            await transfer_usage(response.usage)
                             raise SessionError(
                                 "Could not settle the winning compaction summary usage"
                             ) from error
-                        await usage_sink(response.usage)
+                        await transfer_usage(response.usage)
                 else:
-                    await usage_sink(response.usage)
+                    await transfer_usage(response.usage)
                 if usage_collector is not None:
                     usage_collector.add(response.usage)
 
-            await finish_on_cancellation(settle_completed_response())
+            try:
+                await finish_on_cancellation(settle_completed_response())
+            finally:
+                if isinstance(request_budget, Budget):
+                    request_budget.release_usage(cancelled_usage)
             if cancel.is_set():
                 raise Cancelled("Run cancelled")
             return SummarizerResult(
@@ -3231,175 +3364,214 @@ class AgentRunner:
         assistant_message_id: str,
         *,
         emit_response_deltas: bool = True,
-        failed_usage_collector: Usage | None = None,
+        usage_collector: Usage | None = None,
+        budget: Budget | None = None,
     ) -> ModelResponse:
+        route.provider.request_model.set(request.model)
         attempts = max(0, route.provider.config.max_retries) + 1
         delay = max(0.0, route.provider.config.initial_backoff_seconds)
         failed_usage = Usage()
         for attempt in range(attempts):
+            if budget:
+                budget.check_unsettled(usage_collector if usage_collector is not None else failed_usage)
             actionable_emitted = False
-            try:
+            completed: ModelResponse | None = None
+            recorded = False
 
-                async def consume() -> ModelResponse | None:
-                    nonlocal actionable_emitted
-                    completed: ModelResponse | None = None
-                    pending_reasoning: list[str] = []
-                    reasoning_redactor = StreamingRedactor(self.events.redactor)
-                    reasoning_committed = False
-                    stream = route.provider.stream(request).__aiter__()
+            def record_attempt(usage: Usage) -> None:
+                nonlocal recorded
+                if recorded or observation.handled:
+                    return
+                recorded = True
+                record_usage(usage)
 
-                    async def emit_reasoning(text: str) -> None:
-                        if not emit_response_deltas or not text:
-                            return
-                        await self.events.emit(
-                            "model.reasoning_delta",
-                            session_id=session_id,
-                            run_id=run_id,
-                            message_id=assistant_message_id,
-                            text=text,
-                            provider=route.name,
-                            model=route.model,
-                        )
+            def record_usage(usage: Usage) -> None:
+                if usage_collector is not None:
+                    usage_collector.add(usage)
+                    if budget:
+                        budget.hold_usage(usage_collector)
+            with route.provider.observe_requests(
+                record_usage,
+                (lambda: budget.check_unsettled(usage_collector if usage_collector is not None else failed_usage)) if budget else None,
+                budget.before_model_request if budget else None,
+            ) as observation:
+                try:
 
-                    async def commit_reasoning() -> None:
-                        nonlocal reasoning_committed
-                        if reasoning_committed:
-                            return
-                        pending_reasoning.append(
-                            reasoning_redactor.flush(mask_incomplete=True)
-                        )
-                        for text in pending_reasoning:
-                            await emit_reasoning(text)
-                        pending_reasoning.clear()
-                        reasoning_committed = True
+                    async def consume() -> ModelResponse | None:
+                        nonlocal actionable_emitted, completed
+                        pending_reasoning: list[str] = []
+                        reasoning_redactor = StreamingRedactor(self.events.redactor)
+                        reasoning_committed = False
+                        stream = route.provider.stream(request).__aiter__()
 
-                    async def flush_committed_reasoning() -> None:
-                        if reasoning_committed:
-                            await emit_reasoning(
-                                reasoning_redactor.flush(mask_incomplete=True)
+                        async def emit_reasoning(text: str) -> None:
+                            if not emit_response_deltas or not text:
+                                return
+                            await self.events.emit(
+                                "model.reasoning_delta",
+                                session_id=session_id,
+                                run_id=run_id,
+                                message_id=assistant_message_id,
+                                text=text,
+                                provider=route.name,
+                                model=route.model,
                             )
 
-                    try:
-                        async for item in stream:
-                            self._check_cancel(cancel)
-                            if item.type == "reasoning_summary_delta" and item.text:
-                                text = reasoning_redactor.feed(item.text)
-                                if reasoning_committed:
-                                    await emit_reasoning(text)
-                                else:
-                                    pending_reasoning.append(text)
-                                continue
+                        async def commit_reasoning() -> None:
+                            nonlocal reasoning_committed
+                            if reasoning_committed:
+                                return
+                            pending_reasoning.append(
+                                reasoning_redactor.flush(mask_incomplete=True)
+                            )
+                            for text in pending_reasoning:
+                                await emit_reasoning(text)
+                            pending_reasoning.clear()
+                            reasoning_committed = True
 
-                            if item.type == "text_delta" and item.text:
-                                await commit_reasoning()
-                                actionable_emitted = True
-                                if emit_response_deltas:
+                        async def flush_committed_reasoning() -> None:
+                            if reasoning_committed:
+                                await emit_reasoning(
+                                    reasoning_redactor.flush(mask_incomplete=True)
+                                )
+
+                        try:
+                            async for item in stream:
+                                if item.type == "completed" and item.response is not None:
+                                    completed = item.response
+                                    if completed.usage.is_empty:
+                                        completed.usage = Usage(requests=1, cost_status="incomplete")
+                                    route.provider.normalize_cost(completed.usage, model=route.provider.response_billing_model(completed.model))
+                                    record_attempt(completed.usage)
+                                self._check_cancel(cancel)
+                                if item.type == "reasoning_summary_delta" and item.text:
+                                    text = reasoning_redactor.feed(item.text)
+                                    if reasoning_committed:
+                                        await emit_reasoning(text)
+                                    else:
+                                        pending_reasoning.append(text)
+                                    continue
+
+                                if item.type == "text_delta" and item.text:
+                                    await commit_reasoning()
+                                    actionable_emitted = True
+                                    if emit_response_deltas:
+                                        await self.events.emit(
+                                            "model.text_delta",
+                                            session_id=session_id,
+                                            run_id=run_id,
+                                            message_id=assistant_message_id,
+                                            text=item.text,
+                                            provider=route.name,
+                                            model=route.model,
+                                        )
+                                elif item.type == "tool_call_delta":
+                                    await commit_reasoning()
+                                    actionable_emitted = True
                                     await self.events.emit(
-                                        "model.text_delta",
+                                        "model.tool_call_delta",
                                         session_id=session_id,
                                         run_id=run_id,
-                                        message_id=assistant_message_id,
-                                        text=item.text,
                                         provider=route.name,
                                         model=route.model,
+                                        **item.data,
                                     )
-                            elif item.type == "tool_call_delta":
-                                await commit_reasoning()
-                                actionable_emitted = True
-                                await self.events.emit(
-                                    "model.tool_call_delta",
-                                    session_id=session_id,
-                                    run_id=run_id,
-                                    provider=route.name,
-                                    model=route.model,
-                                    **item.data,
-                                )
-                            elif item.type == "completed" and item.response is not None:
-                                if item.response.text or item.response.tool_calls:
-                                    await commit_reasoning()
-                                else:
-                                    await flush_committed_reasoning()
-                                completed = item.response
-                    finally:
-                        await flush_committed_reasoning()
-                        close = getattr(stream, "aclose", None)
-                        if close is not None:
-                            with contextlib.suppress(Exception):
-                                await close()
-                    return completed
+                                elif item.type == "completed" and item.response is not None:
+                                    if item.response.text or item.response.tool_calls:
+                                        await commit_reasoning()
+                                    else:
+                                        await flush_committed_reasoning()
+                                    completed = item.response
+                        finally:
+                            await flush_committed_reasoning()
+                            close = getattr(stream, "aclose", None)
+                            if close is not None:
+                                with contextlib.suppress(Exception):
+                                    await close()
+                        return completed
 
-                stream_task = asyncio.create_task(consume())
-                cancel_task = asyncio.create_task(cancel.wait())
-                try:
-                    done, _ = await asyncio.wait(
-                        {stream_task, cancel_task},
-                        return_when=asyncio.FIRST_COMPLETED,
+                    stream_task = asyncio.create_task(consume())
+                    cancel_task = asyncio.create_task(cancel.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {stream_task, cancel_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if cancel_task in done and cancel.is_set():
+                            raise Cancelled("Run cancelled")
+                        completed = await stream_task
+                    finally:
+                        cancel_task.cancel()
+                        if not stream_task.done():
+                            stream_task.cancel()
+                        await asyncio.gather(
+                            stream_task,
+                            cancel_task,
+                            return_exceptions=True,
+                        )
+                    if completed is None:
+                        raise ProviderUnavailableError(
+                            f"Provider {route.name} stream ended without a completed response",
+                            retryable=True,
+                        )
+                    if completed.usage.is_empty:
+                        completed.usage = Usage(requests=1, cost_status="incomplete")
+                    route.provider.normalize_cost(completed.usage, model=route.provider.response_billing_model(completed.model))
+                    completed.reasoning_summary = self._redact_reasoning_summary(
+                        completed.reasoning_summary
                     )
-                    if cancel_task in done and cancel.is_set():
-                        raise Cancelled("Run cancelled")
-                    completed = await stream_task
-                finally:
-                    cancel_task.cancel()
-                    if not stream_task.done():
-                        stream_task.cancel()
-                    await asyncio.gather(
-                        stream_task,
-                        cancel_task,
-                        return_exceptions=True,
-                    )
-                if completed is None:
-                    raise ProviderUnavailableError(
-                        f"Provider {route.name} stream ended without a completed response",
-                        retryable=True,
-                    )
-                completed.reasoning_summary = self._redact_reasoning_summary(
-                    completed.reasoning_summary
-                )
-                if (
-                    not completed.text
-                    and not completed.tool_calls
-                    and not completed.incomplete
-                ):
-                    usage = replace(completed.usage)
-                    raise ProviderUnavailableError(
-                        f"Provider {route.name} returned an empty response",
-                        retryable=True,
-                        usage=usage if not usage.is_empty else None,
-                    )
-                if not failed_usage.is_empty:
-                    completed.usage = failed_usage.add(completed.usage)
-                return completed
-            except ProviderError as error:
-                if error.usage is not None:
-                    if failed_usage_collector is not None:
-                        failed_usage_collector.add(error.usage)
-                    failed_usage.add(error.usage)
-                if (
-                    not isinstance(error, (ProviderUnavailableError, ProviderRateLimitError))
-                    or actionable_emitted
-                    or not error.retryable
-                    or attempt + 1 >= attempts
-                ):
+                    if (
+                        not completed.text
+                        and not completed.tool_calls
+                        and not completed.incomplete
+                    ):
+                        usage = replace(completed.usage)
+                        raise ProviderUnavailableError(
+                            f"Provider {route.name} returned an empty response",
+                            retryable=True,
+                            usage=usage if not usage.is_empty else None,
+                        )
                     if not failed_usage.is_empty:
-                        error.usage = failed_usage
+                        completed.usage = failed_usage.add(completed.usage)
+                    return completed
+                except (Cancelled, asyncio.CancelledError):
+                    usage = completed.usage if completed is not None else Usage(requests=1, cost_status="incomplete")
+                    route.provider.normalize_cost(usage, model=route.provider.response_billing_model(completed.model if completed else None))
+                    record_attempt(usage)
                     raise
-                retry_delay = min(
-                    route.provider.config.max_backoff_seconds,
-                    max(0.25, delay),
-                )
-                await self.events.emit(
-                    "model.retrying",
-                    session_id=session_id,
-                    run_id=run_id,
-                    provider=route.name,
-                    model=route.model,
-                    attempt=attempt + 2,
-                    max_attempts=attempts,
-                    delay_seconds=retry_delay,
-                    error=str(error),
-                )
-                await self._await_until_cancelled(asyncio.sleep(retry_delay), cancel)
-                delay = max(0.25, delay * 2)
+                except ProviderError as error:
+                    if error.usage is None and isinstance(error, ProviderUnavailableError):
+                        error.usage = Usage(cost_status="incomplete")
+                    if error.usage is not None:
+                        route.provider.normalize_cost(error.usage)
+                        record_attempt(error.usage)
+                        failed_usage.add(error.usage)
+                    if (
+                        not isinstance(error, (ProviderUnavailableError, ProviderRateLimitError))
+                        or actionable_emitted
+                        or not error.retryable
+                        or attempt + 1 >= attempts
+                    ):
+                        if not failed_usage.is_empty:
+                            error.usage = failed_usage
+                        raise
+                    retry_delay = min(
+                        route.provider.config.max_backoff_seconds,
+                        max(0.25, delay),
+                    )
+                    await self.events.emit(
+                        "model.retrying",
+                        session_id=session_id,
+                        run_id=run_id,
+                        provider=route.name,
+                        model=route.model,
+                        attempt=attempt + 2,
+                        max_attempts=attempts,
+                        delay_seconds=retry_delay,
+                        error=str(error),
+                    )
+                    await self._await_until_cancelled(asyncio.sleep(retry_delay), cancel)
+                    delay = max(0.25, delay * 2)
         raise ProviderUnavailableError(
             f"Provider {route.name} exhausted retries",
             retryable=False,

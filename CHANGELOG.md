@@ -5,6 +5,10 @@ All notable changes follow Keep a Changelog and Semantic Versioning.
 ## [Unreleased]
 
 ### Added
+- Durable user requirement references, explicit supersession provenance, plans, and acceptance notes.
+- Redacted session output artifacts with bounded retrieval, plus search coverage and continuation.
+- Shared route limits and compaction safeguards for helpers, fallbacks, and summaries; model-specific
+  pricing, explicit unknown/incomplete cost, and concurrent dollar-budget reservations.
 - Compaction v2 with atomic conversation bundles, structured deterministic state,
   provider-aware target budgets, durable incremental artifacts, bounded LLM
   summarization, overflow recovery, safe observability, and a fixed release-gate corpus.

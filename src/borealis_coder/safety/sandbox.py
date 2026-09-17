@@ -11,8 +11,10 @@ import signal
 import sys
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ..config import SafetyConfig, SandboxConfig
 from ..errors import ToolError
@@ -22,6 +24,7 @@ from .paths import WorkspaceRoots
 # Receives ("stdout" | "stderr", decoded_chunk) as output arrives. May return an
 # awaitable; exceptions raised by the consumer never abort the command itself.
 OutputSink = Callable[[str, str], Awaitable[None] | None]
+output_capture: ContextVar[Callable[[str, str], None] | None] = ContextVar("output_capture", default=None)
 OUTPUT_TRUNCATION_MARKER = "\n… output truncated …\n"
 _OUTPUT_OBSERVER_DRAIN_SECONDS = 1.0
 _PROCESS_IO_DRAIN_SECONDS = 0.5
@@ -104,6 +107,7 @@ class ProcessResult:
     stream_truncated: bool = False
     stream_complete: bool = True
     lifecycle_complete: bool = True
+    output_artifact: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -291,9 +295,15 @@ class NativeProcessDriver(ProcessDriver):
                 if not data:
                     break
                 text = decoder.decode(data)
+                capture = output_capture.get()
+                if capture is not None:
+                    capture(name, text)
                 sink.append(text)
                 queue_output(name, text)
             final = decoder.decode(b"", final=True)
+            capture = output_capture.get()
+            if capture is not None:
+                capture(name, final)
             sink.append(final)
             queue_output(name, final)
 

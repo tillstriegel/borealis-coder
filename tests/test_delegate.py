@@ -96,7 +96,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
         })
         result = await DelegateTaskTool().execute({"task": "inspect", "max_turns": 2}, context)
         self.assertFalse(result.is_error)
-        self.assertEqual(result.output, "Investigation complete.")
+        self.assertIn("Investigation complete.", result.output)
         self.assertEqual(request.await_count, 2)
         replay = request.await_args_list[1].kwargs["payload"]["input"]
         self.assertEqual(replay[1:3], steps)

@@ -186,20 +186,25 @@ The deterministic provider exists for:
 
 It recognizes a small set of fixture prompts such as `OFFLINE_WRITE_DEMO`. It is not a general language model.
 
+MCP and plugin schemas retain their supplied required fields. Optional arguments remain omittable. Built-in nullable defaults are explicit and do not change external tool arguments.
+
 ## Routing and fallback
 
-`agent.provider` selects the primary route. `agent.provider_fallbacks` is an ordered list of additional configured routes.
+`agent.provider` selects the primary route. `agent.provider_fallbacks` is an ordered list of additional configured routes. Each route prepares and compacts its own view of the canonical conversation using its model and endpoint limits. A context-capacity failure can advance to the next route without discarding the original transcript. Operator limits still apply to every route; preparation alone does not consume a model request.
 
 Fallback occurs for provider-layer failures, not for a model’s ordinary end-turn judgment. A route change emits an event and preserves normalized conversation state. Tool calls are never replayed solely because a provider failed after the tool result was durably recorded.
 
 ## Pricing and budgets
 
-Provider configurations can declare local prices per million input, cached-input, cache-write,
-and output tokens. Borealis computes both actual cost and net prompt-cache savings from normalized
-usage and enforces `agent.max_cost_usd`. When no explicit cache-write price is set, Borealis uses
-the input price; the Anthropic adapter applies its 5-minute or 1-hour write multiplier.
+Provider price fields are optional. Missing input/output pricing means **unknown cost**, not free usage. Explicit zero prices mean free usage. Missing cache-read prices use the normal input rate; missing cache-write prices use the provider's write multiplier. An explicit zero cache price stays zero. Provider-reported charges take priority. Otherwise the charge is an estimate from normalized token categories; cached tokens are not charged again as uncached input.
 
-Price fields default to zero because pricing changes and can depend on account, region, batch mode, or cache behavior. Production operators should set current prices explicitly and monitor the provider’s own billing controls.
+Usage and terminal reports label cost as `known`, `estimated`, `unknown`, or `incomplete`. Mixed known and unknown charges are incomplete. Cancelled requests without usage are unreconciled. Legacy records remain readable and have unknown cost status; their numeric totals are preserved. Native usage categories remain in request events for reconciliation.
+
+Dollar-budget enforcement is opt-in (`agent.max_cost_usd = 0` by default). With `agent.max_cost_usd > 0`, each network request requires usable input/output pricing for its resolved model, including summarizers and server-side fallback candidates. The runtime reserves estimated request cost and holds observed attempt charges in the shared parent budget until settlement. Concurrent helpers, retries, summaries, and fallback routes check both amounts before dispatch. Terminal usage remains held across cancellation until it reaches the accounting sink. Chat Completions reasoning-disabled recovery and Responses reasoning-summary recovery report each wire attempt through the same observer before checking the remaining budget and dispatching recovery. Aggregate responses are not observed a second time. If an OpenAI-compatible, Anthropic, or Gemini stream stops after reporting usage, its latest cumulative snapshot is retained with incomplete status. Chat Completions error frames and HTTP error bodies retain their reported billing usage before raising; failed responses never authorize tool execution. Context-capacity failures can select another route, including one with the same context window and a smaller output reservation; global cost, time, and request limits remain terminal. Missing pricing or unreconciled usage stops the run with a budget error. These estimates cannot guarantee the final provider bill. Set `max_cost_usd = 0` to disable the dollar gate while retaining time, request, and context limits.
+
+Billing uses the requested model alias unless the reported model has an explicit `model_prices` override or is a configured server-side fallback. The reported model remains available in response records. Per-attempt native usage is retained in `model.attempt_usage` session events when usage is settled, including billed failures and retries. Native payloads remain separate; normalized token and cost totals are settled once. An unpriced fallback is not assigned the primary model's prices.
+
+Flat prices belong to the configured route's main model. Use `model_prices` for a different summarizer or fallback model. Each endpoint configuration can specify `context_tokens`, `input_token_limit`, `output_token_limit`, and `request_byte_limit`, plus exact-model `model_limits`. Limits intersect with operator budgets. Unknown capabilities stay unknown and use the configured token assumption. No price scraping or model catalog is used. Request byte limits are independent of tokenizer-free token estimates.
 
 The CLI reports prompt-cache hit rate, read/write tokens, net savings, exact-response-cache hits,
 and avoided tokens. Exact final-text responses are cached locally for a short TTL. Safe

@@ -107,11 +107,18 @@ class Usage:
     reasoning_tokens: int = 0
     requests: int = 0
     cost_usd: float = 0.0
+    cost_status: str = "unknown"  # known | estimated | unknown | incomplete
+    native_usage: dict[str, Any] = field(default_factory=dict)
+    attempt_usage: list[dict[str, Any]] = field(default_factory=list)
     cache_savings_usd: float = 0.0
     application_cache_hits: int = 0
     application_cache_misses: int = 0
     application_cache_saved_tokens: int = 0
     application_cache_saved_cost_usd: float = 0.0
+
+    @property
+    def cost_label(self) -> str:
+        return f"${self.cost_usd:.4f} ({self.cost_status})"
 
     @property
     def total_tokens(self) -> int:
@@ -121,6 +128,7 @@ class Usage:
     def is_empty(self) -> bool:
         return not any(
             (
+                self.cost_status == "incomplete",
                 self.input_tokens,
                 self.output_tokens,
                 self.cached_input_tokens,
@@ -150,6 +158,21 @@ class Usage:
         return self.application_cache_hits / attempts if attempts else 0.0
 
     def add(self, other: Usage) -> Usage:
+        if not other.is_empty or other.cost_status == "incomplete":
+            if self.is_empty and self.cost_status != "incomplete":
+                self.cost_status = other.cost_status
+            elif "incomplete" in (self.cost_status, other.cost_status):
+                self.cost_status = "incomplete"
+            elif "unknown" in (self.cost_status, other.cost_status):
+                self.cost_status = "unknown" if self.cost_status == other.cost_status else "incomplete"
+            elif "estimated" in (self.cost_status, other.cost_status):
+                self.cost_status = "estimated"
+        if self.native_usage and not self.attempt_usage:
+            self.attempt_usage.append({"native_usage": self.native_usage})
+        self.attempt_usage.extend(other.attempt_usage or (
+            [{"native_usage": other.native_usage}] if other.native_usage else []
+        ))
+        self.native_usage = {}
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.cached_input_tokens += other.cached_input_tokens
@@ -173,6 +196,9 @@ class Usage:
             "reasoning_tokens": self.reasoning_tokens,
             "requests": self.requests,
             "cost_usd": round(self.cost_usd, 8),
+            "cost_status": self.cost_status,
+            "native_usage": self.native_usage,
+            "attempt_usage": self.attempt_usage,
             "cache_savings_usd": round(self.cache_savings_usd, 8),
             "provider_cache_hit_rate": round(self.provider_cache_hit_rate, 6),
             "application_cache_hits": self.application_cache_hits,
@@ -194,6 +220,9 @@ class Usage:
             reasoning_tokens=int(value.get("reasoning_tokens", 0) or 0),
             requests=int(value.get("requests", 0) or 0),
             cost_usd=float(value.get("cost_usd", 0.0) or 0.0),
+            cost_status=str(value.get("cost_status", "unknown")),
+            native_usage=dict(value.get("native_usage") or {}),
+            attempt_usage=list(value.get("attempt_usage") or []),
             cache_savings_usd=float(value.get("cache_savings_usd", 0.0) or 0.0),
             application_cache_hits=int(value.get("application_cache_hits", 0) or 0),
             application_cache_misses=int(value.get("application_cache_misses", 0) or 0),

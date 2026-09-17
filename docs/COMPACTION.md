@@ -9,7 +9,7 @@ Compaction v2 creates a bounded provider view. It does not edit the durable sess
 - A synthetic summary is system context. It is never a current user message.
 - An assistant tool call and all matching tool results form one atomic bundle.
 - Malformed call and result relationships stop request preparation.
-- Current objectives, recent user constraints, pending work, blockers, changed files, and verification evidence have priority.
+- Original user instructions, their objective, pending work, blockers, changed files, and verification evidence have priority.
 - A successful compaction must fit the calculated target in tokens and bytes.
 - Cancellation, provider errors, usage, and cost keep their normal accounting behavior.
 - Each artifact records the exact summary, source IDs and hash, configuration fingerprint, retained IDs, routed provider contexts, usage, and parent artifact.
@@ -41,9 +41,15 @@ The deterministic artifact contains these sections in a stable order:
 
 Borealis records an unavailable marker when durable structured evidence does not support a section. It does not infer decisions from prose.
 
+## Protected task state
+
+The session's existing key/value store holds source references for the original objective and later user instructions. Original text remains in the append-only message log. Request preparation includes the instructions themselves, in order, with stable session-local `user:N` references. Follow-ups extend the objective; later explicit replacements or revocations take precedence and remain visible on resume. A leading, unquoted command `Revoke user:N` or `Supersede user:N` records a supersession linked to that later user message. The command must end its line or use a period/colon before an explanation. Commands inside fences, block quotes, indented code, or examples introduced by other text do not change status; the original remains in history. Free-form revocations remain ordered instructions. The runtime does not guess semantic revocations or extract requirements with extra model calls. Conservatively retaining the original text can consume more context than an extracted requirement list.
+
+`update_plan` persists its items and optional acceptance criteria as model notes. They cannot create user permission. Internal verification messages and tool output do not become user instructions. Protected state is budgeted before historical detail; if it cannot fit, the run returns a context-budget error. Search `user:N` with `search_history` to resolve its original message.
+
 ## Context budget
 
-`ContextBudget` starts with the configured model input limit. It reserves output tokens, system and tool-schema tokens, the largest framing allowance across every configured provider route, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input. A sole current user request bypasses proactive compaction when the complete request still fits the hard input limit because there is no historical bundle to remove. Provider-overflow retries never use this bypass. Bundle selection does not reserve continuation metadata that it may remove. Borealis recalculates the reserve from retained messages and tightens the artifact again when needed.
+`ContextBudget` starts with the configured token assumption. The shared `prepare_route_request` then checks the actual provider/model/endpoint, including fallback, helper, and summarizer requests, and uses the existing v2 compactor when needed. Helpers receive their scoped task rather than the parent transcript. Byte ceilings come only from explicit endpoint configuration; a bytes-per-token ratio is not an endpoint limit. It reserves output tokens, system and tool-schema tokens, the largest framing allowance across every configured provider route, continuation state, and a safety margin. Compaction starts at `compact_at_ratio` and must end below `compaction_target_ratio` of the available input. A sole current user request bypasses proactive compaction when the complete request still fits the hard input limit because there is no historical bundle to remove. Provider-overflow retries never use this bypass. Bundle selection does not reserve continuation metadata that it may remove. Borealis recalculates the reserve from retained messages and tightens the artifact again when needed.
 
 The default post-compaction target is 40% of available input, below the 82% trigger. Request preparation reconstructs a compatible summary plus retained messages and new messages, then prunes that working view before checking token, byte, and tool-output thresholds. Already omitted history does not trigger compaction.
 

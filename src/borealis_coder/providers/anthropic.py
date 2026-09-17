@@ -64,6 +64,9 @@ class AnthropicProvider(Provider):
             payload["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
         return payload
 
+    def request_bytes(self, request: ProviderRequest) -> int:
+        return max(len(json_dumps(self._payload(request, stream=stream)).encode("utf-8")) for stream in (False, True))
+
     async def complete(self, request: ProviderRequest) -> ModelResponse:
         async def operation() -> ModelResponse:
             url = self.config.base_url.rstrip("/") + "/messages"
@@ -78,105 +81,121 @@ class AnthropicProvider(Provider):
                 cache_ttl=str(request.metadata.get("prompt_cache_ttl") or "5m"),
             )
 
-        return await self.with_retries(operation)
+        return await self.with_retries(operation, request=request)
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
+        self.request_model.set(request.model)
         url = self.config.base_url.rstrip("/") + "/messages"
         payload = self._payload(request, stream=True)
         text_parts: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
         completed_call_indexes: set[int] = set()
-        usage = Usage(requests=1)
+        usage = Usage(requests=1, cost_status="incomplete")
         message_id: str | None = None
         model: str | None = None
         stop_reason: str | None = None
-        async for event in self.http.stream_sse(url, headers=self._headers(), payload=payload):
-            try:
-                data = json.loads(event.data)
-            except json.JSONDecodeError:
-                continue
-            event_type = data.get("type") or event.event
-            if event_type == "message_start":
-                message = data.get("message") or {}
-                message_id = message.get("id")
-                model = message.get("model")
-                initial = message.get("usage") or {}
-                uncached = int(initial.get("input_tokens", 0) or 0)
-                usage.cached_input_tokens = int(initial.get("cache_read_input_tokens", 0) or 0)
-                usage.cache_write_tokens = int(initial.get("cache_creation_input_tokens", 0) or 0)
-                usage.input_tokens = uncached + usage.cached_input_tokens + usage.cache_write_tokens
-            elif event_type == "content_block_start":
-                index = int(data.get("index", 0))
-                block = data.get("content_block") or {}
-                if block.get("type") == "tool_use":
-                    calls[index] = {
-                        "id": str(block.get("id") or ""),
-                        "name": str(block.get("name") or ""),
-                        "arguments": "",
-                        "input": block.get("input") or {},
-                    }
-            elif event_type == "content_block_delta":
-                index = int(data.get("index", 0))
-                delta = data.get("delta") or {}
-                if delta.get("type") == "text_delta":
-                    text = str(delta.get("text") or "")
-                    text_parts.append(text)
-                    yield ProviderStreamEvent(type="text_delta", text=text)
-                elif delta.get("type") == "input_json_delta":
-                    partial = str(delta.get("partial_json") or "")
-                    call = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
-                    call["arguments"] = str(call.get("arguments") or "") + partial
-                    yield ProviderStreamEvent(
-                        type="tool_call_delta",
-                        data={
-                            "index": index,
-                            "id": call.get("id", ""),
-                            "name": call.get("name", ""),
-                            "delta": partial,
-                        },
+
+        def latest_usage() -> Usage:
+            billing_model = self.response_billing_model(model)
+            return self.normalize_cost(self.price_usage(usage,
+                cache_write_multiplier=_cache_write_multiplier(request), model=billing_model),
+                model=billing_model)
+
+        with self.request_attempt(latest_usage) as record:
+            async for event in self.http.stream_sse(url, headers=self._headers(), payload=payload):
+                try:
+                    data = json.loads(event.data)
+                except json.JSONDecodeError:
+                    continue
+                event_type = data.get("type") or event.event
+                if event_type == "message_start":
+                    message = data.get("message") or {}
+                    message_id = message.get("id")
+                    model = message.get("model")
+                    initial = message.get("usage") or {}
+                    usage.native_usage.update(initial)
+                    uncached = int(initial.get("input_tokens", 0) or 0)
+                    usage.cached_input_tokens = int(initial.get("cache_read_input_tokens", 0) or 0)
+                    usage.cache_write_tokens = int(initial.get("cache_creation_input_tokens", 0) or 0)
+                    usage.input_tokens = uncached + usage.cached_input_tokens + usage.cache_write_tokens
+                    usage.output_tokens = int(initial.get("output_tokens", 0) or 0)
+                elif event_type == "content_block_start":
+                    index = int(data.get("index", 0))
+                    block = data.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        calls[index] = {
+                            "id": str(block.get("id") or ""),
+                            "name": str(block.get("name") or ""),
+                            "arguments": "",
+                            "input": block.get("input") or {},
+                        }
+                elif event_type == "content_block_delta":
+                    index = int(data.get("index", 0))
+                    delta = data.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text = str(delta.get("text") or "")
+                        text_parts.append(text)
+                        yield ProviderStreamEvent(type="text_delta", text=text)
+                    elif delta.get("type") == "input_json_delta":
+                        partial = str(delta.get("partial_json") or "")
+                        call = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        call["arguments"] = str(call.get("arguments") or "") + partial
+                        yield ProviderStreamEvent(
+                            type="tool_call_delta",
+                            data={
+                                "index": index,
+                                "id": call.get("id", ""),
+                                "name": call.get("name", ""),
+                                "delta": partial,
+                            },
+                        )
+                elif event_type == "content_block_stop":
+                    index = int(data.get("index", 0))
+                    if index in calls:
+                        completed_call_indexes.add(index)
+                elif event_type == "message_delta":
+                    delta = data.get("delta") or {}
+                    stop_reason = delta.get("stop_reason") or stop_reason
+                    delta_usage = data.get("usage") or {}
+                    usage.native_usage.update(delta_usage)
+                    if "input_tokens" in usage.native_usage and "output_tokens" in usage.native_usage:
+                        usage.cost_status = "unknown"
+                    usage.output_tokens = int(
+                        delta_usage.get("output_tokens", 0) or usage.output_tokens
                     )
-            elif event_type == "content_block_stop":
-                index = int(data.get("index", 0))
-                if index in calls:
-                    completed_call_indexes.add(index)
-            elif event_type == "message_delta":
-                delta = data.get("delta") or {}
-                stop_reason = delta.get("stop_reason") or stop_reason
-                delta_usage = data.get("usage") or {}
-                usage.output_tokens = int(
-                    delta_usage.get("output_tokens", 0) or usage.output_tokens
+                elif event_type == "error":
+                    error = data.get("error") or {}
+                    raise ProviderError(str(error.get("message") or error))
+            response_incomplete = stop_reason is None or _is_incomplete_stop_reason(stop_reason)
+            tool_calls: list[ToolCall] = []
+            for index, item in sorted(calls.items()):
+                if response_incomplete or index not in completed_call_indexes:
+                    continue
+                raw = str(item.get("arguments") or "")
+                arguments = _parse_arguments(raw) if raw else dict(item.get("input") or {})
+                tool_calls.append(
+                    ToolCall(
+                        id=str(item.get("id") or ""),
+                        name=str(item.get("name") or ""),
+                        arguments=arguments,
+                        raw_arguments=raw or json_dumps(arguments),
+                    )
                 )
-            elif event_type == "error":
-                error = data.get("error") or {}
-                raise ProviderError(str(error.get("message") or error))
-        response_incomplete = stop_reason is None or _is_incomplete_stop_reason(stop_reason)
-        tool_calls: list[ToolCall] = []
-        for index, item in sorted(calls.items()):
-            if response_incomplete or index not in completed_call_indexes:
-                continue
-            raw = str(item.get("arguments") or "")
-            arguments = _parse_arguments(raw) if raw else dict(item.get("input") or {})
-            tool_calls.append(
-                ToolCall(
-                    id=str(item.get("id") or ""),
-                    name=str(item.get("name") or ""),
-                    arguments=arguments,
-                    raw_arguments=raw or json_dumps(arguments),
-                )
+            self.price_usage(
+                usage,
+                cache_write_multiplier=_cache_write_multiplier(request),
+                model=self.response_billing_model(model),
             )
-        self.price_usage(
-            usage,
-            cache_write_multiplier=_cache_write_multiplier(request),
-        )
-        result = ModelResponse(
-            text="".join(text_parts),
-            tool_calls=tool_calls,
-            usage=usage,
-            stop_reason=stop_reason or "incomplete",
-            response_id=message_id,
-            model=model,
-        )
-        yield ProviderStreamEvent(type="completed", response=result)
+            result = ModelResponse(
+                text="".join(text_parts),
+                tool_calls=tool_calls,
+                usage=usage,
+                stop_reason=stop_reason or "incomplete",
+                response_id=message_id,
+                model=model,
+            )
+            record(self.normalize_cost(result.usage, model=self.response_billing_model(model)))
+            yield ProviderStreamEvent(type="completed", response=result)
 
     @staticmethod
     def _messages(messages: list[Message]) -> list[dict[str, Any]]:
@@ -252,8 +271,11 @@ class AnthropicProvider(Provider):
                 cached_input_tokens=cached,
                 cache_write_tokens=cache_write,
                 requests=1,
+                native_usage=dict(usage_data),
+                cost_status="unknown" if {"input_tokens", "output_tokens"} <= usage_data.keys() else "incomplete",
             ),
             cache_write_multiplier=2.0 if cache_ttl == "1h" else 1.25,
+            model=self.response_billing_model(data.get("model")),
         )
         return ModelResponse(
             text="".join(text),

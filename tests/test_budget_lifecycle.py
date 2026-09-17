@@ -71,10 +71,10 @@ class BudgetLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         self.provider.handler = handler
                         result = await self.runner.run("Check streamed retry accounting")
 
-                        self.assertEqual(self.provider.calls, 2)
+                        self.assertEqual(self.provider.calls, 1 if cost_limit else 2)
                         self.assertEqual(result.stop_reason.value, "budget" if cost_limit else "error")
-                        self.assertAlmostEqual(result.usage.cost_usd, 0.1 + (terminal_cost or 0))
-                        self.assertEqual(result.usage.requests, 1 if terminal_cost is None else 2)
+                        self.assertAlmostEqual(result.usage.cost_usd, 0.1 if cost_limit else 0.1 + (terminal_cost or 0))
+                        self.assertEqual(result.usage.requests, 1 if cost_limit or terminal_cost is None else 2)
                         self.assertEqual(
                             self.runner.sessions.usage(result.session_id).to_dict(),
                             result.usage.to_dict(),

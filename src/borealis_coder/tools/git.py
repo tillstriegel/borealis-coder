@@ -12,13 +12,13 @@ async def _git(context: ToolContext, args: list[str], timeout: int = 120) -> Too
     safety_flags = ["-c", "core.fsmonitor=false", "-c", "diff.external="]
     if not context.config.safety.allow_git_hooks:
         safety_flags += ["-c", "core.hooksPath=/dev/null"]
-    result = await context.process.run(
+    result = await context.run_process(
         ["git", *safety_flags, *args],
         cwd=context.workspace,
         timeout=timeout,
         shell=False,
     )
-    return ToolResult(result.render(), is_error=not result.ok, metadata={"exit_code": result.exit_code, "duration_ms": result.duration_ms})
+    return ToolResult(result.render(), is_error=not result.ok, metadata={"exit_code": result.exit_code, "duration_ms": result.duration_ms, **({"output_artifact": result.output_artifact} if result.output_artifact else {})})
 
 
 class GitStatusTool(Tool):

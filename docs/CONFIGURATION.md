@@ -70,7 +70,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `compact_at_ratio` | `0.82` | Compact when estimated context reaches this fraction of the input budget. |
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
 | `max_time_seconds` | `3600` | End-to-end run wall-time ceiling. |
-| `max_cost_usd` | `25.0` | Cumulative run cost ceiling when adapter pricing is configured. |
+| `max_cost_usd` | `0.0` | Opt-in cumulative dollar ceiling. Positive limits require configured pricing. |
 | `max_model_requests` | `40` | Logical parent, delegate, and summarizer request ceiling for one run. |
 | `max_read_only_turns` | `8` | Consecutive tool turns with no observed file changes before Borealis requires an answer from gathered evidence. |
 | `parallel_reads` | `8` | Maximum concurrent read-only tool calls. |
@@ -184,11 +184,17 @@ applies on append, checkpoint retention applies after a complete new checkpoint 
 | `app_name` | OpenRouter app-attribution title (`X-Title`). Ignored by other built-ins. |
 | `model_fallbacks` | OpenRouter backup model slugs tried after the primary model. |
 | `provider_preferences` | OpenRouter provider-routing object, e.g. `allow_fallbacks`, `only`, `order`, `data_collection`, or `zdr`. |
-| `extra_body` | Provider-specific top-level request fields. Primarily an escape hatch for OpenRouter extensions; explicit values can override adapter defaults. |
+| `extra_body` | Provider-specific top-level request fields. Primarily an escape hatch for OpenRouter extensions; request identity, content (including Responses `instructions`), tools, continuation references, response schemas, and output limits cannot be overridden; use their dedicated settings. |
+| `context_tokens` | Optional endpoint context-window limit; includes output reserve. |
+| `input_token_limit` | Optional independent endpoint input limit. |
+| `output_token_limit` | Optional endpoint maximum output; clamps the request reserve. |
+| `request_byte_limit` | Optional known endpoint request-byte limit. No byte ceiling is inferred from tokens. |
+| `model_limits` | Exact-model tables using the four limit keys above. Intersect with endpoint and operator limits. |
+| `model_prices` | Exact-model tables using the four price keys below. Required for priced requests to other models. |
 | `input_cost_per_million` | Optional local price used for budget accounting. |
 | `output_cost_per_million` | Optional output price. |
 | `cached_input_cost_per_million` | Optional cached-input price. |
-| `cache_write_input_cost_per_million` | Optional cache-creation price. Zero derives it from the normal input price and provider cache-write multiplier. |
+| `cache_write_input_cost_per_million` | Optional cache-creation price. Omission derives it from the input rate and provider multiplier; explicit zero is free. |
 | `auth_file` | ChatGPT only: explicit path to a secure file-backed Codex `auth.json`. |
 | `codex_home` | ChatGPT only: Codex credential directory whose `auth.json` should be considered. |
 | `codex_command` | ChatGPT only: official Codex CLI command used by `borealis auth login/logout`. |

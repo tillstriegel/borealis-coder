@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from ..config import AgentConfig
-from ..errors import BudgetExceeded
-from ..models import Message, Usage
+from ..errors import BudgetExceeded, RouteContextExceeded
+from ..models import Message, ProviderRequest, Usage
+from ..providers.base import Provider
 from ..util import estimate_tokens, json_dumps, monotonic_ms
 
 _PROVIDER_FRAMING_ALLOWANCE = {
@@ -48,6 +49,8 @@ class Budget:
     turns: int = 0
     model_requests: int = 0
     usage: Usage | None = None
+    pending_cost_usd: float = 0.0
+    _held_usage: dict[int, tuple[float, bool]] = field(default_factory=dict, repr=False)
 
     @classmethod
     def start(cls, config: AgentConfig) -> Budget:
@@ -93,6 +96,57 @@ class Budget:
             )
         self._check_time_and_cost()
         self.model_requests += 1
+
+    def reserve_cost(self, provider: Provider, request: ProviderRequest) -> float:
+        self._check_time_and_cost()
+        if self.config.max_cost_usd <= 0 or provider.name == "mock":
+            return 0.0
+        self.check_unsettled(Usage())
+        assert self.usage is not None
+        models = [request.model, *(provider.config.model_fallbacks if provider.name == "openrouter" else [])]
+        candidates = [provider.prices(model) for model in models]
+        rates = provider.prices(request.model)
+        if rates is None or any(value is None for value in candidates):
+            raise BudgetExceeded("cost", f"Strict dollar budget requires input/output pricing for {provider.name}/{request.model}")
+        multiplier = (2.0 if request.metadata.get("prompt_cache_ttl") == "1h" else 1.25) if provider.name == "anthropic" else 1.25 if provider.name == "openai" else 1.0
+        known_rates = [candidate for candidate in candidates if candidate is not None]
+        input_rate = max(max(item[0], item[2] if item[2] is not None else item[0],
+                             item[3] if item[3] is not None else item[0] * multiplier) for item in known_rates)
+        output_rate = max(item[1] for item in known_rates)
+        tools = [*request.tools, *([{"response_schema": request.response_schema}] if request.response_schema else [])]
+        context = ContextBudget.calculate(self.config, system=request.system, tools=tools, messages=request.messages, provider=provider.name)
+        estimate = (context.estimated_total(request.messages) * input_rate
+                    + request.max_output_tokens * output_rate) / 1_000_000
+        if self.usage.cost_usd + self.pending_cost_usd + estimate > self.config.max_cost_usd:
+            raise BudgetExceeded("cost", "Estimated request cost plus concurrent reservations exceeds the dollar budget")
+        self.pending_cost_usd += estimate
+        return estimate
+
+    def hold_usage(self, usage: Usage) -> None:
+        """Expose a logical request's observed charges until its sink takes over."""
+        previous, _ = self._held_usage.get(id(usage), (0.0, False))
+        self.pending_cost_usd += usage.cost_usd - previous
+        self._held_usage[id(usage)] = (usage.cost_usd, not usage.is_empty and usage.cost_status in {"unknown", "incomplete"})
+
+    def release_usage(self, usage: Usage) -> None:
+        held, _ = self._held_usage.pop(id(usage), (0.0, False))
+        self.release_cost(held)
+
+    def check_unsettled(self, usage: Usage) -> None:
+        """Check retry/fallback usage not yet settled by the single accounting sink."""
+        self._check_time_and_cost()
+        if self.config.max_cost_usd <= 0:
+            return
+        assert self.usage is not None
+        if (any(incomplete for _, incomplete in self._held_usage.values())
+                or any(not item.is_empty and item.cost_status in {"unknown", "incomplete"} for item in (self.usage, usage))):
+            raise BudgetExceeded("cost", "Strict dollar budget cannot retry with unreconciled usage")
+        unheld_cost = 0.0 if id(usage) in self._held_usage else usage.cost_usd
+        if self.usage.cost_usd + self.pending_cost_usd + unheld_cost > self.config.max_cost_usd:
+            raise BudgetExceeded("cost", "Retry or fallback cost exceeds the remaining dollar budget")
+
+    def release_cost(self, reservation: float) -> None:
+        self.pending_cost_usd = max(0.0, round(self.pending_cost_usd - reservation, 12))
 
     def add_usage(self, usage: Usage) -> None:
         assert self.usage is not None
@@ -219,9 +273,7 @@ class ContextBudget:
             1,
             config.max_input_tokens
             - config.max_output_tokens
-            - dynamic_margin
-            - provider_framing
-            - continuation_state_tokens,
+            - dynamic_margin,
         )
         trigger = max(1, int(available * config.compact_at_ratio))
         effective_target_ratio = min(
@@ -236,16 +288,7 @@ class ContextBudget:
             + continuation_state_tokens
         )
         message_target = max(1, target - fixed)
-        hard_bytes = max(
-            1,
-            (
-                config.max_input_tokens
-                - config.max_output_tokens
-                - dynamic_margin
-                - provider_framing
-            )
-            * 4,
-        )
+        hard_bytes = 2**63 - 1  # Unknown endpoint byte limit; checked on the actual route.
         trigger_bytes = max(1, int(hard_bytes * config.compact_at_ratio))
         target_bytes = max(1, int(hard_bytes * effective_target_ratio))
         empty_request_bytes = estimate_request_bytes("", [], [])
@@ -286,3 +329,97 @@ class ContextBudget:
 
     def below_target(self, messages: list[Message]) -> bool:
         return self.estimated_total(messages) <= self.target_tokens
+
+
+def resolve_route_limits(config: AgentConfig, provider: Provider, model: str, max_output_tokens: int, *, overflow_retry_count: int = 0) -> tuple[AgentConfig, dict[str, int | None]]:
+    """Intersect operator, endpoint and exact-model capabilities without a catalog."""
+    limits = {key: getattr(provider.config, key) for key in (
+        "context_tokens", "input_token_limit", "output_token_limit", "request_byte_limit",
+    )}
+    for key, value in provider.config.model_limits.get(model, {}).items():
+        limits[key] = min(limits[key] or value, value)
+    if provider.name == "openrouter":
+        for model in provider.config.model_fallbacks:
+            for key, value in provider.config.model_limits.get(model, {}).items():
+                limits[key] = min(limits[key] or value, value)
+    output = min(max_output_tokens, limits["output_token_limit"] or max_output_tokens)
+    context_limit = int(min(config.max_input_tokens, limits["context_tokens"] or config.max_input_tokens) * (0.8 ** overflow_retry_count))
+    if limits["input_token_limit"]:
+        context_limit = min(context_limit, limits["input_token_limit"] + output)
+    return replace(config, max_input_tokens=context_limit, max_output_tokens=output), limits
+
+
+def prepare_route_request(request: ProviderRequest, provider: Provider, config: AgentConfig, *, overflow_retry_count: int = 0) -> ProviderRequest:
+    """Apply the actual endpoint/model limits using the existing compaction v2."""
+    from .compaction import (
+        CompactionError,
+        compact_messages,
+        prune_provider_messages,
+        validate_tool_call_order,
+    )
+
+    reserved_fields = {
+        "model", "models", "messages", "input", "system", "instructions",
+        "tools", "functions", "tool_choice", "function_call", "parallel_tool_calls",
+        "response_format", "text", "previous_response_id", "conversation",
+        "max_tokens", "max_output_tokens", "max_completion_tokens",
+    }
+    if reserved_fields.intersection(provider.config.extra_body):
+        raise BudgetExceeded("context", "extra_body overrides request fields that must be validated; use route/model settings instead")
+    effective, limits = resolve_route_limits(config, provider, request.model, request.max_output_tokens, overflow_retry_count=overflow_retry_count)
+    output, context_limit = effective.max_output_tokens, effective.max_input_tokens
+    budget_tools = [*request.tools, *([{ "response_schema": request.response_schema}] if request.response_schema else [])]
+    messages, _ = prune_provider_messages(request.messages)
+    system = request.system
+    byte_limit = limits["request_byte_limit"]
+
+    def fits(items: list[Message], prompt: str) -> bool:
+        current = ContextBudget.calculate(effective, system=prompt, tools=budget_tools, messages=items, provider=provider.name)
+        if current.estimated_total(items) + output + current.safety_margin_tokens > context_limit:
+            return False
+        if byte_limit:
+            metadata = dict(request.metadata)
+            if prompt != request.system:
+                metadata.pop("system_blocks", None)
+            candidate = replace(request, system=prompt, messages=items, max_output_tokens=output, metadata=metadata)
+            size = provider.request_bytes(candidate)
+            if size is None:
+                raise BudgetExceeded("context", "This adapter cannot validate the configured request-byte limit")
+            return size <= byte_limit
+        return True
+
+    # Equal context windows can still leave different input space after output reservation.
+    if not fits([], system):
+        raise RouteContextExceeded("context", "Protected task state, instructions and tool schemas exceed the route budget")
+    compacted = False
+    if not fits(messages, system):
+        # Scoped helpers have only their own user instructions, never the parent transcript.
+        protected = [m.content for m in messages if m.role.value == "user"]
+        if not request.metadata.get("protected_task_state") and protected:
+            system += "\n\nScoped user requirements (user authority):\n" + json_dumps(protected)
+        budget = ContextBudget.calculate(effective, system=system, tools=budget_tools, messages=messages, provider=provider.name)
+        available = context_limit - output - budget.safety_margin_tokens - budget.provider_framing_tokens - budget.system_tokens - budget.tool_schema_tokens
+        if available <= 0 or not fits([], system):
+            raise RouteContextExceeded("context", "Protected task requirements cannot fit the safe route budget")
+        try:
+            messages = compact_messages(messages, force=True, keep_recent=1,
+                                        target_tokens=max(1, int(available * 0.8)),
+                                        target_bytes=max(1, byte_limit - estimate_request_bytes(system, [], budget_tools)) if byte_limit else 0)
+        except CompactionError as error:
+            raise RouteContextExceeded("context", "Route context cannot be compacted within its safe budget") from error
+        if messages and messages[0].metadata.get("compacted"):
+            system += "\n\n" + messages[0].content
+            messages = messages[1:]
+        compacted = True
+    validate_tool_call_order(messages)
+    if not fits(messages, system):
+        raise RouteContextExceeded("context", "Prepared request exceeds the actual model/endpoint limits")
+    metadata = dict(request.metadata)
+    if compacted:
+        metadata.pop("system_blocks", None)
+        metadata.pop("compaction_artifact_id", None)
+        metadata.pop("compacted_context_hashes", None)
+    metadata["resolved_limits"] = {**limits, "configured_context_tokens": config.max_input_tokens,
+                                   "effective_context_tokens": context_limit,
+                                   "token_count_method": "conservative_estimate"}
+    return replace(request, system=system, messages=messages, max_output_tokens=output, metadata=metadata)

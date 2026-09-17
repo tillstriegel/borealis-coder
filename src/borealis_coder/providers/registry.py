@@ -53,7 +53,9 @@ class ProviderRegistry:
                 f"Environment variable {provider_config.api_key_env} is required for provider {provider_name!r}"
             )
         model = config.resolved_model(provider_name, provider_config)
-        return provider_name, model, factory(provider_config, api_key)
+        provider = factory(provider_config, api_key)
+        provider.billing_model = model
+        return provider_name, model, provider
 
 
 DEFAULT_PROVIDER_REGISTRY = ProviderRegistry()

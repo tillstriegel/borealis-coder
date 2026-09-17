@@ -1846,200 +1846,11 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
             list(dict.fromkeys(actual_models)),
         )
 
-    async def test_single_fitting_multibyte_request_bypasses_byte_compaction_trigger(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            config = make_config(
-                root,
-                agent={
-                    "max_input_tokens": 6_000,
-                    "max_output_tokens": 1_000,
-                    "compact_at_ratio": 0.5,
-                    "compaction_target_ratio": 0.4,
-                    "compaction_safety_margin_tokens": 128,
-                    "compaction_provider_framing_tokens": 64,
-                },
-            )
-            runner = await build_runner(root, config=config, interactive=False)
-            session = runner.sessions.create_session(
-                workspace=root, provider="mock", model="deterministic"
-            )
-            message = Message(role=Role.USER, content="🙂" * 2_500)
-            runner.sessions.append_message(session.id, message)
-            prompt_context = PromptContext(stable="system")
-            context_budget = ContextBudget.calculate(
-                config.agent,
-                system=prompt_context.text,
-                tools=[],
-                messages=[message],
-                provider="mock",
-            )
-
-            async def usage_sink(_usage: Usage) -> None:
-                return None
-
-            try:
-                prepared = await runner._prepare_provider_request(
-                    prompt_context=prompt_context,
-                    messages=[message],
-                    schemas=[],
-                    final_turn=False,
-                    verification_finalization_pending=False,
-                    adaptive_cache=False,
-                    conversation_cache=True,
-                    usage_sink=usage_sink,
-                    cancel=asyncio.Event(),
-                    session_id=session.id,
-                    run_id="single-request",
-                    last_prune_signature=None,
-                )
-                artifacts = runner.sessions.compaction_artifacts(session.id)
-            finally:
-                await runner.close()
-
-        self.assertLess(
-            context_budget.estimated_total([message]), context_budget.trigger_tokens
-        )
-        self.assertGreaterEqual(
-            estimate_request_bytes(prompt_context.text, [message], []),
-            context_budget.trigger_bytes,
-        )
-        self.assertLessEqual(
-            estimate_request_bytes(prompt_context.text, [message], []),
-            context_budget.hard_bytes,
-        )
-        self.assertLessEqual(
-            context_budget.estimated_total([message])
-            + context_budget.reserved_output_tokens
-            + context_budget.safety_margin_tokens,
-            context_budget.input_limit,
-        )
-        self.assertFalse(prepared.compacted)
-        self.assertEqual(prepared.request.messages, [message])
-        self.assertEqual(artifacts, [])
-
-    async def test_uncompacted_multibyte_request_over_hard_byte_limit_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            config = make_config(
-                root,
-                agent={
-                    "max_input_tokens": 6_000,
-                    "max_output_tokens": 1_000,
-                    "compact_at_ratio": 0.5,
-                    "compaction_target_ratio": 0.4,
-                    "compaction_safety_margin_tokens": 128,
-                    "compaction_provider_framing_tokens": 64,
-                },
-            )
-            runner = await build_runner(root, config=config, interactive=False)
-            session = runner.sessions.create_session(
-                workspace=root, provider="mock", model="deterministic"
-            )
-            message = Message(role=Role.USER, content="🙂" * 5_000)
-            runner.sessions.append_message(session.id, message)
-            prompt_context = PromptContext(stable="system")
-            context_budget = ContextBudget.calculate(
-                config.agent,
-                system=prompt_context.text,
-                tools=[],
-                messages=[message],
-                provider="mock",
-            )
-
-            async def usage_sink(_usage: Usage) -> None:
-                return None
-
-            try:
-                with self.assertRaisesRegex(BudgetExceeded, "bytes"):
-                    await runner._prepare_provider_request(
-                        prompt_context=prompt_context,
-                        messages=[message],
-                        schemas=[],
-                        final_turn=False,
-                        verification_finalization_pending=False,
-                        adaptive_cache=False,
-                        conversation_cache=True,
-                        usage_sink=usage_sink,
-                        cancel=asyncio.Event(),
-                        session_id=session.id,
-                        run_id="single-request-byte-hard-gate",
-                        last_prune_signature=None,
-                    )
-            finally:
-                await runner.close()
-
-        self.assertLess(
-            context_budget.estimated_total([message]), context_budget.trigger_tokens
-        )
-        self.assertGreater(
-            estimate_request_bytes(prompt_context.text, [message], []),
-            context_budget.hard_bytes,
-        )
-
-    async def test_multibyte_history_triggers_compaction_before_token_threshold(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            config = make_config(
-                root,
-                agent={
-                    "max_input_tokens": 6_000,
-                    "max_output_tokens": 1_000,
-                    "compact_at_ratio": 0.5,
-                    "compaction_target_ratio": 0.4,
-                    "compaction_safety_margin_tokens": 128,
-                    "compaction_provider_framing_tokens": 64,
-                },
-            )
-            runner = await build_runner(root, config=config, interactive=False)
-            session = runner.sessions.create_session(
-                workspace=root, provider="mock", model="deterministic"
-            )
-            messages = [
-                Message(role=Role.USER, content="🙂" * 2_500),
-                Message(role=Role.ASSISTANT, content="old answer"),
-                Message(role=Role.USER, content="current request"),
-            ]
-            for message in messages:
-                runner.sessions.append_message(session.id, message)
-            prompt_context = PromptContext(stable="system")
-            context_budget = ContextBudget.calculate(
-                config.agent,
-                system=prompt_context.text,
-                tools=[],
-                messages=messages,
-                provider="mock",
-            )
-
-            async def usage_sink(_usage: Usage) -> None:
-                return None
-
-            try:
-                prepared = await runner._prepare_provider_request(
-                    prompt_context=prompt_context,
-                    messages=messages,
-                    schemas=[],
-                    final_turn=False,
-                    verification_finalization_pending=False,
-                    adaptive_cache=False,
-                    conversation_cache=True,
-                    usage_sink=usage_sink,
-                    cancel=asyncio.Event(),
-                    session_id=session.id,
-                    run_id="byte-trigger",
-                    last_prune_signature=None,
-                )
-            finally:
-                await runner.close()
-
-        self.assertLess(
-            context_budget.estimated_total(messages), context_budget.trigger_tokens
-        )
-        self.assertGreaterEqual(
-            estimate_request_bytes(prompt_context.text, messages, []),
-            context_budget.trigger_bytes,
-        )
-        self.assertTrue(prepared.compacted)
+    async def test_unknown_byte_limit_does_not_invent_an_endpoint_ceiling(self):
+        config = make_config(Path("."), agent={"max_input_tokens": 6000, "max_output_tokens": 1000})
+        budget = ContextBudget.calculate(config.agent, system="system", tools=[], messages=[])
+        self.assertEqual(budget.hard_bytes, 2**63 - 1)
+        self.assertGreater(budget.hard_bytes, config.agent.max_input_tokens * 4)
 
     async def test_compaction_recomputes_reserve_after_old_continuation_is_removed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2143,11 +1954,11 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                     [
                         Message(
                             role=Role.USER,
-                            content=f"request-{index} " + ("history " * 150),
+                            content=f"request-{index}",
                         ),
                         Message(
                             role=Role.ASSISTANT,
-                            content=f"response-{index}",
+                            content=f"response-{index} " + ("history " * 150),
                             metadata=(
                                 {
                                     "continuation_state": {

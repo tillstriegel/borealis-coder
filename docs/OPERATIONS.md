@@ -66,6 +66,16 @@ borealis sessions export SESSION_ID --output session.json
 
 Checkpoint files live under the data directory and are bounded by configuration. They are recovery aids, not an archival backup system.
 
+Large tool output is retained in session-owned `output_artifacts` before preview truncation. Shell, Git, and verification share capture before native process-output truncation. Artifacts contain redacted permitted content, a stable ID, retained-content SHA-256, retained and observed byte sizes, and collection/completeness status. The fixed limits are 2 MB per artifact and 20 MB and 1,000 artifacts per session. Quota-limited, interrupted, missing, and partial output is labelled; an artifact never implies a fresh file read. Session deletion removes its artifacts, and session export includes them.
+
+Tool previews reserve room for their artifact reference within `tool_output_chars`. Small previews use a compact ID; if the ceiling cannot hold even the ID, the reference remains in tool-result metadata and can be found through history search.
+
+HTTP fetches read at most their collection limit plus one byte. If that extra byte exists, retained evidence is marked partial even when its text fits the preview. `observed_bytes` counts bytes actually collected, not a claimed total response size.
+
+Use `read_artifact` with an artifact ID and a character offset/limit, or a literal `query` to find text deep inside a retained result. `search_history` finds original message references, tool-result events, and artifacts after compaction or restart. Message search previews contain the literal match. Query a returned message ID or `user:N` with `offset` to read up to 8,000 characters, then continue with `next_offset`; `after` paginates messages rather than characters. Exact `tool_call_id` lookups page stored tool-event output in 1,000-character chunks using the same offsets, including delegated outputs without artifacts. Use `after=0` to page within a source; tool-event literal searches keep their match-based previews. Retrieval is bounded to the owning session and workspace, accepts no file paths, and does not produce edit authorization or a current-file hash.
+
+`grep` reports scanned files, skipped reasons, exclusions, scope, completion, and content identities in its visible result. Continue using `next_cursor`. The baseline snapshot describes exactly the scan list selected by the requested glob. Completion checks a fresh enumeration of that scope; matching-file additions, removals, or changes require a restart. Changes to excluded files do not invalidate continuation. A result with skipped files is not an exhaustive negative. Directory enumeration failures report incomplete coverage explicitly. Pagination rescans the scope; it does not keep a background index.
+
 ## Logging and observability
 
 Three evidence streams are available:
