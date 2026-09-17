@@ -135,7 +135,7 @@ class OpenAIProvider(Provider):
     ) -> ModelResponse:
         url = self.config.base_url.rstrip("/") + "/responses"
         payload = self._responses_payload(request, include_reasoning_summary=include_reasoning_summary)
-        with self.request_attempt(error_usage=self._responses_error_usage) as record:
+        with self.request_attempt(error_usage=self._error_usage) as record:
             response = await self.http.post_json(url, headers=self._headers(), payload=payload)
             if not isinstance(response.data, dict):
                 raise ProviderError("OpenAI returned a non-object response")
@@ -225,7 +225,7 @@ class OpenAIProvider(Provider):
             include_reasoning_summary=include_reasoning_summary,
         )
         usage: Usage | None = None
-        with self.request_attempt(lambda: usage, error_usage=self._responses_error_usage) as record:
+        with self.request_attempt(lambda: usage, error_usage=self._error_usage) as record:
             text_parts: list[str] = []
             reasoning_summary_parts: list[str] = []
             reasoning_summary_key: tuple[str, str, str] | None = None
@@ -592,10 +592,11 @@ class OpenAIProvider(Provider):
     async def _complete_chat_once(self, request: ProviderRequest) -> ModelResponse:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         payload = self._chat_payload(request)
-        with self.request_attempt() as record:
+        with self.request_attempt(error_usage=self._error_usage) as record:
             response = await self.http.post_json(url, headers=self._headers(), payload=payload)
             if not isinstance(response.data, dict):
                 raise ProviderError("OpenAI-compatible provider returned a non-object response")
+            _raise_in_band_failure(response.data)
             result = self._parse_chat(response.data, retain_raw=True)
             record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
             return result
@@ -697,7 +698,7 @@ class OpenAIProvider(Provider):
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         payload = self._chat_payload(request, stream=True)
         usage: Usage | None = None
-        with self.request_attempt(lambda: usage) as record:
+        with self.request_attempt(lambda: usage, error_usage=self._error_usage) as record:
             text_parts: list[str] = []
             reasoning_summary_parts: list[str] = []
             reasoning_summary_key: tuple[str, str] | None = None
@@ -712,17 +713,15 @@ class OpenAIProvider(Provider):
                     data = json.loads(item.data)
                 except json.JSONDecodeError:
                     continue
-                if data.get("error") or str(data.get("type") or "").lower() == "error":
-                    _raise_in_band_failure(
-                        data,
-                        default_message="Chat Completions stream failed",
-                    )
                 model = data.get("model") or model
                 response_id = data.get("id") or response_id
                 if data.get("usage"):
                     usage_data = data["usage"]
                     usage = self.normalize_cost(self._usage_from_chat(usage_data, model=model),
                         model=self.response_billing_model(model))
+                if data.get("error") or str(data.get("type") or "").lower() == "error":
+                    _raise_in_band_failure(data, default_message="Chat Completions stream failed",
+                        usage=usage if data.get("usage") else None)
                 for choice in data.get("choices", []) or []:
                     finish_reason = choice.get("finish_reason") or finish_reason
                     delta = choice.get("delta") or {}
@@ -821,13 +820,14 @@ class OpenAIProvider(Provider):
             reasoning_summary=_extract_chat_reasoning_summary(message),
         )
 
-    def _responses_error_usage(self, error: ProviderError) -> Usage | None:
+    def _error_usage(self, error: ProviderError) -> Usage | None:
         data = error.details
         if isinstance(data, dict):
             data = data.get("response", data)
             if isinstance(data, dict) and isinstance(data.get("usage"), dict):
                 model = self.response_billing_model(data.get("model"))
-                return self.normalize_cost(self._usage_from_responses(data["usage"], model=data.get("model")), model=model)
+                parse = self._usage_from_chat if self.api_style == "chat" else self._usage_from_responses
+                return self.normalize_cost(parse(data["usage"], model=data.get("model")), model=model)
         return None
 
     def _usage_from_responses(self, usage_data: dict[str, Any], *, model: str | None = None) -> Usage:
@@ -1061,6 +1061,7 @@ def _raise_in_band_failure(
     data: dict[str, Any],
     *,
     default_message: str | None = None,
+    usage: Usage | None = None,
 ) -> None:
     error = data.get("error")
     failed = str(data.get("status") or "").lower() == "failed"
@@ -1092,15 +1093,17 @@ def _raise_in_band_failure(
     elif isinstance(raw_code, str) and raw_code.isdecimal():
         status = int(raw_code)
     if code in {"rate_limit_error", "rate_limit_exceeded", "too_many_requests"}:
-        raise ProviderRateLimitError(message, retryable=True, details=data)
+        raise ProviderRateLimitError(message, retryable=True, details=data, usage=usage)
     if code in {
         "internal_server_error",
         "request_timeout",
         "server_error",
         "service_unavailable",
     }:
-        raise ProviderUnavailableError(message, retryable=True, details=data)
-    raise classify_provider_error(status, message, details=data)
+        raise ProviderUnavailableError(message, retryable=True, details=data, usage=usage)
+    failure = classify_provider_error(status, message, details=data)
+    failure.usage = usage
+    raise failure
 
 
 def _reasoning_summary_unsupported(error: ProviderError) -> bool:

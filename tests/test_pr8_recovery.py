@@ -21,6 +21,8 @@ from borealis_coder.errors import (
     SessionError,
 )
 from borealis_coder.models import Message, ProviderRequest, Role, ToolCall, ToolResult
+from borealis_coder.providers.anthropic import AnthropicProvider
+from borealis_coder.providers.gemini import GeminiProvider
 from borealis_coder.providers.openai import OpenAIProvider
 from borealis_coder.sessions.store import SessionStore
 from borealis_coder.tools.base import FunctionTool, ToolRegistry, object_schema
@@ -93,6 +95,51 @@ class InterruptedUsageHTTP(RecoveryHTTP):
         self.ready.set()
         await self.release.wait()
         raise OSError('stream interrupted after usage')
+
+
+class UsagePacketsHTTP(RecoveryHTTP):
+    def __init__(self, packets, ending):
+        super().__init__()
+        self.packets = packets
+        self.ending = ending
+
+    async def stream_sse(self, url, *, headers, payload):
+        self.calls.append(payload)
+        for packet in self.packets:
+            yield SimpleNamespace(data=json.dumps(packet), event='')
+        self.ready.set()
+        if self.ending == 'cancel':
+            await self.release.wait()
+        elif self.ending == 'transport':
+            raise OSError('connection interrupted')
+
+
+class ChatErrorUsageHTTP(RecoveryHTTP):
+    def __init__(self, *, earlier=False, http_error=False, retry=False):
+        super().__init__()
+        self.earlier = earlier
+        self.http_error = http_error
+        self.retry = retry
+        self.model = 'snapshot'
+
+    async def response(self, payload):
+        data = await super().response(payload)
+        if len(self.calls) == 1:
+            data['choices'][0]['message']['content'] = 'failed response text'
+            data['choices'][0]['delta'] = {'content': 'failed response text', 'tool_calls': [
+                {'index': 0, 'id': 'failed-call', 'function': {'name': 'write_file', 'arguments': '{}'}}]}
+            data['error'] = {'message': 'server failed' if self.retry else 'reasoning_effort unsupported',
+                             'code': 'server_error' if self.retry else 'unsupported_parameter'}
+            if self.http_error:
+                raise ProviderError(data['error']['message'], details=data, retryable=self.retry)
+        return data
+
+    async def stream_sse(self, url, *, headers, payload):
+        data = await self.response(payload)
+        if len(self.calls) == 1 and self.earlier:
+            yield SimpleNamespace(data=json.dumps({'model': self.model, 'choices': [],
+                'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'cost': .1}}))
+        yield SimpleNamespace(data=json.dumps(data))
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -341,6 +388,114 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(native), 1)
                 self.assertEqual(native[0]['native_usage']['cost'], .6)
                 self.assertEqual(native[0]['model'], 'snapshot')
+
+
+    async def test_anthropic_and_gemini_stream_attempts_retain_usage_on_every_exit(self):
+        for provider_type in (AnthropicProvider, GeminiProvider):
+            for ending in ('cancel', 'initial_cancel', 'transport', 'error', 'success'):
+                with self.subTest(provider=provider_type.name, ending=ending):
+                    self.setup_request(limit=2)
+                    provider = provider_type(ProviderConfig(model='test', max_retries=0,
+                        input_cost_per_million=1, output_cost_per_million=2,
+                        cached_input_cost_per_million=.25, cache_write_input_cost_per_million=1.25))
+                    self.addAsyncCleanup(provider.close)
+                    self.runner.providers = [ProviderRoute(provider.name, 'test', provider)]
+                    if provider_type is AnthropicProvider:
+                        native = {'input_tokens': 10, 'output_tokens': 7,
+                                  'cache_read_input_tokens': 4, 'cache_creation_input_tokens': 2}
+                        packets = [
+                            {'type': 'message_start', 'message': {'model': 'test',
+                                'usage': {**native, 'output_tokens': 1}}},
+                            {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'},
+                                'usage': {'output_tokens': 7}},
+                        ]
+                        expected = (16, 7, 4, 2)
+                        cost = .0000275
+                    else:
+                        native = {'total_input_tokens': 16, 'total_output_tokens': 7,
+                                  'total_cached_tokens': 4, 'total_thought_tokens': 2}
+                        packets = [
+                            {'event_type': 'step.stop', 'usage': {**native, 'total_output_tokens': 1}},
+                            {'event_type': 'step.stop', 'usage': native},
+                        ]
+                        if ending == 'success':
+                            packets.append({'event_type': 'interaction.completed',
+                                'interaction': {'status': 'completed', 'model': 'test', 'usage': native}})
+                        expected = (16, 7, 4, 0)
+                        cost = .000027
+                    if ending == 'success':
+                        packets.append({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'done'}}
+                            if provider_type is AnthropicProvider else
+                            {'event_type': 'step.delta', 'index': 0, 'delta': {'type': 'text', 'text': 'done'}})
+                    if ending == 'error':
+                        packets.append({'type': 'error', 'error': {'message': 'stream failed'}})
+                    if ending == 'initial_cancel':
+                        packets = packets[:1]
+                        native = {**native, 'output_tokens' if provider_type is AnthropicProvider else 'total_output_tokens': 1}
+                        expected = (expected[0], 1, expected[2], expected[3])
+                        cost -= .000012
+                    http = UsagePacketsHTTP(packets, 'cancel' if ending == 'initial_cancel' else ending)
+                    with patch.object(provider, 'http', http):
+                        task = asyncio.create_task(self.run_request(True))
+                        if ending in ('cancel', 'initial_cancel'):
+                            await asyncio.wait_for(http.ready.wait(), timeout=3)
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+                        elif ending != 'success':
+                            with self.assertRaises(ProviderError) as raised:
+                                await task
+                            await self.settle(raised.exception.usage)
+                        else:
+                            await task
+                    self.assert_settled(cost, 1, 'estimated' if ending == 'success' else 'incomplete')
+                    usage = self.runner.sessions.usage(self.session.id)
+                    self.assertEqual((usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
+                                      usage.cache_write_tokens), expected)
+                    attempts = [event.data for _, event in self.runner.sessions._export_events(self.session.id)
+                                if event.type == 'model.attempt_usage']
+                    self.assertEqual(len(attempts), 1)
+                    self.assertEqual(attempts[0]['native_usage'], native)
+                    self.assertEqual(len(http.calls), 1)
+                    self.assertEqual(self.budget.model_requests, 1)
+
+    async def test_chat_error_usage_is_latest_snapshot_and_each_recovery_attempt_settles_once(self):
+        for streaming in (False, True):
+            for earlier, http_error, retry in ((False, False, False), (True, False, False),
+                                              (False, True, False), (True, False, True)):
+                with self.subTest(streaming=streaming, earlier=earlier, http_error=http_error, retry=retry):
+                    self.setup_request(limit=2)
+                    self.provider.config.max_retries = 1 if retry else 0
+                    self.provider.config.initial_backoff_seconds = 0
+                    self.provider.config.model_prices['snapshot'] = {
+                        'input_cost_per_million': 0, 'output_cost_per_million': 6000}
+                    http = ChatErrorUsageHTTP(earlier=earlier, http_error=http_error, retry=retry)
+                    with patch.object(self.provider, 'http', http):
+                        await self.run_request(streaming)
+                    self.assert_settled(.8, 2, 'known')
+                    usage = self.runner.sessions.usage(self.session.id)
+                    self.assertEqual((usage.input_tokens, usage.output_tokens), (20, 4))
+                    attempts = [event.data for _, event in self.runner.sessions._export_events(self.session.id)
+                                if event.type == 'model.attempt_usage']
+                    self.assertEqual([item['native_usage']['cost'] for item in attempts], [.6, .2])
+                    self.assertEqual([item['model'] for item in attempts], ['snapshot', 'snapshot'])
+                    self.assertEqual(len(http.calls), 2)
+
+    async def test_chat_error_with_usage_still_fails_without_completed_output(self):
+        self.setup_request(limit=2)
+        self.request.reasoning_effort = None
+        http = ChatErrorUsageHTTP(earlier=True)
+        events = []
+        observed = []
+        with (patch.object(self.provider, 'http', http),
+              self.provider.observe_requests(observed.append, None),
+              self.assertRaises(ProviderError) as raised):
+            async for event in self.provider.stream(self.request):
+                events.append(event)
+        self.assertFalse(events)
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0], raised.exception.usage)
+        self.assertAlmostEqual(observed[0].cost_usd, .6)
 
 
 class EvidenceRecoveryTests(unittest.IsolatedAsyncioTestCase):
