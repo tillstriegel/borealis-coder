@@ -8,7 +8,7 @@ import random
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar
 
 from ..config import ProviderConfig
@@ -100,7 +100,12 @@ class Provider(abc.ABC):
                 observation.before_recovery()
 
     @contextmanager
-    def request_attempt(self) -> Iterator[Callable[[Usage], None]]:
+    def request_attempt(
+        self,
+        latest_usage: Callable[[], Usage | None] | None = None,
+        *,
+        error_usage: Callable[[ProviderError], Usage | None] | None = None,
+    ) -> Iterator[Callable[[Usage], None]]:
         """Report a wire attempt before returning control to an aggregate wrapper."""
         observation = self._usage_observation.get()
         if observation is not None:
@@ -115,20 +120,28 @@ class Provider(abc.ABC):
             if observation is not None and observation.on_usage is not None:
                 observation.on_usage(usage)
 
+        def incomplete_usage() -> Usage:
+            # Stream snapshots are cumulative. Preserve only the latest one.
+            usage = (latest_usage() if latest_usage is not None else None) or Usage(requests=1)
+            return self.normalize_cost(replace(usage, cost_status="incomplete", attempt_usage=list(usage.attempt_usage)))
+
         try:
             yield record
         except (TimeoutError, OSError) as error:
-            usage = Usage(requests=1, cost_status="incomplete")
+            usage = incomplete_usage()
             record(usage)
             raise ProviderUnavailableError(str(error), retryable=True, usage=usage) from error
         except ProviderError as error:
+            if error.usage is None and error_usage is not None:
+                error.usage = error_usage(error)
             if error.usage is None:
-                error.usage = Usage(cost_status="incomplete")
+                snapshot = latest_usage() if latest_usage is not None else None
+                error.usage = incomplete_usage() if snapshot is not None else Usage(cost_status="incomplete")
             record(self.normalize_cost(error.usage))
             raise
         finally:
             if not recorded:
-                record(Usage(requests=1, cost_status="incomplete"))
+                record(incomplete_usage())
 
     async def with_retries(
         self,

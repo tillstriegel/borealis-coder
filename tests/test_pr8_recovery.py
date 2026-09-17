@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from borealis_coder.agent import build_runner
@@ -13,7 +14,12 @@ from borealis_coder.agent.budget import Budget
 from borealis_coder.agent.runner import ProviderRoute
 from borealis_coder.config import ProviderConfig
 from borealis_coder.context.builder import PromptContext
-from borealis_coder.errors import BudgetExceeded, ProviderUnavailableError, SessionError
+from borealis_coder.errors import (
+    BudgetExceeded,
+    ProviderError,
+    ProviderUnavailableError,
+    SessionError,
+)
 from borealis_coder.models import Message, ProviderRequest, Role, ToolCall, ToolResult
 from borealis_coder.providers.openai import OpenAIProvider
 from borealis_coder.sessions.store import SessionStore
@@ -32,6 +38,8 @@ class RecoveryHTTP:
         self.block = block
         self.empty_second = empty_second
         self.failure = failure
+        self.http_error = False
+        self.first_usage: dict[str, Any] | None = None
 
     async def response(self, payload):
         self.calls.append(payload)
@@ -54,6 +62,37 @@ class RecoveryHTTP:
 
     def close(self):
         pass
+
+
+class ResponsesRecoveryHTTP(RecoveryHTTP):
+    async def response(self, payload):
+        data = await super().response(payload)
+        usage = {'input_tokens': 10, 'output_tokens': 2, 'cost': data['usage']['cost']}
+        if len(self.calls) == 1:
+            if self.first_usage is not None:
+                usage = self.first_usage
+            if self.http_error:
+                raise ProviderError('reasoning summary is unsupported', status_code=400,
+                                    details={'usage': usage})
+            return {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'message': 'reasoning summary is unsupported'}, 'usage': usage}}
+        return {'type': 'response.completed', 'response': {'status': 'completed',
+            'model': self.model, 'usage': usage, 'output': [{'type': 'message',
+            'content': [{'type': 'output_text', 'text': 'done'}]}]}}
+
+    async def post_json(self, url, *, headers, payload):
+        return SimpleNamespace(data=(await self.response(payload))['response'])
+
+
+class InterruptedUsageHTTP(RecoveryHTTP):
+    async def stream_sse(self, url, *, headers, payload):
+        self.calls.append(payload)
+        for cost in (.1, .6):
+            yield SimpleNamespace(data=json.dumps({'model': self.model, 'choices': [],
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'cost': cost}}))
+        self.ready.set()
+        await self.release.wait()
+        raise OSError('stream interrupted after usage')
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -186,6 +225,122 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 if streaming:
                     await self.settle(raised.exception.usage)
                 self.assert_settled(.6, 2, 'incomplete')
+
+
+    def responses_transport(self, **kwargs):
+        self.provider.config.api_style = 'responses'
+        self.http = ResponsesRecoveryHTTP(**kwargs)
+        transport = patch.object(self.provider, 'http', self.http)
+        transport.start()
+        self.addCleanup(transport.stop)
+
+    async def test_responses_recovery_observes_each_attempt_and_checks_shared_budget(self):
+        for streaming in (False, True):
+            for limit in (1, 2):
+                with self.subTest(streaming=streaming, limit=limit):
+                    self.setup_request(limit=limit)
+                    self.responses_transport()
+                    if limit == 1:
+                        with self.assertRaises(BudgetExceeded):
+                            await self.run_request(streaming)
+                        self.assertEqual(len(self.http.calls), 1)
+                        self.assert_settled(.6, 1, 'known')
+                    else:
+                        await self.run_request(streaming)
+                        self.assertEqual(len(self.http.calls), 2)
+                        self.assert_settled(.8, 2, 'known')
+                        self.assertNotIn('summary', self.http.calls[1]['reasoning'])
+                        native = [event.data for _, event in self.runner.sessions._export_events(self.session.id)
+                                  if event.type == 'model.attempt_usage']
+                        self.assertEqual([item['native_usage']['cost'] for item in native], [.6, .2])
+                    self.assertEqual(self.budget.model_requests, len(self.http.calls))
+
+    async def test_responses_recovery_retains_estimated_and_incomplete_cost_status(self):
+        for streaming in (False, True):
+            for first_usage in ({'input_tokens': 10, 'output_tokens': 2}, {}):
+                with self.subTest(streaming=streaming, first_usage=first_usage):
+                    self.setup_request(limit=2)
+                    self.responses_transport()
+                    self.http.first_usage = first_usage
+                    if first_usage:
+                        await self.run_request(streaming)
+                        self.assert_settled(.212, 2, 'estimated')
+                    else:
+                        with self.assertRaises(BudgetExceeded):
+                            await self.run_request(streaming)
+                        self.assert_settled(0, 1, 'incomplete')
+                        self.assertEqual(len(self.http.calls), 1)
+
+    async def test_responses_http_error_usage_survives_recovery(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self.setup_request(limit=2)
+                self.responses_transport()
+                self.http.http_error = True
+                await self.run_request(streaming)
+                self.assert_settled(.8, 2, 'known')
+
+    async def test_responses_recovery_respects_model_request_limit(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self.setup_request(limit=2)
+                self.config.agent.max_model_requests = 1
+                self.responses_transport()
+                with self.assertRaises(BudgetExceeded):
+                    await self.run_request(streaming)
+                self.assertEqual(len(self.http.calls), 1)
+                self.assert_settled(.6, 1, 'known')
+
+    async def test_responses_interrupted_recovery_preserves_first_charge(self):
+        for streaming in (False, True):
+            for cancelled in (False, True):
+                with self.subTest(streaming=streaming, cancelled=cancelled):
+                    self.setup_request(limit=2)
+                    self.responses_transport(block=True, failure=True)
+                    task = asyncio.create_task(self.run_request(streaming))
+                    await asyncio.wait_for(self.http.ready.wait(), timeout=3)
+                    if cancelled:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    else:
+                        self.http.release.set()
+                        with self.assertRaises(ProviderUnavailableError) as raised:
+                            await task
+                        if streaming:
+                            await self.settle(raised.exception.usage)
+                    self.assert_settled(.6, 2, 'incomplete')
+                    self.assertEqual(self.budget.model_requests, 2)
+
+    async def test_chat_interrupted_after_usage_preserves_latest_snapshot_once(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                self.setup_request(limit=2)
+                self.http = InterruptedUsageHTTP()
+                self.http.model = 'snapshot'
+                self.provider.config.model_prices['snapshot'] = {
+                    'input_cost_per_million': 0, 'output_cost_per_million': 6000,
+                }
+                with patch.object(self.provider, 'http', self.http):
+                    task = asyncio.create_task(self.run_request(True))
+                    await asyncio.wait_for(self.http.ready.wait(), timeout=3)
+                    if cancelled:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    else:
+                        self.http.release.set()
+                        with self.assertRaises(ProviderUnavailableError) as raised:
+                            await task
+                        await self.settle(raised.exception.usage)
+                self.assert_settled(.6, 1, 'incomplete')
+                usage = self.runner.sessions.usage(self.session.id)
+                self.assertEqual((usage.input_tokens, usage.output_tokens), (10, 2))
+                native = [event.data for _, event in self.runner.sessions._export_events(self.session.id)
+                          if event.type == 'model.attempt_usage']
+                self.assertEqual(len(native), 1)
+                self.assertEqual(native[0]['native_usage']['cost'], .6)
+                self.assertEqual(native[0]['model'], 'snapshot')
 
 
 class EvidenceRecoveryTests(unittest.IsolatedAsyncioTestCase):

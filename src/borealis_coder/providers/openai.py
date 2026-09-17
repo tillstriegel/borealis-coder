@@ -110,18 +110,22 @@ class OpenAIProvider(Provider):
         return payload
 
     async def _complete_responses(self, request: ProviderRequest) -> ModelResponse:
+        prior_usage = Usage()
         try:
-            return await self._complete_responses_once(
-                request,
-                include_reasoning_summary=True,
-            )
+            return await self._complete_responses_once(request, include_reasoning_summary=True)
         except ProviderError as error:
             if not request.reasoning_effort or not _reasoning_summary_unsupported(error):
                 raise
-        return await self._complete_responses_once(
-            request,
-            include_reasoning_summary=False,
-        )
+            if error.usage is not None:
+                prior_usage.add(error.usage)
+        self.before_recovery_request()
+        try:
+            response = await self._complete_responses_once(request, include_reasoning_summary=False)
+        except ProviderError as error:
+            _attach_usage_to_error(error, prior_usage)
+            raise
+        response.usage = prior_usage.add(response.usage)
+        return response
 
     async def _complete_responses_once(
         self,
@@ -130,22 +134,20 @@ class OpenAIProvider(Provider):
         include_reasoning_summary: bool,
     ) -> ModelResponse:
         url = self.config.base_url.rstrip("/") + "/responses"
-        response = await self.http.post_json(
-            url,
-            headers=self._headers(),
-            payload=self._responses_payload(
-                request,
-                include_reasoning_summary=include_reasoning_summary,
-            ),
-        )
-        if not isinstance(response.data, dict):
-            raise ProviderError("OpenAI returned a non-object response")
-        _raise_in_band_failure(response.data)
-        return self._parse_responses(response.data, retain_raw=True)
+        payload = self._responses_payload(request, include_reasoning_summary=include_reasoning_summary)
+        with self.request_attempt(error_usage=self._responses_error_usage) as record:
+            response = await self.http.post_json(url, headers=self._headers(), payload=payload)
+            if not isinstance(response.data, dict):
+                raise ProviderError("OpenAI returned a non-object response")
+            _raise_in_band_failure(response.data)
+            result = self._parse_responses(response.data, retain_raw=True)
+            record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
+            return result
 
     async def _stream_responses(
         self, request: ProviderRequest
     ) -> AsyncIterator[ProviderStreamEvent]:
+        prior_usage = Usage()
         actionable_output_emitted = False
         try:
             async for event in self._stream_responses_committed_once(
@@ -163,11 +165,19 @@ class OpenAIProvider(Provider):
                 or not _reasoning_summary_unsupported(error)
             ):
                 raise
-        async for event in self._stream_responses_committed_once(
-            request,
-            include_reasoning_summary=False,
-        ):
-            yield event
+            if error.usage is not None:
+                prior_usage.add(error.usage)
+        self.before_recovery_request()
+        try:
+            async for event in self._stream_responses_committed_once(
+                request, include_reasoning_summary=False,
+            ):
+                if event.type == "completed" and event.response is not None:
+                    event.response.usage = prior_usage.add(event.response.usage)
+                yield event
+        except ProviderError as error:
+            _attach_usage_to_error(error, prior_usage)
+            raise
 
     async def _stream_responses_committed_once(
         self,
@@ -214,140 +224,147 @@ class OpenAIProvider(Provider):
             stream=True,
             include_reasoning_summary=include_reasoning_summary,
         )
-        text_parts: list[str] = []
-        reasoning_summary_parts: list[str] = []
-        reasoning_summary_key: tuple[str, str, str] | None = None
-        calls: dict[str, dict[str, Any]] = {}
-        call_aliases: dict[str, str] = {}
-        completed_call_ids: set[str] = set()
-        final_data: dict[str, Any] | None = None
-        async for item in self.http.stream_sse(url, headers=self._headers(), payload=payload):
-            if item.data == "[DONE]":
-                continue
-            try:
-                data = json.loads(item.data)
-            except json.JSONDecodeError:
-                continue
-            event_type = str(data.get("type") or item.event)
-            if event_type == "response.reasoning_summary_text.delta":
-                delta = str(data.get("delta") or "")
-                if not delta:
+        usage: Usage | None = None
+        with self.request_attempt(lambda: usage, error_usage=self._responses_error_usage) as record:
+            text_parts: list[str] = []
+            reasoning_summary_parts: list[str] = []
+            reasoning_summary_key: tuple[str, str, str] | None = None
+            calls: dict[str, dict[str, Any]] = {}
+            call_aliases: dict[str, str] = {}
+            completed_call_ids: set[str] = set()
+            final_data: dict[str, Any] | None = None
+            async for item in self.http.stream_sse(url, headers=self._headers(), payload=payload):
+                if item.data == "[DONE]":
                     continue
-                if any(
-                    name in data for name in ("item_id", "output_index", "summary_index")
-                ):
-                    next_key = (
-                        str(data.get("item_id") or ""),
-                        str(data.get("output_index") or ""),
-                        str(data.get("summary_index") or ""),
-                    )
-                    if reasoning_summary_key is not None and next_key != reasoning_summary_key:
-                        separator = _reasoning_summary_separator(reasoning_summary_parts, delta)
-                        if separator:
-                            delta = separator + delta
-                    reasoning_summary_key = next_key
-                reasoning_summary_parts.append(delta)
-                yield ProviderStreamEvent(type="reasoning_summary_delta", text=delta)
-            elif event_type in {"response.output_text.delta", "response.refusal.delta"}:
-                delta = str(data.get("delta") or "")
-                text_parts.append(delta)
-                yield ProviderStreamEvent(type="text_delta", text=delta)
-            elif event_type in {"response.output_item.added", "response.output_item.done"}:
-                output = data.get("item") or {}
-                if output.get("type") == "function_call":
-                    item_id = str(output.get("id") or "")
-                    call_id = str(output.get("call_id") or "")
-                    key = call_id or item_id
-                    if item_id:
-                        call_aliases[item_id] = key
-                    if call_id:
-                        call_aliases[call_id] = key
-                    call = calls.setdefault(
-                        key,
-                        {"id": key, "name": "", "arguments": ""},
-                    )
-                    if item_id and item_id != key and item_id in calls:
-                        pending = calls.pop(item_id)
-                        call["arguments"] = pending.get("arguments") or call["arguments"]
-                    call["name"] = str(output.get("name") or call["name"])
-                    if output.get("arguments"):
-                        call["arguments"] = str(output["arguments"])
-                    if event_type == "response.output_item.done":
-                        completed_call_ids.add(key)
-            elif event_type == "response.function_call_arguments.delta":
-                raw_key = str(data.get("call_id") or data.get("item_id") or "")
-                key = call_aliases.get(raw_key, raw_key)
-                call = calls.setdefault(key, {"id": key, "name": "", "arguments": ""})
-                call["arguments"] += str(data.get("delta") or "")
-                yield ProviderStreamEvent(
-                    type="tool_call_delta",
-                    data={
-                        "id": key,
-                        "name": call.get("name", ""),
-                        "delta": data.get("delta", ""),
-                    },
-                )
-            elif event_type in {"response.completed", "response.done", "response.incomplete"}:
-                completed_data = (
-                    data.get("response") if isinstance(data.get("response"), dict) else data
-                )
-                _raise_in_band_failure(completed_data)
-                final_data = completed_data
-            elif event_type in {"response.failed", "error"}:
-                failed = (
-                    data.get("response") if isinstance(data.get("response"), dict) else data
-                )
-                _raise_in_band_failure(failed, default_message="Responses stream failed")
-        if final_data:
-            result = self._parse_responses(final_data, retain_raw=True)
-            response_incomplete = _responses_data_is_incomplete(final_data)
-            if not result.text:
-                result.text = "".join(text_parts)
-            streamed_summary = "".join(reasoning_summary_parts)
-            if not result.reasoning_summary:
-                result.reasoning_summary = streamed_summary
-            else:
-                remaining_summary = _remaining_stream_delta(
-                    streamed_summary,
-                    result.reasoning_summary,
-                )
-                if remaining_summary:
+                try:
+                    data = json.loads(item.data)
+                except json.JSONDecodeError:
+                    continue
+                event_type = str(data.get("type") or item.event)
+                if event_type == "response.reasoning_summary_text.delta":
+                    delta = str(data.get("delta") or "")
+                    if not delta:
+                        continue
+                    if any(
+                        name in data for name in ("item_id", "output_index", "summary_index")
+                    ):
+                        next_key = (
+                            str(data.get("item_id") or ""),
+                            str(data.get("output_index") or ""),
+                            str(data.get("summary_index") or ""),
+                        )
+                        if reasoning_summary_key is not None and next_key != reasoning_summary_key:
+                            separator = _reasoning_summary_separator(reasoning_summary_parts, delta)
+                            if separator:
+                                delta = separator + delta
+                        reasoning_summary_key = next_key
+                    reasoning_summary_parts.append(delta)
+                    yield ProviderStreamEvent(type="reasoning_summary_delta", text=delta)
+                elif event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                    delta = str(data.get("delta") or "")
+                    text_parts.append(delta)
+                    yield ProviderStreamEvent(type="text_delta", text=delta)
+                elif event_type in {"response.output_item.added", "response.output_item.done"}:
+                    output = data.get("item") or {}
+                    if output.get("type") == "function_call":
+                        item_id = str(output.get("id") or "")
+                        call_id = str(output.get("call_id") or "")
+                        key = call_id or item_id
+                        if item_id:
+                            call_aliases[item_id] = key
+                        if call_id:
+                            call_aliases[call_id] = key
+                        call = calls.setdefault(
+                            key,
+                            {"id": key, "name": "", "arguments": ""},
+                        )
+                        if item_id and item_id != key and item_id in calls:
+                            pending = calls.pop(item_id)
+                            call["arguments"] = pending.get("arguments") or call["arguments"]
+                        call["name"] = str(output.get("name") or call["name"])
+                        if output.get("arguments"):
+                            call["arguments"] = str(output["arguments"])
+                        if event_type == "response.output_item.done":
+                            completed_call_ids.add(key)
+                elif event_type == "response.function_call_arguments.delta":
+                    raw_key = str(data.get("call_id") or data.get("item_id") or "")
+                    key = call_aliases.get(raw_key, raw_key)
+                    call = calls.setdefault(key, {"id": key, "name": "", "arguments": ""})
+                    call["arguments"] += str(data.get("delta") or "")
                     yield ProviderStreamEvent(
-                        type="reasoning_summary_delta",
-                        text=remaining_summary,
+                        type="tool_call_delta",
+                        data={
+                            "id": key,
+                            "name": call.get("name", ""),
+                            "delta": data.get("delta", ""),
+                        },
                     )
-            final_calls = {call.id: call for call in result.tool_calls}
-            for call_id, partial_data in calls.items():
-                final_call = final_calls.get(call_id)
-                if final_call is None:
-                    continue
-                partial_call = self._call_from_partial(partial_data)
-                if not final_call.name:
-                    final_call.name = partial_call.name
-                if final_call.raw_arguments in {
-                    None,
-                    "",
-                    "{}",
-                } and partial_call.raw_arguments not in {None, "", "{}"}:
-                    final_call.arguments = partial_call.arguments
-                    final_call.raw_arguments = partial_call.raw_arguments
-            result.tool_calls.extend(
-                self._call_from_partial(item)
-                for item in calls.values()
-                if str(item.get("id") or "") not in final_calls
-                and (
-                    not response_incomplete
-                    or str(item.get("id") or "") in completed_call_ids
+                elif event_type in {"response.completed", "response.done", "response.incomplete"}:
+                    completed_data = (
+                        data.get("response") if isinstance(data.get("response"), dict) else data
+                    )
+                    model = self.response_billing_model(completed_data.get("model"))
+                    usage = self.normalize_cost(self._usage_from_responses(completed_data.get("usage") or {},
+                        model=completed_data.get("model")), model=model)
+                    _raise_in_band_failure(completed_data)
+                    final_data = completed_data
+                elif event_type in {"response.failed", "error"}:
+                    failed = (
+                        data.get("response") if isinstance(data.get("response"), dict) else data
+                    )
+                    _raise_in_band_failure(failed, default_message="Responses stream failed")
+            if final_data:
+                result = self._parse_responses(final_data, retain_raw=True)
+                response_incomplete = _responses_data_is_incomplete(final_data)
+                if not result.text:
+                    result.text = "".join(text_parts)
+                streamed_summary = "".join(reasoning_summary_parts)
+                if not result.reasoning_summary:
+                    result.reasoning_summary = streamed_summary
+                else:
+                    remaining_summary = _remaining_stream_delta(
+                        streamed_summary,
+                        result.reasoning_summary,
+                    )
+                    if remaining_summary:
+                        yield ProviderStreamEvent(
+                            type="reasoning_summary_delta",
+                            text=remaining_summary,
+                        )
+                final_calls = {call.id: call for call in result.tool_calls}
+                for call_id, partial_data in calls.items():
+                    final_call = final_calls.get(call_id)
+                    if final_call is None:
+                        continue
+                    partial_call = self._call_from_partial(partial_data)
+                    if not final_call.name:
+                        final_call.name = partial_call.name
+                    if final_call.raw_arguments in {
+                        None,
+                        "",
+                        "{}",
+                    } and partial_call.raw_arguments not in {None, "", "{}"}:
+                        final_call.arguments = partial_call.arguments
+                        final_call.raw_arguments = partial_call.raw_arguments
+                result.tool_calls.extend(
+                    self._call_from_partial(item)
+                    for item in calls.values()
+                    if str(item.get("id") or "") not in final_calls
+                    and (
+                        not response_incomplete
+                        or str(item.get("id") or "") in completed_call_ids
+                    )
                 )
-            )
-        else:
-            result = ModelResponse(
-                text="".join(text_parts),
-                tool_calls=[],
-                reasoning_summary="".join(reasoning_summary_parts),
-                stop_reason="incomplete",
-            )
-        yield ProviderStreamEvent(type="completed", response=result)
+            else:
+                result = ModelResponse(
+                    text="".join(text_parts),
+                    tool_calls=[],
+                    reasoning_summary="".join(reasoning_summary_parts),
+                    stop_reason="incomplete",
+                    usage=Usage(requests=1, cost_status="incomplete"),
+                )
+            record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
+            yield ProviderStreamEvent(type="completed", response=result)
 
     def _responses_input(self, request: ProviderRequest) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
@@ -679,12 +696,12 @@ class OpenAIProvider(Provider):
     ) -> AsyncIterator[ProviderStreamEvent]:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         payload = self._chat_payload(request, stream=True)
-        with self.request_attempt() as record:
+        usage: Usage | None = None
+        with self.request_attempt(lambda: usage) as record:
             text_parts: list[str] = []
             reasoning_summary_parts: list[str] = []
             reasoning_summary_key: tuple[str, str] | None = None
             calls: dict[int, dict[str, Any]] = {}
-            usage = Usage(requests=1, cost_status="incomplete")
             model: str | None = None
             response_id: str | None = None
             finish_reason: str | None = None
@@ -704,7 +721,8 @@ class OpenAIProvider(Provider):
                 response_id = data.get("id") or response_id
                 if data.get("usage"):
                     usage_data = data["usage"]
-                    usage = self._usage_from_chat(usage_data, model=model)
+                    usage = self.normalize_cost(self._usage_from_chat(usage_data, model=model),
+                        model=self.response_billing_model(model))
                 for choice in data.get("choices", []) or []:
                     finish_reason = choice.get("finish_reason") or finish_reason
                     delta = choice.get("delta") or {}
@@ -753,7 +771,7 @@ class OpenAIProvider(Provider):
                     self._call_from_partial(item)
                     for _, item in sorted(completed_calls.items())
                 ],
-                usage=usage,
+                usage=usage or Usage(requests=1, cost_status="incomplete"),
                 stop_reason=finish_reason or "incomplete",
                 response_id=response_id,
                 model=model,
@@ -802,6 +820,15 @@ class OpenAIProvider(Provider):
             raw=data if retain_raw else None,
             reasoning_summary=_extract_chat_reasoning_summary(message),
         )
+
+    def _responses_error_usage(self, error: ProviderError) -> Usage | None:
+        data = error.details
+        if isinstance(data, dict):
+            data = data.get("response", data)
+            if isinstance(data, dict) and isinstance(data.get("usage"), dict):
+                model = self.response_billing_model(data.get("model"))
+                return self.normalize_cost(self._usage_from_responses(data["usage"], model=data.get("model")), model=model)
+        return None
 
     def _usage_from_responses(self, usage_data: dict[str, Any], *, model: str | None = None) -> Usage:
         details = usage_data.get("input_tokens_details") or {}

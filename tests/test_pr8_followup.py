@@ -72,6 +72,24 @@ class FollowupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fallback.seen), 1)
         self.assertIn('Retain the full instruction.', fallback.seen[0].messages[-1].content)
 
+    async def test_output_reservation_failure_tries_same_context_fallback(self):
+        self.config.agent.max_input_tokens = 8000
+        self.config.agent.max_output_tokens = 6000
+        primary = AttemptProvider('primary', context=8000)
+        fallback = AttemptProvider('fallback', context=8000)
+        fallback.config.output_token_limit = 1000
+        self.routes(primary, fallback)
+        result = await self.runner.run('Retain this requirement. ' * 150, session_id=self.session.id)
+        self.assertEqual(result.text, 'done')
+        self.assertFalse(primary.seen)
+        self.assertEqual(len(fallback.seen), 1)
+        request = fallback.seen[0]
+        self.assertEqual(request.max_output_tokens, 1000)
+        from borealis_coder.agent.budget import prepare_route_request
+        validated = prepare_route_request(request, fallback, self.config.agent)
+        self.assertEqual(validated.messages, request.messages)
+        self.assertEqual(validated.system, request.system)
+
     async def test_primary_compaction_does_not_leak_into_fallback(self):
         primary = AttemptProvider('primary', context=9000, failures=1)
         fallback = AttemptProvider('fallback', context=100000)

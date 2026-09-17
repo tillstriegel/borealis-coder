@@ -1482,7 +1482,6 @@ class AgentRunner:
             self.config.agent, route.provider, route.model,
             self.config.agent.max_output_tokens,
         )
-        capacity_error = RouteContextExceeded if agent_config.max_input_tokens < self.config.agent.max_input_tokens else BudgetExceeded
         state = await asyncio.to_thread(self.sessions.task_state, session_id, messages)
         source_refs = {item["source"]: f"user:{index + 1}" for index, item in enumerate(state["instructions"])}
         provider_state = {
@@ -1514,7 +1513,7 @@ class AgentRunner:
             agent_config, system=turn_system, tools=schemas, messages=[],
         )
         if not _fits_context_limit([], protected_budget, system=turn_system, tools=schemas):
-            raise capacity_error("context", "Protected task requirements cannot fit the safe request budget")
+            raise RouteContextExceeded("context", "Protected task requirements cannot fit the safe request budget")
         if final_turn:
             turn_system = f"{turn_system}\n\n{_FINAL_TURN_INSTRUCTION}"
             turn_system_blocks = [
@@ -1617,7 +1616,7 @@ class AgentRunner:
             ):
                 compaction_reason = None
             else:
-                raise capacity_error(
+                raise RouteContextExceeded(
                     "context",
                     f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
                     f"exceeds context budget {agent_config.max_input_tokens} "
@@ -1987,7 +1986,7 @@ class AgentRunner:
                             **compaction_kwargs,
                         )
             except CompactionSizeError as error:
-                raise capacity_error("context", str(error)) from error
+                raise RouteContextExceeded("context", str(error)) from error
             compacted_messages = deterministic_messages
             if deterministic_messages != request_messages:
                 deterministic_artifact = deterministic_messages[0]
@@ -2143,7 +2142,7 @@ class AgentRunner:
                         )
                     )
                 except CompactionSizeError as error:
-                    raise capacity_error("context", str(error)) from error
+                    raise RouteContextExceeded("context", str(error)) from error
                 validate_tool_call_order(retained_messages)
                 artifact_message, reused = await self._record_or_reuse_compaction_artifact(
                     session_id=session_id,
@@ -2268,7 +2267,7 @@ class AgentRunner:
             system=turn_system,
             tools=schemas,
         ):
-            raise capacity_error(
+            raise RouteContextExceeded(
                 "context",
                 f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
                 f"exceeds context budget {agent_config.max_input_tokens} "
