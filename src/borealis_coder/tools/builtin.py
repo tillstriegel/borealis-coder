@@ -5,6 +5,7 @@ from __future__ import annotations
 from .base import ToolRegistry
 from .context import ReadInstructionsTool, ReadSkillTool, RepoMapTool
 from .delegate import DelegateTaskTool
+from .discovery import DiscoverToolsTool
 from .fetch import FetchUrlTool
 from .filesystem import (
     DeleteFileTool,
@@ -16,7 +17,7 @@ from .filesystem import (
     WriteFileTool,
 )
 from .git import GitCommitTool, GitDiffTool, GitLogTool, GitPushTool, GitStatusTool
-from .history import ReadArtifactTool, SearchHistoryTool
+from .history import ReadArtifactTool, RecordFindingTool, SearchHistoryTool
 from .patch import ApplyPatchTool
 from .script import ScriptJobTool, ScriptTool
 from .search import GrepTool
@@ -27,7 +28,7 @@ from .verification import VerifyTool
 
 def build_builtin_registry() -> ToolRegistry:
     return ToolRegistry([
-        ScriptTool(), ScriptJobTool(), ReadArtifactTool(), SearchHistoryTool(), ReadFileTool(), ListDirectoryTool(), GlobFilesTool(), GrepTool(), RepoMapTool(),
+        ScriptTool(), ScriptJobTool(), DiscoverToolsTool(), RecordFindingTool(), ReadArtifactTool(), SearchHistoryTool(), ReadFileTool(), ListDirectoryTool(), GlobFilesTool(), GrepTool(), RepoMapTool(),
         ReadInstructionsTool(), ReadSkillTool(), GitStatusTool(), GitDiffTool(), GitLogTool(),
         WriteFileTool(), ReplaceInFileTool(), ApplyPatchTool(), MakeDirectoryTool(), DeleteFileTool(),
         ShellTool(), VerifyTool(), FetchUrlTool(), UpdatePlanTool(), DelegateTaskTool(), GitCommitTool(), GitPushTool(),

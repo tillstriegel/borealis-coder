@@ -8,10 +8,11 @@ import hashlib
 import html
 import json
 import os
+import re
 import stat
 import threading
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
@@ -119,15 +120,33 @@ class PreparedProviderRequest:
 
 
 @dataclass(slots=True)
-class ReadOnlyWorkState:
+class InvestigationProgress:
     limit: int
     consecutive_turns: int = 0
+    stalled_turns: int = 0
+    evidence: set[str] = field(default_factory=set)
 
     @property
-    def synthesis_pending(self) -> bool:
-        return self.consecutive_turns >= self.limit
+    def checkpoint_pending(self) -> bool:
+        return self.consecutive_turns >= self.limit or self.stalled_turns >= self.limit
 
     def observe_results(self, results: list[Message]) -> None:
+        # Result IDs, durations and timestamps are bookkeeping, not evidence.
+        signatures = set()
+        for result in results:
+            if result.is_error:
+                continue
+            content = result.content
+            if result.tool_name == "shell":
+                content = re.sub(r"(?m)^duration_ms=\d+\n?", "", content)
+            if result.metadata.get("script_job"):
+                content = content.partition("\n")[2]
+            signatures.add(_stable_payload_hash([result.tool_name, content]))
+        novel = bool(signatures - self.evidence)
+        self.evidence.update(signatures)
+        if len(self.evidence) > 256:
+            self.evidence = signatures
+        self.stalled_turns = 0 if novel else self.stalled_turns + 1
         observed_change = any(
             result.metadata.get("changed_files")
             for result in results
@@ -158,11 +177,17 @@ Automatic verification has already run after the mutations. Tools are unavailabl
 response. Return a final answer that accurately reports the supplied verification result and
 does not claim stronger process-lifecycle or mutation guarantees than it provides.
 """
-_READ_ONLY_SYNTHESIS_INSTRUCTION = """# Read-only investigation checkpoint
-The run has reached its read-only evidence limit. Tools are unavailable for this response.
-Answer the user's request now using the evidence already gathered. State any material
-uncertainty instead of doing more investigation.
+_INVESTIGATION_CHECKPOINT_INSTRUCTION = """# Read-only investigation checkpoint
+Summarize the findings and unresolved questions, or take the next concrete step.
+Answer when the evidence is sufficient. Tools remain available for useful work.
+Use record_finding to retain short source quotes and update_plan for pending work.
+Avoid repeating reads that add no evidence. Do not make edits just to show progress.
 """
+_ANSWER_REPAIR_INSTRUCTION = (
+    "The last response did not contain a usable answer. Return a useful answer with "
+    "findings, remaining work and uncertainty, or use available tools for the next "
+    "concrete step. Do not output tool protocol markup."
+)
 _COMPACTION_SUMMARY_CACHE_VERSION = 2
 
 
@@ -779,7 +804,8 @@ class AgentRunner:
         provider_overflow_retries = 0
         last_prune_signature: tuple[int, ...] | None = None
         previous_request_tokens: int | None = None
-        read_only_work = ReadOnlyWorkState(
+        invalid_answers = 0
+        investigation_progress = InvestigationProgress(
             limit=self.config.agent.max_read_only_turns
         )
 
@@ -802,31 +828,49 @@ class AgentRunner:
                     action="stable-prefix-only; shorter compaction window",
                 )
             async def prepare_route(route: ProviderRoute) -> ProviderRequest:
-                nonlocal compacted, last_prune_signature, previous_request_tokens
-                prepared = await self._prepare_provider_request(
-                    prompt_context=prompt_context,
-                    messages=messages,
-                    schemas=schemas,
-                    final_turn=final_turn,
-                    verification_finalization_pending=verification_finalization_pending,
-                    read_only_synthesis_pending=read_only_synthesis_pending,
-                    adaptive_cache=adaptive_cache,
-                    conversation_cache=conversation_cache,
-                    usage_sink=usage_sink,
-                    settled_usage_sink=settled_usage_sink,
-                    cancel=cancel,
-                    session_id=session_id,
-                    run_id=run_id,
-                    last_prune_signature=last_prune_signature,
-                    overflow_retry_count=provider_overflow_retries,
-                    previous_request_tokens=prior_request_tokens,
-                    route=route,
-                    before_model_request=budget.before_model_request,
-                )
+                nonlocal compacted, last_prune_signature, previous_request_tokens, mutation_revision
+                while True:
+                    prepared = await self._prepare_provider_request(
+                        prompt_context=prompt_context,
+                        messages=messages,
+                        schemas=schemas,
+                        final_turn=final_turn,
+                        verification_finalization_pending=verification_finalization_pending,
+                        investigation_checkpoint_pending=investigation_checkpoint_pending,
+                        adaptive_cache=adaptive_cache,
+                        conversation_cache=conversation_cache,
+                        usage_sink=usage_sink,
+                        settled_usage_sink=settled_usage_sink,
+                        cancel=cancel,
+                        session_id=session_id,
+                        run_id=run_id,
+                        last_prune_signature=last_prune_signature,
+                        overflow_retry_count=provider_overflow_retries,
+                        previous_request_tokens=prior_request_tokens,
+                        route=route,
+                        before_model_request=budget.before_model_request,
+                        budget=budget,
+                    )
+                    if budget.model_requests + 1 >= self.config.agent.max_model_requests:
+                        notices = await self._await_until_cancelled(
+                            self._script_notifications(scripts, messages, wait=True), cancel
+                        )
+                        mutation_revision += notices
+                        if notices:
+                            continue
+                    break
+                if _remaining_budget_guidance(budget):
+                    await self.events.emit(
+                        "run.budget_checkpoint", session_id=session_id, run_id=run_id,
+                        remaining_model_requests=max(0, self.config.agent.max_model_requests - budget.model_requests),
+                        remaining_primary_turns=max(0, self.config.agent.max_turns - budget.turns + 1),
+                        tools_available=bool(schemas),
+                    )
                 estimated = prepared.estimated_tokens
                 compacted = compacted or prepared.compacted
                 last_prune_signature = prepared.prune_signature
                 previous_request_tokens = prepared.estimated_tokens
+                prepared.request.metadata["terminal_answer_recovery"] = len(self.providers) == 1
                 await self.events.emit(
                     "model.started",
                     session_id=session_id,
@@ -842,21 +886,22 @@ class AgentRunner:
                 self._check_cancel(cancel)
                 budget.before_turn()
                 final_turn = budget.turns == self.config.agent.max_turns
+                last_request = budget.model_requests + 1 >= self.config.agent.max_model_requests
                 mutation_revision += await self._await_until_cancelled(
-                    self._script_notifications(scripts, messages, wait=final_turn), cancel
+                    self._script_notifications(scripts, messages, wait=final_turn or last_request), cancel
                 )
-                read_only_synthesis_pending = read_only_work.synthesis_pending
+                investigation_checkpoint_pending = investigation_progress.checkpoint_pending
                 tools_disabled = (
                     final_turn
                     or verification_finalization_pending
-                    or read_only_synthesis_pending
                 )
-                schemas = [] if tools_disabled else self.tools.schemas()
-                await self._emit_read_only_synthesis_event(
-                    read_only_work,
-                    session_id=session_id,
-                    run_id=run_id,
-                )
+                schemas = [] if tools_disabled else self.tools.provider_schemas(self.config)
+                if not tools_disabled:
+                    await self._emit_investigation_checkpoint(
+                        investigation_progress,
+                        session_id=session_id,
+                        run_id=run_id,
+                    )
                 prior_request_tokens = previous_request_tokens
 
                 assistant_message_id = new_id("msg")
@@ -864,6 +909,7 @@ class AgentRunner:
                     scripts.active
                     or verification_finalization_pending
                     or awaiting_repair
+                    or context.mutation_tracking == "incomplete"
                     or (
                         self.config.agent.auto_verify
                         and (context.changed_roots or context.mutation_tracking == "incomplete")
@@ -926,70 +972,19 @@ class AgentRunner:
                     model=used_route.model,
                 )
                 response_incomplete = response.incomplete
-                response_tool_calls = [] if response_incomplete else response.tool_calls
-                if verification_finalization_pending or read_only_synthesis_pending:
-                    response_tool_calls = []
-                if response_tool_calls and not tools_disabled:
-                    durable_messages = await asyncio.to_thread(
-                        self.sessions.messages,
-                        session_id,
-                    )
-                    _validate_new_tool_call_ids(
-                        response_tool_calls,
-                        durable_messages,
-                    )
-                assistant_metadata = {
-                    "model": response.model or used_route.model,
-                    "response_id": response.response_id,
-                }
-                if response.continuation_state is not None and not (
-                    final_turn and response_tool_calls
-                ):
-                    continuation = response.continuation_state.to_metadata(
-                        provider=used_route.name,
-                        model=used_route.model,
-                    )
-                    if continuation is not None:
-                        # Persist only provider-selected continuation items, never
-                        # the full raw response.
-                        assistant_metadata["continuation_state"] = continuation
-                if buffer_candidate_output:
-                    assistant_metadata["internal"] = (
-                        "verification_finalizer"
-                        if verification_finalization_pending
-                        else "verification_candidate"
-                    )
-                assistant = Message(
-                    id=assistant_message_id,
-                    role=Role.ASSISTANT,
-                    content=response.text,
-                    tool_calls=[] if tools_disabled else response_tool_calls,
-                    metadata=assistant_metadata,
+                assistant, invalid_answers = await self._record_model_response(
+                    response=response, used_route=used_route, messages=messages,
+                    session_id=session_id, run_id=run_id, turn=budget.turns,
+                    assistant_message_id=assistant_message_id, tools_disabled=tools_disabled,
+                    final_turn=final_turn, verification_finalization_pending=verification_finalization_pending,
+                    buffer_candidate_output=buffer_candidate_output,
+                    invalid_answers=invalid_answers, usage_budget_error=usage_budget_error,
                 )
-                messages.append(assistant)
-                await asyncio.to_thread(self.sessions.append_message, session_id, assistant)
-                await self.events.emit(
-                    "model.completed",
-                    session_id=session_id,
-                    run_id=run_id,
-                    turn=budget.turns,
-                    message_id=assistant.id,
-                    text="" if buffer_candidate_output else response.text,
-                    reasoning_summary=(
-                        "" if buffer_candidate_output else response.reasoning_summary
-                    ),
-                    tool_calls=(
-                        [] if tools_disabled else [call.to_dict() for call in response_tool_calls]
-                    ),
-                    usage=response.usage.to_dict(),
-                    stop_reason=response.stop_reason,
-                )
+                if assistant is None:
+                    continue
+                response_tool_calls = assistant.tool_calls
                 if response.text:
                     final_text = response.text
-                _require_read_only_conclusion(
-                    pending=read_only_synthesis_pending,
-                    text=response.text,
-                )
                 final_response_incomplete = final_turn and response_incomplete
                 if final_turn and (response_tool_calls or final_response_incomplete):
                     recovery_message = max_turns_recovery_message(
@@ -1009,7 +1004,7 @@ class AgentRunner:
                     raise usage_budget_error
                 if response_incomplete:
                     steered = await self._drain_steering(session_id, run_id, messages)
-                    read_only_work.reset_if(steered)
+                    investigation_progress.reset_if(steered)
                     continue
                 if not response_tool_calls:
                     completed_scripts = await self._await_until_cancelled(
@@ -1021,7 +1016,7 @@ class AgentRunner:
                         verification_final_answer_safe = False
                         continue
                     if await self._drain_steering(session_id, run_id, messages):
-                        read_only_work.consecutive_turns = 0
+                        investigation_progress.consecutive_turns = 0
                         verification_finalization_pending = False
                         verification_final_answer_safe = False
                         continue
@@ -1081,9 +1076,9 @@ class AgentRunner:
                     verification_finalization_pending = False
                     verification_final_answer_safe = False
                     awaiting_repair = False
-                read_only_work.observe_results(tool_messages)
+                investigation_progress.observe_results(tool_messages)
                 steered = await self._drain_steering(session_id, run_id, messages)
-                read_only_work.reset_if(steered)
+                investigation_progress.reset_if(steered)
             if (
                 verification is None
                 and (context.changed_roots or context.mutation_tracking == "incomplete")
@@ -1131,82 +1126,15 @@ class AgentRunner:
                 )
             )
         try:
-            if verification is not None and verified_revision != mutation_revision:
-                verification = {
-                    "ok": False,
-                    "checks_ok": False,
-                    "process_lifecycle_complete": False,
-                    "process_lifecycle_guaranteed": False,
-                    "mutation_tracking": context.mutation_tracking,
-                    "steps": [],
-                    "error": (
-                        "Workspace changed after the latest automatic verification; "
-                        "the latest state was not verified."
-                    ),
-                    "roots": [
-                        context.roots.display(root)
-                        for root in sorted(
-                            context.changed_roots, key=lambda item: item.as_posix()
-                        )
-                    ],
-                }
-            if (
-                verification is None
-                and (
-                    context.mutation_tracking == "incomplete"
-                    or (self.config.agent.auto_verify and context.changed_roots)
-                )
-            ):
-                verification = {
-                    "ok": False,
-                    "checks_ok": False,
-                    "process_lifecycle_complete": False,
-                    "process_lifecycle_guaranteed": False,
-                    "mutation_tracking": context.mutation_tracking,
-                    "steps": [],
-                    "error": (
-                        "Automatic verification did not complete; success is not confirmed."
-                    ),
-                    "roots": [
-                        context.roots.display(root)
-                        for root in sorted(
-                            context.changed_roots, key=lambda item: item.as_posix()
-                        )
-                    ],
-                }
-                if context.changed_roots:
-                    final_text = _authoritative_verification_summary(verification, context)
-            if verification is not None and (
-                context.changed_roots or context.mutation_tracking == "incomplete"
-            ):
-                if stop_reason != StopReason.END_TURN or (
-                    not _verification_is_guaranteed(verification, context)
-                    and not verification_final_answer_safe
-                ):
-                    final_text = _authoritative_verification_summary(verification, context)
-                terminal_feedback = Message(
-                    role=Role.USER,
-                    content=_verification_feedback(
-                        verification,
-                        repair=False,
-                        terminal=True,
-                    ),
-                    metadata={"internal": "verification_result_terminal"},
-                )
-                messages.append(terminal_feedback)
-                await asyncio.to_thread(
-                    self.sessions.append_message,
-                    session_id,
-                    terminal_feedback,
-                )
-                await self._publish_authoritative_result(
-                    final_text,
-                    messages=messages,
-                    session_id=session_id,
-                    run_id=run_id,
-                    turn=budget.turns,
-                    stop_reason=stop_reason,
-                )
+            if error_message:
+                error_message = truncate_text(self.events.redactor.text(error_message), 2_000)
+            final_text, verification = await self._finish_run_output(
+                messages=messages, context=context, session_id=session_id, run_id=run_id,
+                turn=budget.turns, final_text=final_text, verification=verification,
+                verified_revision=verified_revision, mutation_revision=mutation_revision,
+                stop_reason=stop_reason, error_message=error_message,
+                verification_final_answer_safe=verification_final_answer_safe,
+            )
             if stop_reason == StopReason.MAX_TURNS:
                 await self._drain_steering(session_id, run_id, messages)
         finally:
@@ -1229,12 +1157,251 @@ class AgentRunner:
             mutation_tracking=context.mutation_tracking,
             verification=verification,
             error=error_message,
-            incomplete=stop_reason in {StopReason.MAX_TURNS, StopReason.BUDGET},
+            incomplete=stop_reason != StopReason.END_TURN,
         )
         await self.events.emit(
             "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
         )
         return result
+
+    async def _record_model_response(
+        self, *, response: ModelResponse, used_route: ProviderRoute,
+        messages: list[Message], session_id: str, run_id: str, turn: int,
+        assistant_message_id: str, tools_disabled: bool, final_turn: bool,
+        verification_finalization_pending: bool, buffer_candidate_output: bool,
+        invalid_answers: int, usage_budget_error: BudgetExceeded | None,
+    ) -> tuple[Message | None, int]:
+        """Validate terminal output before durable or public admission."""
+        response_incomplete = response.incomplete
+        response_tool_calls = [] if response_incomplete else response.tool_calls
+        if final_turn and response_tool_calls:
+            cause = max_turns_recovery_message(self.config.agent.max_turns)
+            if usage_budget_error is not None:
+                cause += " " + str(usage_budget_error)
+            raise BudgetExceeded("turns", cause)
+        if tools_disabled:
+            response_tool_calls = []
+        invalid_answer = (
+            not response_incomplete and not response_tool_calls
+            and (not _usable_answer(response.text) or bool(response.tool_calls))
+        )
+        if invalid_answer:
+            # Usage is already settled. Neither persist nor publish private
+            # protocol text, reasoning, or opaque continuation state.
+            invalid_answers += 1
+            await self.events.emit(
+                "model.invalid_answer", session_id=session_id, run_id=run_id,
+                attempt=invalid_answers, recoverable=not final_turn and invalid_answers <= 2,
+            )
+            if usage_budget_error is not None:
+                raise usage_budget_error
+            if final_turn or invalid_answers > 2:
+                raise BudgetExceeded(
+                    "answer", "Run incomplete: the model did not return a usable answer. "
+                    "Session evidence is preserved; send 'continue' to resume.",
+                )
+            feedback = Message(role=Role.USER, content=_ANSWER_REPAIR_INSTRUCTION,
+                               metadata={"internal": "answer_repair"})
+            messages.append(feedback)
+            await asyncio.to_thread(self.sessions.append_message, session_id, feedback)
+            return None, invalid_answers
+        invalid_answers = 0
+        if _protocol_answer(response.text):
+            response.text = ""
+            response.reasoning_summary = ""
+            response.continuation_state = None
+        if response_tool_calls and not tools_disabled:
+            durable_messages = await asyncio.to_thread(
+                self.sessions.messages,
+                session_id,
+            )
+            _validate_new_tool_call_ids(
+                response_tool_calls,
+                durable_messages,
+            )
+        assistant_metadata = {
+            "model": response.model or used_route.model,
+            "response_id": response.response_id,
+        }
+        if response.continuation_state is not None and not (
+            final_turn and response_tool_calls
+        ):
+            continuation = response.continuation_state.to_metadata(
+                provider=used_route.name,
+                model=used_route.model,
+            )
+            if continuation is not None:
+                # Persist only provider-selected continuation items, never
+                # the full raw response.
+                assistant_metadata["continuation_state"] = continuation
+        if buffer_candidate_output:
+            assistant_metadata["internal"] = (
+                "verification_finalizer"
+                if verification_finalization_pending
+                else "verification_candidate"
+            )
+        assistant = Message(
+            id=assistant_message_id,
+            role=Role.ASSISTANT,
+            content=response.text,
+            tool_calls=[] if tools_disabled else response_tool_calls,
+            metadata=assistant_metadata,
+        )
+        messages.append(assistant)
+        await asyncio.to_thread(self.sessions.append_message, session_id, assistant)
+        await self.events.emit(
+            "model.completed",
+            session_id=session_id,
+            run_id=run_id,
+            turn=turn,
+            message_id=assistant.id,
+            text="" if buffer_candidate_output else response.text,
+            reasoning_summary=(
+                "" if buffer_candidate_output else response.reasoning_summary
+            ),
+            tool_calls=(
+                [] if tools_disabled else [call.to_dict() for call in response_tool_calls]
+            ),
+            usage=response.usage.to_dict(),
+            stop_reason=response.stop_reason,
+        )
+        return assistant, invalid_answers
+
+    async def _finish_run_output(
+        self, *, messages: list[Message], context: ToolContext,
+        session_id: str, run_id: str, turn: int, final_text: str,
+        verification: dict[str, Any] | None, verified_revision: int,
+        mutation_revision: int, stop_reason: StopReason, error_message: str | None,
+        verification_final_answer_safe: bool,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Publish one causal terminal result after all owned jobs have settled."""
+        # Close unadmitted calls before appending a terminal result. This also
+        # leaves a valid transcript if the session is reopened after a stop.
+        messages[:] = await asyncio.to_thread(self.sessions.messages, session_id)
+        rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
+        running_ids = {row["tool_call_id"] for row in rows if row["status"] == "running"}
+        for repair in _abandoned_tool_call_results(messages, running_call_ids=running_ids):
+            messages.append(repair)
+            if repair.tool_call_id in running_ids:
+                assert repair.tool_call_id is not None
+                self._mark_workspace_tracking_incomplete(context)
+                await asyncio.to_thread(
+                    self.sessions.complete_tool_call, session_id, repair.tool_call_id,
+                    output=repair.content, is_error=True, metadata=repair.metadata, message=repair,
+                )
+            else:
+                await asyncio.to_thread(self.sessions.append_message, session_id, repair)
+        if verification is None and context.lifecycle_uncertainty_only and not context.changed_files:
+            verification = _no_change_verification(context)
+            verified_revision = mutation_revision
+        if verification is not None and verified_revision != mutation_revision:
+            verification = {
+                "ok": False,
+                "checks_ok": False,
+                "process_lifecycle_complete": False,
+                "process_lifecycle_guaranteed": False,
+                "mutation_tracking": context.mutation_tracking,
+                "steps": [],
+                "error": (
+                    "Workspace changed after the latest automatic verification; "
+                    "the latest state was not verified."
+                ),
+                "roots": [
+                    context.roots.display(root)
+                    for root in sorted(
+                        context.changed_roots, key=lambda item: item.as_posix()
+                    )
+                ],
+            }
+        if (
+            verification is None
+            and (
+                context.mutation_tracking == "incomplete"
+                or (self.config.agent.auto_verify and context.changed_roots)
+            )
+        ):
+            verification = {
+                "ok": False,
+                "checks_ok": False,
+                "process_lifecycle_complete": False,
+                "process_lifecycle_guaranteed": False,
+                "mutation_tracking": context.mutation_tracking,
+                "steps": [],
+                "error": (
+                    "Automatic verification did not complete; success is not confirmed."
+                ),
+                "roots": [
+                    context.roots.display(root)
+                    for root in sorted(
+                        context.changed_roots, key=lambda item: item.as_posix()
+                    )
+                ],
+            }
+            if context.changed_roots:
+                final_text = _authoritative_verification_summary(verification, context)
+        if verification is not None and (
+            context.changed_roots or context.mutation_tracking == "incomplete"
+        ):
+            if (stop_reason == StopReason.END_TURN and context.lifecycle_uncertainty_only
+                    and not context.changed_files and not verification_final_answer_safe):
+                final_text, verification_final_answer_safe = _verified_final_answer(final_text, verification, context)
+            if stop_reason != StopReason.END_TURN or (
+                not _verification_is_guaranteed(verification, context)
+                and not verification_final_answer_safe
+            ):
+                final_text = _authoritative_verification_summary(verification, context)
+            if stop_reason != StopReason.END_TURN:
+                final_text = _causal_stop_summary(error_message, final_text)
+            terminal_feedback = Message(
+                role=Role.USER,
+                content=_verification_feedback(
+                    verification,
+                    repair=False,
+                    terminal=True,
+                ),
+                metadata={"internal": "verification_result_terminal"},
+            )
+            messages.append(terminal_feedback)
+            await asyncio.to_thread(
+                self.sessions.append_message,
+                session_id,
+                terminal_feedback,
+            )
+            await self._publish_authoritative_result(
+                final_text,
+                messages=messages,
+                session_id=session_id,
+                run_id=run_id,
+                turn=turn,
+                stop_reason=stop_reason,
+            )
+        elif stop_reason != StopReason.END_TURN:
+            final_text = _causal_stop_summary(error_message, final_text)
+            await self._publish_authoritative_result(
+                final_text, messages=messages, session_id=session_id, run_id=run_id,
+                turn=turn, stop_reason=stop_reason,
+                verification_result=False,
+            )
+        else:
+            candidate = next(
+                (message for message in reversed(messages) if message.role == Role.ASSISTANT),
+                None,
+            )
+            if (
+                candidate is not None
+                and candidate.metadata.get("internal") in {
+                    "verification_candidate", "verification_finalizer",
+                }
+                and not candidate.tool_calls
+                and candidate.content == final_text
+            ):
+                # Preparation may settle a job after streaming was suppressed.
+                # Promote only the accepted terminal candidate, never stale work.
+                await self._publish_authoritative_result(
+                    final_text, messages=messages, session_id=session_id, run_id=run_id,
+                    turn=turn, stop_reason=stop_reason, verification_result=False,
+                )
+        return final_text, verification
 
     async def _settle_script_response_usage(
         self, scripts: ScriptScope, usage: Usage, usage_sink: Callable[[Usage], Awaitable[None]]
@@ -1264,7 +1431,9 @@ class AgentRunner:
                 return results[0]
             finally:
                 if nested_context.mutation_tracking == "incomplete":
-                    self._mark_workspace_tracking_incomplete(context)
+                    self._mark_workspace_tracking_incomplete(
+                        context, lifecycle_only=nested_context.lifecycle_uncertainty_only,
+                    )
         return ScriptScope(context, self.tools, execute_nested, self._mutation_lock, self._script_job_slots)
 
     async def _recover_script_calls(self, rows: list[dict[str, Any]], context: ToolContext) -> None:
@@ -1358,13 +1527,14 @@ class AgentRunner:
         run_id: str,
         turn: int,
         stop_reason: StopReason,
+        verification_result: bool = True,
     ) -> None:
         if not text:
             return
         message = Message(
             role=Role.ASSISTANT,
             content=text,
-            metadata={"authoritative_verification": True},
+            metadata={"terminal_result": True, **({"authoritative_verification": True} if verification_result else {})},
         )
         messages.append(message)
         await asyncio.to_thread(self.sessions.append_message, session_id, message)
@@ -1386,7 +1556,7 @@ class AgentRunner:
             tool_calls=[],
             usage={},
             stop_reason=stop_reason.value,
-            authoritative_verification=True,
+            authoritative_verification=verification_result,
         )
 
     async def _verify_changes(
@@ -1401,15 +1571,7 @@ class AgentRunner:
             run_id=context.run_id,
         )
         if context.lifecycle_uncertainty_only and not context.changed_files:
-            verification = {
-                "ok": True,
-                "checks_ok": True,
-                "process_lifecycle_complete": False,
-                "process_lifecycle_guaranteed": False,
-                "steps": [],
-                "mutation_tracking": context.mutation_tracking,
-                "skipped_reason": "no_observed_workspace_changes",
-            }
+            verification = _no_change_verification(context)
             await self.events.emit(
                 "verification.completed",
                 session_id=context.session_id,
@@ -1475,21 +1637,24 @@ class AgentRunner:
         )
         return verification
 
-    async def _emit_read_only_synthesis_event(
+    async def _emit_investigation_checkpoint(
         self,
-        state: ReadOnlyWorkState,
+        state: InvestigationProgress,
         *,
         session_id: str,
         run_id: str,
     ) -> None:
-        if not state.synthesis_pending:
+        if not state.checkpoint_pending:
             return
         await self.events.emit(
-            "run.read_only_synthesis",
+            "run.investigation_checkpoint",
             session_id=session_id,
             run_id=run_id,
             read_only_turns=state.consecutive_turns,
+            stalled_turns=state.stalled_turns,
+            tools_available=True,
         )
+        state.consecutive_turns = 0
 
     async def _handle_candidate_verification(
         self,
@@ -1537,6 +1702,12 @@ class AgentRunner:
 
         verification = await self._verify_changes(context, cancel)
         verified_revision = mutation_revision
+        if context.lifecycle_uncertainty_only and not context.changed_files:
+            final_text, safe = _verified_final_answer(final_text, verification, context)
+            return CandidateVerificationDecision(
+                verification, final_text, verified_revision, repair_cycles, False, False,
+                stop_reason, error_message, False, safe,
+            )
         final_text = _authoritative_verification_summary(verification, context)
         can_continue = budget.turns < self.config.agent.max_turns
         checks_ok = bool(verification["checks_ok"])
@@ -1590,8 +1761,9 @@ class AgentRunner:
         settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
         overflow_retry_count: int = 0,
         previous_request_tokens: int | None = None,
-        read_only_synthesis_pending: bool = False,
+        investigation_checkpoint_pending: bool = False,
         before_model_request: Callable[[], None] | None = None,
+        budget: Budget | None = None,
         route: ProviderRoute | None = None,
     ) -> PreparedProviderRequest:
         route = route or self.providers[0]
@@ -1626,6 +1798,25 @@ class AgentRunner:
             # user message. Keep exact-response cache keys independent of source IDs.
             turn_system = prompt_context.text
             turn_system_blocks = prompt_context.system_blocks
+        budget_guidance = ""
+        budget_block_index: int | None = None
+
+        def refresh_budget_guidance() -> bool:
+            nonlocal turn_system, turn_system_blocks, budget_guidance, budget_block_index
+            guidance = _remaining_budget_guidance(budget) if budget is not None else ""
+            if guidance == budget_guidance:
+                return False
+            block = {"text": guidance, "cacheable": False}
+            if budget_block_index is None:
+                budget_block_index = len(turn_system_blocks)
+                turn_system_blocks = [*turn_system_blocks, block]
+            else:
+                turn_system_blocks[budget_block_index] = block
+            budget_guidance = guidance
+            turn_system = "\n\n".join(str(item["text"]) for item in turn_system_blocks)
+            return True
+
+        refresh_budget_guidance()
         protected_budget = ContextBudget.calculate(
             agent_config, system=turn_system, tools=schemas, messages=[],
         )
@@ -1643,11 +1834,11 @@ class AgentRunner:
                 *turn_system_blocks,
                 {"text": _VERIFICATION_FINAL_INSTRUCTION, "cacheable": False},
             ]
-        elif read_only_synthesis_pending:
-            turn_system = f"{turn_system}\n\n{_READ_ONLY_SYNTHESIS_INSTRUCTION}"
+        elif investigation_checkpoint_pending:
+            turn_system = f"{turn_system}\n\n{_INVESTIGATION_CHECKPOINT_INSTRUCTION}"
             turn_system_blocks = [
                 *turn_system_blocks,
-                {"text": _READ_ONLY_SYNTHESIS_INSTRUCTION, "cacheable": False},
+                {"text": _INVESTIGATION_CHECKPOINT_INSTRUCTION, "cacheable": False},
             ]
 
         request_messages, metrics = prune_provider_messages(messages)
@@ -1688,6 +1879,7 @@ class AgentRunner:
                 conversation_cache=conversation_cache,
                 providers=budget_providers,
                 overflow_retry_count=overflow_retry_count,
+                budget_guidance_index=budget_block_index,
             )
         if incremental is not None:
             prior_artifact, request_messages, _, metrics = incremental
@@ -1892,6 +2084,7 @@ class AgentRunner:
                 tools=schemas,
                 prompt_cache_key=prompt_context.cache_routing_key,
                 conversation_cache=conversation_cache,
+                budget_guidance_index=budget_block_index,
             )
             incremental_parent = await asyncio.to_thread(
                 self.sessions.latest_compaction_artifact,
@@ -2186,6 +2379,24 @@ class AgentRunner:
                         ),
                         *deterministic_messages[1:],
                     ]
+                elif (
+                    intended_strategy == "llm"
+                    and budget is not None
+                    and budget.model_requests + 1 >= agent_config.max_model_requests
+                ):
+                    # Preserve the final request for the answer, including any
+                    # Script notice that required this preparation to run again.
+                    compacted_messages = [
+                        replace(
+                            deterministic_artifact,
+                            metadata={
+                                **deterministic_artifact.metadata,
+                                "requested_strategy": intended_strategy,
+                                "fallback_reason": "final_request_reserved",
+                            },
+                        ),
+                        *deterministic_messages[1:],
+                    ]
                 elif intended_strategy == "llm":
                     transcript_message_ids: set[str] | None = None
                     source_ids = [
@@ -2247,6 +2458,12 @@ class AgentRunner:
                 retained_messages = [
                     message for message in compacted_messages if message is not artifact_message
                 ]
+                if refresh_budget_guidance():
+                    compaction_budget = ContextBudget.calculate(
+                        agent_config, system=turn_system, tools=schemas,
+                        messages=request_messages, providers=budget_providers,
+                        overflow_retry_count=overflow_retry_count,
+                    )
                 try:
                     artifact_message, retained_messages = (
                         _fit_artifact_to_request_byte_target(
@@ -2273,6 +2490,7 @@ class AgentRunner:
                     tools=schemas,
                     prompt_cache_key=prompt_context.cache_routing_key,
                     conversation_cache=conversation_cache,
+                    budget_guidance_index=budget_block_index,
                 )
                 compaction_artifact_id = str(artifact_message.metadata["artifact_id"])
                 compaction_context_hashes = dict(
@@ -2373,6 +2591,13 @@ class AgentRunner:
                     messages=len(request_messages),
                     **compaction_metadata,
                 )
+        if refresh_budget_guidance():
+            context_budget = ContextBudget.calculate(
+                agent_config, system=turn_system, tools=schemas,
+                messages=request_messages, providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
+            estimated = context_budget.estimated_total(request_messages)
         estimated_bytes = estimate_request_bytes(
             turn_system,
             request_messages,
@@ -2438,6 +2663,7 @@ class AgentRunner:
         conversation_cache: bool,
         providers: tuple[str, ...],
         overflow_retry_count: int,
+        budget_guidance_index: int | None = None,
     ) -> tuple[CompactionArtifact, list[Message], dict[str, str], ContextPruneMetrics] | None:
         """Reconstruct the working view; the caller checks its size limits."""
 
@@ -2464,6 +2690,7 @@ class AgentRunner:
             tools=tools,
             prompt_cache_key=prompt_cache_key,
             conversation_cache=conversation_cache,
+            budget_guidance_index=budget_guidance_index,
         )
         artifact = await asyncio.to_thread(
             self.sessions.latest_compaction_artifact,
@@ -2535,6 +2762,7 @@ class AgentRunner:
         tools: list[dict[str, Any]],
         prompt_cache_key: str = "",
         conversation_cache: bool = False,
+        budget_guidance_index: int | None = None,
     ) -> tuple[Message, bool]:
         """Reuse an exact immutable artifact or persist the exact new provider context."""
 
@@ -2552,6 +2780,7 @@ class AgentRunner:
             tools=tools,
             prompt_cache_key=prompt_cache_key,
             conversation_cache=conversation_cache,
+            budget_guidance_index=budget_guidance_index,
         )
         source_hash = str(artifact_message.metadata["source_hash"])
         provider_source_hash = _stable_payload_hash(
@@ -2824,7 +3053,32 @@ class AgentRunner:
         tools: list[dict[str, Any]],
         prompt_cache_key: str = "",
         conversation_cache: bool = False,
+        budget_guidance_index: int | None = None,
     ) -> str:
+        if budget_guidance_index is not None:
+            # Only the block inserted by this preparation is transient. Keep
+            # every user/security instruction and the actual provider hashes.
+            system_blocks = [
+                block for index, block in enumerate(system_blocks)
+                if index != budget_guidance_index
+            ]
+            system = "\n\n".join(str(block["text"]) for block in system_blocks)
+            system_tokens = estimate_tokens(system)
+            context_budget = replace(
+                context_budget,
+                system_tokens=system_tokens,
+                message_target_tokens=max(
+                    1, context_budget.target_tokens - system_tokens
+                    - context_budget.tool_schema_tokens
+                    - context_budget.provider_framing_tokens
+                    - context_budget.continuation_state_tokens,
+                ),
+                message_target_bytes=max(
+                    1, context_budget.target_bytes
+                    - estimate_request_bytes(system, [], tools)
+                    + estimate_request_bytes("", [], []),
+                ),
+            )
         fingerprint_payload = {
             "artifact_version": artifact_version,
             "strategy": strategy,
@@ -3015,6 +3269,9 @@ class AgentRunner:
                         self.sessions.get_cached_response,
                         cache_key,
                     )
+                if cached is not None and not _usable_answer(str((cached.get("response") or {}).get("text") or "")):
+                    # Old cache entries predate terminal-answer validation.
+                    cached = None
                 if cached is not None:
                     original_usage = Usage.from_dict(cached.get("usage"))
                     payload = cached.get("response") or {}
@@ -3570,32 +3827,35 @@ class AgentRunner:
                                     continue
 
                                 if item.type == "text_delta" and item.text:
-                                    await commit_reasoning()
+                                    # Terminal text must be classified before publication.
+                                    # A protocol prefix may span any number of deltas.
                                     actionable_emitted = True
-                                    if emit_response_deltas:
-                                        await self.events.emit(
-                                            "model.text_delta",
-                                            session_id=session_id,
-                                            run_id=run_id,
-                                            message_id=assistant_message_id,
-                                            text=item.text,
-                                            provider=route.name,
-                                            model=route.model,
-                                        )
                                 elif item.type == "tool_call_delta":
                                     await commit_reasoning()
                                     actionable_emitted = True
-                                    await self.events.emit(
-                                        "model.tool_call_delta",
-                                        session_id=session_id,
-                                        run_id=run_id,
-                                        provider=route.name,
-                                        model=route.model,
-                                        **item.data,
-                                    )
+                                    if emit_response_deltas and request.tools:
+                                        await self.events.emit(
+                                            "model.tool_call_delta",
+                                            session_id=session_id,
+                                            run_id=run_id,
+                                            provider=route.name,
+                                            model=route.model,
+                                            **item.data,
+                                        )
                                 elif item.type == "completed" and item.response is not None:
-                                    if item.response.text or item.response.tool_calls:
+                                    publishable = bool(
+                                        item.response.tool_calls or item.response.incomplete
+                                        or _usable_answer(item.response.text)
+                                    ) and not _protocol_answer(item.response.text)
+                                    if publishable:
                                         await commit_reasoning()
+                                        if emit_response_deltas and item.response.text:
+                                            await self.events.emit(
+                                                "model.text_delta", session_id=session_id,
+                                                run_id=run_id, message_id=assistant_message_id,
+                                                text=item.response.text, provider=route.name,
+                                                model=route.model,
+                                            )
                                     else:
                                         await flush_committed_reasoning()
                                     completed = item.response
@@ -3637,11 +3897,8 @@ class AgentRunner:
                     completed.reasoning_summary = self._redact_reasoning_summary(
                         completed.reasoning_summary
                     )
-                    if (
-                        not completed.text
-                        and not completed.tool_calls
-                        and not completed.incomplete
-                    ):
+                    if (not completed.text and not completed.tool_calls and not completed.incomplete
+                            and not request.metadata.get("terminal_answer_recovery")):
                         usage = replace(completed.usage)
                         raise ProviderUnavailableError(
                             f"Provider {route.name} returned an empty response",
@@ -4496,7 +4753,7 @@ def _authoritative_verification_summary(
         else:
             summary = "No automatic verification commands were executed."
     else:
-        summary = "Automatic verification failed."
+        summary = "Automatic verification failed." if verification.get("steps") else "Automatic verification was not completed."
         failed = next(
             (
                 step
@@ -4628,17 +4885,46 @@ def _tool_result_may_have_mutated(message: Message) -> bool:
 def _is_cacheable_response(response: ModelResponse) -> bool:
     stop_reason = str(response.stop_reason or "").strip().lower()
     return bool(
-        response.text and not response.tool_calls and stop_reason in _CACHEABLE_STOP_REASONS
+        _usable_answer(response.text) and not response.tool_calls and stop_reason in _CACHEABLE_STOP_REASONS
     )
 
 
-def _require_read_only_conclusion(*, pending: bool, text: str) -> None:
-    if pending and not text.strip():
-        raise BudgetExceeded(
-            "read_only",
-            "Run incomplete: read-only investigation reached its evidence limit "
-            "without a textual conclusion. Session preserved; send 'continue' to resume.",
-        )
+def _usable_answer(text: str) -> bool:
+    """Reject known terminal protocol/continuation forms, not general prose."""
+    value = text.strip()
+    if not value:
+        return False
+    if _protocol_answer(value):
+        return False
+    intention = re.fullmatch(
+        r"(?:Let me|I will|I'll) (?:read|inspect|check|look at) ([^\n]{1,160})",
+        value, re.I,
+    )
+    if intention is None:
+        return True
+    # Paths and commands can contain dots, colons and shell punctuation. Quoted
+    # targets are opaque; prose after a sentence/clause boundary is still valid.
+    target = re.sub(r"`[^`]*`|\"[^\"]*\"|'[^']*'", "target", intention[1])
+    return bool(re.search(r"[.!?:;]\s", target))
+
+
+def _protocol_answer(text: str) -> bool:
+    return bool(re.match(r"^\s*<(?:[\uff5c|]DSML[\uff5c|]|tool_call(?:s)?\b|function_call\b)", text, re.I))
+
+
+def _remaining_budget_guidance(budget: Budget) -> str:
+    requests = max(0, budget.config.max_model_requests - budget.model_requests)
+    turns = max(0, budget.config.max_turns - budget.turns + 1)
+    if requests > 2 and turns > 2:
+        return ""
+    return (
+        "# Remaining run budget\n"
+        f"Remaining logical requests including this request: {requests}. "
+        f"Remaining primary turns including this turn: {turns}.\n"
+        "Answer now if the evidence is sufficient. Avoid redundant coverage checks or "
+        "re-reading established evidence. Otherwise take only the next necessary step "
+        "with available tools. Helper and retry requests share the same request allowance."
+    )
 
 
 def _interrupted_verification(
@@ -4654,6 +4940,24 @@ def _interrupted_verification(
         "steps": [],
         "error": error,
     }
+
+
+def _no_change_verification(context: ToolContext) -> dict[str, Any]:
+    return {
+        "ok": True, "checks_ok": True, "steps": [],
+        "process_lifecycle_complete": False, "process_lifecycle_guaranteed": False,
+        "mutation_tracking": context.mutation_tracking,
+        "skipped_reason": "no_observed_workspace_changes",
+    }
+
+
+def _causal_stop_summary(error: str | None, progress: str) -> str:
+    cause = error or "The run stopped before completion."
+    if not cause.lower().startswith("run incomplete"):
+        cause = "Run incomplete. " + cause
+    if _usable_answer(progress):
+        cause += "\n\nLast recorded progress or verification:\n" + truncate_text(progress, 4_000)
+    return cause
 
 
 def _track_repeated_tool_batch(

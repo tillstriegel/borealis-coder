@@ -119,6 +119,7 @@ class SandboxConfig:
 @dataclass(slots=True)
 class ScriptConfig:
     enabled: bool = True
+    tool_surface: str = "ptc"  # ptc | direct
     source_bytes: int = 256_000
     memory_bytes: int = 64_000_000
     stack_bytes: int = 512_000
@@ -592,8 +593,10 @@ def _enabled(name: str) -> bool:
 def validate_config(config: Config) -> None:
     if not isinstance(config.script.enabled, bool):
         raise ConfigurationError("script.enabled must be a boolean")
+    if not isinstance(config.script.tool_surface, str) or config.script.tool_surface not in {"ptc", "direct"}:
+        raise ConfigurationError("script.tool_surface must be ptc or direct")
     for item in fields(ScriptConfig):
-        if item.name == "enabled":
+        if item.name in {"enabled", "tool_surface"}:
             continue
         value = getattr(config.script, item.name)
         if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:

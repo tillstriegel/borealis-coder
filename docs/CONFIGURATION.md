@@ -71,8 +71,8 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
 | `max_time_seconds` | `3600` | End-to-end run wall-time ceiling. |
 | `max_cost_usd` | `0.0` | Opt-in cumulative dollar ceiling. Positive limits require configured pricing. |
-| `max_model_requests` | `40` | Logical parent, delegate, and summarizer request ceiling for one run. |
-| `max_read_only_turns` | `8` | Consecutive tool turns with no observed file changes before Borealis requires an answer from gathered evidence. |
+| `max_model_requests` | `40` | Logical parent, delegate, and summarizer request ceiling for one run. Advisory guidance shows remaining requests/turns when either has at most two left. It keeps ordinary tools available; the ceiling still stops admission. |
+| `max_read_only_turns` | `8` | Investigation checkpoint interval in tool rounds without file changes. Guidance asks for findings or a concrete next step; tools remain available. Novel successful output resets the stalled-round counter. Repeated-call and global budgets still stop admission. |
 | `parallel_reads` | `8` | Maximum concurrent read-only tool calls. |
 | `max_repeated_calls` | `3` | Repeated identical call threshold for stuck detection. |
 | `auto_verify` | `true` | Run project verification after mutations. |
@@ -131,6 +131,7 @@ external authority opt-in as safety settings. Defaults:
 | Key | Default | Meaning |
 |---|---:|---|
 | `enabled` | `true` | Expose `script` and `script_job`. Requires the declared quickjs-ng dependency. |
+| `tool_surface` | `"ptc"` | Normal provider surface: `script`, `script_job`, `discover_tools`, and `delegate_task` when available. `"direct"` exposes the full registry for legacy integrations. Disabling Script or using a restricted registry without its audited executor deliberately falls back to direct schemas. |
 | `source_bytes` | `256000` | UTF-8 source ceiling per program. |
 | `memory_bytes` | `64000000` | QuickJS heap ceiling per worker. |
 | `stack_bytes` | `512000` | QuickJS stack ceiling. |

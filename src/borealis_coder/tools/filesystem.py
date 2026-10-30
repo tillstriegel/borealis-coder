@@ -46,14 +46,16 @@ class ReadFileTool(Tool):
                 "content": "".join(selected), "path": resolved.display,
                 "sha256": sha256_bytes(data), "line_count": len(lines),
                 "start_line": start, "end_line": min(end, len(lines)),
-            })
+            }, metadata={"path": resolved.display, "sha256": sha256_bytes(data),
+                         "start_line": start, "end_line": min(end, len(lines))})
         numbered = "".join(f"{index:>6}\t{line}" for index, line in enumerate(selected, start=start))
         limit = int(arguments.get("max_chars") or context.config.context.tool_output_chars)
         digest = sha256_bytes(data)
         preview = bound_tool_output(ToolResult(numbered), context, limit)
         return ToolResult(
             f"path: {resolved.display}\nsha256: {digest}\nlines: {len(lines)}\n\n{preview.output}",
-            metadata={"path": resolved.display, "sha256": digest, "line_count": len(lines), **preview.metadata},
+            metadata={"path": resolved.display, "sha256": digest, "line_count": len(lines),
+                      "start_line": start, "end_line": min(end, len(lines)), **preview.metadata},
         )
 
 
@@ -324,7 +326,7 @@ class ListDirectoryTool(Tool):
 
 class GlobFilesTool(Tool):
     name = "glob_files"
-    description = "Find workspace files matching a glob pattern."
+    description = "Find workspace files matching a glob pattern. **/ matches zero or more directories; plain basename patterns also match nested files."
     effect = Effect.READ
     concurrent = True
     parameters = object_schema({
@@ -343,13 +345,32 @@ class GlobFilesTool(Tool):
         ignored = set(context.config.context.ignored_dirs)
         matches: list[str] = []
         for current, dirs, files in os.walk(resolved.path):
-            dirs[:] = [item for item in dirs if item not in ignored]
-            for name in files:
+            dirs[:] = sorted(item for item in dirs if item not in ignored and not (Path(current) / item).is_symlink())
+            for name in sorted(files):
                 path = Path(current) / name
+                if path.is_symlink() or not path.is_file():
+                    continue
                 rel = path.relative_to(resolved.path).as_posix()
-                if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
+                if _glob_matches(rel, pattern) or fnmatch.fnmatch(name, pattern):
                     matches.append(context.roots.display(path))
                     if len(matches) >= limit:
                         return ToolResult("\n".join(sorted(matches)), metadata={"truncated": True, "matches": len(matches)})
         matches.sort()
         return ToolResult("\n".join(matches) or "No matches", metadata={"matches": len(matches)})
+
+
+def _glob_matches(path: str, pattern: str) -> bool:
+    """Keep existing fnmatch behavior and let ** consume zero path segments."""
+    if fnmatch.fnmatch(path, pattern):
+        return True
+    parts = path.split("/")
+    reachable = {0}
+    for component in pattern.split("/"):
+        if component == "**":
+            reachable = set(range(min(reachable), len(parts) + 1)) if reachable else set()
+        else:
+            reachable = {index + 1 for index in reachable
+                         if index < len(parts) and fnmatch.fnmatch(parts[index], component)}
+        if not reachable:
+            return False
+    return len(parts) in reachable

@@ -23,6 +23,85 @@ _DEDUPLICATED_PROVIDER_CONTEXT_STORAGE = "deduplicated-v1"
 _EVENT_EXPORT_PAGE_SIZE = 1_000
 
 
+def _truncated_envelope_has_quote(content: str, quote: str) -> bool:
+    """Decode source value strings in a quota-retained JSON prefix.
+
+    Follow JSON structure so keys and metadata cannot become source evidence.
+    An unfinished string contributes only its fully retained escape sequences.
+    """
+    decoder = json.JSONDecoder()
+    position = 0
+    matched = False
+
+    def whitespace() -> None:
+        nonlocal position
+        while position < len(content) and content[position] in " \r\n\t":
+            position += 1
+
+    def string() -> tuple[str, bool]:
+        nonlocal position
+        try:
+            text, position = decoder.raw_decode(content, position)
+            if not isinstance(text, str):
+                raise ValueError("Expected string")
+            return text, True
+        except json.JSONDecodeError:
+            prefix = re.match(
+                r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*',
+                content[position + 1 :],
+            )
+            assert prefix is not None
+            return json.loads('"' + prefix[0] + '"'), False
+
+    def value(source: bool = False, *, root: bool = False) -> None:
+        nonlocal position, matched
+        whitespace()
+        token = content[position]
+        if token == '"':
+            text, complete = string()
+            matched = matched or (source and quote in text)
+            if not complete:
+                raise ValueError("End of retained string")
+        elif token in "{[":
+            closing = "}" if token == "{" else "]"
+            position += 1
+            whitespace()
+            if content[position] == closing:
+                position += 1
+                return
+            while True:
+                selected = source
+                if token == "{":
+                    if content[position] != '"':
+                        raise ValueError("Expected key")
+                    key, complete = string()
+                    if not complete:
+                        raise ValueError("End of retained key")
+                    whitespace()
+                    if content[position] != ":":
+                        raise ValueError("Expected colon")
+                    position += 1
+                    selected = source or (root and key in {"output", "data"})
+                value(selected)
+                whitespace()
+                delimiter = content[position]
+                position += 1
+                if delimiter == closing:
+                    return
+                if delimiter != ",":
+                    raise ValueError("Expected delimiter")
+                whitespace()
+        else:
+            _, position = decoder.raw_decode(content, position)
+
+    try:
+        if content.lstrip().startswith("{"):
+            value(root=True)
+    except (ValueError, IndexError, RecursionError):
+        pass  # A quota prefix normally ends inside a value or container.
+    return matched
+
+
 class _SessionRunLease:
     """A process-bound file lease used to distinguish live and stale runs."""
 
@@ -1097,6 +1176,19 @@ class SessionStore:
             for row in rows
         ]
 
+    def finding_source(self, session_id: str, workspace: Path, call_id: str) -> dict[str, Any]:
+        """Read one completed source from the owning session, not a global history scan."""
+        self.authorize_workspace(session_id, workspace)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT tool_name,output,is_error,status,metadata_json FROM tool_calls "
+                "WHERE session_id=? AND tool_call_id=?", (session_id, call_id),
+            ).fetchone()
+        if row is None or row["status"] != "completed" or row["is_error"]:
+            raise SessionError("Finding source must be a successful completed call in this session")
+        return {"tool": row["tool_name"], "output": row["output"],
+                "metadata": json.loads(row["metadata_json"] or "{}")}
+
     def add_usage(self, session_id: str, usage: Usage) -> Usage:
         with self._lock, self._connection:
             self._add_usage_locked(session_id, usage)
@@ -1384,6 +1476,41 @@ class SessionStore:
     def authorize_workspace(self, session_id: str, workspace: Path) -> None:
         if Path(self.get_session(session_id).workspace).resolve() != workspace.resolve():
             raise SessionError("Session does not belong to this workspace")
+
+    def output_artifact_has_quote(
+        self, session_id: str, workspace: Path, artifact_id: str, quote: str,
+        *, json_envelope: bool = False,
+    ) -> bool:
+        """Match retained text without loading full evidence into model history."""
+        self.authorize_workspace(session_id, workspace)
+        if not quote or len(quote) > 600:
+            raise SessionError("Invalid finding quote length")
+        expression = "instr(content, ?) > 0"
+        partial_content = "NULL"
+        parameters: list[Any] = [quote]
+        if json_envelope:
+            # SQLite decodes JSON string values before matching. Searching encoded
+            # fragments would confuse literal backslashes with JSON escapes.
+            expression = (
+                "CASE WHEN json_valid(content) THEN "
+                "instr(json_extract(content, '$.output'), ?) > 0 OR EXISTS ("
+                "SELECT 1 FROM json_tree(content, '$.data') "
+                "WHERE type='text' AND instr(value, ?) > 0) ELSE 0 END"
+            )
+            parameters.append(quote)
+            partial_content = "CASE WHEN NOT json_valid(content) THEN content END"
+        with self._lock:
+            row = self._connection.execute(
+                f"SELECT {expression} AS matched, {partial_content} AS partial_content, "
+                "metadata_json FROM output_artifacts "
+                "WHERE session_id=? AND artifact_id=?",
+                [*parameters, session_id, artifact_id],
+            ).fetchone()
+        if row is None:
+            raise SessionError("Artifact missing or unavailable in this session")
+        if row["partial_content"] is not None and json.loads(row["metadata_json"]).get("status") == "quota_limited":
+            return _truncated_envelope_has_quote(row["partial_content"], quote)
+        return bool(row["matched"])
 
     def read_output_artifact(
         self, session_id: str, workspace: Path, artifact_id: str, *,

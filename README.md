@@ -324,7 +324,8 @@ See [configuration reference](docs/CONFIGURATION.md) and [provider adapters](doc
 
 The built-in palette includes:
 
-- `script`, `script_job`
+- `script`, `script_job`, `discover_tools`
+- `record_finding`, `read_artifact`, `search_history`
 - `read_file`, `list_directory`, `glob_files`, `grep`
 - `write_file`, `replace_in_file`, `delete_file`, `make_directory`
 - `apply_patch`
@@ -338,9 +339,21 @@ The built-in palette includes:
 
 All tool schemas use strict JSON-object contracts. Read-only calls can execute concurrently; mutations execute sequentially to preserve deterministic state.
 
+`glob_files` treats `**/` as zero or more directories. For example, `**/*.json`
+under `settings` finds immediate and nested JSON files; `settings/**/*.json` does
+the same from the workspace. Basename patterns such as `*.json` still find nested
+files. Results are sorted and bounded, configured ignored directories are skipped,
+and glob discovery does not follow file or directory symlinks.
+
 ### Script workflows
 
-Prefer `script` for multi-tool work. Its provider-compatible object schema accepts
+Normal sessions expose a small native surface: `script`, `script_job`,
+`discover_tools`, and the separate `delegate_task` capability. Use
+`discover_tools({names: [], offset: 0})` for the paged catalog, then exact names
+for full argument schemas. Run work inside Script with `await tools.NAME(args)`;
+only printed output returns to the model. Discovery does not grant permission.
+
+Script's provider-compatible object schema accepts
 one literal JavaScript `source` string and a `background` boolean. For example:
 
 ```javascript
@@ -380,7 +393,8 @@ budget expiry, stop, and runner close drain child calls and reap workers. Jobs a
 run-scoped: handles expire at run end, and restart never replays uncertain work.
 Partial effects remain visible; a Script is not an atomic transaction.
 
-Script is enabled by default. Set `[script] enabled = false` in trusted
+Script is enabled by default. Set `[script] tool_surface = "direct"` for explicit
+legacy compatibility with the full native tool palette. Set `[script] enabled = false` in trusted
 configuration to remove both tools from the effective palette. A missing or
 unusable engine fails explicitly; no unsafe interpreter fallback is used. See
 [configuration limits](docs/CONFIGURATION.md#script) and the

@@ -95,13 +95,13 @@ class ReadUntilSynthesisProvider(Provider):
     async def complete(self, request):
         self.calls += 1
         self.tool_counts.append(len(request.tools))
-        if request.tools:
+        if "# Read-only investigation checkpoint" not in request.system:
             return ModelResponse(
                 tool_calls=[
                     ToolCall(
                         id=f"read-{self.calls}",
                         name="read_file",
-                        arguments={"path": "example.txt"},
+                        arguments={"path": "example.txt", "start_line": None, "end_line": None, "max_chars": None},
                     )
                 ],
                 usage=Usage(requests=1),
@@ -118,13 +118,13 @@ class NoChangeShellUntilSynthesisProvider(ReadUntilSynthesisProvider):
     async def complete(self, request):
         self.calls += 1
         self.tool_counts.append(len(request.tools))
-        if request.tools:
+        if "# Read-only investigation checkpoint" not in request.system:
             return ModelResponse(
                 tool_calls=[
                     ToolCall(
                         id=f"shell-{self.calls}",
                         name="shell",
-                        arguments={"command": "pwd"},
+                        arguments={"command": "pwd", "cwd": ".", "timeout_seconds": None, "description": "Inspect fixture"},
                     )
                 ],
                 usage=Usage(requests=1),
@@ -1648,7 +1648,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertTrue(result.incomplete)
-                self.assertEqual(result.text, "partial-2")
+                self.assertIn("partial-2", result.text)
+                self.assertIn("maximum 2 model turns", result.text)
                 self.assertEqual(provider.calls, 2)
                 self.assertTrue(provider.saw_continuation)
                 self.assertIn("final response was incomplete", result.error or "")
@@ -1768,7 +1769,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertTrue(result.incomplete)
-                self.assertEqual(result.text, "")
+                self.assertIn("maximum 1 model turns", result.text)
                 self.assertIn("final response was incomplete", result.error or "")
                 self.assertFalse(
                     any(
@@ -1776,7 +1777,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                         for _, event in runner.sessions.events(result.session_id)
                     )
                 )
-                self.assertIn("continuation_state", messages[-1].metadata)
+                self.assertIn("continuation_state", messages[-2].metadata)
+                self.assertEqual(messages[-1].content, result.text)
             finally:
                 await runner.close()
 
@@ -2291,7 +2293,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(first.stop_reason.value, "stuck")
                 before_resume = runner.sessions.messages(first.session_id)
                 self.assertEqual(before_resume[-1].role, Role.ASSISTANT)
-                self.assertEqual(before_resume[-1].tool_calls[0].id, "repeated-2")
+                self.assertEqual(before_resume[-2].tool_call_id, "repeated-2")
+                self.assertTrue(before_resume[-2].metadata["not_started"])
+                validate_tool_call_order(before_resume)
 
                 provider.complete_after_stuck = True
                 resumed = await runner.run("continue", session_id=first.session_id)
@@ -2317,7 +2321,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                         for call in runner.sessions.tool_calls(first.session_id)
                     },
                 )
-                self.assertEqual(after_resume[abandoned_index + 2].content, "continue")
+                self.assertIn("Repeated identical", after_resume[abandoned_index + 2].content)
+                self.assertEqual(after_resume[abandoned_index + 3].content, "continue")
             finally:
                 await runner.close()
 
@@ -2454,7 +2459,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 result = await runner.run("finish within the limit")
                 self.assertEqual(result.stop_reason.value, "max_turns")
                 self.assertTrue(result.incomplete)
-                self.assertEqual(result.text, "Completed cleanly.")
+                self.assertIn("Completed cleanly.", result.text)
+                self.assertIn("final response was incomplete", result.text)
                 self.assertIn("final response was incomplete", result.error or "")
                 self.assertIn("send 'continue' to resume", result.error or "")
             finally:
@@ -2503,7 +2509,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 verify.assert_awaited_once()
                 self.assertEqual((root / "durable.txt").read_text(), "durable")
                 self.assertFalse((root / "must-not-run.txt").exists())
-                self.assertEqual(provider.tool_counts, [len(runner.tools.schemas()), 0])
+                self.assertEqual(provider.tool_counts, [len(runner.tools.provider_schemas(config)), 0])
                 persisted = runner.sessions.messages(result.session_id)
                 final_assistant = persisted[-2]
                 self.assertEqual(final_assistant.role, Role.ASSISTANT)
@@ -3149,7 +3155,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.close()
 
-    async def test_read_only_turn_limit_forces_synthesis_without_more_tools(self):
+    async def test_read_only_checkpoint_invites_synthesis_with_tools_available(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "example.txt").write_text("example\n")
@@ -3188,15 +3194,15 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(provider.calls, 3)
                 self.assertGreater(provider.tool_counts[0], 0)
                 self.assertGreater(provider.tool_counts[1], 0)
-                self.assertEqual(provider.tool_counts[2], 0)
+                self.assertGreater(provider.tool_counts[2], 0)
                 self.assertEqual(
-                    sum(event.type == "run.read_only_synthesis" for event in events),
+                    sum(event.type == "run.investigation_checkpoint" for event in events),
                     1,
                 )
             finally:
                 await runner.close()
 
-    async def test_no_change_shell_turns_count_toward_the_evidence_limit(self):
+    async def test_no_change_shell_checkpoint_keeps_tools_available(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = make_config(
@@ -3225,8 +3231,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             try:
                 result = await runner.run("check without changing files")
 
-                self.assertEqual(result.text, "The no-change checks are sufficient.")
-                self.assertEqual(provider.tool_counts[-1], 0)
+                self.assertIn("The no-change checks are sufficient.", result.text)
+                self.assertNotIn("verification failed", result.text.lower())
+                self.assertGreater(provider.tool_counts[-1], 0)
                 self.assertEqual(provider.calls, 3)
                 self.assertEqual(result.changed_files, [])
             finally:
@@ -3467,7 +3474,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertNotIn("fully verified", result.text)
                 self.assertNotIn("fully verified", "".join(visible_text))
-                self.assertEqual(result.text.splitlines()[0], "Checks passed.")
+                self.assertIn("Checks passed.", result.text)
+                self.assertIsNone(result.error)
                 self.assertIn("Process lifecycle not guaranteed", result.text)
                 persisted = runner.sessions.messages(result.session_id)
                 hidden_outputs = {
@@ -3613,7 +3621,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.stop_reason.value, "budget")
                 self.assertNotIn("fully verified", result.text)
-                self.assertEqual(result.text.splitlines()[0], "Checks passed.")
+                self.assertIn("Checks passed.", result.text)
+                self.assertIn(result.error, result.text)
                 self.assertIn("Process lifecycle not guaranteed", result.text)
                 persisted = runner.sessions.messages(result.session_id)
                 finalizer = next(
@@ -3887,7 +3896,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     result = await runner.run("report lifecycle accurately")
 
-                self.assertEqual(result.text.splitlines()[0], "Checks passed.")
+                self.assertIn("Checks passed.", result.text)
+                self.assertIn(result.error, result.text)
                 self.assertIn("Process lifecycle not guaranteed", result.text)
                 assert result.verification is not None
                 self.assertTrue(result.verification["checks_ok"])

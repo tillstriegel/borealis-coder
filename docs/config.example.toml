@@ -62,6 +62,7 @@ process_file_size_bytes = 200000000
 
 [script]
 enabled = true
+tool_surface = "ptc" # Set "direct" for the legacy full-schema surface.
 source_bytes = 256000
 memory_bytes = 64000000
 stack_bytes = 512000

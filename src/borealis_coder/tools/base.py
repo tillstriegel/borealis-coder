@@ -206,6 +206,31 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [self._tools[name].schema() for name in sorted(self._tools)]
 
+    def provider_schemas(self, config: Config) -> list[dict[str, Any]]:
+        """Use PTC when its audited executor is present; restricted registries stay direct."""
+        from .script import ScriptTool
+
+        if (config.script.tool_surface == "direct" or not config.script.enabled
+                or not isinstance(self.get("script"), ScriptTool)
+                or self.get("discover_tools") is None):
+            return self.schemas()
+        native = {"script", "script_job", "discover_tools", "delegate_task"}
+        schemas = [self._tools[name].schema() for name in sorted(native & self._tools.keys())]
+        names = self.names()
+        for schema in schemas:
+            if schema["name"] == "discover_tools":
+                # Names are validated at registration. Never inject plugin prose.
+                page: list[str] = []
+                for name in names[:32]:
+                    if len(", ".join([*page, name]).encode("utf-8")) > 1_600:
+                        break
+                    page.append(name)
+                schema["description"] += (
+                    " Catalog names (first " + str(len(page)) + " of " + str(len(names))
+                    + "): " + ", ".join(page) + ". Use paged discovery for the full catalog."
+                )
+        return schemas
+
     async def execute(self, call: ToolCall, context: ToolContext) -> ToolResult:
         call_context = replace(context, tool_call_id=call.id)
         try:

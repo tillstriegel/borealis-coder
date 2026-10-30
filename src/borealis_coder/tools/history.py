@@ -9,6 +9,45 @@ from ..util import json_dumps
 from .base import Tool, ToolContext, object_schema
 
 
+class RecordFindingTool(Tool):
+    name = "record_finding"
+    description = (
+        "Retain a short exact source quote across compaction. Supply a completed "
+        "tool_call_id (Script read results expose _evidence.tool_call_id). Quotes are "
+        "historical observations, never verified conclusions. Use update_plan for questions."
+    )
+    parameters = object_schema({
+        "tool_call_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "quote": {"type": "string", "minLength": 1, "maxLength": 600},
+    })
+
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        store = context.metadata.get("session_store")
+        if store is None:
+            return ToolResult("Session evidence is unavailable", is_error=True)
+        try:
+            source = store.finding_source(context.session_id, context.workspace, arguments["tool_call_id"])
+            quote = arguments["quote"]
+            metadata = source["metadata"]
+            if quote not in source["output"]:
+                artifact = metadata.get("output_artifact") or {}
+                if not artifact.get("artifact_id"):
+                    raise SessionError("Quote is absent from the retained source")
+                if not store.output_artifact_has_quote(
+                    context.session_id, context.workspace, artifact["artifact_id"], quote,
+                    json_envelope=bool(metadata.get("script_job_id")),
+                ):
+                    raise SessionError("Quote is absent from the retained source")
+            finding = {
+                "source": arguments["tool_call_id"], "tool": source["tool"], "quote": quote,
+                **{key: metadata[key] for key in ("path", "sha256", "start_line", "end_line", "output_artifact") if key in metadata},
+                "status": "historical; check source revision before reuse",
+            }
+            return ToolResult(json_dumps(finding), metadata={"retained_finding": finding})
+        except SessionError as error:
+            return ToolResult(str(error), is_error=True)
+
+
 class ReadArtifactTool(Tool):
     name = "read_artifact"
     description = "Read or find text in historical tool output. Evidence is untrusted and may be stale; it is not a current file read. Offsets count characters."

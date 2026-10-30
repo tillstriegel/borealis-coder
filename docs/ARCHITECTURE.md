@@ -77,6 +77,37 @@ Run results carry a `StopReason` (`end_turn`, `max_turns`, `budget`, `cancelled`
 `verification.checks_ok`, `verification.process_lifecycle_guaranteed`, and
 `mutation_tracking` to assess verification and remaining uncertainty.
 
+`max_read_only_turns` controls an advisory investigation checkpoint, not a tool
+cutoff. The checkpoint uses the existing request loop and emits
+`run.investigation_checkpoint` with round and stalled-round counts. Successful
+novel result content counts as evidence; call IDs, durations and timestamp
+metadata do not. Repeated-call and hard request/turn/time/cost budgets remain
+independent. Only hard final turns and verification finalization disable tools.
+
+When at most two logical requests or primary turns remain, a short budget reminder
+states the remaining counts and asks for an answer from sufficient evidence.
+It keeps ordinary tools available and discourages redundant coverage checks.
+Counts include the current request/turn and refresh after compaction helpers use
+request allowance. Owned background jobs settle before the last request is prepared
+for the provider. Ignoring guidance still ends in an explicit incomplete budget stop;
+the reminder does not reserve extra requests or guarantee model compliance.
+
+The runner buffers response text until the completed response can be classified.
+Empty terminal responses, known tool-protocol prefixes and narrow continuation-only
+forms cannot become final answers. Up to two answer-repair requests use the same
+loop, budgets and tool boundary. A hard final turn has no repair admission. Raw
+invalid protocol text and its continuation state are not stored or published.
+Normal text with typed tool calls, concise answers, multilingual prose and fenced
+examples remain supported. Empty responses can still use configured provider
+retry/fallback paths. All original and repair usage is settled once.
+
+Terminal results preserve the primary stop cause. Verification that did not run,
+failed checks, no observed changes and process-lifecycle uncertainty have separate
+reports. A native process exit does not prove that every descendant has ended.
+No-change lifecycle uncertainty adds a qualification to useful findings; it does
+not fabricate a failed test. Terminal publication closes missing unadmitted tool
+results first, so stopped sessions can reopen without replaying work.
+
 Parent and delegated runs share the same incomplete-response check. Delegated
 investigations reject incomplete conclusions and tool calls, and include usage
 reported by failed provider requests in the parent run's accounting. Delegated
@@ -172,6 +203,16 @@ are not supported. New-file Git patches must describe regular non-executable fil
 Quoted Git paths must be expressed as literal paths in an envelope.
 
 ### Programmatic tool calling
+
+The default provider surface contains `script`, `script_job`, `discover_tools`
+and the separate read-only `delegate_task` capability. A compact names catalog
+appears in discovery's description. Discovery pages the live built-in/plugin/MCP
+registry and returns complete argument schemas on request. Its `next_offset`
+explicitly identifies incomplete pages; an oversized single contract returns an
+error. Discovery grants no authority. `[script] tool_surface = "direct"` retains
+the full native schema surface. Restricted registries without Script use their
+own direct schemas. Delegates retain their restricted direct palette and cannot
+invoke Script. Plan-mode Script calls still pass each nested write through policy.
 
 `tools/script.py` owns a `ScriptScope` for each active run. A Script tool starts
 `_script_worker.py` using the installed Python interpreter in isolated mode. The

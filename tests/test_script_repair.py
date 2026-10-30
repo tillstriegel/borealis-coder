@@ -188,7 +188,7 @@ class ScriptRepairTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.provider.calls, 1)
             self.assertEqual(result.stop_reason, StopReason.BUDGET)
             self.assertTrue(result.incomplete)
-            self.assertFalse(result.text)
+            self.assertIn("maximum 1 model requests", result.text)
             self.assertFalse(any("Stale candidate" in json.dumps(u) for u in updates))
             return
         notices = [m for m in requests[1].messages if m.metadata.get("internal") == "script_completion"]

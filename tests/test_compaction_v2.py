@@ -1162,10 +1162,7 @@ class StructuredCompactionTests(unittest.TestCase):
             len(json.dumps(bounded)),
             len(json.dumps(authoritative)),
         )
-        self.assertLess(
-            len(bounded["historical_excerpts"]),
-            len(authoritative["historical_excerpts"]),
-        )
+        self.assertEqual(bounded["historical_excerpts"], authoritative["historical_excerpts"])
         self.assertLessEqual(estimate_tokens(compacted[0].content), 400)
 
     def test_byte_target_drops_lower_priority_multibyte_tool_argument_bundle(self):
@@ -2335,9 +2332,9 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 await runner.close()
 
         self.assertEqual([artifact.strategy for artifact in artifacts], ["llm", "llm"])
-        self.assertGreater(
-            len(artifacts[0].metadata["authoritative_evidence"]["historical_excerpts"]),
-            100,
+        self.assertLessEqual(
+            len(json_dumps(artifacts[0].metadata["authoritative_evidence"]["historical_excerpts"])),
+            18_000,
         )
         self.assertEqual(artifacts[0].metadata["evidence"]["historical_excerpts"], [])
         for artifact in artifacts:

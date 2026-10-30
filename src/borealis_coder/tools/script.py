@@ -65,6 +65,9 @@ class ScriptJob:
     process: asyncio.subprocess.Process | None = None
     notified: bool = False
     children: set[asyncio.Task[Any]] = field(default_factory=set)
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    plan: list[dict[str, Any]] | None = None
+    changed_files: set[str] = field(default_factory=set)
 
 
 NestedExecutor = Callable[[ToolCall, ToolContext], Awaitable[ToolResult]]
@@ -137,7 +140,9 @@ class ScriptScope:
         output = self.context.events.redactor.text(job.output)
         return ToolResult(json_dumps(status) + ("\n" + output if output else ""),
                           is_error=job.state in {"error", "stopped"} or bool(job.errors),
-                          metadata={"script_job": status})
+                          metadata={"script_job": status, "retained_findings": job.findings,
+                                    "changed_files": sorted(job.changed_files),
+                                    **({"retained_plan": job.plan} if job.plan is not None else {})})
 
     async def control(self, job_id: str, action: str, seconds: float) -> ToolResult:
         self.check()
@@ -179,6 +184,10 @@ class ScriptScope:
         )
         self.archive_remaining = max(0, self.archive_remaining - artifact["stored_bytes"])
         result.metadata["output_artifact"] = artifact
+        if result.data is not None:
+            result.data = {**result.data, "_evidence": {
+                "tool_call_id": context.tool_call_id, "output_artifact": artifact,
+            }}
         return result
 
     async def _invoke(self, job: ScriptJob, request: dict[str, Any]) -> dict[str, Any]:
@@ -196,9 +205,21 @@ class ScriptScope:
         lock = self.reads if tool and tool.concurrent and tool.effect == Effect.READ and tool.effective_mutation_scope == MutationScope.NONE else self.mutation_lock
         async with lock:
             self.check()
-            result = await self.execute(call, context)
+            before = set(context.changed_files)
+            try:
+                result = await self.execute(call, context)
+            finally:
+                job.changed_files.update(context.changed_files - before)
+            if (tool is not None and tool.effect == Effect.WRITE and not result.is_error
+                    and isinstance(result.metadata.get("path"), str)):
+                job.changed_files.add(result.metadata["path"])
         if result.is_error:
             job.errors += 1
+        else:
+            if name == "record_finding" and isinstance(result.metadata.get("retained_finding"), dict):
+                job.findings = [*job.findings, result.metadata["retained_finding"]][-12:]
+            if name == "update_plan" and isinstance(result.metadata.get("items"), list):
+                job.plan = result.metadata["items"]
         return {"id": request["id"], "result": {**result.to_dict(), "data": result.data}}
 
     async def _run(self, job: ScriptJob, source: str) -> None:

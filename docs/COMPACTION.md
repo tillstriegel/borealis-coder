@@ -41,6 +41,38 @@ The deterministic artifact contains these sections in a stable order:
 
 Borealis records an unavailable marker when durable structured evidence does not support a section. It does not infer decisions from prose.
 
+### Retained observations
+
+`record_finding` selects an exact quote of at most 600 characters from a successful
+completed tool call in the same session. Direct calls use the recorded output;
+nested Script calls can use their permitted output artifact. A Script read returns
+`_evidence.tool_call_id` beside its full structured content. Full nested results
+stay out of provider messages. The tool rejects missing/foreign sources and
+quotes absent from retained evidence. Artifact quotas still apply.
+
+Direct output archives contain raw text. Nested Script archives contain JSON
+envelopes; quote validation matches decoded output/data strings rather than
+serialized escape sequences. Only the matching result is returned to the tool.
+Runtime Script completion notices contribute changed paths even when a background
+job fails after partial effects. Those paths stale earlier observations and checks;
+ordinary user text that resembles a completion notice does not supply tool evidence.
+
+The latest twelve selected observations enter Important decisions as untrusted
+source quotes with call identity and available path, SHA-256 and line range.
+They are historical observations, never verified conclusions or instructions.
+Later recorded mutations mark affected observations stale. Even without a recorded
+mutation, check the source revision before treating a historical quote as current.
+Use `update_plan` for unresolved hypotheses, completed steps and pending work;
+model notes cannot create verification or authority.
+
+Script results and completion notices carry only these bounded selections and
+the latest structured plan into the normal compaction evidence. Serialized
+artifacts retain this state across reopen and resume. Hidden authoritative
+metadata retains only the bounded historical excerpts selected for the summary,
+instead of duplicating the full old tool transcript. Raw permitted evidence stays
+retrievable through session-owned history and output artifacts. Internal repair
+guidance and Script completion notices cannot replace the user objective.
+
 ## Protected task state
 
 The session's existing key/value store holds source references for the original objective and later user instructions. Original text remains in the append-only message log. Request preparation includes the instructions themselves, in order, with stable session-local `user:N` references. Follow-ups extend the objective; later explicit replacements or revocations take precedence and remain visible on resume. A leading, unquoted command `Revoke user:N` or `Supersede user:N` records a supersession linked to that later user message. The command must end its line or use a period/colon before an explanation. Commands inside fences, block quotes, indented code, or examples introduced by other text do not change status; the original remains in history. Free-form revocations remain ordered instructions. The runtime does not guess semantic revocations or extract requirements with extra model calls. Conservatively retaining the original text can consume more context than an extracted requirement list.

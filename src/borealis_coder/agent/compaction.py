@@ -642,9 +642,7 @@ def extract_compaction_evidence(
         for message in messages
         if message.role == Role.USER
         and not message.metadata.get("compacted")
-        and not str(message.metadata.get("internal") or "").startswith(
-            "verification_"
-        )
+        and not message.metadata.get("internal")
     ]
     if user_messages:
         substantive_user_messages = [
@@ -682,11 +680,30 @@ def extract_compaction_evidence(
     for message_index, message in enumerate(messages):
         for call in message.tool_calls:
             call_details[call.id] = (call.name, call.arguments)
-        if message.role != Role.TOOL:
-            continue
-        tool_name, arguments = call_details.get(
-            message.tool_call_id or "", (message.tool_name or "", {})
+        script_completion = (
+            message.role == Role.USER
+            and message.metadata.get("internal") == "script_completion"
+            and isinstance(message.metadata.get("script_job"), dict)
         )
+        if (message.tool_name in {"script", "script_job"}
+                or script_completion):
+            for finding in message.metadata.get("retained_findings", [])[-12:]:
+                if isinstance(finding, dict) and isinstance(finding.get("quote"), str):
+                    value = "Observed source quote: " + json_dumps(finding)
+                    if value not in evidence.important_decisions:
+                        evidence.important_decisions.append(value)
+            evidence.important_decisions = evidence.important_decisions[-12:]
+            if isinstance(message.metadata.get("retained_plan"), list):
+                latest_plan = message.metadata["retained_plan"]
+        if message.role != Role.TOOL and not script_completion:
+            continue
+        if script_completion:
+            tool_name = "script_job"
+            arguments = {"job_id": message.metadata["script_job"].get("job_id")}
+        else:
+            tool_name, arguments = call_details.get(
+                message.tool_call_id or "", (message.tool_name or "", {})
+            )
         if tool_name == "update_plan" and not message.is_error:
             plan_value = message.metadata.get("items")
             if not isinstance(plan_value, list):
@@ -705,6 +722,21 @@ def extract_compaction_evidence(
         if successful_mutation:
             latest_mutation_index = message_index
             evidence.files_changed.extend(paths)
+            # Findings carry original hashes/ranges. A later recorded mutation
+            # makes observations explicitly stale, including incremental artifacts.
+            updated_decisions = []
+            for decision in evidence.important_decisions:
+                if decision.startswith("Observed source quote: "):
+                    try:
+                        finding = json.loads(decision.removeprefix("Observed source quote: "))
+                    except (ValueError, TypeError):
+                        finding = None
+                    if isinstance(finding, dict):
+                        if not paths or finding.get("path") in paths:
+                            finding["status"] = "stale after recorded mutation; read source again"
+                        decision = "Observed source quote: " + json_dumps(finding)
+                updated_decisions.append(decision)
+            evidence.important_decisions = updated_decisions
             if paths and not message.is_error:
                 evidence.completed_work.append(
                     f"Recorded successful {tool_name or 'mutation'}: {', '.join(paths)}"
@@ -730,6 +762,11 @@ def extract_compaction_evidence(
                 "Latest recorded git state:\n"
                 + truncate_text(message.content.strip(), 2_000),
             )
+        if tool_name == "record_finding" and not message.is_error:
+            finding = message.metadata.get("retained_finding")
+            if isinstance(finding, dict) and isinstance(finding.get("quote"), str):
+                evidence.important_decisions.append("Observed source quote: " + json_dumps(finding))
+                evidence.important_decisions = evidence.important_decisions[-12:]
 
     verification_messages = [
         (message_index, message)
@@ -1317,7 +1354,9 @@ def compact_messages(
                     "compacted_bundles": len(older_bundles),
                     "retained_bundles": len(recent_bundles),
                     "evidence": bounded_evidence.to_dict(),
-                    "authoritative_evidence": evidence.to_dict(),
+                    "authoritative_evidence": replace(
+                        evidence, historical_excerpts=bounded_evidence.historical_excerpts,
+                    ).to_dict(),
                 },
             ),
             *recent,

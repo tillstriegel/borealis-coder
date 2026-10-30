@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Callable
 
 from ..config import ProviderConfig
@@ -52,16 +53,18 @@ class MockProvider(Provider):
         if "OFFLINE_WRITE_DEMO" in last and not any(
             message.tool_calls for message in request.messages
         ):
+            write = {
+                "path": "borealis-demo.txt",
+                "content": "Created by the deterministic Borealis mock provider.\n",
+                "expected_sha256": None,
+            }
+            ptc = any(tool["name"] == "script" for tool in request.tools)
             return ModelResponse(
                 tool_calls=[
                     ToolCall(
                         id="call_mock_write",
-                        name="write_file",
-                        arguments={
-                            "path": "borealis-demo.txt",
-                            "content": "Created by the deterministic Borealis mock provider.\n",
-                            "expected_sha256": None,
-                        },
+                        name="script" if ptc else "write_file",
+                        arguments={"source": "const result = await tools.write_file(" + json.dumps(write) + "); text(result.output);", "background": False} if ptc else write,
                     )
                 ],
                 usage=Usage(input_tokens=50, output_tokens=25, requests=1),
