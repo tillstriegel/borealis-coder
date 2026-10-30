@@ -41,6 +41,12 @@ class ReadFileTool(Tool):
         if arguments.get("end_line") is not None and end < start:
             raise ToolError("end_line must be >= start_line")
         selected = lines[start - 1 : end]
+        if context.metadata.get("script_mode"):
+            return ToolResult("", data={
+                "content": "".join(selected), "path": resolved.display,
+                "sha256": sha256_bytes(data), "line_count": len(lines),
+                "start_line": start, "end_line": min(end, len(lines)),
+            })
         numbered = "".join(f"{index:>6}\t{line}" for index, line in enumerate(selected, start=start))
         limit = int(arguments.get("max_chars") or context.config.context.tool_output_chars)
         digest = sha256_bytes(data)

@@ -17,6 +17,7 @@ from .base import Tool, ToolContext, object_schema
 
 class DelegateTaskTool(Tool):
     name = "delegate_task"
+    script_accessible = False
     description = "Delegate a bounded, read-only investigation to an isolated subagent and return its evidence-backed conclusion."
     effect = Effect.READ
     concurrent = True
@@ -38,7 +39,7 @@ class DelegateTaskTool(Tool):
             tool for name in registry.names()
             if (tool := registry.get(name)) is not None
             and tool.effect == Effect.READ
-            and name != self.name
+            and tool.script_accessible
         ]
         schemas = [tool.schema() for tool in read_tools]
         allowed = {tool.name for tool in read_tools}

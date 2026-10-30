@@ -25,6 +25,7 @@ _WORKSPACE_AUTHORITY_SECTIONS = frozenset({
     "cache",
     "safety",
     "sandbox",
+    "script",
     "storage",
     "telemetry",
 })
@@ -113,6 +114,24 @@ class SandboxConfig:
     docker_network: bool = False
     process_cpu_seconds: int = 600
     process_file_size_bytes: int = 200_000_000
+
+
+@dataclass(slots=True)
+class ScriptConfig:
+    enabled: bool = True
+    source_bytes: int = 256_000
+    memory_bytes: int = 64_000_000
+    stack_bytes: int = 512_000
+    cpu_seconds: int = 30
+    wall_seconds: float = 900
+    foreground_seconds: float = 300
+    max_calls: int = 1000
+    parallel_reads: int = 8
+    max_jobs: int = 4
+    ipc_bytes: int = 20_000_000
+    result_bytes: int = 16_000_000
+    output_bytes: int = 24_000
+    archive_bytes: int = 20_000_000
 
 
 @dataclass(slots=True)
@@ -242,6 +261,7 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    script: ScriptConfig = field(default_factory=ScriptConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -326,6 +346,7 @@ DEFAULTS: dict[str, Any] = {
     "agent": asdict(AgentConfig()),
     "safety": asdict(SafetyConfig()),
     "sandbox": asdict(SandboxConfig()),
+    "script": asdict(ScriptConfig()),
     "context": asdict(ContextConfig()),
     "storage": asdict(StorageConfig()),
     "cache": asdict(CacheConfig()),
@@ -469,6 +490,7 @@ def load_config(
         "agent",
         "safety",
         "sandbox",
+        "script",
         "context",
         "storage",
         "cache",
@@ -492,6 +514,7 @@ def load_config(
         agent=_construct(AgentConfig, dict(merged.get("agent") or {})),
         safety=_construct(SafetyConfig, dict(merged.get("safety") or {})),
         sandbox=_construct(SandboxConfig, dict(merged.get("sandbox") or {})),
+        script=_construct(ScriptConfig, dict(merged.get("script") or {})),
         context=_construct(ContextConfig, dict(merged.get("context") or {})),
         storage=_construct(StorageConfig, dict(merged.get("storage") or {})),
         cache=_construct(CacheConfig, dict(merged.get("cache") or {})),
@@ -567,6 +590,20 @@ def _enabled(name: str) -> bool:
 
 
 def validate_config(config: Config) -> None:
+    if not isinstance(config.script.enabled, bool):
+        raise ConfigurationError("script.enabled must be a boolean")
+    for item in fields(ScriptConfig):
+        if item.name == "enabled":
+            continue
+        value = getattr(config.script, item.name)
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            raise ConfigurationError(f"script.{item.name} must be positive and finite")
+        if item.name not in {"foreground_seconds", "wall_seconds"} and not isinstance(value, int):
+            raise ConfigurationError(f"script.{item.name} must be an integer")
+    if config.script.foreground_seconds > 300:
+        raise ConfigurationError("script.foreground_seconds cannot exceed 300")
+    if config.script.result_bytes + 1024 > config.script.ipc_bytes:
+        raise ConfigurationError("script.ipc_bytes must exceed result_bytes by at least 1024")
     if config.agent.max_turns < 1:
         raise ConfigurationError("agent.max_turns must be positive")
     if config.agent.max_model_requests < 1:

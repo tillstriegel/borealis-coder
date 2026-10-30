@@ -119,6 +119,7 @@ class Tool:
     }
     effect: Effect = Effect.READ
     concurrent: bool = False
+    script_accessible: bool = True
     default_risk: str = "low"
     mutation_scope: MutationScope | None = None
 
@@ -267,12 +268,19 @@ class ToolRegistry:
                 metadata={"error_type": type(error).__name__, "unexpected": True},
             )
         duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-        result = bound_tool_output(result, context, context.config.context.tool_output_chars)
+        retain = context.metadata.get("script_retain_result")
+        if callable(retain):
+            retained = retain(result, context)
+            if not isinstance(retained, ToolResult):
+                raise ToolError("Invalid Script result handler")
+            result = retained
+        else:
+            result = bound_tool_output(result, context, context.config.context.tool_output_chars)
         result.metadata.setdefault("duration_ms", duration_ms)
         await context.events.emit(
             "tool.completed", session_id=context.session_id, run_id=context.run_id,
             tool_call_id=call.id, tool=call.name, is_error=result.is_error,
-            output=result.output, metadata=result.metadata,
+            output=truncate_text(result.output, context.config.context.tool_output_chars), metadata=result.metadata,
         )
         return result
 

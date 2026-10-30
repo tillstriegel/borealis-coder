@@ -60,6 +60,22 @@ docker_network = false
 process_cpu_seconds = 600
 process_file_size_bytes = 200000000
 
+[script]
+enabled = true
+source_bytes = 256000
+memory_bytes = 64000000
+stack_bytes = 512000
+cpu_seconds = 30
+wall_seconds = 900
+foreground_seconds = 300
+max_calls = 1000
+parallel_reads = 8
+max_jobs = 4
+ipc_bytes = 20000000
+result_bytes = 16000000
+output_bytes = 24000
+archive_bytes = 20000000
+
 [context]
 repo_map_chars = 28000
 max_file_bytes = 2000000

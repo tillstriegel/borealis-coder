@@ -143,8 +143,10 @@ class GrepTool(Tool):
             except (ValueError, KeyError, TypeError):
                 return ToolResult("Search continuation is stale or invalid; restart the search.", is_error=True)
         rows: list[str] = []
+        structured: list[dict[str, Any]] = []
         output_chars = 0
-        output_limit = context.config.context.tool_output_chars
+        script_mode = context.metadata.get("script_mode")
+        output_limit = context.config.script.result_bytes if script_mode else context.config.context.tool_output_chars
         file_limit = context.config.context.max_file_bytes
         match_count = 0
         seen = 0
@@ -194,6 +196,8 @@ class GrepTool(Tool):
                         break
                     match_count += 1
                     identities[display] = hashlib.sha256(data).hexdigest()
+                    if script_mode:
+                        structured.append({"path": display, "line": index + 1, "text": lines[index], "is_match": True})
                     for ctx_index in range(max(0, index - context_lines), min(len(lines), index + context_lines + 1)):
                         if ctx_index in emitted_context:
                             continue
@@ -214,6 +218,8 @@ class GrepTool(Tool):
                     "scope": arguments["path"], "glob": file_glob,
                     "excluded_directories": context.config.context.ignored_dirs,
                     "next_cursor": next_cursor, "snapshot": identity, "content_sha256": identities}
+        if script_mode:
+            return ToolResult("", data={"matches": structured, "coverage": metadata})
         negative = "No matches in the completed search scope" if metadata["complete"] else "No matches in the portion examined"
         body = ("\n".join(rows) or negative) + ("\nContent SHA-256: " + json_dumps(identities) if identities else "")
         coverage = {k: v for k, v in metadata.items() if k != "content_sha256"}

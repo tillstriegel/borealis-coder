@@ -1901,7 +1901,8 @@ class CompactionRunnerTests(unittest.IsolatedAsyncioTestCase):
                 prepared = await runner._prepare_provider_request(
                     prompt_context=prompt_context,
                     messages=runner.sessions.messages(session.id),
-                    schemas=runner.tools.schemas(),
+                    # Isolate continuation pressure from growth in the built-in palette.
+                    schemas=[],
                     final_turn=False,
                     verification_finalization_pending=False,
                     adaptive_cache=False,

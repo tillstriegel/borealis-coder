@@ -27,12 +27,14 @@ from ..errors import (
     ProviderUnavailableError,
     RouteContextExceeded,
     SessionError,
+    ToolError,
 )
 from ..events import EventBus
 from ..models import (
     AgentResult,
     CompactionArtifact,
     ContinuationState,
+    Effect,
     Message,
     ModelResponse,
     ProviderRequest,
@@ -47,6 +49,8 @@ from ..safety import ApprovalManager
 from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import MutationScope, ToolContext, ToolRegistry, VerificationPlanner
+from ..tools.base import bound_tool_output
+from ..tools.script import ScriptJobTool, ScriptScope, ScriptTool
 from ..util import (
     estimate_tokens,
     finish_on_cancellation,
@@ -443,8 +447,24 @@ class AgentRunner:
         self._accepting_steering: set[str] = set()
         self._approval_managers: dict[str, ApprovalManager] = {}
         self.mcp_manager: MCPManager | None = None
+        self._mutation_lock = asyncio.Lock()
+        self._script_scopes: set[ScriptScope] = set()
+        self._script_job_slots: set[str] = set()
+        self._run_tasks: set[asyncio.Task[Any]] = set()
+        self._closing = False
 
     async def close(self) -> None:
+        await finish_on_cancellation(self._close())
+
+    async def _close(self) -> None:
+        self._closing = True
+        for event in self._cancel.values():
+            event.set()
+        for task in self._run_tasks:
+            task.cancel()
+        await finish_on_cancellation(asyncio.gather(*self._run_tasks, return_exceptions=True))
+        for scope in list(self._script_scopes):
+            await scope.close()
         async with contextlib.AsyncExitStack() as cleanup:
             cleanup.push_async_callback(asyncio.to_thread, self.sessions.close)
             cleanup.push_async_callback(self.events.flush)
@@ -503,6 +523,33 @@ class AgentRunner:
         return prompts
 
     async def run(
+        self,
+        prompt: str,
+        *,
+        session_id: str | None = None,
+        user_message_id: str | None = None,
+        user_metadata: dict[str, Any] | None = None,
+        wait_for_active_run: bool = False,
+    ) -> AgentResult:
+        if self._closing:
+            raise SessionError("Runner is closed")
+        task = asyncio.create_task(self._run(
+            prompt, session_id=session_id, user_message_id=user_message_id,
+            user_metadata=user_metadata, wait_for_active_run=wait_for_active_run,
+        ))
+        self._run_tasks.add(task)
+        try:
+            while True:
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if task.done():
+                        return task.result()
+                    task.cancel()
+        finally:
+            self._run_tasks.discard(task)
+
+    async def _run(
         self,
         prompt: str,
         *,
@@ -653,8 +700,12 @@ class AgentRunner:
         context.metadata["budget"] = budget
         context.metadata["usage_sink"] = usage_sink
         context.metadata["before_model_request"] = budget.before_model_request
+
+        scripts = self._new_script_scope(context, cancel)
+        context.metadata["script_scope"] = scripts
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
         tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
+        await self._recover_script_calls(tool_call_rows, context)
         running_call_ids = {
             str(row["tool_call_id"])
             for row in tool_call_rows
@@ -732,6 +783,7 @@ class AgentRunner:
             limit=self.config.agent.max_read_only_turns
         )
 
+        self._script_scopes.add(scripts)
         try:
             prompt_context = await asyncio.to_thread(self.context_builder.build, query=prompt)
             session_usage = await asyncio.to_thread(self.sessions.usage, session_id)
@@ -790,6 +842,9 @@ class AgentRunner:
                 self._check_cancel(cancel)
                 budget.before_turn()
                 final_turn = budget.turns == self.config.agent.max_turns
+                mutation_revision += await self._await_until_cancelled(
+                    self._script_notifications(scripts, messages, wait=final_turn), cancel
+                )
                 read_only_synthesis_pending = read_only_work.synthesis_pending
                 tools_disabled = (
                     final_turn
@@ -806,7 +861,8 @@ class AgentRunner:
 
                 assistant_message_id = new_id("msg")
                 buffer_candidate_output = bool(
-                    verification_finalization_pending
+                    scripts.active
+                    or verification_finalization_pending
                     or awaiting_repair
                     or (
                         self.config.agent.auto_verify
@@ -849,11 +905,9 @@ class AgentRunner:
                         await usage_sink(error.usage)
                     raise
                 provider_overflow_retries = 0
-                usage_budget_error: BudgetExceeded | None = None
-                try:
-                    await usage_sink(response.usage)
-                except BudgetExceeded as error:
-                    usage_budget_error = error
+                usage_budget_error = await self._settle_script_response_usage(
+                    scripts, response.usage, usage_sink
+                )
                 cumulative_usage = await asyncio.to_thread(self.sessions.usage, session_id)
                 if not adaptive_cache and self._low_cache_effectiveness(cumulative_usage):
                     adaptive_cache = True
@@ -958,6 +1012,14 @@ class AgentRunner:
                     read_only_work.reset_if(steered)
                     continue
                 if not response_tool_calls:
+                    completed_scripts = await self._await_until_cancelled(
+                        self._script_notifications(scripts, messages, wait=True), cancel
+                    )
+                    mutation_revision += completed_scripts
+                    if completed_scripts and not final_turn:
+                        verification_finalization_pending = False
+                        verification_final_answer_safe = False
+                        continue
                     if await self._drain_steering(session_id, run_id, messages):
                         read_only_work.consecutive_turns = 0
                         verification_finalization_pending = False
@@ -1054,6 +1116,8 @@ class AgentRunner:
                 "run.error", session_id=session_id, run_id=run_id, error=error_message
             )
         finally:
+            await scripts.close()
+            self._script_scopes.discard(scripts)
             verification, verified_revision, error_message = (
                 await self._verify_max_turn_exit(
                     stop_reason=stop_reason,
@@ -1171,6 +1235,59 @@ class AgentRunner:
             "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
         )
         return result
+
+    async def _settle_script_response_usage(
+        self, scripts: ScriptScope, usage: Usage, usage_sink: Callable[[Usage], Awaitable[None]]
+    ) -> BudgetExceeded | None:
+        script_error: Exception | None = None
+        try:
+            scripts.check()
+        except (BudgetExceeded, Cancelled, ToolError) as error:
+            script_error = error
+        usage_budget_error = None
+        try:
+            await usage_sink(usage)
+        except BudgetExceeded as error:
+            usage_budget_error = error
+        # Settle the completed response before propagating a scope stop.
+        if script_error is not None:
+            raise script_error
+        if scripts.fatal is not None:
+            raise scripts.fatal
+        return usage_budget_error
+
+    def _new_script_scope(self, context: ToolContext, cancel: asyncio.Event) -> ScriptScope:
+        async def execute_nested(call: ToolCall, nested_context: ToolContext) -> ToolResult:
+            results: list[ToolResult] = []
+            try:
+                await self._execute_one(call, nested_context, cancel, nested_results=results)
+                return results[0]
+            finally:
+                if nested_context.mutation_tracking == "incomplete":
+                    self._mark_workspace_tracking_incomplete(context)
+        return ScriptScope(context, self.tools, execute_nested, self._mutation_lock, self._script_job_slots)
+
+    async def _recover_script_calls(self, rows: list[dict[str, Any]], context: ToolContext) -> None:
+        for row in rows:
+            if row["status"] == "running" and row["metadata"].get("script_job_id"):
+                await asyncio.to_thread(
+                    self.sessions.complete_tool_call, context.session_id, row["tool_call_id"],
+                    output="Unknown outcome: owning Script run ended. Inspect effects before retrying.",
+                    is_error=True, metadata={"unknown_outcome": True, "workspace_change_tracking": "incomplete"},
+                )
+                self._mark_workspace_tracking_incomplete(context)
+
+    async def _script_notifications(self, scripts: ScriptScope, messages: list[Message], *, wait: bool = False) -> int:
+        notices = await scripts.notifications(wait=wait)
+        for notification in notices:
+            notification.output = "Script completion: " + notification.output
+            context = replace(scripts.context, tool_call_id=notification.metadata["script_job"]["job_id"])
+            notification = bound_tool_output(notification, context, self.config.context.tool_output_chars)
+            notice = Message(role=Role.USER, content=notification.output, is_error=notification.is_error,
+                             metadata={"internal": "script_completion", **notification.metadata})
+            messages.append(notice)
+            await asyncio.to_thread(self.sessions.append_message, scripts.context.session_id, notice)
+        return len(notices)
 
     async def _verify_max_turn_exit(
         self,
@@ -3589,12 +3706,15 @@ class AgentRunner:
         writes: list[ToolCall] = []
         for call in calls:
             tool = self.tools.get(call.name)
-            (reads if tool and tool.concurrent else writes).append(call)
+            (reads if tool and tool.concurrent and tool.effect == Effect.READ and tool.effective_mutation_scope == MutationScope.NONE else writes).append(call)
+        script_scope = context.metadata.get("script_scope")
         semaphore = asyncio.Semaphore(max(1, self.config.agent.parallel_reads))
 
         async def run_read(call: ToolCall):
             async with semaphore:
                 self._check_cancel(cancel)
+                if isinstance(script_scope, ScriptScope):
+                    script_scope.check()
                 return await self._execute_one(call, context, cancel)
 
         try:
@@ -3616,7 +3736,13 @@ class AgentRunner:
                 )
             for call in writes:
                 self._check_cancel(cancel)
-                messages[call.id] = await self._execute_one(call, context, cancel)
+                if isinstance(script_scope, ScriptScope):
+                    script_scope.check()
+                if isinstance(self.tools.get(call.name), ScriptTool | ScriptJobTool):
+                    messages[call.id] = await self._execute_one(call, context, cancel)
+                else:
+                    async with self._mutation_lock:
+                        messages[call.id] = await self._execute_one(call, context, cancel)
         except (asyncio.CancelledError, Cancelled):
             await self._record_unstarted_calls(calls, context)
             raise
@@ -3627,6 +3753,9 @@ class AgentRunner:
                 reason=f"Run stopped before tool execution: {error}",
                 budget_kind=error.kind,
             )
+            raise
+        except ToolError:
+            await self._record_unstarted_calls(calls, context, reason="Run stopped after a Script host failure")
             raise
         return [messages[call.id] for call in calls]
 
@@ -3690,7 +3819,7 @@ class AgentRunner:
         call_id: str,
         *,
         reason: str,
-        message: Message,
+        message: Message | None,
     ) -> None:
         """Ignore a stale cancellation only when another finalizer won the race."""
 
@@ -3723,6 +3852,8 @@ class AgentRunner:
         call: ToolCall,
         context: ToolContext,
         cancel: asyncio.Event,
+        *,
+        nested_results: list[ToolResult] | None = None,
     ):
         await asyncio.to_thread(
             self.sessions.start_tool_call,
@@ -3730,7 +3861,9 @@ class AgentRunner:
             context.run_id,
             call.id,
             call.name,
-            call.arguments,
+            context.events.redactor.value(call.arguments) if nested_results is not None else call.arguments,
+            metadata=({"script_parent_id": context.metadata["script_parent_id"],
+                       "script_job_id": context.metadata["script_job_id"]} if nested_results is not None else None),
         )
         workspace_before = None
         tool = self.tools.get(call.name)
@@ -3778,9 +3911,33 @@ class AgentRunner:
                 context.session_id,
                 call.id,
                 reason=cancelled_result.output,
-                message=self._tool_result_message(call, cancelled_result),
+                message=self._tool_result_message(call, cancelled_result) if nested_results is None else None,
             )
             raise
+        except Exception:
+            if nested_results is not None:
+                if workspace_before is not None:
+                    try:
+                        after_failure = await self._workspace_snapshot(timeout=_TOOL_FINALIZATION_GRACE_SECONDS)
+                        self._record_workspace_changes(workspace_before, after_failure, context)
+                    except Exception:
+                        pass
+                self._mark_workspace_tracking_incomplete(context)
+                # Preserve the primary failure if persistence is also unavailable.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self.sessions.complete_tool_call, context.session_id, call.id,
+                        output="Nested tool result collection failed; inspect partial effects before retrying.",
+                        is_error=True, metadata={"script_job_id": context.metadata["script_job_id"],
+                                                 "script_parent_id": context.metadata["script_parent_id"],
+                                                 "workspace_change_tracking": "incomplete"},
+                    )
+            raise
+        if nested_results is not None:
+            nested_results.append(result)
+            result = replace(result, output=truncate_text(result.output, context.config.context.tool_output_chars), data=None)
+            result.metadata = {**result.metadata, "script_parent_id": context.metadata["script_parent_id"],
+                               "script_job_id": context.metadata["script_job_id"]}
         cancellation_message = self._tool_result_message(call, result)
         workspace_reconciled = workspace_before is None
         try:
@@ -3830,7 +3987,7 @@ class AgentRunner:
                         output=result.output,
                         is_error=result.is_error,
                         metadata=result.metadata,
-                        message=cancellation_message,
+                        message=cancellation_message if nested_results is None else None,
                     ),
                     cancel,
                 )
@@ -3843,7 +4000,7 @@ class AgentRunner:
                     output=result.output,
                     is_error=result.is_error,
                     metadata=result.metadata,
-                    message=cancellation_message,
+                    message=cancellation_message if nested_results is None else None,
                 ),
                 cancel,
             )
@@ -3863,7 +4020,7 @@ class AgentRunner:
                     output=cancellation_message.content,
                     is_error=cancellation_message.is_error,
                     metadata=cancellation_message.metadata,
-                    message=cancellation_message,
+                    message=cancellation_message if nested_results is None else None,
                 )
             )
             raise

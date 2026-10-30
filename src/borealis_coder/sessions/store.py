@@ -921,7 +921,8 @@ class SessionStore:
         return result
 
     def start_tool_call(
-        self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any]
+        self, session_id: str, run_id: str, call_id: str, name: str, arguments: dict[str, Any],
+        *, metadata: dict[str, Any] | None = None,
     ) -> None:
         if not call_id.strip():
             raise SessionError("Tool call ID must be non-empty")
@@ -930,10 +931,10 @@ class SessionStore:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 """INSERT INTO tool_calls(
-                    session_id,tool_call_id,run_id,tool_name,arguments_json,status,started_at
-                ) VALUES(?,?,?,?,?,'running',?)
+                    session_id,tool_call_id,run_id,tool_name,arguments_json,status,started_at,metadata_json
+                ) VALUES(?,?,?,?,?,'running',?,?)
                 ON CONFLICT(session_id,tool_call_id) DO NOTHING""",
-                (session_id, call_id, run_id, name, arguments_json, utc_now()),
+                (session_id, call_id, run_id, name, arguments_json, utc_now(), json_dumps(metadata or {})),
             )
             if cursor.rowcount:
                 return

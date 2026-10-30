@@ -327,6 +327,7 @@ class ToolResult:
     output: str
     is_error: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    data: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"output": self.output, "is_error": self.is_error, "metadata": self.metadata}
