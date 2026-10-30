@@ -742,7 +742,7 @@ class InteractiveCLI:
                     (
                         "usage",
                         f"{usage.total_tokens} tokens · {usage.requests} requests "
-                        f"· ${usage.cost_usd:.4f}",
+                        f"· {usage.cost_label}",
                     ),
                     (
                         "prompt cache",
@@ -1040,8 +1040,7 @@ def _turn_footer(result: AgentResult) -> str:
         f"{result.turns} model turn{'s' if result.turns != 1 else ''}",
         f"{result.usage.total_tokens} tokens",
     ]
-    if result.usage.cost_usd:
-        parts.append(f"${result.usage.cost_usd:.4f}")
+    parts.append(result.usage.cost_label)
     if result.usage.cached_input_tokens or result.usage.cache_write_tokens:
         parts.append(
             f"prompt cache {result.usage.provider_cache_hit_rate:.0%} hit "

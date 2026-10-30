@@ -840,7 +840,7 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
                 return_value=(b"ok", 200, "text/plain", "utf-8", None),
             ) as request,
         ):
-            body, status, _, _ = _fetch_public_url("https://example.com", 100)
+            body, status, _, _, _ = _fetch_public_url("https://example.com", 100)
         self.assertEqual((body, status), ("ok", 200))
         resolver.assert_called_once()
         self.assertEqual(request.call_args.args[1], "93.184.216.34")

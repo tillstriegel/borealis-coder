@@ -77,6 +77,40 @@ Hard gates are independent of interactive approval:
 
 An approval cannot silently override a disabled hard gate. The embedding application must change configuration deliberately.
 
+## Script execution
+
+`script` runs JavaScript in a fresh QuickJS context in a dedicated Python
+subprocess. Python starts in isolated mode (`-I`) with a minimal environment;
+provider credentials, user-site imports, and workspace imports are not inherited.
+The engine receives no Python callbacks, host objects, module loader, file,
+network, process, or environment APIs. A serialized bridge admits registered
+tools through the same schema, policy, approval, checkpoint, and mutation
+accounting path as direct calls. Script is a workflow container, so read-only
+programs remain usable in plan mode; each nested effect has its own policy gate.
+
+The trusted supervisor validates frame size, JSON types, depth and call identity,
+limits calls and in-flight reads, serializes side effects, bounds printed output
+and archives, and enforces a wall deadline across all IPC and child work. The
+worker configures engine heap, stack and CPU limits; POSIX also applies an OS CPU
+limit. Timeouts and fatal host cancellation/budget errors stop the worker without
+returning a catchable JavaScript tool result. All admitted tasks are drained and
+the subprocess is reaped before its slot is released. Ordinary refused tools
+reject their promises and stay visible as job errors even when caught.
+
+This is embedded-engine isolation, not an OS/kernel sandbox against engine
+vulnerabilities. The Script worker runs on the host even when shell tools use
+the Docker driver. Put the entire Borealis process in a restricted container or
+VM when that boundary is required. Plugins remain trusted Python code and MCP
+servers retain their own process authority. There is no unsafe execution fallback
+when QuickJS cannot start. Disable Script with trusted `[script] enabled = false`.
+
+Jobs are owned by one run/session, cannot control other runs, and stop before
+run teardown. Completion uses events and model notices, with no polling loop.
+There is no durable job daemon or mutation replay after restart. Nested lifecycle
+records and redacted quota-bounded artifacts survive; interrupted records are
+marked with an unknown outcome on resume. Partial mutations are retained, and
+workflow rollback or atomicity is not promised.
+
 ## Command controls
 
 The shell tool parses and classifies common shell chains and detects categories such as:

@@ -22,7 +22,7 @@ class CountPythonFiles(Tool):
     name = "count_python_files"
     description = "Count Python source files inside the workspace."
     effect = Effect.READ
-    schema = {
+    parameters = {
         "type": "object",
         "properties": {
             "path": {"type": ["string", "null"]},
@@ -31,11 +31,28 @@ class CountPythonFiles(Tool):
         "additionalProperties": False,
     }
 
-    async def run(self, arguments: dict, context: ToolContext) -> ToolResult:
-        base = context.roots.resolve(arguments.get("path") or ".")
+    async def execute(self, arguments: dict, context: ToolContext) -> ToolResult:
+        base = context.roots.resolve(arguments.get("path") or ".", must_exist=True, kind="dir").path
         count = sum(1 for item in base.rglob("*.py") if item.is_file())
-        return ToolResult(text=str(count), data={"count": count})
+        return ToolResult(output=str(count), data={"count": count})
 ```
+
+### Script bridge
+
+Registered plugin and MCP tools are available as `await tools.NAME(arguments)`
+inside Script. The same policy/approval/lifecycle path applies. Tools must declare
+accurate effects and mutation scopes; tools with effects are serialized even if
+`concurrent = True`. Cancellation must stop and drain owned work before returning.
+Do not suppress host cancellation or budget exceptions.
+
+Return `ToolResult(output=...)` for text, or optional JSON-compatible
+`data={...}` for structured program results. Script resolves `data` when present,
+otherwise `{output, is_error, metadata}`. Direct calls keep their text preview.
+Script redacts and archives nested results before transport and rejects oversized,
+overdeep or non-JSON results. Tool errors reject with `error.result` and count
+against job status even if caught. Script/job control and delegation are excluded
+from nested calls through `Tool.script_accessible = False`, including aliases;
+read-only delegates keep their direct tool palette.
 
 ## Installed-package tools
 

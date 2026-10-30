@@ -16,7 +16,9 @@ from .filesystem import (
     WriteFileTool,
 )
 from .git import GitCommitTool, GitDiffTool, GitLogTool, GitPushTool, GitStatusTool
+from .history import ReadArtifactTool, SearchHistoryTool
 from .patch import ApplyPatchTool
+from .script import ScriptJobTool, ScriptTool
 from .search import GrepTool
 from .shell import ShellTool
 from .todo import UpdatePlanTool
@@ -25,7 +27,7 @@ from .verification import VerifyTool
 
 def build_builtin_registry() -> ToolRegistry:
     return ToolRegistry([
-        ReadFileTool(), ListDirectoryTool(), GlobFilesTool(), GrepTool(), RepoMapTool(),
+        ScriptTool(), ScriptJobTool(), ReadArtifactTool(), SearchHistoryTool(), ReadFileTool(), ListDirectoryTool(), GlobFilesTool(), GrepTool(), RepoMapTool(),
         ReadInstructionsTool(), ReadSkillTool(), GitStatusTool(), GitDiffTool(), GitLogTool(),
         WriteFileTool(), ReplaceInFileTool(), ApplyPatchTool(), MakeDirectoryTool(), DeleteFileTool(),
         ShellTool(), VerifyTool(), FetchUrlTool(), UpdatePlanTool(), DelegateTaskTool(), GitCommitTool(), GitPushTool(),

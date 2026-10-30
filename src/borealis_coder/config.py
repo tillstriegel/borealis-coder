@@ -25,6 +25,7 @@ _WORKSPACE_AUTHORITY_SECTIONS = frozenset({
     "cache",
     "safety",
     "sandbox",
+    "script",
     "storage",
     "telemetry",
 })
@@ -44,7 +45,7 @@ class AgentConfig:
     compact_at_ratio: float = 0.82
     max_output_tokens: int = 16_000
     max_time_seconds: int = 3_600
-    max_cost_usd: float = 25.0
+    max_cost_usd: float = 0.0
     parallel_reads: int = 8
     max_repeated_calls: int = 3
     auto_verify: bool = True
@@ -113,6 +114,24 @@ class SandboxConfig:
     docker_network: bool = False
     process_cpu_seconds: int = 600
     process_file_size_bytes: int = 200_000_000
+
+
+@dataclass(slots=True)
+class ScriptConfig:
+    enabled: bool = True
+    source_bytes: int = 256_000
+    memory_bytes: int = 64_000_000
+    stack_bytes: int = 512_000
+    cpu_seconds: int = 30
+    wall_seconds: float = 900
+    foreground_seconds: float = 300
+    max_calls: int = 1000
+    parallel_reads: int = 8
+    max_jobs: int = 4
+    ipc_bytes: int = 20_000_000
+    result_bytes: int = 16_000_000
+    output_bytes: int = 24_000
+    archive_bytes: int = 20_000_000
 
 
 @dataclass(slots=True)
@@ -190,10 +209,18 @@ class ProviderConfig:
     model_fallbacks: list[str] = field(default_factory=list)
     provider_preferences: dict[str, Any] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
-    input_cost_per_million: float = 0.0
-    output_cost_per_million: float = 0.0
-    cached_input_cost_per_million: float = 0.0
-    cache_write_input_cost_per_million: float = 0.0
+    input_cost_per_million: float | None = None
+    output_cost_per_million: float | None = None
+    cached_input_cost_per_million: float | None = None
+    cache_write_input_cost_per_million: float | None = None
+    # Limits and prices apply to this configured endpoint. Exact model overrides
+    # prevent a small summarizer or fallback from inheriting another model's price.
+    context_tokens: int | None = None
+    input_token_limit: int | None = None
+    output_token_limit: int | None = None
+    request_byte_limit: int | None = None
+    model_limits: dict[str, dict[str, int]] = field(default_factory=dict)
+    model_prices: dict[str, dict[str, float]] = field(default_factory=dict)
     # ChatGPT/Codex OAuth settings. Ignored by other provider types.
     auth_file: str = ""
     codex_home: str = ""
@@ -234,6 +261,7 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    script: ScriptConfig = field(default_factory=ScriptConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -318,6 +346,7 @@ DEFAULTS: dict[str, Any] = {
     "agent": asdict(AgentConfig()),
     "safety": asdict(SafetyConfig()),
     "sandbox": asdict(SandboxConfig()),
+    "script": asdict(ScriptConfig()),
     "context": asdict(ContextConfig()),
     "storage": asdict(StorageConfig()),
     "cache": asdict(CacheConfig()),
@@ -461,6 +490,7 @@ def load_config(
         "agent",
         "safety",
         "sandbox",
+        "script",
         "context",
         "storage",
         "cache",
@@ -484,6 +514,7 @@ def load_config(
         agent=_construct(AgentConfig, dict(merged.get("agent") or {})),
         safety=_construct(SafetyConfig, dict(merged.get("safety") or {})),
         sandbox=_construct(SandboxConfig, dict(merged.get("sandbox") or {})),
+        script=_construct(ScriptConfig, dict(merged.get("script") or {})),
         context=_construct(ContextConfig, dict(merged.get("context") or {})),
         storage=_construct(StorageConfig, dict(merged.get("storage") or {})),
         cache=_construct(CacheConfig, dict(merged.get("cache") or {})),
@@ -559,6 +590,20 @@ def _enabled(name: str) -> bool:
 
 
 def validate_config(config: Config) -> None:
+    if not isinstance(config.script.enabled, bool):
+        raise ConfigurationError("script.enabled must be a boolean")
+    for item in fields(ScriptConfig):
+        if item.name == "enabled":
+            continue
+        value = getattr(config.script, item.name)
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+            raise ConfigurationError(f"script.{item.name} must be positive and finite")
+        if item.name not in {"foreground_seconds", "wall_seconds"} and not isinstance(value, int):
+            raise ConfigurationError(f"script.{item.name} must be an integer")
+    if config.script.foreground_seconds > 300:
+        raise ConfigurationError("script.foreground_seconds cannot exceed 300")
+    if config.script.result_bytes + 1024 > config.script.ipc_bytes:
+        raise ConfigurationError("script.ipc_bytes must exceed result_bytes by at least 1024")
     if config.agent.max_turns < 1:
         raise ConfigurationError("agent.max_turns must be positive")
     if config.agent.max_model_requests < 1:
@@ -658,8 +703,25 @@ def validate_config(config: Config) -> None:
             "cached_input_cost_per_million",
             "cache_write_input_cost_per_million",
         ):
-            if getattr(provider, field_name) < 0:
+            value = getattr(provider, field_name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0):
                 raise ConfigurationError(f"providers.{name}.{field_name} cannot be negative")
+        limit_keys = {"context_tokens", "input_token_limit", "output_token_limit", "request_byte_limit"}
+        for key in limit_keys:
+            value = getattr(provider, key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+                raise ConfigurationError(f"providers.{name}.{key} must be a positive integer")
+        for model, limits in provider.model_limits.items():
+            if not model or not isinstance(limits, dict) or set(limits) - limit_keys:
+                raise ConfigurationError(f"providers.{name}.model_limits has invalid model limits")
+            if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in limits.values()):
+                raise ConfigurationError(f"providers.{name}.model_limits must contain positive integers")
+        price_keys = {"input_cost_per_million", "output_cost_per_million", "cached_input_cost_per_million", "cache_write_input_cost_per_million"}
+        for model, prices in provider.model_prices.items():
+            if not model or not isinstance(prices, dict) or set(prices) - price_keys:
+                raise ConfigurationError(f"providers.{name}.model_prices has invalid model prices")
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in prices.values()):
+                raise ConfigurationError(f"providers.{name}.model_prices must contain finite nonnegative prices")
         if provider.type == "chatgpt" and provider.api_style not in {"", "responses"}:
             raise ConfigurationError(
                 f"providers.{name}.api_style must be responses for ChatGPT/Codex auth"

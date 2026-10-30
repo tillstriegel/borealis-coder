@@ -4,7 +4,7 @@
 
 Created and maintained by Till Striegel.
 
-The project is deliberately dependency-light: the runtime uses the Python standard library plus prompt-toolkit for stable interactive terminal input on Python 3.11–3.13. Provider SDKs are not required. This keeps the execution boundary inspectable and makes the harness practical for local tools, CI workers, containers, and embedded applications.
+The project is deliberately dependency-light: the runtime uses the Python standard library, prompt-toolkit for interactive terminal input, and quickjs-ng for isolated JavaScript workflows on Python 3.11–3.13. Provider SDKs are not required. This keeps the execution boundary inspectable and makes the harness practical for local tools, CI workers, containers, and embedded applications.
 
 > **Release status:** `0.1.3` is a production-oriented beta/release candidate. The offline acceptance suite, unit/integration tests, wheel build, and clean-install checks are part of the release process. Live provider behavior still depends on the selected API, model, account, and network environment. Use Docker or another operating-system sandbox for untrusted repositories or models; the native driver is resource-bounded process execution, not a kernel security boundary.
 
@@ -12,6 +12,7 @@ The project is deliberately dependency-light: the runtime uses the Python standa
 
 Modern coding agents need more than an LLM call wrapped around a shell. Borealis treats the following as first-class runtime subsystems:
 
+- **Programmatic tool calling:** one JavaScript workflow can call many tools, filter their full results, and print a small summary.
 - **Agent orchestration:** streaming model turns, tool cycles, cancellation, steering, fallback routes, stuck-loop detection, budgets, and compacted context.
 - **Deterministic code mutation:** SHA-guarded writes, exact replacements, transactional patch validation, bounded deletion, checkpoints, and rollback.
 - **Repository intelligence:** Git-aware discovery, hierarchical `AGENTS.md` instructions, lazy skills, language-aware symbol extraction, ranked repository maps, search, and focused reads.
@@ -323,6 +324,7 @@ See [configuration reference](docs/CONFIGURATION.md) and [provider adapters](doc
 
 The built-in palette includes:
 
+- `script`, `script_job`
 - `read_file`, `list_directory`, `glob_files`, `grep`
 - `write_file`, `replace_in_file`, `delete_file`, `make_directory`
 - `apply_patch`
@@ -335,6 +337,54 @@ The built-in palette includes:
 - `delegate_task`
 
 All tool schemas use strict JSON-object contracts. Read-only calls can execute concurrently; mutations execute sequentially to preserve deterministic state.
+
+### Script workflows
+
+Prefer `script` for multi-tool work. Its provider-compatible object schema accepts
+one literal JavaScript `source` string and a `background` boolean. For example:
+
+```javascript
+const found = await tools.grep({
+  pattern: "TODO", path: ".", glob: "*.py", regex: false,
+  case_sensitive: true, context_lines: 0, max_results: 100, cursor: null
+});
+const paths = [...new Set(found.matches.map(match => match.path))];
+const files = await Promise.all(paths.map(path => tools.read_file({
+  path, start_line: null, end_line: null, max_chars: null
+})));
+text({files: files.length, lines: files.reduce((n, file) => n + file.line_count, 0)});
+```
+
+`read_file` returns selected UTF-8 content without line-number wrappers, plus
+`path`, `sha256`, `line_count`, `start_line`, and `end_line`. It retains the file
+byte ceiling; `max_chars` affects direct previews only. `grep` returns structured
+matching lines and coverage/continuation metadata under the existing search and
+file ceilings. Other tools return `{output, is_error, metadata}`; extensions may
+supply structured `data` instead. Tool errors reject with `error.result` and count
+as job errors even when caught. Edits retain short responses and hash/checkpoint
+rules. Direct tools remain available with their existing preview caps.
+
+Only `text(...)`/`print(...)` output and bounded job status enter the conversation.
+Nested outputs are redacted and archived under session quotas; use
+`search_history` and `read_artifact` to inspect retained evidence. JavaScript has
+no native file, network, system, environment, Node, or Python APIs. Calls still
+pass through Borealis policy and approvals. Recursive Script, job control, and
+delegation calls are refused inside programs; use delegation directly.
+
+Foreground work waits at most 300 seconds, then returns a live `job_id` and output
+so far. `background: true` returns immediately. `script_job` accepts `job_id`,
+`action` (`status`, `wait`, or `stop`), and `seconds` (0–300). Completion wakes the
+owning run through events and a completion notice; the model need not poll. The
+runner settles jobs before verification and final publication. Run cancellation,
+budget expiry, stop, and runner close drain child calls and reap workers. Jobs are
+run-scoped: handles expire at run end, and restart never replays uncertain work.
+Partial effects remain visible; a Script is not an atomic transaction.
+
+Script is enabled by default. Set `[script] enabled = false` in trusted
+configuration to remove both tools from the effective palette. A missing or
+unusable engine fails explicitly; no unsafe interpreter fallback is used. See
+[configuration limits](docs/CONFIGURATION.md#script) and the
+[security boundary](docs/SECURITY_MODEL.md#script-execution).
 
 ## Context and instructions
 

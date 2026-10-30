@@ -10,9 +10,9 @@ from typing import Any
 
 from ..errors import ToolError
 from ..models import Effect, ToolResult
-from ..util import atomic_write_text, read_bytes_up_to, sha256_bytes, sha256_text, truncate_text
+from ..util import atomic_write_text, read_bytes_up_to, sha256_bytes, sha256_text
 from ._workspace_lock import workspace_transaction
-from .base import MutationScope, Tool, ToolContext, nullable, object_schema
+from .base import MutationScope, Tool, ToolContext, bound_tool_output, nullable, object_schema
 
 
 class ReadFileTool(Tool):
@@ -41,13 +41,19 @@ class ReadFileTool(Tool):
         if arguments.get("end_line") is not None and end < start:
             raise ToolError("end_line must be >= start_line")
         selected = lines[start - 1 : end]
+        if context.metadata.get("script_mode"):
+            return ToolResult("", data={
+                "content": "".join(selected), "path": resolved.display,
+                "sha256": sha256_bytes(data), "line_count": len(lines),
+                "start_line": start, "end_line": min(end, len(lines)),
+            })
         numbered = "".join(f"{index:>6}\t{line}" for index, line in enumerate(selected, start=start))
         limit = int(arguments.get("max_chars") or context.config.context.tool_output_chars)
-        numbered = truncate_text(numbered, limit)
         digest = sha256_bytes(data)
+        preview = bound_tool_output(ToolResult(numbered), context, limit)
         return ToolResult(
-            f"path: {resolved.display}\nsha256: {digest}\nlines: {len(lines)}\n\n{numbered}",
-            metadata={"path": resolved.display, "sha256": digest, "line_count": len(lines)},
+            f"path: {resolved.display}\nsha256: {digest}\nlines: {len(lines)}\n\n{preview.output}",
+            metadata={"path": resolved.display, "sha256": digest, "line_count": len(lines), **preview.metadata},
         )
 
 

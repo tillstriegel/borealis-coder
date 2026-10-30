@@ -171,6 +171,38 @@ mode changes, renames, copies, combined merge diffs, and sections without text h
 are not supported. New-file Git patches must describe regular non-executable files.
 Quoted Git paths must be expressed as literal paths in an envelope.
 
+### Programmatic tool calling
+
+`tools/script.py` owns a `ScriptScope` for each active run. A Script tool starts
+`_script_worker.py` using the installed Python interpreter in isolated mode. The
+worker evaluates one top-level async JavaScript function with `tools`, `text`,
+and `print` bindings. Promise jobs exchange bounded JSON frames with the host;
+no Python objects or callable host capabilities enter the engine.
+
+Each nested call uses `AgentRunner._execute_one` with its own ID and the same
+run/session, schema validation, policy/approval gates, mutation snapshots and
+checkpoints. Nested lifecycle rows and output artifacts are durable, while only
+the outer Script result is a provider tool message. This preserves tool/result
+ordering through compaction and session replay. `ToolResult.data` carries full
+structured reads/search hits only across the Script bridge. Normal tools keep
+their existing previews. Errors and output are redacted before storage.
+
+A host semaphore bounds independent reads; a runner-wide lock serializes nested
+and direct side effects. Job slots span the runner and release only after cleanup.
+The supervisor owns every worker and admitted task through completion, stop,
+error, cancellation, run-budget expiry and close. It enforces limits outside JS,
+and never replays an uncertain mutation. Completed jobs emit `script.completed`;
+run-boundary notices deliver selected output within the normal preview cap,
+with excess retained in owned output artifacts. Before the last allowed model
+request, active jobs settle and their notices enter that request. Earlier turns
+can continue while jobs run. A fatal scope error immediately cancels sibling
+jobs; each job drains its admitted calls and worker even while a provider request
+is pending. Completed provider usage settles before a pending fatal error stops
+the run. A candidate final response waits for active jobs before verification
+and final publication.
+Run-scoped handles expire at teardown; restart retains evidence and marks
+unfinished nested lifecycle rows as unknown outcomes.
+
 ### `safety/`
 
 The safety subsystem is deliberately independent from prompts and providers.

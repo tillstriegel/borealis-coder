@@ -149,7 +149,7 @@ class VerificationPlanner:
                     "blocked": True,
                 })
                 break
-            result = await context.process.run(
+            result = await context.run_process(
                 step.command,
                 cwd=self.workspace,
                 timeout=step.timeout,
@@ -160,6 +160,7 @@ class VerificationPlanner:
                 "duration_ms": result.duration_ms, "timed_out": result.timed_out,
                 "stdout": result.stdout, "stderr": result.stderr,
                 "process_lifecycle_complete": result.lifecycle_complete,
+                **({"output_artifact": result.output_artifact} if result.output_artifact else {}),
             })
             if not result.ok:
                 report.ok = False

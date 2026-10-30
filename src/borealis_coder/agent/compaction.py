@@ -1205,10 +1205,12 @@ def compact_messages(
         older = [message for bundle in older_bundles for message in bundle.messages]
         recent = [message for bundle in recent_bundles for message in bundle.messages]
         if (target_tokens > 0 or target_bytes > 0) and retained_count == 1:
+            # A parallel tool batch can fill the whole target by itself. Leave
+            # space for mandatory summary sections before trimming diagnostics.
             recent = _shrink_diagnostic_messages(
                 recent,
-                target_tokens=target_tokens,
-                target_bytes=target_bytes,
+                target_tokens=max(1, int(target_tokens * 0.6)) if target_tokens else 0,
+                target_bytes=max(1, int(target_bytes * 0.6)) if target_bytes else 0,
             )
         base_ids = base_source_message_ids or []
         current_ids = [message.id for message in messages]

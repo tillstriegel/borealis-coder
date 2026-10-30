@@ -73,6 +73,9 @@ class GeminiProvider(Provider):
             }
         return payload
 
+    def request_bytes(self, request: ProviderRequest) -> int:
+        return max(len(json_dumps(self._payload(request, stream=stream)).encode("utf-8")) for stream in (False, True))
+
     async def complete(self, request: ProviderRequest) -> ModelResponse:
         async def operation() -> ModelResponse:
             response = await self.http.post_json(
@@ -82,16 +85,23 @@ class GeminiProvider(Provider):
                 raise ProviderError("Gemini returned a non-object response")
             return self._parse(response.data, retain_raw=True)
 
-        return await self.with_retries(operation)
+        return await self.with_retries(operation, request=request)
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
+        self.request_model.set(request.model)
         payload = self._payload(request, stream=True)
         steps: dict[int, dict[str, Any]] = {}
         text_parts: dict[int, list[str]] = {}
         argument_parts: dict[int, list[str]] = {}
         usage_data: dict[str, Any] = {}
         final_data: dict[str, Any] | None = None
-        try:
+        model: str | None = None
+
+        def latest_usage() -> Usage:
+            return self.normalize_cost(self._parse_usage({"usage": usage_data, "model": model}),
+                model=self.response_billing_model(model))
+
+        with self.request_attempt(latest_usage) as record:
             async for event in self.http.stream_sse(
                 self._url(stream=True), headers=self._headers(), payload=payload
             ):
@@ -101,6 +111,8 @@ class GeminiProvider(Provider):
                     continue
                 if not isinstance(data, dict):
                     continue
+                interaction = data.get("interaction")
+                model = (interaction.get("model") if isinstance(interaction, dict) else None) or data.get("model") or model
                 event_type = str(data.get("event_type") or data.get("type") or event.event)
                 if event_type == "step.start":
                     index = int(data.get("index", 0))
@@ -147,6 +159,7 @@ class GeminiProvider(Provider):
                     final_data = (
                         data.get("interaction") if isinstance(data.get("interaction"), dict) else data
                     )
+                    usage_data.update((final_data or {}).get("usage") or {})
                 elif event_type in {"error", "interaction.error", "interaction.failed"}:
                     error = data.get("error")
                     if error is None and isinstance(data.get("interaction"), dict):
@@ -156,45 +169,38 @@ class GeminiProvider(Provider):
                     else:
                         message = error or data.get("message") or "Gemini stream failed"
                     interaction = data.get("interaction")
-                    reported_usage = dict(usage_data)
-                    reported_usage.update(
+                    usage_data.update(
                         (interaction.get("usage") if isinstance(interaction, dict) else None)
                         or data.get("usage") or {}
                     )
-                    raise ProviderError(
-                        str(message),
-                        usage=self._parse_usage({"usage": reported_usage}),
-                    )
-        except ProviderError as error:
-            if error.usage is None:
-                error.usage = self._parse_usage({"usage": usage_data})
-            raise
-        result_data = dict(final_data or {})
-        if not final_data:
-            result_data["status"] = "incomplete"
-        if not result_data.get("steps"):
-            result_data["steps"] = []
-            for index in sorted(steps):
-                step = dict(steps[index])
-                if index in text_parts:
-                    step["content"] = [
-                        *(step.get("content") or []),
-                        {"type": "text", "text": "".join(text_parts[index])},
-                    ]
-                if step.get("type") == "function_call":
-                    arguments = step.get("arguments")
-                    if index in argument_parts:
-                        prefix = (
-                            json_dumps(arguments) if isinstance(arguments, dict) and arguments
-                            else str(arguments or "")
-                        )
-                        step["arguments"] = _parse_arguments(prefix + "".join(argument_parts[index]))
-                    elif isinstance(arguments, str):
-                        step["arguments"] = _parse_arguments(arguments)
-                result_data["steps"].append(step)
-        result_data["usage"] = {**usage_data, **(result_data.get("usage") or {})}
-        result = self._parse(result_data, retain_raw=True)
-        yield ProviderStreamEvent(type="completed", response=result)
+                    raise ProviderError(str(message))
+            result_data = dict(final_data or {})
+            if not final_data:
+                result_data["status"] = "incomplete"
+            if not result_data.get("steps"):
+                result_data["steps"] = []
+                for index in sorted(steps):
+                    step = dict(steps[index])
+                    if index in text_parts:
+                        step["content"] = [
+                            *(step.get("content") or []),
+                            {"type": "text", "text": "".join(text_parts[index])},
+                        ]
+                    if step.get("type") == "function_call":
+                        arguments = step.get("arguments")
+                        if index in argument_parts:
+                            prefix = (
+                                json_dumps(arguments) if isinstance(arguments, dict) and arguments
+                                else str(arguments or "")
+                            )
+                            step["arguments"] = _parse_arguments(prefix + "".join(argument_parts[index]))
+                        elif isinstance(arguments, str):
+                            step["arguments"] = _parse_arguments(arguments)
+                    result_data["steps"].append(step)
+            result_data["usage"] = {**usage_data, **(result_data.get("usage") or {})}
+            result = self._parse(result_data, retain_raw=True)
+            record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
+            yield ProviderStreamEvent(type="completed", response=result)
 
     def _steps(self, request: ProviderRequest) -> list[dict[str, Any]]:
         steps: list[dict[str, Any]] = []
@@ -315,7 +321,10 @@ class GeminiProvider(Provider):
                 cached_input_tokens=int(usage_data.get("total_cached_tokens", 0) or 0),
                 reasoning_tokens=int(usage_data.get("total_thought_tokens", 0) or 0),
                 requests=1,
-            )
+                native_usage=dict(usage_data),
+                cost_status="unknown" if {"total_input_tokens", "total_output_tokens"} <= usage_data.keys() else "incomplete",
+            ),
+            model=self.response_billing_model(data.get("model")),
         )
 
 

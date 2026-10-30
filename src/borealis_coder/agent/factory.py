@@ -70,6 +70,9 @@ async def build_runner(
         )
         context_builder = ContextBuilder(workspace, config)
         tools = build_builtin_registry()
+        if not config.script.enabled:
+            tools.unregister("script")
+            tools.unregister("script_job")
         load_entrypoint_tools(tools)
         load_workspace_plugins(workspace, tools)
         mcp = MCPManager(workspace, config)

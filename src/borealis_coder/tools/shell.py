@@ -65,12 +65,8 @@ class ShellTool(Tool):
             await emit_output(stream, redacted)
 
         try:
-            result = await context.process.run(
-                command,
-                cwd=cwd,
-                timeout=timeout,
-                shell=True,
-                on_output=on_output,
+            result = await context.run_process(
+                command, cwd=cwd, timeout=timeout, shell=True, on_output=on_output,
             )
         except asyncio.CancelledError:
             if not context.process.guarantees_bounded_lifecycle:
@@ -88,6 +84,8 @@ class ShellTool(Tool):
             "stream_complete": result.stream_complete,
             "process_lifecycle_complete": result.lifecycle_complete,
         }
+        if result.output_artifact is not None:
+            metadata["output_artifact"] = result.output_artifact
         if not result.lifecycle_complete:
             metadata["workspace_change_tracking"] = "incomplete"
         return ToolResult(result.render(), is_error=not result.ok, metadata=metadata)

@@ -22,7 +22,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
-dependencies = ["prompt-toolkit>=3.0.53,<4"]
+dependencies = ["prompt-toolkit>=3.0.53,<4", "quickjs-ng==0.17.0.2"]
 
 [project.optional-dependencies]
 dev = [

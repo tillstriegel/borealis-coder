@@ -38,7 +38,7 @@ Direct variables:
 | `BOREALIS_ENABLE_WORKSPACE_PLUGINS` | Enables workspace Python plugins when set to `1`. |
 | `BOREALIS_ENABLE_WORKSPACE_MCP` | Trust workspace configuration to start MCP servers. |
 | `BOREALIS_ALLOW_WORKSPACE_PROVIDER_ENDPOINTS` | Trust workspace configuration to set provider endpoints or credential sources. |
-| `BOREALIS_ALLOW_WORKSPACE_AUTHORITY` | Trust workspace provider selection, budgets, safety, sandbox, storage, cache, telemetry, and context resource ceilings. Does not enable MCP or provider endpoints. |
+| `BOREALIS_ALLOW_WORKSPACE_AUTHORITY` | Trust workspace provider selection, budgets, safety, sandbox, Script limits, storage, cache, telemetry, and context resource ceilings. Does not enable MCP or provider endpoints. |
 | `BOREALIS_CHATGPT_AUTH_FILE` | Explicit file-backed Codex `auth.json` used by the `chatgpt` provider. |
 | `BOREALIS_CHATGPT_HOME` | Borealis-managed Codex credential directory. |
 | `BOREALIS_CHATGPT_ACCOUNT_ID` | Account/workspace ID for an externally supplied `CODEX_ACCESS_TOKEN`. |
@@ -70,7 +70,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `compact_at_ratio` | `0.82` | Compact when estimated context reaches this fraction of the input budget. |
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
 | `max_time_seconds` | `3600` | End-to-end run wall-time ceiling. |
-| `max_cost_usd` | `25.0` | Cumulative run cost ceiling when adapter pricing is configured. |
+| `max_cost_usd` | `0.0` | Opt-in cumulative dollar ceiling. Positive limits require configured pricing. |
 | `max_model_requests` | `40` | Logical parent, delegate, and summarizer request ceiling for one run. |
 | `max_read_only_turns` | `8` | Consecutive tool turns with no observed file changes before Borealis requires an answer from gathered evidence. |
 | `parallel_reads` | `8` | Maximum concurrent read-only tool calls. |
@@ -122,6 +122,41 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `docker_network` | `false` | Enable container network only when `safety.network` also permits it. |
 | `process_cpu_seconds` | `600` | Native Unix CPU resource limit. |
 | `process_file_size_bytes` | `200000000` | Native Unix output-file resource limit. |
+
+## `[script]`
+
+Script settings grant execution resources. Workspace files require the same
+external authority opt-in as safety settings. Defaults:
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `enabled` | `true` | Expose `script` and `script_job`. Requires the declared quickjs-ng dependency. |
+| `source_bytes` | `256000` | UTF-8 source ceiling per program. |
+| `memory_bytes` | `64000000` | QuickJS heap ceiling per worker. |
+| `stack_bytes` | `512000` | QuickJS stack ceiling. |
+| `cpu_seconds` | `30` | Cumulative worker CPU allowance, checked by the worker and engine; POSIX also uses an OS CPU limit. |
+| `wall_seconds` | `900` | Host deadline through startup, all IPC, tool calls, and worker completion. |
+| `foreground_seconds` | `300` | Foreground/wait threshold, must be at most 300. Does not stop ongoing jobs. |
+| `max_calls` | `1000` | Nested call ceiling per job; also bounds retained job handles per run. |
+| `parallel_reads` | `8` | In-flight independent reads across Script jobs in one run. |
+| `max_jobs` | `4` | Concurrent workers across the runner; slots release after child tasks and workers end. |
+| `ipc_bytes` | `20000000` | Serialized frame ceiling. IPC nesting is limited to 32 levels. |
+| `result_bytes` | `16000000` | Serialized nested result ceiling; larger/deeper/non-JSON results become tool errors. |
+| `output_bytes` | `24000` | Total printed UTF-8 bytes per job, before redaction. |
+| `archive_bytes` | `20000000` | Retained nested result bytes per run, also subject to existing session quotas. |
+
+Limits must be positive and finite; byte/count/CPU limits must be integers.
+`ipc_bytes` must exceed `result_bytes` by at least 1024 bytes. Source and result
+JSON escaping also consume IPC space. The conversation preview remains subject
+to `context.tool_output_chars`. Artifacts retain at most 2 MB each, 20 MB per
+session, and 1000 artifacts per session; quota-limited evidence is labelled.
+These ceilings do not bypass `context.max_file_bytes`, `context.max_search_results`,
+run budgets, tool policy, or per-tool limits. Mutations are serialized with direct
+calls across this runner. Programs cannot call Script/job tools or delegates.
+
+Jobs belong to the exact run and session and are cancelled at run end. They do
+not survive process restart. Recorded partial effects and uncertain interrupted
+calls must be inspected before retrying.
 
 ## `[context]`
 
@@ -184,11 +219,17 @@ applies on append, checkpoint retention applies after a complete new checkpoint 
 | `app_name` | OpenRouter app-attribution title (`X-Title`). Ignored by other built-ins. |
 | `model_fallbacks` | OpenRouter backup model slugs tried after the primary model. |
 | `provider_preferences` | OpenRouter provider-routing object, e.g. `allow_fallbacks`, `only`, `order`, `data_collection`, or `zdr`. |
-| `extra_body` | Provider-specific top-level request fields. Primarily an escape hatch for OpenRouter extensions; explicit values can override adapter defaults. |
+| `extra_body` | Provider-specific top-level request fields. Primarily an escape hatch for OpenRouter extensions; request identity, content (including Responses `instructions`), tools, continuation references, response schemas, and output limits cannot be overridden; use their dedicated settings. |
+| `context_tokens` | Optional endpoint context-window limit; includes output reserve. |
+| `input_token_limit` | Optional independent endpoint input limit. |
+| `output_token_limit` | Optional endpoint maximum output; clamps the request reserve. |
+| `request_byte_limit` | Optional known endpoint request-byte limit. No byte ceiling is inferred from tokens. |
+| `model_limits` | Exact-model tables using the four limit keys above. Intersect with endpoint and operator limits. |
+| `model_prices` | Exact-model tables using the four price keys below. Required for priced requests to other models. |
 | `input_cost_per_million` | Optional local price used for budget accounting. |
 | `output_cost_per_million` | Optional output price. |
 | `cached_input_cost_per_million` | Optional cached-input price. |
-| `cache_write_input_cost_per_million` | Optional cache-creation price. Zero derives it from the normal input price and provider cache-write multiplier. |
+| `cache_write_input_cost_per_million` | Optional cache-creation price. Omission derives it from the input rate and provider multiplier; explicit zero is free. |
 | `auth_file` | ChatGPT only: explicit path to a secure file-backed Codex `auth.json`. |
 | `codex_home` | ChatGPT only: Codex credential directory whose `auth.json` should be considered. |
 | `codex_command` | ChatGPT only: official Codex CLI command used by `borealis auth login/logout`. |

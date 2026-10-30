@@ -36,6 +36,8 @@ class ProviderAdapterTests(unittest.TestCase):
                 base_url="https://x",
                 api_style="responses",
                 input_cost_per_million=2,
+                output_cost_per_million=0,
+                cached_input_cost_per_million=0,
             ),
             "key",
         )

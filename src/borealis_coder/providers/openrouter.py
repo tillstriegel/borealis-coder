@@ -20,7 +20,7 @@ class OpenRouterProvider(OpenAIProvider):
 
     @property
     def api_style(self) -> str:
-        return self.config.api_style or "chat"
+        return super().api_style if self.config.api_style else "chat"
 
     def _headers(self) -> dict[str, str]:
         headers = super()._headers()
@@ -74,16 +74,16 @@ class OpenRouterProvider(OpenAIProvider):
             payload.update(self.config.extra_body)
         return payload
 
-    def _usage_from_chat(self, usage_data: dict[str, Any]) -> Usage:
-        usage = super()._usage_from_chat(usage_data)
+    def _usage_from_chat(self, usage_data: dict[str, Any], *, model: str | None = None) -> Usage:
+        usage = super()._usage_from_chat(usage_data, model=model)
         details = usage_data.get("completion_tokens_details") or {}
         usage.reasoning_tokens = int(
             details.get("reasoning_tokens", usage_data.get("reasoning_tokens", 0)) or 0
         )
         return self._apply_reported_cost(usage, usage_data)
 
-    def _usage_from_responses(self, usage_data: dict[str, Any]) -> Usage:
-        usage = super()._usage_from_responses(usage_data)
+    def _usage_from_responses(self, usage_data: dict[str, Any], *, model: str | None = None) -> Usage:
+        usage = super()._usage_from_responses(usage_data, model=model)
         return self._apply_reported_cost(usage, usage_data)
 
     @staticmethod

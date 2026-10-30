@@ -1161,7 +1161,9 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                     cancel.set()
                     with self.assertRaises(Cancelled):
                         await asyncio.wait_for(task, timeout=1)
-                usage_sink.assert_not_awaited()
+                usage_sink.assert_awaited_once()
+                assert usage_sink.await_args is not None
+                self.assertEqual(usage_sink.await_args.args[0].cost_status, "incomplete")
             finally:
                 await runner.close()
 
