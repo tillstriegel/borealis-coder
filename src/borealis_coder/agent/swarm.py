@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import TypeVar
 
 from ..config import AgentConfig
+from ..models import ToolResult
 from ..util import finish_on_cancellation
 
 T = TypeVar("T")
@@ -25,6 +26,7 @@ class SwarmState:
     active_requests: int = 0
     mutations: int = 0
     receipts: dict[str, str] = field(default_factory=dict, repr=False)
+    handoffs: dict[str, ToolResult] = field(default_factory=dict, repr=False)
     provider_slots: asyncio.Semaphore = field(init=False, repr=False)
 
     def __post_init__(self) -> None:

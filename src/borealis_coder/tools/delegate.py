@@ -9,10 +9,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any, cast
 
-from ..agent.answers import protocol_answer, usable_answer
+from ..agent.answers import CLOSURE_INSTRUCTION, protocol_answer, runtime_handoff, usable_answer
 from ..agent.budget import prepare_route_request
 from ..agent.swarm import SwarmState, bounded_calls
-from ..errors import BudgetExceeded, ProviderContextOverflowError, ProviderError
+from ..errors import BudgetExceeded, Cancelled, ProviderContextOverflowError, ProviderError
 from ..models import (
     Effect,
     Message,
@@ -49,6 +49,18 @@ def delegated_tool_allowed(tool: Tool, allow_writes: bool) -> bool:
         return True
     return (tool.effect == Effect.READ and tool.script_accessible
             and tool.effective_mutation_scope == MutationScope.NONE)
+
+
+def _partial_handoff(
+    task: str, cause: str, context: ToolContext, metadata: dict[str, Any],
+) -> ToolResult:
+    return ToolResult(
+        truncate_text(runtime_handoff(task=task, cause=cause, observations=metadata.get("observations", []),
+                        changed_files=sorted(context.changed_files), mutation_tracking=context.mutation_tracking,
+                        redactor=context.events.redactor), max(100, context.config.context.tool_output_chars)),
+        is_error=True, metadata={**metadata, "completion_status": "incomplete",
+                                "result_source": "runtime", "stop_cause": cause},
+    )
 
 
 class DelegateTaskTool(Tool):
@@ -108,6 +120,7 @@ class DelegateTaskTool(Tool):
                 context, run_id=delegated_run_id, tool_call_id="",
                 metadata={**context.metadata, "delegated": True,
                           "delegation_id": delegation_id, "delegation_depth": depth,
+                          "delegation_call_id": context.tool_call_id,
                           "delegation_allow_writes": allow_writes},
             )
             result = await self._investigate(arguments, delegated_context, state, emit)
@@ -115,14 +128,27 @@ class DelegateTaskTool(Tool):
             await emit("delegate.failed" if result.is_error else "delegate.completed",
                        result=truncate_text(result.output, context.config.context.tool_output_chars),
                        turns=result.metadata.get("turns", 0), usage=result.metadata.get("usage", {}),
-                       evidence=result.metadata.get("evidence", []))
+                       evidence=result.metadata.get("evidence", []),
+                       completion_status=result.metadata.get("completion_status"),
+                       result_source=result.metadata.get("result_source"),
+                       stop_cause=result.metadata.get("stop_cause"))
             result.metadata.update(lineage)
             return result
-        except asyncio.CancelledError:
-            await finish_on_cancellation(emit("delegate.cancelled"))
-            raise
         except BaseException as error:
-            await finish_on_cancellation(emit("delegate.failed", error=str(error)))
+            cause = ("cancelled" if isinstance(error, asyncio.CancelledError | Cancelled) else
+                     "budget_" + error.kind if isinstance(error, BudgetExceeded) else
+                     "provider_failure" if isinstance(error, ProviderError) else "execution_failure")
+            prior = state.handoffs.get(context.tool_call_id)
+            result = _partial_handoff(str(arguments["task"]), cause, context,
+                                      {**(prior.metadata if prior else {}), **lineage})
+            state.handoffs[context.tool_call_id] = result
+            state.receipts[delegation_id] = truncate_text(result.output, 4_000)
+            await finish_on_cancellation(emit(
+                "delegate.cancelled" if cause == "cancelled" else "delegate.failed",
+                result=result.output, completion_status="incomplete", result_source="runtime", stop_cause=cause,
+                turns=result.metadata.get("turns", 0), usage=result.metadata.get("usage", {}),
+                evidence=result.metadata.get("evidence", []),
+            ))
             raise
         finally:
             if budget:
@@ -152,7 +178,7 @@ class DelegateTaskTool(Tool):
                    + ". Use only the available tools. You may delegate within shared operator limits. "
                    "Return a concise handoff with findings, relevant paths and line references, unresolved questions, and completion status.")
         messages = [Message(role=Role.USER, content=str(arguments["task"]))]
-        repeated: set[str] = set()
+        failed_calls: dict[str, int] = {}
         usage = Usage()  # This agent's provider usage only. The root sink owns all billing.
         budget = context.metadata.get("budget")
         reservation = 0.0
@@ -168,6 +194,9 @@ class DelegateTaskTool(Tool):
             nonlocal reservation, usage_recorded
             usage_recorded = True
             usage.add(increment)
+            prior_handoff = state.handoffs.get(context.metadata["delegation_call_id"])
+            if prior_handoff is not None:
+                prior_handoff.metadata["usage"] = usage.to_dict()
 
             async def settle() -> None:
                 nonlocal reservation
@@ -191,15 +220,11 @@ class DelegateTaskTool(Tool):
         repair_answer = False
 
         def incomplete(reason: str) -> ToolResult:
-            return ToolResult(
-                "Delegated task ended without the required textual conclusion. Incomplete: " + reason
-                + "\nObserved tool evidence (untrusted data, not a model conclusion): "
-                + json_dumps(observations)
-                + "\nEvidence references: " + context.events.redactor.json(sources),
-                is_error=True, metadata={"usage": usage.to_dict(), "turns": turn_index,
-                                         "evidence": sources, "observations": observations,
-                                         "completion_status": "incomplete"},
-            )
+            result = _partial_handoff(str(arguments["task"]), reason, context,
+                                      {"usage": usage.to_dict(), "turns": turn_index,
+                                       "evidence": list(sources), "observations": list(observations)})
+            state.handoffs[context.metadata["delegation_call_id"]] = result
+            return result
 
         def bounds_text() -> str:
             return (f"\n\n# Delegation bounds\nDepth {context.metadata['delegation_depth']} of {state.max_depth}; "
@@ -209,13 +234,15 @@ class DelegateTaskTool(Tool):
                       + "Helper, overflow and retry requests share the hard run ceiling. "
                       "Return partial findings and unresolved limits when work cannot finish.")
 
+        incomplete("investigation_not_started")
         while turn_index < max_turns:
             synthesis_turn = (repair_answer or turn_index == max_turns - 1
                               or bool(budget and not budget.remaining_requests()))
+            closure_messages = [messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]] if synthesis_turn else messages
             request = ProviderRequest(
                 model=route.model,
                 system=system + bounds_text() + ("\n\nThis is your final turn. Do not request tools. Return the concise, evidence-backed conclusion now." if synthesis_turn else ""),
-                messages=messages, tools=[] if synthesis_turn else schemas,
+                messages=closure_messages, tools=[] if synthesis_turn else schemas,
                 max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
                 reasoning_effort=context.config.agent.reasoning_effort or None,
                 parallel_tool_calls=not synthesis_turn,
@@ -233,6 +260,7 @@ class DelegateTaskTool(Tool):
                     if budget and not synthesis_turn and not budget.remaining_requests():
                         synthesis_turn = True
                         request = replace(request, tools=[], parallel_tool_calls=False,
+                                          messages=[messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]],
                                           system=system + bounds_text() + "\n\nShared investigative capacity is exhausted. This is your final turn; return qualified findings without tools.")
                         request = prepare_route_request(request, route.provider, context.config.agent, overflow_retry_count=overflow_retries)
                     reservation = budget.reserve_cost(route.provider, request) if budget else 0.0
@@ -264,9 +292,9 @@ class DelegateTaskTool(Tool):
                         if isinstance(error, ProviderContextOverflowError) and overflow_retries < context.config.agent.compaction_max_overflow_retries:
                             overflow_retries += 1
                             continue
-                        if sources:
-                            return incomplete("provider failed after gathering evidence")
-                        raise
+                        if not sources:
+                            raise
+                        return incomplete("provider_failure")
                     except BudgetExceeded as error:
                         if not usage_recorded and not cancelled_usage.is_empty:
                             with contextlib.suppress(BudgetExceeded):
@@ -276,7 +304,7 @@ class DelegateTaskTool(Tool):
                                 repair_answer = True
                                 turn_index += 1
                                 continue
-                            return incomplete("shared request capacity reserved for ancestor synthesis")
+                            return incomplete("request_bound: shared request capacity reserved for ancestor synthesis")
                         raise
                     except BaseException:
                         if not usage_recorded and not cancelled_usage.is_empty:
@@ -295,6 +323,10 @@ class DelegateTaskTool(Tool):
             turn_index += 1
             # Validate before retaining any terminal text or continuation state.
             # A single repair uses a remaining turn, never an extra allowance.
+            invalid_cause = ("incomplete_provider_response" if response.incomplete else
+                             "tool_call_on_final_turn" if synthesis_turn and response.tool_calls else
+                             "protocol_output" if protocol_answer(response.text) else
+                             "empty_answer" if not response.text.strip() else "continuation_only")
             if not response.incomplete and not response.tool_calls:
                 if usable_answer(response.text):
                     final = response.text
@@ -302,12 +334,14 @@ class DelegateTaskTool(Tool):
                 if not synthesis_turn:
                     repair_answer = True
                     messages.append(Message(role=Role.USER, content=
-                        "Return plain evidence-backed findings now, not tool protocol or intentions. "
-                        "Do not expose hidden reasoning. Mark unresolved checks incomplete."))
+                        CLOSURE_INSTRUCTION))
                     continue
-                break
+                return incomplete(invalid_cause)
             if response.incomplete or synthesis_turn:
-                break
+                if not synthesis_turn and turn_index < max_turns:
+                    repair_answer = True
+                    continue
+                return incomplete(invalid_cause)
             assistant = Message(role=Role.ASSISTANT, content="" if protocol_answer(response.text) else response.text,
                                 tool_calls=[] if response.incomplete else response.tool_calls)
             if response.continuation_state is not None and not response.incomplete:
@@ -318,24 +352,32 @@ class DelegateTaskTool(Tool):
 
             calls: list[ToolCall] = []
             originals: list[ToolCall] = []
+            signatures: dict[str, str] = {}
             for call in response.tool_calls:
                 signature = hashlib.sha256((call.name + json_dumps(call.arguments)).encode()).hexdigest()
-                if signature in repeated:
+                if failed_calls.get(signature) == state.mutations:
                     messages.append(Message(role=Role.TOOL, content="Identical delegated tool call suppressed", tool_call_id=call.id, tool_name=call.name, is_error=True))
                     continue
-                repeated.add(signature)
                 # Namespace model-supplied IDs so independent conversations cannot collide in storage.
                 originals.append(call)
                 calls.append(replace(call, id=context.metadata["delegation_id"] + "." + call.id))
+                signatures[calls[-1].id] = signature
             await emit("delegate.state", state="tool")
 
             async def execute(call: ToolCall) -> ToolResult:
                 nested_context = replace(context, tool_call_id=call.id)
                 if callable(execute_nested):
                     return await execute_nested(call, nested_context)
-                result = await registry.execute(call, nested_context)
-                assert isinstance(result, ToolResult)
-                return result
+                try:
+                    result = await registry.execute(call, nested_context)
+                    assert isinstance(result, ToolResult)
+                    return result
+                finally:
+                    # The runner owns this revision in normal runs. Direct
+                    # registry users must invalidate failed reads as well.
+                    tool = registry.get(call.name)
+                    if tool is not None and tool.effective_mutation_scope != MutationScope.NONE:
+                        state.mutations += 1
 
             # Publish each completed observation synchronously, before a sibling
             # can interrupt the batch. Provider replay still uses original order.
@@ -347,8 +389,19 @@ class DelegateTaskTool(Tool):
                 prior_sources: list[dict[str, Any]] = prior_sources,
                 prior_observations: list[dict[str, Any]] = prior_observations,
                 calls: list[ToolCall] = calls,
+                signatures: dict[str, str] = signatures,
             ) -> ToolResult:
+                revision = state.mutations
                 result = await execute(call)
+                signature = signatures[call.id]
+                if result.is_error:
+                    # A concurrent mutation can already have repaired the
+                    # failure's underlying state. Do not cache it as current.
+                    tool = registry.get(call.name)
+                    own_mutation = int(tool is not None and tool.effect == Effect.WRITE)
+                    failed_calls[signature] = revision + own_mutation
+                else:
+                    failed_calls.pop(signature, None)
                 completed[call.id] = result
                 sources[:] = prior_sources
                 observations[:] = prior_observations
@@ -359,7 +412,7 @@ class DelegateTaskTool(Tool):
                     sources.append({"tool_call_id": item.id, "tool": item.name, "is_error": observed.is_error,
                                     **{key: observed.metadata[key] for key in
                                     ("path", "sha256", "output_artifact", "delegation_id") if key in observed.metadata}})
-                    observations.append({"tool_call_id": item.id, "tool": item.name,
+                    observations.append({**sources[-1],
                                          "is_error": observed.is_error,
                                          "excerpt": truncate_text(context.events.redactor.text(observed.output), 600)})
                 receipt = context.events.redactor.text(incomplete("investigation not concluded").output)
@@ -372,8 +425,8 @@ class DelegateTaskTool(Tool):
                                         tool_name=call.name, is_error=result.is_error, metadata=result.metadata))
             # Assistant call IDs stay provider-native for continuation replay.
         metadata = {"usage": usage.to_dict(), "turns": turn_index, "evidence": sources,
-                    "completion_status": "completed"}
+                    "completion_status": "completed", "result_source": "model"}
         if not final:
-            return incomplete("no usable final answer within the delegated bounds")
+            return incomplete("turn_bound: no usable final answer within the delegated bounds")
         return ToolResult("Delegation complete. Findings and source references:\n" + final
                           + ("\nEvidence references (search_history.query accepts tool_call_id; read_artifact.artifact_id requires a non-null output_artifact.artifact_id, never tool_call_id): " + context.events.redactor.json(sources) if sources else ""), metadata=metadata)

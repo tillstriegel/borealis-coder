@@ -131,10 +131,15 @@ are consumed on dispatch or released when the child settles. They do not increas
 the request ceiling or guarantee a successful model answer.
 
 Empty answers, raw tool protocol and incomplete provider output are not successful
-child findings. A malformed terminal answer can use one remaining child turn for
-tool-free repair, never extra turns. Failed conclusions retain bounded, attributed
-tool observations and evidence references, marked incomplete rather than invented
-findings. Budget-stop output also retains bounded delegated receipts. A
+child findings. An early incomplete or malformed answer can use one remaining
+child turn for an explicit tool-free final handoff, never extra turns. If the
+model cannot conclude, a runtime-generated handoff reports the stop cause, task,
+latest attributed observations, known edits, verification limits and remaining
+work. It is marked `completion_status=incomplete`, `result_source=runtime`, not
+successful model findings. Cancellation and fatal budgets retain that handoff
+without further model dispatch. Root stop reports likewise retain direct and
+delegated evidence. These guarantees require the process and durable store to
+remain available; they do not cover SIGKILL or storage failure. A
 `tool_call_id` is a history reference; it is not a `read_artifact` identifier.
 
 ## `[safety]`

@@ -3156,7 +3156,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     and message.tool_name == "delegate_task"
                 )
                 self.assertTrue(delegate_result.is_error)
-                self.assertIn("without the required textual conclusion", delegate_result.content)
+                self.assertIn("runtime handoff", delegate_result.content)
+                self.assertIn("tool_call_on_final_turn", delegate_result.content)
+                self.assertEqual(delegate_result.metadata["completion_status"], "incomplete")
                 self.assertEqual(result.text, "Done.")
             finally:
                 await runner.close()

@@ -146,6 +146,7 @@ class ApplyPatchTool(Tool):
                 context.checkpoints.release(checkpoint.id)
             raise
         outcomes: list[str] = []
+        changed_path_roots: dict[str, list[str]] = {}
         try:
             for target, operation, content, _ in planned:
                 display = context.roots.display(target)
@@ -157,7 +158,9 @@ class ApplyPatchTool(Tool):
                     atomic_write_text(target, content)
                     outcomes.append(f"{'added' if operation == 'add' else 'updated'} {display} sha256={sha256_text(content)}")
                 context.changed_files.add(display)
-                context.changed_roots.add(context.roots.resolve(target).root)
+                root = context.roots.resolve(target).root
+                context.changed_roots.add(root)
+                changed_path_roots.setdefault(display, []).append(str(root))
         except Exception:
             if checkpoint is not None:
                 context.checkpoints.restore(checkpoint.id)
@@ -167,6 +170,7 @@ class ApplyPatchTool(Tool):
             context.checkpoints.release(checkpoint.id)
         return ToolResult("\n".join(outcomes), metadata={
             "files": [context.roots.display(item) for item in targets],
+            "changed_path_roots": changed_path_roots,
             "checkpoint_id": checkpoint.id if checkpoint else None,
         })
 

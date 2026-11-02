@@ -60,6 +60,7 @@ from ..util import (
     new_id,
     truncate_text,
 )
+from .answers import CLOSURE_INSTRUCTION, runtime_handoff
 from .answers import protocol_answer as _protocol_answer
 from .answers import usable_answer as _usable_answer
 from .budget import (
@@ -616,12 +617,16 @@ class AgentRunner:
             try:
                 run_id = new_id("run")
                 deadline_expired = asyncio.Event()
+                worker_started = asyncio.Event()
+                terminal_started = asyncio.Event()
                 worker = asyncio.create_task(
                     self._run_locked(
                         prompt,
                         session_id,
                         run_id=run_id,
                         deadline_expired=deadline_expired,
+                        worker_started=worker_started,
+                        terminal_started=terminal_started,
                         user_message_id=user_message_id,
                         user_metadata=user_metadata,
                         existing_session=existing_session,
@@ -639,34 +644,83 @@ class AgentRunner:
                 self.cancel(session_id)
                 worker.cancel()
                 try:
-                    return await worker
+                    return await self._await_run_worker(worker, terminal_started)
                 except asyncio.CancelledError:
-                    await asyncio.to_thread(
-                        self.sessions.update_session, session_id, status="idle"
-                    )
-                    stop_reason = (
-                        StopReason.BUDGET
-                        if deadline_expired.is_set()
-                        else StopReason.CANCELLED
-                    )
-                    error = (
-                        f"Maximum {self.config.agent.max_time_seconds}s run time reached"
-                        if deadline_expired.is_set()
-                        else "Run cancelled"
-                    )
-                    return AgentResult(
-                        session_id=session_id,
-                        run_id=run_id,
-                        text="",
-                        stop_reason=stop_reason,
-                        usage=Usage(),
-                        turns=0,
-                        error=error,
-                        mutation_tracking="incomplete",
-                    )
+                    if worker_started.is_set():
+                        # Never erase initialized state with a replacement result.
+                        raise
+
+                    async def startup_fallback() -> AgentResult:
+                        await asyncio.to_thread(
+                            self.sessions.update_session, session_id, status="idle"
+                        )
+                        self._cancel.pop(session_id, None)
+                        stop_reason = (
+                            StopReason.BUDGET
+                            if deadline_expired.is_set()
+                            else StopReason.CANCELLED
+                        )
+                        error = (
+                            f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+                            if deadline_expired.is_set()
+                            else "Run cancelled"
+                        )
+                        fallback_context = replace(
+                            self.tool_context, session_id=session_id, run_id=run_id,
+                            changed_files=set(), changed_roots=set(),
+                            metadata={"run_task": prompt}, mutation_tracking="incomplete",
+                        )
+                        text, verification = await self._finish_run_output(
+                            messages=[], context=fallback_context, session_id=session_id, run_id=run_id,
+                            turn=0, final_text="", verification=None, verified_revision=-1,
+                            mutation_revision=0, stop_reason=stop_reason, error_message=error,
+                            verification_final_answer_safe=False,
+                        )
+                        result = AgentResult(
+                            session_id=session_id, run_id=run_id, text=text, stop_reason=stop_reason,
+                            usage=Usage(), turns=0, error=error, mutation_tracking="incomplete",
+                            verification=verification, incomplete=True,
+                        )
+                        await self.events.emit("run.completed", session_id=session_id, run_id=run_id,
+                                               result=result.to_dict())
+                        return result
+
+                    return await self._await_run_finalization(startup_fallback())
             finally:
                 self._accepting_steering.discard(session_id)
-                await asyncio.to_thread(self.sessions.release_run_lease, session_id)
+                await self._await_run_finalization(
+                    asyncio.to_thread(self.sessions.release_run_lease, session_id)
+                )
+
+    @staticmethod
+    async def _await_run_worker(
+        worker: asyncio.Task[AgentResult], terminal_started: asyncio.Event,
+    ) -> AgentResult:
+        while True:
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                if worker.done():
+                    return worker.result()
+                # Repeated cancellation still interrupts execution/tool
+                # reconciliation, but never cancels its canonical terminal owner.
+                if not terminal_started.is_set():
+                    worker.cancel()
+
+    @staticmethod
+    async def _await_run_finalization(operation: Awaitable[Any]) -> Any:
+        """Join the sole terminal owner; cancellation cannot start a replacement.
+
+        Only use after execution has stopped (or cancellation has been delivered
+        to it). Unlike execution/usage settlement, terminal delivery returns its
+        committed result rather than retrospectively replacing it with a stop.
+        A genuinely cancelled owner still propagates cancellation.
+        """
+        task = asyncio.ensure_future(operation)
+        try:
+            return await finish_on_cancellation(task)
+        except asyncio.CancelledError:
+            return task.result()
 
     async def _run_locked(
         self,
@@ -675,10 +729,13 @@ class AgentRunner:
         *,
         run_id: str,
         deadline_expired: asyncio.Event,
+        worker_started: asyncio.Event,
+        terminal_started: asyncio.Event,
         user_message_id: str | None,
         user_metadata: dict[str, Any] | None,
         existing_session: bool,
     ) -> AgentResult:
+        worker_started.set()
         cancel = asyncio.Event()
         self._cancel[session_id] = cancel
         approvals = self._approval_managers.get(session_id)
@@ -706,6 +763,7 @@ class AgentRunner:
             metadata=dict(self.tool_context.metadata),
         )
         context.metadata["session_store"] = self.sessions
+        context.metadata["run_task"] = prompt
         context.metadata["context_builder"] = self.context_builder
         context.metadata["provider_routes"] = self.providers
         context.metadata["tool_registry"] = self.tools
@@ -758,71 +816,7 @@ class AgentRunner:
 
         scripts = self._new_script_scope(context, cancel)
         context.metadata["script_scope"] = scripts
-        messages = await asyncio.to_thread(self.sessions.messages, session_id)
-        tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
-        await self._recover_nested_calls(tool_call_rows, context)
-        running_call_ids = {
-            str(row["tool_call_id"])
-            for row in tool_call_rows
-            if row["status"] == "running"
-        }
-        repairs = _abandoned_tool_call_results(
-            messages,
-            running_call_ids=running_call_ids,
-        )
-        for repair in repairs:
-            if repair.tool_call_id in running_call_ids:
-                tool = self.tools.get(repair.tool_name or "")
-                if (
-                    tool is None
-                    or tool.effective_mutation_scope != MutationScope.NONE
-                ):
-                    repair.metadata["workspace_change_tracking"] = "incomplete"
-                    self._mark_workspace_tracking_incomplete(context)
-                await asyncio.to_thread(
-                    self.sessions.complete_tool_call,
-                    session_id,
-                    repair.tool_call_id,
-                    output=repair.content,
-                    is_error=True,
-                    metadata=repair.metadata,
-                    message=repair,
-                )
-            else:
-                await asyncio.to_thread(
-                    self.sessions.append_message,
-                    session_id,
-                    repair,
-                )
-        messages.extend(repairs)
-        durable_user_metadata = dict(user_metadata or {})
-        if existing_session and is_recovery_continuation_prompt(prompt):
-            durable_user_metadata["recovery_continuation"] = {"prompt": "continue"}
-        user = Message(
-            id=user_message_id or new_id("msg"),
-            role=Role.USER,
-            content=prompt,
-            metadata=durable_user_metadata,
-        )
-        messages.append(user)
-        await asyncio.to_thread(self.sessions.append_message, session_id, user)
-        await asyncio.to_thread(self.sessions.update_session, session_id, status="running")
-        try:
-            await self.events.emit(
-                "run.started",
-                session_id=session_id,
-                run_id=run_id,
-                prompt=prompt,
-            )
-            await self.events.emit(
-                "swarm.started", session_id=session_id, run_id=run_id,
-                task=truncate_text(prompt, 160), limits=context.metadata["swarm_state"].limits(),
-                max_model_requests=self.config.agent.max_model_requests,
-            )
-        except Exception:
-            self._cancel.pop(session_id, None)
-            await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
-            raise
+        messages: list[Message] = []
         last_batch_signature: str | None = None
         repeated_batch_count = 0
         final_text = ""
@@ -846,6 +840,66 @@ class AgentRunner:
 
         self._script_scopes.add(scripts)
         try:
+            messages = await asyncio.to_thread(self.sessions.messages, session_id)
+            tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
+            await self._recover_nested_calls(tool_call_rows, context)
+            running_call_ids = {
+                str(row["tool_call_id"])
+                for row in tool_call_rows
+                if row["status"] == "running"
+            }
+            repairs = _abandoned_tool_call_results(
+                messages,
+                running_call_ids=running_call_ids,
+            )
+            for repair in repairs:
+                if repair.tool_call_id in running_call_ids:
+                    tool = self.tools.get(repair.tool_name or "")
+                    if (
+                        tool is None
+                        or tool.effective_mutation_scope != MutationScope.NONE
+                    ):
+                        repair.metadata["workspace_change_tracking"] = "incomplete"
+                        self._mark_workspace_tracking_incomplete(context)
+                    await asyncio.to_thread(
+                        self.sessions.complete_tool_call,
+                        session_id,
+                        repair.tool_call_id,
+                        output=repair.content,
+                        is_error=True,
+                        metadata=repair.metadata,
+                        message=repair,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.sessions.append_message,
+                        session_id,
+                        repair,
+                    )
+            messages.extend(repairs)
+            durable_user_metadata = dict(user_metadata or {})
+            if existing_session and is_recovery_continuation_prompt(prompt):
+                durable_user_metadata["recovery_continuation"] = {"prompt": "continue"}
+            user = Message(
+                id=user_message_id or new_id("msg"),
+                role=Role.USER,
+                content=prompt,
+                metadata=durable_user_metadata,
+            )
+            messages.append(user)
+            await asyncio.to_thread(self.sessions.append_message, session_id, user)
+            await asyncio.to_thread(self.sessions.update_session, session_id, status="running")
+            await self.events.emit(
+                "run.started",
+                session_id=session_id,
+                run_id=run_id,
+                prompt=prompt,
+            )
+            await self.events.emit(
+                "swarm.started", session_id=session_id, run_id=run_id,
+                task=truncate_text(prompt, 160), limits=context.metadata["swarm_state"].limits(),
+                max_model_requests=self.config.agent.max_model_requests,
+            )
             prompt_context = await asyncio.to_thread(
                 self.context_builder.build, query=prompt,
                 direct=not any(schema["name"] == "script" for schema in self.tools.provider_schemas(self.config)),
@@ -950,6 +1004,7 @@ class AgentRunner:
                 investigation_checkpoint_pending = investigation_progress.checkpoint_pending
                 tools_disabled = (
                     final_turn
+                    or invalid_answers > 0
                     or (last_request and context.metadata["swarm_state"].admitted > 0)
                     or verification_finalization_pending
                 )
@@ -1062,7 +1117,16 @@ class AgentRunner:
                 if usage_budget_error is not None:
                     raise usage_budget_error
                 if response_incomplete:
+                    # Preserve provider-selected continuation state, but use the
+                    # remaining allowance for an explicit text-only handoff.
+                    invalid_answers = 1
+                    feedback = Message(role=Role.USER, content=CLOSURE_INSTRUCTION,
+                                       metadata={"internal": "answer_repair"})
+                    messages.append(feedback)
+                    await asyncio.to_thread(self.sessions.append_message, session_id, feedback)
                     steered = await self._drain_steering(session_id, run_id, messages)
+                    if steered:
+                        invalid_answers = 0
                     investigation_progress.reset_if(steered)
                     continue
                 if not response_tool_calls:
@@ -1172,62 +1236,86 @@ class AgentRunner:
         except Exception as error:
             stop_reason = StopReason.ERROR
             error_message = f"{type(error).__name__}: {error}"
-            await self.events.emit(
-                "run.error", session_id=session_id, run_id=run_id, error=error_message
-            )
         finally:
-            await scripts.close()
-            budget.release_closure("root")
-            self._script_scopes.discard(scripts)
-            verification, verified_revision, error_message = (
-                await self._verify_max_turn_exit(
-                    stop_reason=stop_reason,
-                    verification=verification,
-                    verified_revision=verified_revision,
-                    mutation_revision=mutation_revision,
-                    error_message=error_message,
-                    context=context,
-                    cancel=cancel,
-                    deadline_expired=deadline_expired,
+            terminal_started.set()
+            # Execution is over. One owned task now drains jobs and publishes
+            # the actual result through idle/ack/completed; never restart with
+            # an empty startup context if its caller is cancelled here.
+            async def finalize() -> AgentResult:
+                nonlocal verification, verified_revision, error_message, final_text
+                await scripts.close()
+                budget.release_closure("root")
+                self._script_scopes.discard(scripts)
+                verification, verified_revision, error_message = (
+                    await self._verify_max_turn_exit(
+                        stop_reason=stop_reason,
+                        verification=verification,
+                        verified_revision=verified_revision,
+                        mutation_revision=mutation_revision,
+                        error_message=error_message,
+                        context=context,
+                        cancel=cancel,
+                        deadline_expired=deadline_expired,
+                    )
                 )
-            )
-        try:
-            if error_message:
-                error_message = truncate_text(self.events.redactor.text(error_message), 2_000)
-            final_text, verification = await self._finish_run_output(
-                messages=messages, context=context, session_id=session_id, run_id=run_id,
-                turn=budget.turns, final_text=final_text, verification=verification,
-                verified_revision=verified_revision, mutation_revision=mutation_revision,
-                stop_reason=stop_reason, error_message=error_message,
-                verification_final_answer_safe=verification_final_answer_safe,
-            )
-            if stop_reason == StopReason.MAX_TURNS:
-                await self._drain_steering(session_id, run_id, messages)
-        finally:
-            if stop_reason == StopReason.MAX_TURNS:
-                self._accepting_steering.discard(session_id)
-            self._cancel.pop(session_id, None)
-            queue = self._steering.get(session_id)
-            if queue is not None and queue.empty():
-                self._steering.pop(session_id, None)
-            await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
-        usage = budget.usage or Usage()
-        result = AgentResult(
-            session_id=session_id,
-            run_id=run_id,
-            text=final_text,
-            stop_reason=stop_reason,
-            usage=usage,
-            turns=budget.turns,
-            changed_files=sorted(context.changed_files),
-            mutation_tracking=context.mutation_tracking,
-            verification=verification,
-            error=error_message,
-            incomplete=stop_reason != StopReason.END_TURN,
-        )
-        await self.events.emit(
-            "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
-        )
+                try:
+                    if stop_reason == StopReason.ERROR:
+                        await self.events.emit(
+                            "run.error", session_id=session_id, run_id=run_id, error=error_message
+                        )
+                    if error_message:
+                        error_message = truncate_text(self.events.redactor.text(error_message), 2_000)
+                    final_text, verification = await self._finish_run_output(
+                        messages=messages, context=context, session_id=session_id, run_id=run_id,
+                        turn=budget.turns, final_text=final_text, verification=verification,
+                        verified_revision=verified_revision, mutation_revision=mutation_revision,
+                        stop_reason=stop_reason, error_message=error_message,
+                        verification_final_answer_safe=verification_final_answer_safe,
+                    )
+                    if stop_reason == StopReason.MAX_TURNS:
+                        await self._drain_steering(session_id, run_id, messages)
+                finally:
+                    if stop_reason == StopReason.MAX_TURNS:
+                        self._accepting_steering.discard(session_id)
+                    self._cancel.pop(session_id, None)
+                    queue = self._steering.get(session_id)
+                    if queue is not None and queue.empty():
+                        self._steering.pop(session_id, None)
+                    await asyncio.to_thread(self.sessions.update_session, session_id, status="idle")
+                usage = budget.usage or Usage()
+                result = AgentResult(
+                    session_id=session_id,
+                    run_id=run_id,
+                    text=final_text,
+                    stop_reason=stop_reason,
+                    usage=usage,
+                    turns=budget.turns,
+                    changed_files=sorted(context.changed_files),
+                    mutation_tracking=context.mutation_tracking,
+                    verification=verification,
+                    error=error_message,
+                    incomplete=stop_reason != StopReason.END_TURN,
+                )
+                if context.metadata["swarm_state"].admitted or context.metadata.get("recovered_nested_runs") or context.metadata.get("settled_delegation_runs"):
+                    # Acknowledge only after terminal output/verification is durable.
+                    session = await asyncio.to_thread(self.sessions.get_session, session_id)
+                    settled = set(session.metadata.get("settled_delegation_runs", []))
+                    if context.metadata["swarm_state"].admitted:
+                        settled.add(run_id)
+                    if context.metadata.get("nested_recovery_complete"):
+                        settled.update(context.metadata.get("recovered_nested_runs", set()))
+                    settled.update(context.metadata.get("settled_delegation_runs", set()))
+                    settled.difference_update(context.metadata.get("unresolved_nested_runs", set()))
+                    await asyncio.to_thread(
+                        self.sessions.update_session, session_id,
+                        metadata={**session.metadata, "settled_delegation_runs": sorted(settled)},
+                    )
+                await self.events.emit(
+                    "run.completed", session_id=session_id, run_id=run_id, result=result.to_dict()
+                )
+                return result
+
+            result = await self._await_run_finalization(finalize())
         return result
 
     async def _record_model_response(
@@ -1241,7 +1329,7 @@ class AgentRunner:
         response_incomplete = response.incomplete
         response_tool_calls = [] if response_incomplete else response.tool_calls
         if final_turn and response_tool_calls:
-            cause = max_turns_recovery_message(self.config.agent.max_turns)
+            cause = max_turns_recovery_message(self.config.agent.max_turns) + " tool_call_on_final_turn"
             if usage_budget_error is not None:
                 cause += " " + str(usage_budget_error)
             raise BudgetExceeded("turns", cause)
@@ -1252,19 +1340,23 @@ class AgentRunner:
             and (not _usable_answer(response.text) or bool(response.tool_calls))
         )
         if invalid_answer:
+            invalid_cause = ("tool_call_on_final_turn" if response.tool_calls else
+                             "protocol_output" if _protocol_answer(response.text) else
+                             "empty_answer" if not response.text.strip() else "continuation_only")
             # Usage is already settled. Neither persist nor publish private
             # protocol text, reasoning, or opaque continuation state.
             invalid_answers += 1
             await self.events.emit(
                 "model.invalid_answer", session_id=session_id, run_id=run_id,
                 attempt=invalid_answers, recoverable=not final_turn and invalid_answers <= 2,
+                cause=invalid_cause,
             )
             if usage_budget_error is not None:
                 raise usage_budget_error
             if final_turn or invalid_answers > 2:
                 raise BudgetExceeded(
                     "answer", "Run incomplete: the model did not return a usable answer. "
-                    "Session evidence is preserved; send 'continue' to resume.",
+                    "Session evidence is preserved; send 'continue' to resume. " + invalid_cause,
                 )
             feedback = Message(role=Role.USER, content=_ANSWER_REPAIR_INSTRUCTION,
                                metadata={"internal": "answer_repair"})
@@ -1408,6 +1500,20 @@ class AgentRunner:
             }
             if context.changed_roots:
                 final_text = _authoritative_verification_summary(verification, context)
+        if stop_reason != StopReason.END_TURN:
+            current = [row for row in rows if row["run_id"] == run_id or str(row["run_id"]).startswith(run_id + ".")]
+            handoff = runtime_handoff(
+                task=context.metadata.get("run_task", "Current session task"),
+                cause=error_message or stop_reason.value,
+                observations=[{"tool_call_id": row["tool_call_id"], "tool": row["tool_name"],
+                               "is_error": row["status"] != "completed",
+                               "excerpt": truncate_text(self.events.redactor.text(row["output"] or "Outcome not recorded"), 600),
+                               **{key: row["metadata"][key] for key in ("path", "sha256", "output_artifact") if key in row["metadata"]}}
+                              for row in current[-8:]],
+                changed_files=sorted(context.changed_files), mutation_tracking=context.mutation_tracking,
+                verification=verification, redactor=self.events.redactor,
+            )
+            delegated_evidence = handoff + ("\n\nDelegated handoffs:\n" + delegated_evidence if delegated_evidence else "")
         if verification is not None and (
             context.changed_roots or context.mutation_tracking == "incomplete"
         ):
@@ -1507,6 +1613,24 @@ class AgentRunner:
 
     async def _recover_nested_calls(self, rows: list[dict[str, Any]], context: ToolContext) -> None:
         """Settle abandoned nested receipts without adding child TOOL messages."""
+        context.metadata["nested_recovery_complete"] = False
+        completed_runs: set[str] = set()
+        if any(row["metadata"].get("delegation_id") for row in rows):
+            session = await asyncio.to_thread(self.sessions.get_session, context.session_id)
+            completed_runs.update(session.metadata.get("settled_delegation_runs", []))
+            # Older runs have only telemetry as their terminal marker. Page the
+            # whole session: an early root can finish after thousands of events.
+            sequence = 0
+            while page := await asyncio.to_thread(
+                self.sessions.events, context.session_id, after_sequence=sequence,
+            ):
+                completed_runs.update(event.run_id for _, event in page
+                                      if event.type == "run.completed" and event.run_id)
+                sequence = page[-1][0]
+            completed_runs.intersection_update(str(row["run_id"]).split(".", 1)[0]
+                                               for row in rows if row["metadata"].get("delegation_id"))
+            context.metadata["settled_delegation_runs"] = completed_runs
+        recovered_runs: set[str] = context.metadata.setdefault("recovered_nested_runs", set())
         for row in rows:
             metadata = row["metadata"]
             delegated = bool(metadata.get("delegation_id"))
@@ -1527,6 +1651,8 @@ class AgentRunner:
                     "recovery": "previous_run_ended",
                     **({"workspace_change_tracking": "incomplete"} if may_mutate else {}),
                 }
+                if may_mutate:
+                    self._mark_workspace_tracking_incomplete(context)
                 owner = "delegated" if delegated else "Script"
                 await asyncio.to_thread(
                     self.sessions.complete_tool_call, context.session_id, row["tool_call_id"],
@@ -1535,10 +1661,81 @@ class AgentRunner:
                 )
             elif not delegated:
                 continue
-            # Unknown mutation outcomes remain uncertain on subsequent resumes,
+            # Uncertain mutation coverage stays uncertain on subsequent resumes,
             # including a crash after the recovery receipt was committed.
-            if metadata.get("unknown_outcome") and metadata.get("workspace_change_tracking") == "incomplete":
+            if metadata.get("workspace_change_tracking") == "incomplete":
                 self._mark_workspace_tracking_incomplete(context)
+            if not delegated or row["status"] == "running":
+                continue
+            # Root IDs contain no dots; each child appends its delegation ID.
+            # A completed root delegate is not a terminal primary run marker.
+            root_run = str(row["run_id"]).split(".", 1)[0]
+            if root_run in completed_runs:
+                continue
+            tool = self.tools.get(row["tool_name"])
+            if tool is None:
+                self._mark_workspace_tracking_incomplete(context)
+            paths = metadata.get("changed_files")
+            if paths is None and row["status"] == "completed" and tool is not None and tool.effective_mutation_scope == MutationScope.TRACKED:
+                paths = metadata.get("files")
+                if paths is None and metadata.get("path"):
+                    paths = [metadata["path"]]
+                if paths is None:
+                    self._mark_workspace_tracking_incomplete(context)
+            if paths is not None and (not isinstance(paths, list) or not all(isinstance(path, str) for path in paths)):
+                self._mark_workspace_tracking_incomplete(context)
+                context.metadata.setdefault("unresolved_nested_runs", set()).add(root_run)
+                continue
+            for display in paths or []:
+                # Displays are labels, not root identities. In particular,
+                # "aux:file" can also be a literal primary-root filename.
+                context.changed_files.add(display)
+                roots = self._recovered_path_roots(display, metadata, context)
+                if roots is None:
+                    self._mark_workspace_tracking_incomplete(context)
+                    context.metadata.setdefault("unresolved_nested_runs", set()).add(root_run)
+                else:
+                    context.changed_roots.update(roots)
+                    recovered_runs.add(root_run)
+        # Do not permanently acknowledge a partially attributed batch. A later
+        # resume with the original explicit roots can recover it meaningfully.
+        recovered_runs.difference_update(context.metadata.get("unresolved_nested_runs", set()))
+        context.metadata["nested_recovery_complete"] = True
+
+    @staticmethod
+    def _recovered_path_roots(
+        display: str, metadata: dict[str, Any], context: ToolContext,
+    ) -> set[Path] | None:
+        identities = metadata.get("changed_path_roots")
+        if "changed_path_roots" not in metadata:
+            # Legacy unqualified primary paths remain useful. Qualified or
+            # literal-colon labels cannot prove an owner without identity.
+            if ":" in display.split("/", 1)[0]:
+                return None
+            owners = [str(context.workspace)]
+        elif isinstance(identities, dict):
+            owners = identities.get(display)
+            if not isinstance(owners, list) or not owners:
+                return None
+        else:
+            return None
+        roots: set[Path] = set()
+        for identity in owners:
+            # Compare to *currently permitted* canonical roots before any
+            # filesystem access. Neither omitted roots nor replacements with
+            # the same basename acquire authority through a stored receipt.
+            root = next((root for root in context.roots.roots if str(root) == identity), None)
+            if root is None:
+                return None
+            prefix = "" if root == context.workspace else root.name + ":"
+            if not display.startswith(prefix):
+                return None
+            relative = display[len(prefix):]
+            path = Path(relative)
+            if not relative or path.is_absolute() or ".." in path.parts:
+                return None
+            roots.add(root)
+        return roots
 
     async def _script_notifications(self, scripts: ScriptScope, messages: list[Message], *, wait: bool = False) -> int:
         notices = await scripts.notifications(wait=wait)
@@ -1575,7 +1772,12 @@ class AgentRunner:
         verified_revision = mutation_revision
         try:
             verification = await self._verify_changes(context, cancel)
-        except Cancelled as verification_error:
+        except Cancelled as error:
+            verification_error = (
+                f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+                if deadline_expired.is_set()
+                else str(error)
+            )
             verification = _interrupted_verification(
                 context,
                 str(verification_error),
@@ -1630,6 +1832,8 @@ class AgentRunner:
             content=text,
             metadata={"terminal_result": True, **({"authoritative_verification": True} if verification_result else {})},
         )
+        if stop_reason != StopReason.END_TURN:
+            message.metadata.update(result_source="runtime", completion_status="incomplete")
         messages.append(message)
         await asyncio.to_thread(self.sessions.append_message, session_id, message)
         await self.events.emit(
@@ -4273,12 +4477,26 @@ class AgentRunner:
                     self._workspace_snapshot(), cancel
                 )
             result = await self._await_until_cancelled(self.tools.execute(call, context), cancel)
+            swarm = context.metadata.get("swarm_state")
+            if result.is_error and isinstance(swarm, SwarmState) and call.id in swarm.handoffs:
+                result = swarm.handoffs[call.id]
         except BudgetExceeded as error:
             budget_error = error
-            result = ToolResult(
+            swarm = context.metadata.get("swarm_state")
+            result = (swarm.handoffs.get(call.id) if isinstance(swarm, SwarmState) else None) or ToolResult(
                 str(error), is_error=True, metadata={"budget_kind": error.kind},
             )
         except (asyncio.CancelledError, Cancelled):
+            swarm = context.metadata.get("swarm_state")
+            handoff = swarm.handoffs.get(call.id) if isinstance(swarm, SwarmState) else None
+            if handoff is not None:
+                await finish_on_cancellation(asyncio.to_thread(
+                    self.sessions.complete_tool_call, context.session_id, call.id,
+                    output=handoff.output, is_error=True,
+                    metadata={**handoff.metadata, **(nested_metadata or {})},
+                    message=self._tool_result_message(call, handoff) if nested_results is None else None,
+                ))
+                raise
             cancelled_result = ToolResult(
                 "Run cancelled",
                 is_error=True,
@@ -4292,7 +4510,7 @@ class AgentRunner:
                 except asyncio.CancelledError:
                     workspace_after = None
                 changed = self._record_workspace_changes(
-                    workspace_before, workspace_after, context
+                    workspace_before, workspace_after, context, metadata=cancelled_result.metadata
                 )
                 if changed:
                     cancelled_result.metadata["changed_files"] = sorted(changed)
@@ -4343,7 +4561,7 @@ class AgentRunner:
                     required=False,
                 )
                 changed = self._record_workspace_changes(
-                    workspace_before, workspace_after, context
+                    workspace_before, workspace_after, context, metadata=result.metadata
                 )
                 if changed:
                     result.metadata["changed_files"] = sorted(changed)
@@ -4524,6 +4742,8 @@ class AgentRunner:
         before: dict[Path, tuple[Path, int, int, int, int, int, str]],
         after: dict[Path, tuple[Path, int, int, int, int, int, str]] | None,
         context: ToolContext,
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> set[str]:
         if after is None:
             self._mark_workspace_tracking_incomplete(context)
@@ -4541,6 +4761,8 @@ class AgentRunner:
             displays.add(display)
             context.changed_files.add(display)
             context.changed_roots.add(root)
+            if metadata is not None:
+                metadata.setdefault("changed_path_roots", {}).setdefault(display, []).append(str(root))
         if changed_paths:
             context.lifecycle_uncertainty_only = False
         return displays
@@ -5071,7 +5293,7 @@ def _causal_stop_summary(error: str | None, progress: str, delegated_evidence: s
     if _usable_answer(progress):
         cause += "\n\nLast recorded progress or verification:\n" + truncate_text(progress, 4_000)
     if delegated_evidence:
-        cause += "\n\nDelegated receipts (attributed observations; incomplete checks are not conclusions):\n" + delegated_evidence
+        cause += "\n\nRecorded operational evidence (attributed observations; incomplete checks are not conclusions):\n" + delegated_evidence
     return cause
 
 

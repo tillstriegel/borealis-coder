@@ -99,9 +99,10 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Investigation complete.", result.output)
         self.assertEqual(request.await_count, 2)
         replay = request.await_args_list[1].kwargs["payload"]["input"]
-        self.assertEqual(replay[1:3], steps)
-        self.assertEqual(replay[3]["type"], "function_result")
-        self.assertEqual(replay[3]["call_id"], "inspect")
+        self.assertIn("final handoff", str(replay[1]))
+        self.assertEqual(replay[2:4], steps)
+        self.assertEqual(replay[4]["type"], "function_result")
+        self.assertEqual(replay[4]["call_id"], "inspect")
         self.assertNotIn("opaque-signature", str(result))
 
     async def test_failed_delegated_request_keeps_reported_usage(self):
@@ -189,17 +190,19 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
                 stop_reason="length",
                 usage=Usage(requests=1),
             ),
+            ModelResponse(text=" "),  # The bounded closure also fails; no tools execute.
             ModelResponse(text="The investigation was incomplete."),
         )
         result = await self.runner.run("investigate")
         self.assertEqual(executed, [])
         self.assertTrue(self.delegate_result(result.session_id).is_error)
-        self.assertEqual(result.usage.requests, 3)
+        self.assertEqual(result.usage.requests, 4)
 
     async def test_incomplete_text_is_not_a_successful_conclusion(self):
         self.provider.enqueue(
             self.delegation(),
             ModelResponse(text="I found the cause and it is", stop_reason="max_tokens"),
+            ModelResponse(text=" "),
             ModelResponse(text="The investigation was incomplete."),
         )
         result = await self.runner.run("investigate")
