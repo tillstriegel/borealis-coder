@@ -1630,7 +1630,14 @@ async def compact_messages_with_summary(
                 resolved = await outcome
             else:
                 resolved = outcome
-        except (BudgetExceeded, Cancelled, SessionError):
+        except BudgetExceeded as error:
+            if error.kind != "model_requests":
+                raise
+            return _deterministic_fallback(
+                compacted, "summarizer_request_capacity",
+                summarizer_results=summarizer_results,
+            )
+        except (Cancelled, SessionError):
             raise
         except Exception:
             return _deterministic_fallback(

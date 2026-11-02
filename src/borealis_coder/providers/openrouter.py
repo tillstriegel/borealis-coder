@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from ..models import ProviderRequest, Usage
@@ -17,6 +18,16 @@ class OpenRouterProvider(OpenAIProvider):
     """
 
     name = "openrouter"
+
+    def _empty_chat_recovery_request(self, request: ProviderRequest) -> ProviderRequest:
+        # Omission leaves default-on models reasoning. OpenRouter's documented
+        # 'none' effort disables it; unsupported-control recovery still omits it.
+        return replace(request, reasoning_effort="none",
+                       metadata={**request.metadata, "chat_reasoning_recovery": "disable"})
+
+    def _unsupported_chat_recovery_request(self, request: ProviderRequest) -> ProviderRequest:
+        return replace(request, reasoning_effort=None,
+                       metadata={**request.metadata, "chat_reasoning_recovery": "omit"})
 
     @property
     def api_style(self) -> str:
@@ -37,7 +48,15 @@ class OpenRouterProvider(OpenAIProvider):
         payload.pop("reasoning_effort", None)
         if request.reasoning_effort:
             payload["reasoning"] = {"effort": request.reasoning_effort}
-        return self._apply_extensions(payload, request)
+        payload = self._apply_extensions(payload, request)
+        recovery = request.metadata.get("chat_reasoning_recovery")
+        if recovery in {"disable", "omit"}:
+            # Extension fields must not silently undo the recovery's wire intent.
+            payload.pop("reasoning_effort", None)
+            payload.pop("reasoning", None)
+            if recovery == "disable":
+                payload["reasoning"] = {"effort": "none"}
+        return payload
 
     def _responses_payload(
         self,

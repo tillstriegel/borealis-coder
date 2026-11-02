@@ -1311,7 +1311,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         first_payload = cast(dict[str, Any], fake.calls[0][1]["payload"])
         second_payload = cast(dict[str, Any], fake.calls[1][1]["payload"])
         self.assertEqual(first_payload["reasoning"], {"effort": "high"})
-        self.assertNotIn("reasoning", second_payload)
+        self.assertEqual(second_payload["reasoning"], {"effort": "none"})
 
     async def test_complete_chat_preserves_usage_across_reasoning_disabled_retry(self) -> None:
         provider = OpenRouterProvider(
@@ -1339,7 +1339,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.usage.requests, 2)
         self.assertEqual(complete_once.await_count, 2)
         fallback_request = complete_once.await_args_list[1].args[0]
-        self.assertIsNone(fallback_request.reasoning_effort)
+        self.assertEqual(fallback_request.reasoning_effort, "none")
 
     async def test_complete_chat_preserves_usage_when_internal_fallback_fails(self) -> None:
         provider = OpenRouterProvider(
@@ -1372,7 +1372,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.usage.output_tokens, 5)
         self.assertEqual(response.usage.requests, 2)
         self.assertEqual(complete_once.await_count, 3)
-        self.assertIsNone(complete_once.await_args_list[1].args[0].reasoning_effort)
+        self.assertEqual(complete_once.await_args_list[1].args[0].reasoning_effort, "none")
         self.assertEqual(complete_once.await_args_list[2].args[0].reasoning_effort, "high")
 
     async def test_chat_stream_error_carries_usage_from_failed_internal_fallback(self) -> None:

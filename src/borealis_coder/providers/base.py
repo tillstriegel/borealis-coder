@@ -37,6 +37,7 @@ class _UsageObservation:
     on_usage: Callable[[Usage], None] | None
     check_usage: Callable[[], None] | None
     before_recovery: Callable[[], None] | None = None
+    prepare_recovery: Callable[[ProviderRequest], None] | None = None
     handled: bool = False
 
 
@@ -82,20 +83,24 @@ class Provider(abc.ABC):
         self, on_usage: Callable[[Usage], None] | None,
         check_usage: Callable[[], None] | None,
         before_recovery: Callable[[], None] | None = None,
+        *,
+        prepare_recovery: Callable[[ProviderRequest], None] | None = None,
     ) -> Iterator[_UsageObservation]:
         existing = self._usage_observation.get()
-        observation = existing or _UsageObservation(on_usage, check_usage, before_recovery)
+        observation = existing or _UsageObservation(on_usage, check_usage, before_recovery, prepare_recovery)
         token = self._usage_observation.set(observation)
         try:
             yield observation
         finally:
             self._usage_observation.reset(token)
 
-    def before_recovery_request(self) -> None:
+    def before_recovery_request(self, request: ProviderRequest | None = None) -> None:
         observation = self._usage_observation.get()
         if observation is not None:
             if observation.check_usage is not None:
                 observation.check_usage()
+            if request is not None and observation.prepare_recovery is not None:
+                observation.prepare_recovery(request)
             if observation.before_recovery is not None:
                 observation.before_recovery()
 

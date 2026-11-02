@@ -60,6 +60,8 @@ from ..util import (
     new_id,
     truncate_text,
 )
+from .answers import protocol_answer as _protocol_answer
+from .answers import usable_answer as _usable_answer
 from .budget import (
     Budget,
     ContextBudget,
@@ -844,7 +846,10 @@ class AgentRunner:
 
         self._script_scopes.add(scripts)
         try:
-            prompt_context = await asyncio.to_thread(self.context_builder.build, query=prompt)
+            prompt_context = await asyncio.to_thread(
+                self.context_builder.build, query=prompt,
+                direct=not any(schema["name"] == "script" for schema in self.tools.provider_schemas(self.config)),
+            )
             session_usage = await asyncio.to_thread(self.sessions.usage, session_id)
             adaptive_cache = self._low_cache_effectiveness(session_usage)
             conversation_cache = (
@@ -860,8 +865,27 @@ class AgentRunner:
                     hit_rate=session_usage.provider_cache_hit_rate,
                     action="stable-prefix-only; shorter compaction window",
                 )
+            def prepare_dispatch(request: ProviderRequest) -> None:
+                nonlocal tools_disabled
+                # Preparation helpers, retries and adapter recovery all spend
+                # physical requests. Decide at dispatch, not at turn selection.
+                if (context.metadata["swarm_state"].admitted > 0
+                        and budget.model_requests + 1 >= self.config.agent.max_model_requests):
+                    tools_disabled = True
+                    request.tools = []
+                    request.parallel_tool_calls = False
+                    # Keep validated instructions/cache blocks unchanged; schema
+                    # removal only shrinks the endpoint request. Its old provider
+                    # view hash, however, no longer describes this dispatch.
+                    for key in ("compaction_artifact_id", "compacted_context_hashes"):
+                        request.metadata.pop(key, None)
+
             async def prepare_route(route: ProviderRoute) -> ProviderRequest:
                 nonlocal compacted, last_prune_signature, previous_request_tokens, mutation_revision
+                if context.metadata["swarm_state"].admitted > 0:
+                    # A preceding root tool turn/retry may have consumed its old
+                    # reservation. Every preparation must protect the next combine.
+                    budget.reserve_closure("root")
                 while True:
                     prepared = await self._prepare_provider_request(
                         prompt_context=prompt_context,
@@ -926,6 +950,7 @@ class AgentRunner:
                 investigation_checkpoint_pending = investigation_progress.checkpoint_pending
                 tools_disabled = (
                     final_turn
+                    or (last_request and context.metadata["swarm_state"].admitted > 0)
                     or verification_finalization_pending
                 )
                 schemas = [] if tools_disabled else self.tools.provider_schemas(self.config)
@@ -959,6 +984,7 @@ class AgentRunner:
                         emit_response_deltas=not buffer_candidate_output,
                         usage_sink=usage_sink,
                         budget=budget,
+                        prepare_dispatch=prepare_dispatch,
                     )
                 except ProviderContextOverflowError as error:
                     if error.usage is not None:
@@ -1151,6 +1177,7 @@ class AgentRunner:
             )
         finally:
             await scripts.close()
+            budget.release_closure("root")
             self._script_scopes.discard(scripts)
             verification, verified_revision, error_message = (
                 await self._verify_max_turn_exit(
@@ -1314,6 +1341,9 @@ class AgentRunner:
         verification_final_answer_safe: bool,
     ) -> tuple[str, dict[str, Any] | None]:
         """Publish one causal terminal result after all owned jobs have settled."""
+        swarm = context.metadata.get("swarm_state")
+        delegated_evidence = (truncate_text(self.events.redactor.text(self.events.redactor.json(swarm.receipts)), 8_000)
+                              if isinstance(swarm, SwarmState) and swarm.receipts else "")
         # Close unadmitted calls before appending a terminal result. This also
         # leaves a valid transcript if the session is reopened after a stop.
         messages[:] = await asyncio.to_thread(self.sessions.messages, session_id)
@@ -1390,7 +1420,7 @@ class AgentRunner:
             ):
                 final_text = _authoritative_verification_summary(verification, context)
             if stop_reason != StopReason.END_TURN:
-                final_text = _causal_stop_summary(error_message, final_text)
+                final_text = _causal_stop_summary(error_message, final_text, delegated_evidence)
             terminal_feedback = Message(
                 role=Role.USER,
                 content=_verification_feedback(
@@ -1415,7 +1445,7 @@ class AgentRunner:
                 stop_reason=stop_reason,
             )
         elif stop_reason != StopReason.END_TURN:
-            final_text = _causal_stop_summary(error_message, final_text)
+            final_text = _causal_stop_summary(error_message, final_text, delegated_evidence)
             await self._publish_authoritative_result(
                 final_text, messages=messages, session_id=session_id, run_id=run_id,
                 turn=turn, stop_reason=stop_reason,
@@ -3242,6 +3272,7 @@ class AgentRunner:
         usage_sink: Callable[[Usage], Awaitable[None]],
         budget: Budget | None = None,
         emit_response_deltas: bool = True,
+        prepare_dispatch: Callable[[ProviderRequest], None] | None = None,
     ) -> tuple[ModelResponse, ProviderRoute]:
         """Preserve reported failed-attempt usage if a request is cancelled."""
 
@@ -3252,6 +3283,7 @@ class AgentRunner:
                 emit_response_deltas=emit_response_deltas,
                 usage_collector=cancelled_usage,
                 budget=budget,
+                prepare_dispatch=prepare_dispatch,
             )
         except ProviderError as error:
             if not cancelled_usage.is_empty:
@@ -3281,6 +3313,7 @@ class AgentRunner:
         emit_response_deltas: bool = True,
         usage_collector: Usage | None = None,
         budget: Budget | None = None,
+        prepare_dispatch: Callable[[ProviderRequest], None] | None = None,
     ) -> tuple[ModelResponse, ProviderRoute]:
         errors: list[str] = []
         failed_usage = Usage()
@@ -3313,6 +3346,8 @@ class AgentRunner:
                     provider=route.name, model=route.model, error=str(error), retryable=True,
                 )
                 continue
+            if prepare_dispatch is not None:
+                prepare_dispatch(routed)
             artifact_id = routed.metadata.get("compaction_artifact_id")
             context_hashes = routed.metadata.get("compacted_context_hashes")
             if isinstance(artifact_id, str) and isinstance(context_hashes, dict):
@@ -3327,6 +3362,20 @@ class AgentRunner:
                 )
             try:
                 cache_key = self._response_cache_key(route, routed)
+                cache_request_changed = False
+
+                def prepare_stream_dispatch(
+                    actual: ProviderRequest, route: ProviderRoute = route,
+                    expected_key: str = cache_key,
+                ) -> None:
+                    nonlocal cache_request_changed
+                    if prepare_dispatch is not None:
+                        prepare_dispatch(actual)
+                    # Retries and adapter recovery may dispatch a different view,
+                    # including a fallback clone. Never cache it under the old key.
+                    if self.config.cache.response_cache_enabled:
+                        cache_request_changed |= self._response_cache_key(route, actual) != expected_key
+
                 cached = None
                 if self.config.cache.response_cache_enabled:
                     cached = await asyncio.to_thread(
@@ -3416,6 +3465,7 @@ class AgentRunner:
                         emit_response_deltas=emit_response_deltas,
                         usage_collector=usage_collector,
                         budget=budget,
+                        prepare_dispatch=prepare_stream_dispatch,
                     )
                 finally:
                     if budget:
@@ -3425,7 +3475,7 @@ class AgentRunner:
                                        usage=response.usage.to_dict())
                 if self.config.cache.response_cache_enabled:
                     response.usage.application_cache_misses += cache_misses
-                    if _is_cacheable_response(response):
+                    if _is_cacheable_response(response) and not cache_request_changed:
                         cached_response: dict[str, Any] = {
                             "text": response.text,
                             "reasoning_summary": response.reasoning_summary,
@@ -3644,8 +3694,6 @@ class AgentRunner:
                         cached.get("requested_model") or request.model
                     ),
                 )
-            if before_model_request is not None:
-                before_model_request()
             request_budget = getattr(before_model_request, "__self__", None)
             reservation = request_budget.reserve_cost(route.provider, request) if isinstance(request_budget, Budget) else 0.0
             cancelled_usage = Usage()
@@ -3655,10 +3703,22 @@ class AgentRunner:
                 if isinstance(request_budget, Budget):
                     request_budget.hold_usage(cancelled_usage)
 
+            def account_summary() -> None:
+                # Helpers own no closure reservation. Keep the bound budget for
+                # cost holds/checks; a callback wrapper would hide that owner.
+                if isinstance(request_budget, Budget):
+                    request_budget.before_model_request(closure=False)
+                elif before_model_request is not None:
+                    before_model_request()
+
+            async def send_summary() -> ModelResponse:
+                account_summary()
+                return await route.provider.complete(request)
+
             request_task = asyncio.create_task(route.provider.with_retries(
-                lambda: route.provider.complete(request),
+                send_summary,
                 on_usage=observe_usage,
-                before_recovery=before_model_request,
+                before_recovery=account_summary,
                 request=request,
                 check_usage=(lambda _: request_budget.check_unsettled(cancelled_usage)) if isinstance(request_budget, Budget) else None,
             ))
@@ -3804,6 +3864,7 @@ class AgentRunner:
         emit_response_deltas: bool = True,
         usage_collector: Usage | None = None,
         budget: Budget | None = None,
+        prepare_dispatch: Callable[[ProviderRequest], None] | None = None,
     ) -> ModelResponse:
         route.provider.request_model.set(request.model)
         attempts = max(0, route.provider.config.max_retries) + 1
@@ -3812,6 +3873,10 @@ class AgentRunner:
         for attempt in range(attempts):
             if budget:
                 budget.check_unsettled(usage_collector if usage_collector is not None else failed_usage)
+                if attempt:
+                    if prepare_dispatch is not None:
+                        prepare_dispatch(request)
+                    budget.before_model_request()
             actionable_emitted = False
             completed: ModelResponse | None = None
             recorded = False
@@ -3832,6 +3897,7 @@ class AgentRunner:
                 record_usage,
                 (lambda: budget.check_unsettled(usage_collector if usage_collector is not None else failed_usage)) if budget else None,
                 budget.before_model_request if budget else None,
+                prepare_recovery=prepare_dispatch,
             ) as observation:
                 try:
 
@@ -4959,29 +5025,6 @@ def _is_cacheable_response(response: ModelResponse) -> bool:
     )
 
 
-def _usable_answer(text: str) -> bool:
-    """Reject known terminal protocol/continuation forms, not general prose."""
-    value = text.strip()
-    if not value:
-        return False
-    if _protocol_answer(value):
-        return False
-    intention = re.fullmatch(
-        r"(?:Let me|I will|I'll) (?:read|inspect|check|look at) ([^\n]{1,160})",
-        value, re.I,
-    )
-    if intention is None:
-        return True
-    # Paths and commands can contain dots, colons and shell punctuation. Quoted
-    # targets are opaque; prose after a sentence/clause boundary is still valid.
-    target = re.sub(r"`[^`]*`|\"[^\"]*\"|'[^']*'", "target", intention[1])
-    return bool(re.search(r"[.!?:;]\s", target))
-
-
-def _protocol_answer(text: str) -> bool:
-    return bool(re.match(r"^\s*<(?:[\uff5c|]DSML[\uff5c|]|tool_call(?:s)?\b|function_call\b)", text, re.I))
-
-
 def _remaining_budget_guidance(budget: Budget) -> str:
     requests = max(0, budget.config.max_model_requests - budget.model_requests)
     turns = max(0, budget.config.max_turns - budget.turns + 1)
@@ -5021,12 +5064,14 @@ def _no_change_verification(context: ToolContext) -> dict[str, Any]:
     }
 
 
-def _causal_stop_summary(error: str | None, progress: str) -> str:
+def _causal_stop_summary(error: str | None, progress: str, delegated_evidence: str = "") -> str:
     cause = error or "The run stopped before completion."
     if not cause.lower().startswith("run incomplete"):
         cause = "Run incomplete. " + cause
     if _usable_answer(progress):
         cause += "\n\nLast recorded progress or verification:\n" + truncate_text(progress, 4_000)
+    if delegated_evidence:
+        cause += "\n\nDelegated receipts (attributed observations; incomplete checks are not conclusions):\n" + delegated_evidence
     return cause
 
 

@@ -185,7 +185,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             context.metadata.update(provider_routes=self.runner.providers, tool_registry=ToolRegistry([]),
                 context_builder=SimpleNamespace(system_prompt=lambda **_: 'Inspect'), usage_sink=self.settle,
                 budget=self.budget, before_model_request=self.budget.before_model_request)
-            await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1}, context)
+            return await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1}, context)
 
     def assert_settled(self, cost, requests, status):
         self.assertEqual(self.settlements, 1)
@@ -333,8 +333,14 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.setup_request(limit=2)
                 self.config.agent.max_model_requests = 1
                 self.responses_transport()
-                with self.assertRaises(BudgetExceeded):
-                    await self.run_request(streaming)
+                if streaming:
+                    with self.assertRaises(BudgetExceeded):
+                        await self.run_request(streaming)
+                else:
+                    receipt = await self.run_request(streaming)
+                    assert receipt is not None
+                    self.assertTrue(receipt.is_error)
+                    self.assertEqual(receipt.metadata['completion_status'], 'incomplete')
                 self.assertEqual(len(self.http.calls), 1)
                 self.assert_settled(.6, 1, 'known')
 

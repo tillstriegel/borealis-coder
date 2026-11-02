@@ -1066,7 +1066,8 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result.text, "Recovered summary")
                 self.assertEqual(provider.calls, 2)
-                self.assertEqual(requests, ["summary"])
+                # Each physical dispatch, including the failed billed attempt, is reserved.
+                self.assertEqual(requests, ["summary", "summary"])
                 self.assertEqual(collected.requests, 2)
                 self.assertAlmostEqual(collected.cost_usd, 0.3)
                 usage_sink.assert_awaited_once_with(collected)

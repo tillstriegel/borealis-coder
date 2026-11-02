@@ -82,15 +82,13 @@ class BudgetLifecycleTests(unittest.IsolatedAsyncioTestCase):
                             result.usage.to_dict(),
                         )
 
-    async def test_delegated_budget_exit_is_terminal_before_run_completion(self):
+    async def test_delegated_budget_refusal_is_terminal_before_root_synthesis(self):
         self.runner.config.agent.max_model_requests = 2
         self.provider.enqueue(
             ModelResponse(tool_calls=[ToolCall(
                 id="delegate", name="delegate_task", arguments={"task": "inspect", "max_turns": 3},
             )]),
-            ModelResponse(tool_calls=[ToolCall(name="list_directory", arguments={
-                "path": ".", "depth": 1, "include_hidden": False, "max_entries": 10,
-            })]),
+            ModelResponse(text="Delegation was refused; no findings are available."),
         )
         statuses_at_completion = []
 
@@ -102,10 +100,16 @@ class BudgetLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.runner.events.subscribe(observe)
         result = await self.runner.run("inspect")
-        self.assertEqual(result.stop_reason.value, "budget")
-        self.assertCountEqual(statuses_at_completion, ["error", "completed"])
-        messages = self.assert_finished_calls(result, {"delegate"})
-        self.assertEqual(messages["delegate"].metadata["budget_kind"], "model_requests")
+        self.assertEqual(result.stop_reason.value, "end_turn")
+        self.assertEqual(result.usage.requests, 2)
+        self.assertCountEqual(statuses_at_completion, ["error"])
+        history = self.runner.sessions.messages(result.session_id)
+        validate_tool_call_order(history)
+        self.assertEqual(len(self.runner.sessions.tool_calls(result.session_id)), 1)
+        messages = {m.tool_call_id: m for m in history if m.role == Role.TOOL}
+        self.assertEqual(set(messages), {"delegate"})
+        self.assertTrue(messages["delegate"].metadata["refused"])
+        self.assertEqual(messages["delegate"].metadata["completion_status"], "incomplete")
         self.assertNotIn("unknown_outcome", messages["delegate"].metadata)
 
         self.provider.enqueue(ModelResponse(text="Resumed cleanly."))

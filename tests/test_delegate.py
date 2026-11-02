@@ -209,6 +209,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
         self.provider.enqueue(
             self.delegation(),
             ModelResponse(text=" \n\t", stop_reason="stop"),
+            ModelResponse(text=" \n\t", stop_reason="stop"),
             ModelResponse(text="The investigation returned no conclusion."),
         )
         result = await self.runner.run("investigate")

@@ -51,6 +51,7 @@ class Budget:
     usage: Usage | None = None
     pending_cost_usd: float = 0.0
     _held_usage: dict[int, tuple[float, bool]] = field(default_factory=dict, repr=False)
+    _request_closures: set[str] = field(default_factory=set, repr=False)
 
     @classmethod
     def start(cls, config: AgentConfig) -> Budget:
@@ -84,10 +85,27 @@ class Budget:
             raise RuntimeError("Cannot retry a model turn before it starts")
         self.turns -= 1
 
-    def before_model_request(self) -> None:
+    def remaining_requests(self, owner: str | None = None) -> int:
+        """Unconsumed capacity, excluding other agents' reserved closure requests."""
+        return max(0, self.config.max_model_requests - self.model_requests
+                   - len(self._request_closures - ({owner} if owner else set())))
+
+    def reserve_closure(self, owner: str) -> bool:
+        # Synchronous admission/consumption makes sibling races atomic on the loop.
+        if owner in self._request_closures:
+            return True
+        if not self.remaining_requests():
+            return False
+        self._request_closures.add(owner)
+        return True
+
+    def release_closure(self, owner: str) -> None:
+        self._request_closures.discard(owner)
+
+    def before_model_request(self, owner: str = "root", *, closure: bool = True) -> None:
         """Reserve one logical provider request across the whole run."""
 
-        if self.model_requests >= self.config.max_model_requests:
+        if not self.remaining_requests(owner if closure else None):
             raise BudgetExceeded(
                 "model_requests",
                 max_model_requests_recovery_message(
@@ -95,6 +113,8 @@ class Budget:
                 ),
             )
         self._check_time_and_cost()
+        if closure:
+            self.release_closure(owner)
         self.model_requests += 1
 
     def reserve_cost(self, provider: Provider, request: ProviderRequest) -> float:

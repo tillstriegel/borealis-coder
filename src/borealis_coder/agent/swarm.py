@@ -24,6 +24,7 @@ class SwarmState:
     admitted: int = 0
     active_requests: int = 0
     mutations: int = 0
+    receipts: dict[str, str] = field(default_factory=dict, repr=False)
     provider_slots: asyncio.Semaphore = field(init=False, repr=False)
 
     def __post_init__(self) -> None:

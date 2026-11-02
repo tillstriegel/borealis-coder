@@ -71,7 +71,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
 | `max_time_seconds` | `3600` | End-to-end run wall-time ceiling. |
 | `max_cost_usd` | `0.0` | Opt-in cumulative dollar ceiling. Positive limits require configured pricing. |
-| `max_model_requests` | `40` | Logical parent, delegate, and summarizer request ceiling for one run. Advisory guidance shows remaining requests/turns when either has at most two left. It keeps ordinary tools available; the ceiling still stops admission. |
+| `max_model_requests` | `40` | Hard parent, delegate, summarizer, retry and recovery request ceiling for one run. Guidance shows remaining capacity. After delegation, the final root request is synthesis-only; closure reservations stay within this ceiling. Non-delegating investigation checkpoints keep tools available. |
 | `max_read_only_turns` | `8` | Investigation checkpoint interval in tool rounds without file changes. Guidance asks for findings or a concrete next step; tools remain available. Novel successful output resets the stalled-round counter. Repeated-call and global budgets still stop admission. |
 | `parallel_reads` | `8` | Maximum concurrent read-only tool calls. |
 | `swarm_max_depth` | `2` | Maximum delegation depth, root = 0; `1` permits children only, `0` disables delegation. Integer 0–16. |
@@ -116,6 +116,26 @@ and context overflow. Every provider charge is settled once at the root. Per-age
 usage describes that agent's own requests; it is not another charge or a subtree
 sum. Cancellation and fatal budgets cancel and drain owned tool workers before
 returning. Delegation is local to a root run; it is not a persistent job service.
+
+Delegates receive direct-tool instructions and discovery filtered to their inherited
+palette. Explicit discovery of a forbidden tool reports it unavailable; the execution
+guard remains independent. Script instructions and the root catalog are not child
+capabilities. Optional values use JSON `null`, not the literal string `"null"`.
+
+Before child work starts, the run reserves one request for root synthesis and one
+for each active child's conclusion. Investigative work, nested admissions and
+retries cannot spend another agent's closure request. A child switches to a
+tool-free conclusion when investigative capacity is exhausted; it may start with
+only that conclusion turn, or be refused if even closure cannot fit. Reservations
+are consumed on dispatch or released when the child settles. They do not increase
+the request ceiling or guarantee a successful model answer.
+
+Empty answers, raw tool protocol and incomplete provider output are not successful
+child findings. A malformed terminal answer can use one remaining child turn for
+tool-free repair, never extra turns. Failed conclusions retain bounded, attributed
+tool observations and evidence references, marked incomplete rather than invented
+findings. Budget-stop output also retains bounded delegated receipts. A
+`tool_call_id` is a history reference; it is not a `read_artifact` identifier.
 
 ## `[safety]`
 
@@ -270,6 +290,14 @@ applies on append, checkpoint retention applies after a complete new checkpoint 
 | `allow_custom_chatgpt_endpoints` | ChatGPT only: first half of the dual opt-in for non-default API/OAuth endpoints. The process must also set `BOREALIS_ALLOW_CUSTOM_CHATGPT_ENDPOINTS=1`. |
 
 Model identifiers change over time. Treat built-in IDs as dated defaults, not a guarantee of account availability.
+
+For OpenRouter Chat Completions, empty or reasoning-only output gets one bounded
+recovery with `reasoning: {"effort": "none"}`. Omitting reasoning controls leaves
+default-on models enabled; `exclude: true` only hides tokens. An initial omitted
+effort still preserves the provider default. Unsupported-control recovery instead
+omits reasoning controls, including conflicting `extra_body` controls. These are
+distinct recovery intents for both complete and streaming requests, subject to the
+same hard request budget. See OpenRouter's [reasoning contract](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
 ## `[cache]`
 

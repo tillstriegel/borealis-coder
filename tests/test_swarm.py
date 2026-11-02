@@ -215,7 +215,9 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         self.runner.config.agent.swarm_allow_writes = True
         self.runner.config.agent.auto_verify = True
         if interruption == "requests":
-            self.runner.config.agent.max_model_requests = 6
+            # Include ancestor closure reservations; still stop on the exact hard
+            # request bound after a real nested mutation, not before admission.
+            self.runner.config.agent.max_model_requests = 9
         if interruption == "cost":
             self.runner.config.agent.max_cost_usd = 0.1
         after_write = asyncio.Event()
@@ -227,6 +229,8 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if depth == 2:
                 return response(calls=[write("latest.txt", "latest revision\n")])
             if depth == 1:
+                if interruption == "requests" and request.messages[-1].role == Role.TOOL:
+                    return response(text="Nested change observed; current verification is required.")
                 return response(calls=[delegate("grandchild")])
             if call == 1:
                 return response(calls=[write("first.txt", "verified revision\n")])
@@ -236,6 +240,8 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                 return response(text="Checks passed for the first revision.")
             if call == 4:
                 return response(calls=[delegate()])
+            if interruption == "requests" and call == 8:
+                return response(text="<tool_call>not a conclusion")
             self.fail("Unexpected provider work after interrupted delegation")
 
         async def controlled(request):
@@ -250,6 +256,8 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.Event().wait()
                     finally:
                         drained.set()
+                if interruption == "requests":
+                    return response(text="Nested write observed; remaining checks incomplete.")
                 self.assertEqual(interruption, "cost")
                 return response(text="Billed over budget", cost=0.2)
             return await original(request)
@@ -273,12 +281,12 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(task, 5)
         self.assertEqual(len(steered), 1)
         self.assertEqual(verify.await_count, 1)
-        self.assertEqual(result.stop_reason.value, "cancelled" if interruption == "cancel" else "budget")
+        self.assertEqual(result.stop_reason.value, "cancelled" if interruption == "cancel" else "budget", result.error)
         self.assertEqual((self.root / "latest.txt").read_text(), "latest revision\n")
         self.assertEqual(set(result.changed_files), {"first.txt", "latest.txt"})
         # A dispatched cancelled request is settled once as unknown usage, not omitted.
-        self.assertEqual(result.usage.requests, 6 if interruption == "requests" else 7)
-        self.assertAlmostEqual(result.usage.cost_usd, 0.26 if interruption == "cost" else 0.06)
+        self.assertEqual(result.usage.requests, 9 if interruption == "requests" else 7)
+        self.assertAlmostEqual(result.usage.cost_usd, 0.26 if interruption == "cost" else 0.09 if interruption == "requests" else 0.06)
         self.assertEqual(drained.is_set(), interruption == "cancel")
         self.assert_settled(result)
         assert result.verification is not None
