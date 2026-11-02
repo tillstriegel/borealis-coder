@@ -277,3 +277,21 @@ Also isolate the worker account, use read-only provider credentials where possib
 - Provider-side retention and training policies are outside Borealis.
 - No independent third-party security audit has been completed for version 0.1.3.
 - No application-level encryption or multi-tenant authorization is built into the core.
+
+## Delegated agent authority
+
+Recursive agents share the root's request/time/cost budgets and cannot change
+operator depth, cumulative descendant, provider concurrency or child-turn limits.
+Children default to read-only. Trusted `agent.swarm_allow_writes = true` permits
+only built-in write, replace, delete, mkdir and patch tools. The registry checks
+the capability at execution as well as schema selection. Descendants cannot gain
+more authority than their parent. Plan mode, approvals, allowed roots, protected
+paths, stale hashes and checkpoints remain effective.
+
+Delegates cannot use shell, Script/job control, or custom/external mutation tools.
+Each nested call uses the root runner's durable lifecycle; shared file changes
+reach root verification. Provider slots are released before tools, and mutation
+locks cover individual operations rather than recursive conversations. Fatal
+budgets and cancellation drain child work and settle billable usage before the
+root finishes. Task/result text in the swarm view is bounded, redacted through the
+EventBus, and rendered literally with control/bidi characters neutralized.

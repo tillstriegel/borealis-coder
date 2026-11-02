@@ -194,7 +194,9 @@ class ScriptScope:
         self.check()
         name = request["name"]
         tool = self.registry.get(name)
-        if tool is not None and not tool.script_accessible:
+        from .delegate import DelegateTaskTool
+
+        if tool is not None and (not tool.script_accessible or isinstance(tool, DelegateTaskTool | ScriptTool | ScriptJobTool)):
             raise ToolError("Recursive Script, job control and delegation are unavailable inside Script")
         context = replace(self.context, tool_call_id="", metadata={
             **self.context.metadata, "script_mode": True, "script_retain_result": self.retain_result,

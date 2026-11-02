@@ -84,6 +84,7 @@ from .compaction import (
     prune_provider_messages,
     validate_tool_call_order,
 )
+from .swarm import SwarmState, bounded_calls
 
 if TYPE_CHECKING:
     from ..mcp import MCPManager
@@ -716,12 +717,39 @@ class AgentRunner:
             except BudgetExceeded as error:
                 budget_error = error
             await finish_on_cancellation(asyncio.to_thread(self.sessions.add_usage, session_id, usage))
+            await self.events.emit(
+                "swarm.updated", session_id=session_id, run_id=run_id,
+                usage=budget.usage.to_dict() if budget.usage else {},
+                model_requests=budget.model_requests,
+                limits=context.metadata["swarm_state"].limits(),
+            )
             if budget_error is not None:
                 raise budget_error
 
         async def settled_usage_sink(usage: Usage) -> None:
             budget.add_usage(usage)
 
+        context.metadata["swarm_state"] = SwarmState.start(self.config.agent)
+
+        async def delegate_execute(call: ToolCall, nested_context: ToolContext) -> ToolResult:
+            results: list[ToolResult] = []
+            tool = self.tools.get(call.name)
+            try:
+                if tool is not None and tool.effect == Effect.WRITE:
+                    async with self._mutation_lock:
+                        await self._execute_one(call, nested_context, cancel, nested_results=results)
+                else:
+                    await self._execute_one(call, nested_context, cancel, nested_results=results)
+                return results[0]
+            finally:
+                if tool is not None and tool.effect == Effect.WRITE:
+                    context.metadata["swarm_state"].mutations += 1
+                if nested_context.mutation_tracking == "incomplete":
+                    self._mark_workspace_tracking_incomplete(
+                        context, lifecycle_only=nested_context.lifecycle_uncertainty_only,
+                    )
+
+        context.metadata["delegate_execute"] = delegate_execute
         context.metadata["budget"] = budget
         context.metadata["usage_sink"] = usage_sink
         context.metadata["before_model_request"] = budget.before_model_request
@@ -730,7 +758,7 @@ class AgentRunner:
         context.metadata["script_scope"] = scripts
         messages = await asyncio.to_thread(self.sessions.messages, session_id)
         tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
-        await self._recover_script_calls(tool_call_rows, context)
+        await self._recover_nested_calls(tool_call_rows, context)
         running_call_ids = {
             str(row["tool_call_id"])
             for row in tool_call_rows
@@ -783,6 +811,11 @@ class AgentRunner:
                 session_id=session_id,
                 run_id=run_id,
                 prompt=prompt,
+            )
+            await self.events.emit(
+                "swarm.started", session_id=session_id, run_id=run_id,
+                task=truncate_text(prompt, 160), limits=context.metadata["swarm_state"].limits(),
+                max_model_requests=self.config.agent.max_model_requests,
             )
         except Exception:
             self._cancel.pop(session_id, None)
@@ -1058,24 +1091,30 @@ class AgentRunner:
                         maximum=self.config.agent.max_repeated_calls,
                     )
                 )
-                tool_messages = await self._execute_calls(
-                    response_tool_calls,
-                    cancel,
-                    context,
-                )
-                for tool_message in tool_messages:
-                    messages.append(tool_message)
-                batch_may_mutate = any(
-                    (tool := self.tools.get(call.name)) is not None
-                    and tool.effective_mutation_scope != MutationScope.NONE
-                    and _tool_result_may_have_mutated(message)
-                    for call, message in zip(response_tool_calls, tool_messages, strict=True)
-                )
-                if batch_may_mutate:
-                    mutation_revision += 1
-                    verification_finalization_pending = False
-                    verification_final_answer_safe = False
-                    awaiting_repair = False
+                delegated_mutations_before = context.metadata["swarm_state"].mutations
+                batch_may_mutate = False
+                try:
+                    tool_messages = await self._execute_calls(
+                        response_tool_calls,
+                        cancel,
+                        context,
+                    )
+                    for tool_message in tool_messages:
+                        messages.append(tool_message)
+                    batch_may_mutate = any(
+                        (tool := self.tools.get(call.name)) is not None
+                        and tool.effective_mutation_scope != MutationScope.NONE
+                        and _tool_result_may_have_mutated(message)
+                        for call, message in zip(response_tool_calls, tool_messages, strict=True)
+                    )
+                finally:
+                    # Descendants reconcile their writes while draining even when
+                    # the batch exits through a fatal budget or cancellation.
+                    if batch_may_mutate or context.metadata["swarm_state"].mutations != delegated_mutations_before:
+                        mutation_revision += 1
+                        verification_finalization_pending = False
+                        verification_final_answer_safe = False
+                        awaiting_repair = False
                 investigation_progress.observe_results(tool_messages)
                 steered = await self._drain_steering(session_id, run_id, messages)
                 investigation_progress.reset_if(steered)
@@ -1436,14 +1475,39 @@ class AgentRunner:
                     )
         return ScriptScope(context, self.tools, execute_nested, self._mutation_lock, self._script_job_slots)
 
-    async def _recover_script_calls(self, rows: list[dict[str, Any]], context: ToolContext) -> None:
+    async def _recover_nested_calls(self, rows: list[dict[str, Any]], context: ToolContext) -> None:
+        """Settle abandoned nested receipts without adding child TOOL messages."""
         for row in rows:
-            if row["status"] == "running" and row["metadata"].get("script_job_id"):
+            metadata = row["metadata"]
+            delegated = bool(metadata.get("delegation_id"))
+            script = bool(metadata.get("script_job_id"))
+            if not (delegated or script):
+                continue
+            if row["status"] == "running":
+                tool = self.tools.get(row["tool_name"])
+                may_mutate = (
+                    script
+                    or metadata.get("workspace_change_tracking") == "incomplete"
+                    or tool is None
+                    or tool.effective_mutation_scope != MutationScope.NONE
+                )
+                metadata = {
+                    **metadata,
+                    "unknown_outcome": True,
+                    "recovery": "previous_run_ended",
+                    **({"workspace_change_tracking": "incomplete"} if may_mutate else {}),
+                }
+                owner = "delegated" if delegated else "Script"
                 await asyncio.to_thread(
                     self.sessions.complete_tool_call, context.session_id, row["tool_call_id"],
-                    output="Unknown outcome: owning Script run ended. Inspect effects before retrying.",
-                    is_error=True, metadata={"unknown_outcome": True, "workspace_change_tracking": "incomplete"},
+                    output=f"Unknown outcome: owning {owner} run ended. Inspect effects before retrying.",
+                    is_error=True, metadata=metadata,
                 )
+            elif not delegated:
+                continue
+            # Unknown mutation outcomes remain uncertain on subsequent resumes,
+            # including a crash after the recovery receipt was committed.
+            if metadata.get("unknown_outcome") and metadata.get("workspace_change_tracking") == "incomplete":
                 self._mark_workspace_tracking_incomplete(context)
 
     async def _script_notifications(self, scripts: ScriptScope, messages: list[Message], *, wait: bool = False) -> int:
@@ -3965,26 +4029,16 @@ class AgentRunner:
             tool = self.tools.get(call.name)
             (reads if tool and tool.concurrent and tool.effect == Effect.READ and tool.effective_mutation_scope == MutationScope.NONE else writes).append(call)
         script_scope = context.metadata.get("script_scope")
-        semaphore = asyncio.Semaphore(max(1, self.config.agent.parallel_reads))
 
         async def run_read(call: ToolCall):
-            async with semaphore:
-                self._check_cancel(cancel)
-                if isinstance(script_scope, ScriptScope):
-                    script_scope.check()
-                return await self._execute_one(call, context, cancel)
+            self._check_cancel(cancel)
+            if isinstance(script_scope, ScriptScope):
+                script_scope.check()
+            return await self._execute_one(call, context, cancel)
 
         try:
             if reads:
-                read_tasks = [asyncio.create_task(run_read(call)) for call in reads]
-                try:
-                    read_messages = await asyncio.gather(*read_tasks)
-                except BaseException as error:
-                    if isinstance(error, BudgetExceeded):
-                        for task in read_tasks:
-                            task.cancel()
-                    await asyncio.gather(*read_tasks, return_exceptions=True)
-                    raise
+                read_messages = await bounded_calls(reads, self.config.agent.parallel_reads, run_read)
                 messages.update(
                     {
                         call.id: message
@@ -4112,16 +4166,35 @@ class AgentRunner:
         *,
         nested_results: list[ToolResult] | None = None,
     ):
-        await asyncio.to_thread(
+        nested_metadata = None
+        if nested_results is not None:
+            nested_metadata = (
+                {"delegation_id": context.metadata["delegation_id"],
+                 "delegation_depth": context.metadata["delegation_depth"]}
+                if context.metadata.get("delegated") else
+                {"script_parent_id": context.metadata["script_parent_id"],
+                 "script_job_id": context.metadata["script_job_id"]}
+            )
+        start_call = asyncio.to_thread(
             self.sessions.start_tool_call,
             context.session_id,
             context.run_id,
             call.id,
             call.name,
             context.events.redactor.value(call.arguments) if nested_results is not None else call.arguments,
-            metadata=({"script_parent_id": context.metadata["script_parent_id"],
-                       "script_job_id": context.metadata["script_job_id"]} if nested_results is not None else None),
+            metadata=nested_metadata,
         )
+        if nested_results is None:
+            await start_call
+        else:
+            try:
+                await finish_on_cancellation(start_call)
+            except asyncio.CancelledError:
+                await finish_on_cancellation(asyncio.to_thread(
+                    self._cancel_tool_call_if_running, context.session_id, call.id,
+                    reason="Run cancelled before nested tool execution", message=None,
+                ))
+                raise
         workspace_before = None
         tool = self.tools.get(call.name)
         mutation_scope = (
@@ -4185,16 +4258,13 @@ class AgentRunner:
                     await asyncio.to_thread(
                         self.sessions.complete_tool_call, context.session_id, call.id,
                         output="Nested tool result collection failed; inspect partial effects before retrying.",
-                        is_error=True, metadata={"script_job_id": context.metadata["script_job_id"],
-                                                 "script_parent_id": context.metadata["script_parent_id"],
-                                                 "workspace_change_tracking": "incomplete"},
+                        is_error=True, metadata={**(nested_metadata or {}), "workspace_change_tracking": "incomplete"},
                     )
             raise
         if nested_results is not None:
             nested_results.append(result)
             result = replace(result, output=truncate_text(result.output, context.config.context.tool_output_chars), data=None)
-            result.metadata = {**result.metadata, "script_parent_id": context.metadata["script_parent_id"],
-                               "script_job_id": context.metadata["script_job_id"]}
+            result.metadata = {**result.metadata, **(nested_metadata or {})}
         cancellation_message = self._tool_result_message(call, result)
         workspace_reconciled = workspace_before is None
         try:

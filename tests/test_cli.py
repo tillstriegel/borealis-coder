@@ -1298,10 +1298,12 @@ class CLITests(unittest.TestCase):
                 history_enabled=False,
             )
             shell.renderer._status_stream = TTYBuffer()
-            with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()):
+            with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()), patch.dict(os.environ, {"TERM": "xterm-256color"}):
                 self.assertTrue(shell._concurrent_input())
+            with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()), patch.dict(os.environ, {"TERM": "dumb"}):
+                self.assertFalse(shell._concurrent_input())
             shell.renderer._status_stream = io.StringIO()
-            with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()):
+            with patch("borealis_coder.interactive.sys.stdin", TTYBuffer()), patch.dict(os.environ, {"TERM": "xterm-256color"}):
                 self.assertFalse(shell._concurrent_input())
 
     def test_terminal_input_preserves_cursor_position_when_editing(self) -> None:

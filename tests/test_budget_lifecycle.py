@@ -33,7 +33,9 @@ class BudgetLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.provider = provider
 
     def assert_finished_calls(self, result, expected):
-        rows = self.runner.sessions.tool_calls(result.session_id)
+        all_rows = self.runner.sessions.tool_calls(result.session_id)
+        self.assertNotIn("running", {row["status"] for row in all_rows})
+        rows = [row for row in all_rows if not row["metadata"].get("delegation_id")]
         self.assertEqual({row["tool_call_id"] for row in rows}, set(expected))
         self.assertNotIn("running", {row["status"] for row in rows})
         messages = self.runner.sessions.messages(result.session_id)
@@ -101,7 +103,7 @@ class BudgetLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.runner.events.subscribe(observe)
         result = await self.runner.run("inspect")
         self.assertEqual(result.stop_reason.value, "budget")
-        self.assertEqual(statuses_at_completion, ["error"])
+        self.assertCountEqual(statuses_at_completion, ["error", "completed"])
         messages = self.assert_finished_calls(result, {"delegate"})
         self.assertEqual(messages["delegate"].metadata["budget_kind"], "model_requests")
         self.assertNotIn("unknown_outcome", messages["delegate"].metadata)

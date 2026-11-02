@@ -205,7 +205,7 @@ Quoted Git paths must be expressed as literal paths in an envelope.
 ### Programmatic tool calling
 
 The default provider surface contains `script`, `script_job`, `discover_tools`
-and the separate read-only `delegate_task` capability. A compact names catalog
+and the separate `delegate_task` capability. A compact names catalog
 appears in discovery's description. Discovery pages the live built-in/plugin/MCP
 registry and returns complete argument schemas on request. Its `next_offset`
 explicitly identifies incomplete pages; an oversized single contract returns an
@@ -356,7 +356,12 @@ Borealis uses `asyncio` throughout.
 - Read-only tool calls from one model response can run concurrently up to `agent.parallel_reads`.
 - Mutations and shell effects remain ordered.
 - Provider and subprocess cancellation propagate from the session cancellation event.
-- Delegated read-only subagents receive a restricted registry and independent context, then return a bounded report to the parent tool call.
+- Delegates use isolated conversations and a capability-filtered palette. The registry checks that same boundary even for hallucinated calls and tool aliases. Trusted `swarm_allow_writes` grants only built-in file/patch tools; Script, shell and external mutations remain excluded.
+- One `SwarmState` per root run owns atomic cumulative admission and delegated provider slots. Defaults are depth 2 (root 0), 8 descendants, 2 provider operations and 6 turns per child. Depth/total zero disables delegation. Slots never span child tool execution.
+- Tool batches allocate a fixed worker set. Fatal exits cancel and drain those workers recursively, including usage settlement, before parent completion. Provider retries share root request/time/cost budgets. Each agent reports only its own usage; one root sink owns accounting.
+- Descendant calls use `_execute_one` and the canonical registry, with namespaced durable call IDs and delegation metadata. Their results are stored separately from root TOOL messages. Shared changed-file/root sets and mutation revisions feed root verification, including after fatal budgets and cancellation drain. Mutation gates cover individual writes, never a recursive parent conversation.
+- Resume settles abandoned nested delegation rows as unknown outcomes without replay or child TOOL messages in the root conversation. It preserves attribution and carries possible mutation uncertainty into root verification on subsequent resumes. Interrupted known delegated read-only calls settle without making workspace tracking uncertain.
+- `delegate.started/state/usage/completed/failed/cancelled/refused` events carry lineage, bounded task labels, capability and shared limits. Aurora's event-driven `SwarmView` renders these events in the existing prompt-toolkit shell; the same state supports plain inspection. The view caps retained nodes at 256 and reports omissions; full lifecycle evidence remains in the session events.
 
 ## Data and cache invariants
 

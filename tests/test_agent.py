@@ -3020,7 +3020,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertNotEqual(nested_read.run_id, result.run_id)
                 durable = runner.sessions.tool_calls(result.session_id)
-                self.assertEqual([item["tool_name"] for item in durable], ["delegate_task"])
+                self.assertCountEqual([item["tool_name"] for item in durable], ["delegate_task", "read_file"])
+                nested_durable = next(item for item in durable if item["tool_name"] == "read_file")
+                self.assertEqual(nested_durable["run_id"], nested_read.run_id)
+                self.assertEqual(nested_durable["metadata"]["delegation_id"], delegated_start.data["delegation_id"])
+                self.assertEqual(nested_durable["status"], "completed")
+                self.assertFalse(any(message.tool_name == "read_file" for message in
+                                     runner.sessions.messages(result.session_id)))
             finally:
                 await runner.close()
 

@@ -173,6 +173,21 @@ Common commands inside the shell:
 | `/paste` | Enter a multiline task and finish it with a line containing only `/end`. |
 | `/exit` or `/quit` | Close the shell. |
 
+Delegation supports bounded recursive swarms. Defaults allow two levels, eight
+cumulative descendants, two simultaneous delegated provider operations, and six
+turns per child. Children are read-only by default. To allow built-in workspace
+file edits, set `agent.swarm_allow_writes = true` in trusted configuration or use
+`/swarm-writes on` for future shell turns. Normal approvals, protected paths,
+checkpoints, and verification still apply; children cannot use shell or Script.
+Set `swarm_max_depth` or `swarm_max_descendants` to `0` to disable delegation.
+See [configuration](docs/CONFIGURATION.md#recursive-delegation).
+
+The live Aurora swarm tree appears when delegation starts. Press **F6** to inspect
+agents with arrows, **Left/Right** to fold/expand, **Page Up/Down** for evidence,
+and **Enter** to return to your draft. **F7** or `/swarm` toggles the view. The tree
+shows inherited permissions, live state, and shared limits without replacing
+terminal scrollback. See [interactive controls](docs/INTERACTIVE_CLI.md#live-swarm-view).
+
 Press Ctrl+C while a turn is running to cancel that turn and retain the shell and
 session. At the input prompt, Ctrl+C exits. Prefix a literal slash-leading prompt
 with another slash, such as `//explain /api/users`.

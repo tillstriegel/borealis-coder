@@ -1092,8 +1092,13 @@ class SessionStore:
         reason: str = "cancelled",
         message: Message | None = None,
     ) -> None:
-        metadata_json = json_dumps({"cancelled": True})
         with self._lock, self._connection:
+            previous = self._connection.execute(
+                "SELECT metadata_json FROM tool_calls WHERE session_id=? AND tool_call_id=?",
+                (session_id, call_id),
+            ).fetchone()
+            metadata = json.loads(previous["metadata_json"] or "{}") if previous else {}
+            metadata_json = json_dumps({**metadata, "cancelled": True})
             cursor = self._connection.execute(
                 """UPDATE tool_calls SET
                     output=?,is_error=1,status='cancelled',completed_at=?,metadata_json=?

@@ -76,6 +76,48 @@ non-color output uses a persistent heartbeat every ten seconds instead.
 These messages describe observable runtime state. Borealis does not expose
 private model reasoning or stream raw tool arguments to the terminal.
 
+## Live swarm view
+
+The Aurora swarm tree appears automatically on delegation. It stays in a bounded
+region beside the editable prompt and preserves normal terminal scrollback.
+Rows show parent/child relationships, state, and `read-only` or `write` capability.
+Selected detail shows bounded results, errors and evidence. The shared receipt
+shows cumulative admitted descendants (`Agents`), active delegated provider work,
+root request usage and authoritative root spend. The footer counts tree entries,
+including the root and refusals but excluding descendants hidden by folding.
+Unknown spend is labelled; per-agent usage
+is never summed into the root receipt again. At most 256 nodes are retained in the
+view, with an omission count. Session events retain the full lineage.
+
+| Control | Action |
+|---|---|
+| F6 | Show/focus the swarm inspector; press again to return to input. |
+| Up / Down | Select an agent while the inspector has focus. |
+| Left / Right | Collapse / expand the selected branch. |
+| Page Up / Page Down | Scroll selected evidence. |
+| Enter / Escape | Return to the current input draft and cursor. |
+| F7 or `/swarm` | Toggle the tree, including during active work. |
+| `/swarm-writes [on or off]` | Inspect/change file-write permission for future turns in this process. |
+
+Ctrl+C, approvals, EOF and queued follow-ups keep their existing behavior.
+Resize preserves selection and the draft. Narrow screens clip rows and scroll the
+selected region. `NO_COLOR` uses a monochrome view; dumb terminals and redirected
+input use the serial shell. JSON mode never starts the live UI. Task and result
+text cannot inject ANSI controls, terminal commands, or bidi overrides.
+
+An offline synthetic demo uses the production runner, file tools, event model,
+and prompt-toolkit compositor. It makes no live provider requests:
+
+```bash
+PYTHONPATH=src python scripts/swarm_demo.py
+# Export actual screen cells, text and SVG at a chosen terminal size:
+PYTHONPATH=src python scripts/swarm_demo.py --capture-dir /path/to/captures --width 80 --height 24
+```
+
+The fixture demonstrates nested/concurrent work, a workspace write, provider
+failure, capacity refusal and cancellation. Demo files use an isolated temporary
+workspace and disappear when the demo exits.
+
 ## Follow-up steering
 
 On an interactive TTY, the prompt stays available while Borealis is working.
@@ -90,7 +132,7 @@ cursor position, and wrapped text stable while Borealis streams model and tool o
 above it. Borealis pauses the animated activity pulse during input and coalesces rapid
 terminal writes, so refreshes cannot erase or split the input buffer.
 
-Slash-prefixed input typed while a turn is active is treated as steering text,
+Except for `/swarm`, slash-prefixed input typed while a turn is active is treated as steering text,
 not as an interactive command. Wait for the normal session prompt to run `/help`,
 `/status`, `/exit`, or another shell command. Redirected stdin remains serial and
 waits for each turn to finish before reading the next line.
@@ -134,6 +176,8 @@ in bounded form.
 | Command | Description |
 |---|---|
 | `/help` | Show the built-in command reference. |
+| `/swarm` | Toggle the live tree; F6 focuses it during work. |
+| `/swarm-writes [on or off]` | Show/change delegated file-write permission for future turns. |
 | `/status` | Show route, safety, sandbox, verification, session, and cumulative usage. |
 | `/session` | Show the current workspace, provider, model, and session ID. |
 | `/sessions [N]` | List up to N recent sessions for this workspace. |
