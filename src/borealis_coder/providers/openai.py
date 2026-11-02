@@ -118,7 +118,7 @@ class OpenAIProvider(Provider):
                 raise
             if error.usage is not None:
                 prior_usage.add(error.usage)
-        self.before_recovery_request()
+        self.before_recovery_request(request)
         try:
             response = await self._complete_responses_once(request, include_reasoning_summary=False)
         except ProviderError as error:
@@ -167,7 +167,7 @@ class OpenAIProvider(Provider):
                 raise
             if error.usage is not None:
                 prior_usage.add(error.usage)
-        self.before_recovery_request()
+        self.before_recovery_request(request)
         try:
             async for event in self._stream_responses_committed_once(
                 request, include_reasoning_summary=False,
@@ -554,8 +554,16 @@ class OpenAIProvider(Provider):
             payload["stream_options"] = {"include_usage": True}
         return payload
 
+    def _empty_chat_recovery_request(self, request: ProviderRequest) -> ProviderRequest:
+        # Generic compatible endpoints historically recover by omitting controls.
+        return replace(request, reasoning_effort=None)
+
+    def _unsupported_chat_recovery_request(self, request: ProviderRequest) -> ProviderRequest:
+        return replace(request, reasoning_effort=None)
+
     async def _complete_chat(self, request: ProviderRequest) -> ModelResponse:
         prior_usage = Usage()
+        fallback = self._unsupported_chat_recovery_request(request)
         try:
             response = await self._complete_chat_once(request)
         except ProviderError as error:
@@ -566,16 +574,17 @@ class OpenAIProvider(Provider):
         else:
             if _has_actionable_output(response):
                 return response
-            if not request.reasoning_effort:
+            fallback = self._empty_chat_recovery_request(request)
+            if fallback.reasoning_effort == request.reasoning_effort:
                 raise ProviderUnavailableError(
                     "OpenAI-compatible provider returned an empty response",
                     retryable=True,
                     usage=response.usage,
                 )
             prior_usage.add(response.usage)
-        self.before_recovery_request()
+        self.before_recovery_request(fallback)
         try:
-            response = await self._complete_chat_once(replace(request, reasoning_effort=None))
+            response = await self._complete_chat_once(fallback)
         except ProviderError as error:
             _attach_usage_to_error(error, prior_usage)
             raise
@@ -604,8 +613,10 @@ class OpenAIProvider(Provider):
     async def _stream_chat(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         actionable_output_emitted = False
         empty_response = False
+        recover_empty = False
         pending_reasoning: list[ProviderStreamEvent] = []
         prior_usage = Usage()
+        fallback = self._unsupported_chat_recovery_request(request)
         try:
             async for event in self._stream_chat_once(request):
                 if event.type == "reasoning_summary_delta" and not actionable_output_emitted:
@@ -627,6 +638,8 @@ class OpenAIProvider(Provider):
                     prior_usage.add(event.response.usage)
                     event.response.reasoning_summary = ""
                     empty_response = True
+                    fallback = self._empty_chat_recovery_request(request)
+                    recover_empty = fallback.reasoning_effort != request.reasoning_effort
                     continue
                 if event.type in {"text_delta", "tool_call_delta"}:
                     for pending in pending_reasoning:
@@ -644,11 +657,11 @@ class OpenAIProvider(Provider):
             if error.usage is not None:
                 prior_usage.add(error.usage)
             empty_response = True
-        if request.reasoning_effort and not actionable_output_emitted and empty_response:
+            recover_empty = True
+        if recover_empty and not actionable_output_emitted and empty_response:
             pending_reasoning.clear()
-            fallback = replace(request, reasoning_effort=None)
             fallback_output_emitted = False
-            self.before_recovery_request()
+            self.before_recovery_request(fallback)
             try:
                 async for event in self._stream_chat_once(fallback):
                     if event.type == "reasoning_summary_delta" and not fallback_output_emitted:

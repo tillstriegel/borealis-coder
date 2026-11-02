@@ -41,6 +41,11 @@ class AgentConfig:
     max_turns: int = 60
     max_model_requests: int = 40
     max_read_only_turns: int = 8
+    swarm_max_depth: int = 2
+    swarm_max_descendants: int = 8
+    swarm_max_concurrent: int = 2
+    swarm_max_turns: int = 6
+    swarm_allow_writes: bool = False
     max_input_tokens: int = 180_000
     compact_at_ratio: float = 0.82
     max_output_tokens: int = 16_000
@@ -607,6 +612,17 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("script.foreground_seconds cannot exceed 300")
     if config.script.result_bytes + 1024 > config.script.ipc_bytes:
         raise ConfigurationError("script.ipc_bytes must exceed result_bytes by at least 1024")
+    if not isinstance(config.agent.swarm_allow_writes, bool):
+        raise ConfigurationError("agent.swarm_allow_writes must be a boolean")
+    for name, minimum in (("swarm_max_depth", 0), ("swarm_max_descendants", 0),
+                          ("swarm_max_concurrent", 1), ("swarm_max_turns", 1)):
+        value = getattr(config.agent, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ConfigurationError(f"agent.{name} must be an integer >= {minimum}")
+    if config.agent.swarm_max_depth > 16:
+        raise ConfigurationError("agent.swarm_max_depth cannot exceed 16")
+    if config.agent.swarm_max_turns > 16:
+        raise ConfigurationError("agent.swarm_max_turns cannot exceed 16")
     if config.agent.max_turns < 1:
         raise ConfigurationError("agent.max_turns must be positive")
     if config.agent.max_model_requests < 1:

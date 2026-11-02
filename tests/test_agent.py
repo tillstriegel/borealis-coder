@@ -3020,7 +3020,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertNotEqual(nested_read.run_id, result.run_id)
                 durable = runner.sessions.tool_calls(result.session_id)
-                self.assertEqual([item["tool_name"] for item in durable], ["delegate_task"])
+                self.assertCountEqual([item["tool_name"] for item in durable], ["delegate_task", "read_file"])
+                nested_durable = next(item for item in durable if item["tool_name"] == "read_file")
+                self.assertEqual(nested_durable["run_id"], nested_read.run_id)
+                self.assertEqual(nested_durable["metadata"]["delegation_id"], delegated_start.data["delegation_id"])
+                self.assertEqual(nested_durable["status"], "completed")
+                self.assertFalse(any(message.tool_name == "read_file" for message in
+                                     runner.sessions.messages(result.session_id)))
             finally:
                 await runner.close()
 
@@ -3150,7 +3156,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     and message.tool_name == "delegate_task"
                 )
                 self.assertTrue(delegate_result.is_error)
-                self.assertIn("without the required textual conclusion", delegate_result.content)
+                self.assertIn("runtime handoff", delegate_result.content)
+                self.assertIn("tool_call_on_final_turn", delegate_result.content)
+                self.assertEqual(delegate_result.metadata["completion_status"], "incomplete")
                 self.assertEqual(result.text, "Done.")
             finally:
                 await runner.close()
@@ -4249,14 +4257,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 head.write_text("after\n")
                 session_id = next(iter(runner._cancel))
                 self.assertTrue(runner.cancel(session_id))
-                return ProcessResult(
-                    command="git commit",
-                    exit_code=0,
-                    stdout="committed",
-                    stderr="",
-                    duration_ms=1,
-                    lifecycle_complete=True,
-                )
+                # The mutation committed, but its result has not been delivered.
+                # Keep it pending so this tests cancellation, not the supported
+                # competing schedule where a completed result wins cancellation.
+                await asyncio.Event().wait()
+                self.fail("Cancellation should interrupt delivery of the commit result")
 
             try:
                 with patch.object(

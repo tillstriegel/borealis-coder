@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import os
 import shlex
 import signal
 import sys
@@ -21,6 +22,7 @@ from .diagnostics import run_diagnostics
 from .errors import BorealisError, ConfigurationError, SessionError
 from .models import AgentResult, Event, Role
 from .safety import ApprovalRequest
+from .swarm_view import SwarmView
 from .terminal import AuroraUI, ConsoleRenderer, ReadlineHistory
 from .terminal_input import LineBufferedStdout, TerminalInput, TerminalInputInterrupted
 from .tools._workspace_lock import workspace_transaction
@@ -31,6 +33,8 @@ ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
 
 _COMMAND_OPTIONS = (
     ("/help", "Show every command and keyboard control"),
+    ("/swarm", "Toggle live swarm tree (F6 inspect, F7 hide)"),
+    ("/swarm-writes", "Show or change delegated file-write permission"),
     ("/status", "Inspect runtime, safety, usage, and cache health"),
     ("/session", "Show the active workspace, route, and session"),
     ("/sessions", "Browse recent sessions in this workspace"),
@@ -97,6 +101,7 @@ class InteractiveCLI:
             tuple[ApprovalRequest, asyncio.Future[str]]
         ] = asyncio.Queue()
         self._input: TerminalInput | None = None
+        self.swarm = SwarmView()
 
     @property
     def ui(self) -> AuroraUI:
@@ -124,6 +129,7 @@ class InteractiveCLI:
                 self.renderer._status_stream = sys.stdout
                 self._input = TerminalInput(
                     history_file,
+                    swarm=self.swarm,
                     history_enabled=self.history_enabled,
                     completions=_COMMANDS,
                     completion_descriptions=_COMMAND_DESCRIPTIONS,
@@ -254,6 +260,8 @@ class InteractiveCLI:
                                 line, pending_approval[1]
                             ):
                                 pending_approval = None
+                        elif line == "/swarm":
+                            await self._command(line)
                         elif line and completed_role in {"follow_up", "next_turn"}:
                             self._queue_follow_up(_unescape_prompt(line))
                         elif line.startswith("//"):
@@ -380,6 +388,8 @@ class InteractiveCLI:
     async def _render_event(self, event: Event) -> None:
         """Render every event; prompt-toolkit keeps the input line stable."""
 
+        if self.swarm.adopt(event) and self._input is not None:
+            self._input.invalidate()
         await self.renderer.handle(event)
 
     async def _select_initial_session(self) -> None:
@@ -417,7 +427,7 @@ class InteractiveCLI:
         return self.ui.prompt(short)
 
     def _concurrent_input(self) -> bool:
-        return _is_tty(sys.stdin) and _is_tty(self.renderer.status_stream)
+        return os.getenv("TERM") != "dumb" and _is_tty(sys.stdin) and _is_tty(self.renderer.status_stream)
 
     def _input_prompt(self, active: bool) -> str:
         if not _is_tty(sys.stdin):
@@ -469,6 +479,7 @@ class InteractiveCLI:
         return await future
 
     def _show_approval(self, request: ApprovalRequest) -> None:
+        self.swarm.focused = False
         self.renderer.finish_turn()
         self.ui.panel(
             "Approval required",
@@ -598,6 +609,19 @@ class InteractiveCLI:
             return True, None
         if command == "/help":
             self._print_help()
+        elif command == "/swarm":
+            self.swarm.visible = not self.swarm.visible
+            self.swarm.focused = False
+            if self._input is not None:
+                self._input.invalidate()
+            else:
+                print("".join(fragment[1] for fragment in self.swarm.render(80, 20)))
+        elif command == "/swarm-writes":
+            await self._set_boolean(
+                args, label="delegated file writes",
+                getter=lambda config: config.agent.swarm_allow_writes,
+                setter=lambda config, value: setattr(config.agent, "swarm_allow_writes", value),
+            )
         elif command in {"/new", "/clear"}:
             self.session_id = None
             self.ui.notice(
@@ -946,6 +970,8 @@ class InteractiveCLI:
                 (
                     "Session",
                     [
+                        ("/swarm", "live tree · F6 inspect · F7 hide"),
+                        ("/swarm-writes [on|off]", "delegated file writes for future turns"),
                         ("/status", "runtime, safety, session, and usage"),
                         ("/session", "active workspace, route, and session"),
                         ("/sessions [N]", "recent sessions in this workspace"),

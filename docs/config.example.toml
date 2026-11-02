@@ -11,6 +11,12 @@ reasoning_effort = "medium"
 max_turns = 60
 max_model_requests = 40
 max_read_only_turns = 8
+# Root depth is 0. Set depth or descendants to 0 to disable delegation.
+swarm_max_depth = 2
+swarm_max_descendants = 8 # Cumulative admissions; excludes root, never recycled.
+swarm_max_concurrent = 2 # Delegated provider work only, released before tools.
+swarm_max_turns = 6
+swarm_allow_writes = false # Trusted opt-in for built-in file/patch tools only.
 max_input_tokens = 180000
 compact_at_ratio = 0.82
 max_output_tokens = 16000

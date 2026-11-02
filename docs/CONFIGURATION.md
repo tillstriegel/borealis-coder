@@ -62,7 +62,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 |---|---:|---|
 | `provider` | `"auto"` | Provider route name. Auto checks API-key providers, then a usable ChatGPT/Codex login, then local compatible and mock routes. |
 | `model` | `""` | Global model override. Empty uses the selected provider’s model. |
-| `small_model` | `""` | Optional cheaper/faster model for delegated tasks and LLM compaction. |
+| `small_model` | `""` | Optional cheaper/faster model for LLM compaction. Delegates use the primary route. |
 | `provider_fallbacks` | `[]` | Ordered provider route names tried after the primary route fails. |
 | `reasoning_effort` | `"medium"` | Adapter hint for providers/models that expose reasoning controls. |
 | `max_turns` | `60` | Maximum primary model turns per run. The final turn has tools disabled so the model can finish cleanly. |
@@ -71,9 +71,14 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
 | `max_time_seconds` | `3600` | End-to-end run wall-time ceiling. |
 | `max_cost_usd` | `0.0` | Opt-in cumulative dollar ceiling. Positive limits require configured pricing. |
-| `max_model_requests` | `40` | Logical parent, delegate, and summarizer request ceiling for one run. Advisory guidance shows remaining requests/turns when either has at most two left. It keeps ordinary tools available; the ceiling still stops admission. |
+| `max_model_requests` | `40` | Hard parent, delegate, summarizer, retry and recovery request ceiling for one run. Guidance shows remaining capacity. After delegation, the final root request is synthesis-only; closure reservations stay within this ceiling. Non-delegating investigation checkpoints keep tools available. |
 | `max_read_only_turns` | `8` | Investigation checkpoint interval in tool rounds without file changes. Guidance asks for findings or a concrete next step; tools remain available. Novel successful output resets the stalled-round counter. Repeated-call and global budgets still stop admission. |
 | `parallel_reads` | `8` | Maximum concurrent read-only tool calls. |
+| `swarm_max_depth` | `2` | Maximum delegation depth, root = 0; `1` permits children only, `0` disables delegation. Integer 0–16. |
+| `swarm_max_descendants` | `8` | Cumulative admitted descendants per root run, excluding root; `0` disables delegation. Completed, failed, and cancelled children still consume admission. |
+| `swarm_max_concurrent` | `2` | Simultaneous delegated provider operations, including their retries/backoff and usage settlement. Positive integer. Slots are released before child tools run. |
+| `swarm_max_turns` | `6` | Per-child turn ceiling, integer 1–16; effective turns = min(requested `max_turns`, ceiling). Final turn has no tools. |
+| `swarm_allow_writes` | `false` | Permit built-in workspace file/patch tools in children and descendants, subject to inherited capability and normal policy. Does not grant shell, network, external mutations, or Script access. |
 | `max_repeated_calls` | `3` | Repeated identical call threshold for stuck detection. |
 | `auto_verify` | `true` | Run project verification after mutations. |
 | `auto_verify_max_seconds` | `900` | Verification time budget. |
@@ -87,6 +92,55 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `compaction_summarizer_input_tokens` | `32000` | Maximum input tokens for one summary chunk. |
 | `compaction_summarizer_total_input_tokens` | `96000` | Maximum input tokens across all summary chunks. |
 | `compaction_shadow_v2` | `false` | Generate safe v2 size metrics while compatibility v1 remains active. |
+
+### Recursive delegation
+
+`delegate_task(task, max_turns)` keeps a separate conversation at each depth.
+The limits above are trusted operator settings in the user config, explicit
+`--config`, or environment. Repository config cannot change them without the
+external workspace-authority opt-in. Model arguments cannot change these limits
+or enable writes. `/swarm-writes on` enables file writes for future interactive
+turns in the current process; `/swarm-writes off` revokes them.
+
+Admission is atomic before child preparation. The total is cumulative, not a
+reusable pool. Each tool batch uses at most `parallel_reads` workers rather than
+allocating a task per requested call; admitted agent conversations are bounded
+by `swarm_max_descendants`. Provider waiters are therefore bounded by the admitted
+agents. Provider slots cover only delegated provider work, not the root provider
+or file tools. A parent releases its slot before awaiting descendants, so a
+concurrency limit of 1 supports recursion. Built-in mutations use the runner's
+mutation gate and their existing workspace transactions.
+
+Root request/time/cost limits cover descendants and delegated retries, recovery,
+and context overflow. Every provider charge is settled once at the root. Per-agent
+usage describes that agent's own requests; it is not another charge or a subtree
+sum. Cancellation and fatal budgets cancel and drain owned tool workers before
+returning. Delegation is local to a root run; it is not a persistent job service.
+
+Delegates receive direct-tool instructions and discovery filtered to their inherited
+palette. Explicit discovery of a forbidden tool reports it unavailable; the execution
+guard remains independent. Script instructions and the root catalog are not child
+capabilities. Optional values use JSON `null`, not the literal string `"null"`.
+
+Before child work starts, the run reserves one request for root synthesis and one
+for each active child's conclusion. Investigative work, nested admissions and
+retries cannot spend another agent's closure request. A child switches to a
+tool-free conclusion when investigative capacity is exhausted; it may start with
+only that conclusion turn, or be refused if even closure cannot fit. Reservations
+are consumed on dispatch or released when the child settles. They do not increase
+the request ceiling or guarantee a successful model answer.
+
+Empty answers, raw tool protocol and incomplete provider output are not successful
+child findings. An early incomplete or malformed answer can use one remaining
+child turn for an explicit tool-free final handoff, never extra turns. If the
+model cannot conclude, a runtime-generated handoff reports the stop cause, task,
+latest attributed observations, known edits, verification limits and remaining
+work. It is marked `completion_status=incomplete`, `result_source=runtime`, not
+successful model findings. Cancellation and fatal budgets retain that handoff
+without further model dispatch. Root stop reports likewise retain direct and
+delegated evidence. These guarantees require the process and durable store to
+remain available; they do not cover SIGKILL or storage failure. A
+`tool_call_id` is a history reference; it is not a `read_artifact` identifier.
 
 ## `[safety]`
 
@@ -241,6 +295,14 @@ applies on append, checkpoint retention applies after a complete new checkpoint 
 | `allow_custom_chatgpt_endpoints` | ChatGPT only: first half of the dual opt-in for non-default API/OAuth endpoints. The process must also set `BOREALIS_ALLOW_CUSTOM_CHATGPT_ENDPOINTS=1`. |
 
 Model identifiers change over time. Treat built-in IDs as dated defaults, not a guarantee of account availability.
+
+For OpenRouter Chat Completions, empty or reasoning-only output gets one bounded
+recovery with `reasoning: {"effort": "none"}`. Omitting reasoning controls leaves
+default-on models enabled; `exclude: true` only hides tokens. An initial omitted
+effort still preserves the provider default. Unsupported-control recovery instead
+omits reasoning controls, including conflicting `extra_body` controls. These are
+distinct recovery intents for both complete and streaming requests, subject to the
+same hard request budget. See OpenRouter's [reasoning contract](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
 ## `[cache]`
 

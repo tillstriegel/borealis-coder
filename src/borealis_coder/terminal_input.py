@@ -13,12 +13,19 @@ from pathlib import Path
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition, is_done
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input import Input
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.output import Output
 from prompt_toolkit.patch_stdout import StdoutProxy
 from prompt_toolkit.shortcuts import CompleteStyle
+from prompt_toolkit.styles import Style
+
+from .swarm_view import SwarmView
 
 _HISTORY_TIMESTAMP = re.compile(r"^# \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 _LIBEDIT_HEADER = "_HiStOrY_V2_"
@@ -136,7 +143,44 @@ class TerminalInput:
         completion_descriptions: dict[str, str],
         input: Input | None = None,
         output: Output | None = None,
+        swarm: SwarmView | None = None,
     ) -> None:
+        self.swarm = swarm or SwarmView()
+        bindings = KeyBindings()
+
+        @bindings.add("f6")
+        def focus_swarm(event):
+            self.swarm.visible = True
+            self.swarm.focused = not self.swarm.focused
+
+        @bindings.add("f7")
+        def toggle_swarm(event):
+            self.swarm.visible = not self.swarm.visible
+            self.swarm.focused = False
+
+        focused = Condition(lambda: self.swarm.visible and self.swarm.focused)
+
+        @bindings.add("up", filter=focused)
+        @bindings.add("down", filter=focused)
+        def select_agent(event):
+            self.swarm.move(-1 if event.key_sequence[0].key == "up" else 1)
+
+        @bindings.add("left", filter=focused)
+        @bindings.add("right", filter=focused)
+        def fold_agent(event):
+            self.swarm.collapse(event.key_sequence[0].key == "left")
+
+        @bindings.add("pageup", filter=focused)
+        @bindings.add("pagedown", filter=focused)
+        def scroll_detail(event):
+            self.swarm.detail_offset = max(0, self.swarm.detail_offset +
+                                          (-3 if event.key_sequence[0].key == "pageup" else 3))
+
+        @bindings.add("enter", filter=focused)
+        @bindings.add("escape", filter=focused)
+        def return_to_input(event):
+            self.swarm.focused = False
+
         self._history_file = history_file
         if history_enabled:
             history_file.parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +194,11 @@ class TerminalInput:
             sentence=True,
         )
         self._session: PromptSession[str] = PromptSession(
+            key_bindings=bindings,
+            style=Style.from_dict({
+                "swarm.title": "ansicyan bold", "swarm.muted": "ansibrightblack",
+                "swarm.text": "", "swarm.selected": "ansigreen bold",
+            }) if "NO_COLOR" not in os.environ and os.getenv("TERM") != "dumb" else Style([]),
             history=history,
             completer=completer,
             complete_while_typing=True,
@@ -158,8 +207,24 @@ class TerminalInput:
             input=input,
             output=output,
         )
+        layout = self._session.app.layout
+        layout.container = HSplit([
+            ConditionalContainer(
+                Window(FormattedTextControl(self._swarm_toolbar), dont_extend_height=True,
+                       wrap_lines=False),
+                filter=Condition(lambda: self.swarm.visible) & ~is_done,
+            ),
+            layout.container,
+        ])
         self._history_enabled = history_enabled
         self.reading = False
+
+    def _swarm_toolbar(self):
+        size = self._session.app.output.get_size()
+        return self.swarm.render(size.columns, max(1, min(16, size.rows - 10)))
+
+    def invalidate(self) -> None:
+        self._session.app.invalidate()
 
     @property
     def current_text(self) -> str:

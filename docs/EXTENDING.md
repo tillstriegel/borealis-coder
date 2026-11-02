@@ -52,7 +52,7 @@ Script redacts and archives nested results before transport and rejects oversize
 overdeep or non-JSON results. Tool errors reject with `error.result` and count
 against job status even if caught. Script/job control and delegation are excluded
 from nested calls through `Tool.script_accessible = False`, including aliases;
-read-only delegates keep their direct tool palette.
+delegates keep their direct capability-filtered tool palette. Delegates may recurse, but Script cannot call delegation tools, including aliases/subclasses. Custom WRITE tools are not admitted by the delegated file-write opt-in.
 
 ## Installed-package tools
 

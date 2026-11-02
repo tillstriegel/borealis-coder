@@ -106,7 +106,7 @@ class WriteFileTool(Tool):
             context.changed_roots.add(resolved.root)
         return ToolResult(
             f"Wrote {size} bytes to {resolved.display}\nsha256: {sha256_text(content)}",
-            metadata={"path": resolved.display, "sha256": sha256_text(content), "checkpoint_id": checkpoint.id if checkpoint else None, "created": not existed},
+            metadata={"path": resolved.display, "changed_path_roots": {resolved.display: [str(resolved.root)]}, "sha256": sha256_text(content), "checkpoint_id": checkpoint.id if checkpoint else None, "created": not existed},
         )
 
 
@@ -165,7 +165,7 @@ class ReplaceInFileTool(Tool):
             context.changed_roots.add(resolved.root)
         return ToolResult(
             f"Replaced {count} occurrence(s) in {resolved.display}\nsha256: {sha256_text(updated)}",
-            metadata={"path": resolved.display, "replacements": count, "sha256": sha256_text(updated), "checkpoint_id": checkpoint.id if checkpoint else None},
+            metadata={"path": resolved.display, "changed_path_roots": {resolved.display: [str(resolved.root)]}, "replacements": count, "sha256": sha256_text(updated), "checkpoint_id": checkpoint.id if checkpoint else None},
         )
 
 
@@ -204,7 +204,7 @@ class DeleteFileTool(Tool):
             resolved.path.unlink()
             context.changed_files.add(resolved.display)
             context.changed_roots.add(resolved.root)
-        return ToolResult(f"Deleted {resolved.display}", metadata={"path": resolved.display, "checkpoint_id": checkpoint.id if checkpoint else None})
+        return ToolResult(f"Deleted {resolved.display}", metadata={"path": resolved.display, "changed_path_roots": {resolved.display: [str(resolved.root)]}, "checkpoint_id": checkpoint.id if checkpoint else None})
 
 
 def _file_digest(path: Path) -> str:
@@ -278,7 +278,8 @@ class MakeDirectoryTool(Tool):
             context.changed_roots.add(resolved.root)
         return ToolResult(
             f"Directory ready: {resolved.display}",
-            metadata={"path": resolved.display, "changed_files": changed_files},
+            metadata={"path": resolved.display, "changed_files": changed_files,
+                      "changed_path_roots": {display: [str(resolved.root)] for display in changed_files}},
         )
 
 
