@@ -97,6 +97,106 @@ class CompletedDescendantRecoveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await runner.close()
 
+    async def test_cancelled_descendant_receipts_recover_uncertainty_without_replay(self):
+        for writing in (True, False):
+            for settled in (False, True):
+                with self.subTest(writing=writing, settled=settled):
+                    path = f"cancelled-{writing}-{settled}.txt"
+                    runner = await build_runner(self.root, config=self.config, interactive=False)
+                    try:
+                        session = runner.sessions.create_session(workspace=self.root, provider="mock", model="fixture")
+                        root_run = "run_cancelled_child"
+                        parent = delegate(identifier="root-cancelled")
+                        runner.sessions.append_message(session.id, Message(role=Role.ASSISTANT, tool_calls=[parent]))
+                        runner.sessions.start_tool_call(session.id, root_run, parent.id, parent.name, parent.arguments)
+                        await runner.events.emit("run.started", session_id=session.id, run_id=root_run)
+                        context = replace(runner.tool_context, session_id=session.id,
+                            run_id=root_run + ".delegate_child",
+                            metadata={**runner.tool_context.metadata, "delegated": True,
+                                      "delegation_id": "delegate_child", "delegation_depth": 1,
+                                      "delegation_allow_writes": True})
+                        if writing:
+                            call = write(path, "surviving mutation\n")
+                        else:
+                            (self.root / path).write_text("surviving mutation\n")
+                            call = ToolCall(name="read_file", arguments={"path": path,
+                                "start_line": None, "end_line": None, "max_chars": None})
+                        call.id = "delegate_child.cancelled"
+                        published = asyncio.Event()
+                        original_emit = runner.events.emit
+
+                        async def interrupt_publication(kind, *, original_emit=original_emit,
+                                                        published=published, **data):
+                            await original_emit(kind, **data)
+                            if kind == "tool.completed":
+                                published.set()
+                                await asyncio.Event().wait()
+
+                        with patch.object(runner.events, "emit", side_effect=interrupt_publication):
+                            task = asyncio.create_task(runner._execute_one(call, context, asyncio.Event(), nested_results=[]))
+                            try:
+                                await asyncio.wait_for(published.wait(), 3)
+                                task.cancel()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await asyncio.wait_for(task, 3)
+                            finally:
+                                if not task.done():
+                                    task.cancel()
+                                await asyncio.gather(task, return_exceptions=True)
+                        receipt = next(row for row in runner.sessions.tool_calls(session.id)
+                                       if row["tool_call_id"] == call.id)
+                        self.assertEqual(receipt["status"], "cancelled")
+                        self.assertNotIn("workspace_change_tracking", receipt["metadata"])
+                        self.assertEqual((self.root / path).read_text(), "surviving mutation\n")
+                        if settled:
+                            message = Message(role=Role.TOOL, tool_call_id=parent.id,
+                                              tool_name=parent.name, content="Prior root acknowledged its effects.")
+                            runner.sessions.complete_tool_call(session.id, parent.id, output=message.content,
+                                                              is_error=False, message=message)
+                            await runner.events.emit("run.completed", session_id=session.id, run_id=root_run)
+                    finally:
+                        await runner.close()
+
+                    runner = await build_runner(self.root, config=self.config, interactive=False)
+                    try:
+                        context = replace(runner.tool_context, session_id=session.id, run_id="run_recover_cancelled")
+                        await runner._recover_nested_calls(runner.sessions.tool_calls(session.id), context)
+                        uncertain = writing and not settled
+                        self.assertEqual(context.mutation_tracking, "incomplete" if uncertain else "complete")
+                        provider = runner.providers[0].provider
+                        assert isinstance(provider, MockProvider)
+                        provider.handler = lambda request, count: response(text="Recovered candidate.")
+                        checked = []
+
+                        async def verify_content(context, steps, *, checked=checked, path=path):
+                            checked.append(context.workspace)
+                            self.assertEqual((context.workspace / path).read_text(), "surviving mutation\n")
+                            return VerificationReport(ok=True, steps=[{"name": "Check surviving file", "exit_code": 0}])
+
+                        with patch("borealis_coder.agent.runner.VerificationPlanner.run", side_effect=verify_content):
+                            result = await asyncio.wait_for(runner.run("continue", session_id=session.id), 10)
+                        self.assertEqual(result.mutation_tracking, "incomplete" if uncertain else "complete")
+                        if uncertain:
+                            self.assertIn(self.root, checked)
+                            self.assertIsNotNone(result.verification)
+                            self.assertIn("Mutation tracking: incomplete", result.text)
+                            self.assertNotIn(root_run, runner.sessions.get_session(session.id).metadata.get("settled_delegation_runs", []))
+                            again = replace(runner.tool_context, session_id=session.id, run_id="run_again")
+                            await runner._recover_nested_calls(runner.sessions.tool_calls(session.id), again)
+                            self.assertEqual(again.mutation_tracking, "incomplete")
+                        else:
+                            self.assertEqual(checked, [])
+                            self.assertIsNone(result.verification)
+                        rows = runner.sessions.tool_calls(session.id)
+                        self.assertEqual(next(row for row in rows if row["tool_call_id"] == call.id), receipt)
+                        self.assertEqual(len([row for row in rows if row["tool_call_id"] == call.id]), 1)
+                        messages = runner.sessions.messages(session.id)
+                        validate_tool_call_order(messages)
+                        self.assertFalse(any(m.role == Role.TOOL and m.tool_call_id == call.id for m in messages))
+                        self.assertEqual((self.root / path).read_text(), "surviving mutation\n")
+                    finally:
+                        await runner.close()
+
     async def test_completed_write_recovered_with_running_root_delegate(self):
         await self.assert_recovered(root_completed=False)
 

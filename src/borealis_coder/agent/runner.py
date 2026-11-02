@@ -1675,6 +1675,13 @@ class AgentRunner:
             tool = self.tools.get(row["tool_name"])
             if tool is None:
                 self._mark_workspace_tracking_incomplete(context)
+            # Cancellation can interrupt registry publication after a mutation
+            # but before its result metadata reaches the canonical receipt.
+            if (row["status"] == "cancelled" and not metadata.get("not_started")
+                    and metadata.get("workspace_change_tracking") != "complete"
+                    and (tool is None or tool.effective_mutation_scope != MutationScope.NONE)):
+                self._mark_workspace_tracking_incomplete(context)
+                context.metadata.setdefault("unresolved_nested_runs", set()).add(root_run)
             paths = metadata.get("changed_files")
             if paths is None and row["status"] == "completed" and tool is not None and tool.effective_mutation_scope == MutationScope.TRACKED:
                 paths = metadata.get("files")

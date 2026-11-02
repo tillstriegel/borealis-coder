@@ -4257,14 +4257,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 head.write_text("after\n")
                 session_id = next(iter(runner._cancel))
                 self.assertTrue(runner.cancel(session_id))
-                return ProcessResult(
-                    command="git commit",
-                    exit_code=0,
-                    stdout="committed",
-                    stderr="",
-                    duration_ms=1,
-                    lifecycle_complete=True,
-                )
+                # The mutation committed, but its result has not been delivered.
+                # Keep it pending so this tests cancellation, not the supported
+                # competing schedule where a completed result wins cancellation.
+                await asyncio.Event().wait()
+                self.fail("Cancellation should interrupt delivery of the commit result")
 
             try:
                 with patch.object(
