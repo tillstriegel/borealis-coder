@@ -6,12 +6,14 @@ import asyncio
 import contextlib
 import hashlib
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any, cast
 
 from ..agent.answers import CLOSURE_INSTRUCTION, protocol_answer, runtime_handoff, usable_answer
 from ..agent.budget import prepare_route_request
 from ..agent.swarm import SwarmState, bounded_calls
+from ..config import Config
 from ..errors import BudgetExceeded, Cancelled, ProviderContextOverflowError, ProviderError
 from ..models import (
     Effect,
@@ -24,6 +26,7 @@ from ..models import (
     Usage,
 )
 from ..providers.base import Provider
+from ..providers.diagnostics import provider_diagnostic
 from ..util import finish_on_cancellation, json_dumps, new_id, truncate_text
 from .base import MutationScope, Tool, ToolContext, object_schema
 
@@ -57,7 +60,8 @@ def _partial_handoff(
     return ToolResult(
         truncate_text(runtime_handoff(task=task, cause=cause, observations=metadata.get("observations", []),
                         changed_files=sorted(context.changed_files), mutation_tracking=context.mutation_tracking,
-                        redactor=context.events.redactor), max(100, context.config.context.tool_output_chars)),
+                        redactor=context.events.redactor,
+                        provider_diagnostic=metadata.get("provider_diagnostic")), max(100, context.config.context.tool_output_chars)),
         is_error=True, metadata={**metadata, "completion_status": "incomplete",
                                 "result_source": "runtime", "stop_cause": cause},
     )
@@ -73,6 +77,16 @@ class DelegateTaskTool(Tool):
         "task": {"type": "string", "minLength": 1, "maxLength": 8000},
         "max_turns": {"type": "integer", "minimum": 1, "maximum": 16},
     })
+
+    def schema_for_config(self, config: Config) -> dict[str, Any]:
+        schema = deepcopy(self.schema())
+        cap = config.agent.swarm_max_turns
+        schema["parameters"]["properties"]["max_turns"]["maximum"] = cap
+        schema["description"] = (
+            f"Delegate at most {cap} child turns. Choose a scope that fits; return partial findings early. "
+            + self.description
+        )
+        return schema
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         state = context.metadata.get("swarm_state")
@@ -91,6 +105,8 @@ class DelegateTaskTool(Tool):
             "parent_tool_call_id": context.tool_call_id, "depth": depth,
             "task": truncate_text(str(arguments["task"]), 160),
             "capability": "write" if allow_writes else "read-only",
+            "requested_max_turns": int(arguments["max_turns"]),
+            "effective_max_turns": min(int(arguments["max_turns"]), state.max_turns),
         }
 
         async def emit(kind: str, **data: Any) -> None:
@@ -131,7 +147,8 @@ class DelegateTaskTool(Tool):
                        evidence=result.metadata.get("evidence", []),
                        completion_status=result.metadata.get("completion_status"),
                        result_source=result.metadata.get("result_source"),
-                       stop_cause=result.metadata.get("stop_cause"))
+                       stop_cause=result.metadata.get("stop_cause"),
+                       provider_diagnostic=result.metadata.get("provider_diagnostic"))
             result.metadata.update(lineage)
             return result
         except BaseException as error:
@@ -148,6 +165,7 @@ class DelegateTaskTool(Tool):
                 result=result.output, completion_status="incomplete", result_source="runtime", stop_cause=cause,
                 turns=result.metadata.get("turns", 0), usage=result.metadata.get("usage", {}),
                 evidence=result.metadata.get("evidence", []),
+                provider_diagnostic=result.metadata.get("provider_diagnostic"),
             ))
             raise
         finally:
@@ -171,7 +189,7 @@ class DelegateTaskTool(Tool):
         tools = [tool for name in registry.names()
                  if (tool := registry.get(name)) is not None
                  and delegated_tool_allowed(tool, context.metadata["delegation_allow_writes"])]
-        schemas = [tool.schema() for tool in tools]
+        schemas = [tool.schema_for_config(context.config) for tool in tools]
         system = await asyncio.to_thread(builder.system_prompt, query=str(arguments["task"]), direct=True)
         capability = "built-in workspace file edits" if context.metadata["delegation_allow_writes"] else "read-only investigation"
         system += ("\n\n# Delegated role\nYour maximum capability is " + capability
@@ -218,10 +236,16 @@ class DelegateTaskTool(Tool):
         max_turns = min(int(arguments["max_turns"]), state.max_turns)
         turn_index = 0
         repair_answer = False
+        diagnostic: dict[str, Any] | None = None
+        # Two turns still allow investigation; one turn can only conclude.
+        closure_start = max(1, max_turns - 2) if max_turns > 1 else 0
 
         def incomplete(reason: str) -> ToolResult:
             result = _partial_handoff(str(arguments["task"]), reason, context,
                                       {"usage": usage.to_dict(), "turns": turn_index,
+                                       "requested_max_turns": int(arguments["max_turns"]),
+                                       "effective_max_turns": max_turns,
+                                       **({"provider_diagnostic": diagnostic} if diagnostic else {}),
                                        "evidence": list(sources), "observations": list(observations)})
             state.handoffs[context.metadata["delegation_call_id"]] = result
             return result
@@ -236,12 +260,13 @@ class DelegateTaskTool(Tool):
 
         incomplete("investigation_not_started")
         while turn_index < max_turns:
-            synthesis_turn = (repair_answer or turn_index == max_turns - 1
+            # With three or more turns, leave one turn for a rejected conclusion.
+            synthesis_turn = (repair_answer or turn_index >= closure_start
                               or bool(budget and not budget.remaining_requests()))
             closure_messages = [messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]] if synthesis_turn else messages
             request = ProviderRequest(
                 model=route.model,
-                system=system + bounds_text() + ("\n\nThis is your final turn. Do not request tools. Return the concise, evidence-backed conclusion now." if synthesis_turn else ""),
+                system=system + bounds_text() + ("\n\nThis is a conclusion turn. Do not request tools. Return the concise, evidence-backed conclusion now." if synthesis_turn else ""),
                 messages=closure_messages, tools=[] if synthesis_turn else schemas,
                 max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
                 reasoning_effort=context.config.agent.reasoning_effort or None,
@@ -285,15 +310,21 @@ class DelegateTaskTool(Tool):
                             request=request,
                             check_usage=(lambda _, observed=cancelled_usage: budget.check_unsettled(observed)) if budget else None,
                         )
+                        # Recovery succeeded. Clear the active failure before
+                        # usage settlement can publish a cost/cancellation stop.
+                        diagnostic = None
+                        incomplete("investigation not concluded")
                         await record_usage(response.usage)
                     except ProviderError as error:
+                        diagnostic = provider_diagnostic(error, provider.name, context.events.redactor)
+                        # Settlement may stop the run after recording the charge.
+                        # Its terminal handoff must already own this diagnostic.
+                        incomplete("provider_failure")
                         if error.usage is not None:
                             await record_usage(error.usage)
                         if isinstance(error, ProviderContextOverflowError) and overflow_retries < context.config.agent.compaction_max_overflow_retries:
                             overflow_retries += 1
                             continue
-                        if not sources:
-                            raise
                         return incomplete("provider_failure")
                     except BudgetExceeded as error:
                         if not usage_recorded and not cancelled_usage.is_empty:
@@ -331,14 +362,14 @@ class DelegateTaskTool(Tool):
                 if usable_answer(response.text):
                     final = response.text
                     break
-                if not synthesis_turn:
+                if not repair_answer and turn_index < max_turns:
                     repair_answer = True
                     messages.append(Message(role=Role.USER, content=
                         CLOSURE_INSTRUCTION))
                     continue
                 return incomplete(invalid_cause)
             if response.incomplete or synthesis_turn:
-                if not synthesis_turn and turn_index < max_turns:
+                if not repair_answer and turn_index < max_turns:
                     repair_answer = True
                     continue
                 return incomplete(invalid_cause)
@@ -425,6 +456,7 @@ class DelegateTaskTool(Tool):
                                         tool_name=call.name, is_error=result.is_error, metadata=result.metadata))
             # Assistant call IDs stay provider-native for continuation replay.
         metadata = {"usage": usage.to_dict(), "turns": turn_index, "evidence": sources,
+                    "requested_max_turns": int(arguments["max_turns"]), "effective_max_turns": max_turns,
                     "completion_status": "completed", "result_source": "model"}
         if not final:
             return incomplete("turn_bound: no usable final answer within the delegated bounds")

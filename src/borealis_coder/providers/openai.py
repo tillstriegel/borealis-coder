@@ -138,7 +138,7 @@ class OpenAIProvider(Provider):
         with self.request_attempt(error_usage=self._error_usage) as record:
             response = await self.http.post_json(url, headers=self._headers(), payload=payload)
             if not isinstance(response.data, dict):
-                raise ProviderError("OpenAI returned a non-object response")
+                raise ProviderError("OpenAI returned a non-object response", code="malformed_response")
             _raise_in_band_failure(response.data)
             result = self._parse_responses(response.data, retain_raw=True)
             record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
@@ -552,6 +552,9 @@ class OpenAIProvider(Provider):
             }
         if stream:
             payload["stream_options"] = {"include_usage": True}
+        if not request.tools:
+            payload["tool_choice"] = "none"
+            payload["parallel_tool_calls"] = False
         return payload
 
     def _empty_chat_recovery_request(self, request: ProviderRequest) -> ProviderRequest:
@@ -580,6 +583,7 @@ class OpenAIProvider(Provider):
                     "OpenAI-compatible provider returned an empty response",
                     retryable=True,
                     usage=response.usage,
+                    code="empty_response",
                 )
             prior_usage.add(response.usage)
         self.before_recovery_request(fallback)
@@ -594,6 +598,7 @@ class OpenAIProvider(Provider):
                 "OpenAI-compatible provider returned an empty response with reasoning disabled",
                 retryable=False,
                 usage=usage if not usage.is_empty else None,
+                code="empty_after_recovery",
             )
         response.usage = prior_usage.add(response.usage)
         return response
@@ -604,7 +609,7 @@ class OpenAIProvider(Provider):
         with self.request_attempt(error_usage=self._error_usage) as record:
             response = await self.http.post_json(url, headers=self._headers(), payload=payload)
             if not isinstance(response.data, dict):
-                raise ProviderError("OpenAI-compatible provider returned a non-object response")
+                raise ProviderError("OpenAI-compatible provider returned a non-object response", code="malformed_response")
             _raise_in_band_failure(response.data)
             result = self._parse_chat(response.data, retain_raw=True)
             record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
@@ -683,6 +688,7 @@ class OpenAIProvider(Provider):
                                 "with reasoning disabled",
                                 retryable=False,
                                 usage=usage if not usage.is_empty else None,
+                                code="empty_after_recovery",
                             )
                         event.response.usage = prior_usage.add(event.response.usage)
                         for pending in pending_reasoning:
@@ -701,6 +707,7 @@ class OpenAIProvider(Provider):
         error = ProviderUnavailableError(
             "OpenAI-compatible provider returned an empty response",
             retryable=not actionable_output_emitted,
+            code="empty_response",
         )
         _attach_usage_to_error(error, prior_usage)
         raise error
@@ -795,7 +802,7 @@ class OpenAIProvider(Provider):
     def _parse_chat(self, data: dict[str, Any], *, retain_raw: bool) -> ModelResponse:
         choices = data.get("choices") or []
         if not choices:
-            raise ProviderError("OpenAI-compatible response contained no choices")
+            raise ProviderError("OpenAI-compatible response contained no choices", code="malformed_response")
         choice = choices[0]
         message = choice.get("message") or {}
         calls: list[ToolCall] = []

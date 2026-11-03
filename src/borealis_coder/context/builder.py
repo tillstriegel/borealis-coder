@@ -171,6 +171,8 @@ class ContextBuilder:
         return (
             "# Current execution policy\n"
             f"Safety mode: {self.config.safety.mode}; network: {self.config.safety.network}; sandbox: {self.config.sandbox.driver}"
+            f"\nDelegated child-turn cap: {self.config.agent.swarm_max_turns}. "
+            "Choose a scope that fits; return partial findings early. Closure and repair share this cap."
         )
 
     def _git_status(self) -> tuple[str, set[str]]:

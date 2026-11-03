@@ -28,12 +28,14 @@ class ProviderError(BorealisError):
         retryable: bool = False,
         details: Any = None,
         usage: Usage | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
         self.details = details
         self.usage = usage
+        self.code = code
 
 
 class ProviderAuthenticationError(ProviderError):

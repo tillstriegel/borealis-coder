@@ -962,7 +962,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.text, "Recovered answer.")
                 self.assertEqual(result.usage.input_tokens, 9)
                 self.assertEqual(result.usage.output_tokens, 5)
-                self.assertEqual(result.usage.requests, 2)
+                self.assertEqual(result.usage.requests, 3)
                 self.assertEqual(len(fake_http.calls), 3)
                 events = [event for _, event in runner.sessions.events(result.session_id)]
                 self.assertTrue(any(event.type == "model.retrying" for event in events))

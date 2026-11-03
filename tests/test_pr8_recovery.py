@@ -199,6 +199,20 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.budget.pending_cost_usd, 0)
         self.assertFalse(self.budget._held_usage)
 
+    def assert_provider_failure_receipt(self, receipt, *, retryable, code=None):
+        assert receipt is not None
+        self.assertTrue(receipt.is_error)
+        self.assertEqual(receipt.metadata['completion_status'], 'incomplete')
+        self.assertEqual(receipt.metadata['result_source'], 'runtime')
+        self.assertEqual(receipt.metadata['stop_cause'], 'provider_failure')
+        self.assertEqual(receipt.metadata['provider_diagnostic'], {
+            'category': 'unavailable', 'provider': 'openai', 'retryable': retryable,
+            **({'code': code} if code else {}),
+        })
+        self.assertIn('Status: Incomplete', receipt.output)
+        self.assertIn('No completed tool observations', receipt.output)
+        self.assertEqual(receipt.metadata['usage']['requests'], self.budget.model_requests)
+
     async def test_recovery_rejected_before_dispatch_when_only_40_cents_remain(self):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
@@ -256,22 +270,32 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
                 self.setup_request(limit=2, empty_second=True)
-                with self.assertRaises(ProviderUnavailableError) as raised:
-                    await self.run_request(streaming)
                 if streaming:
+                    with self.assertRaises(ProviderUnavailableError) as raised:
+                        await self.run_request(streaming)
                     self.assertIsNotNone(raised.exception.usage)
                     await self.settle(raised.exception.usage)
+                else:
+                    receipt = await self.run_request(streaming)
+                    self.assert_provider_failure_receipt(receipt, retryable=False, code='empty_after_recovery')
                 self.assert_settled(.8, 2, 'known')
+                self.assertEqual(len(self.http.calls), 2)
+                self.assertEqual(self.budget.model_requests, 2)
 
     async def test_recovery_transport_failure_preserves_known_and_incomplete_attempts(self):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
                 self.setup_request(limit=2, failure=True)
-                with self.assertRaises(ProviderUnavailableError) as raised:
-                    await self.run_request(streaming)
                 if streaming:
+                    with self.assertRaises(ProviderUnavailableError) as raised:
+                        await self.run_request(streaming)
                     await self.settle(raised.exception.usage)
+                else:
+                    receipt = await self.run_request(streaming)
+                    self.assert_provider_failure_receipt(receipt, retryable=True)
                 self.assert_settled(.6, 2, 'incomplete')
+                self.assertEqual(len(self.http.calls), 2)
+                self.assertEqual(self.budget.model_requests, 2)
 
 
     def responses_transport(self, **kwargs):
@@ -358,12 +382,16 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                             await task
                     else:
                         self.http.release.set()
-                        with self.assertRaises(ProviderUnavailableError) as raised:
-                            await task
                         if streaming:
+                            with self.assertRaises(ProviderUnavailableError) as raised:
+                                await task
                             await self.settle(raised.exception.usage)
+                        else:
+                            receipt = await task
+                            self.assert_provider_failure_receipt(receipt, retryable=True)
                     self.assert_settled(.6, 2, 'incomplete')
                     self.assertEqual(self.budget.model_requests, 2)
+                    self.assertEqual(len(self.http.calls), 2)
 
     async def test_chat_interrupted_after_usage_preserves_latest_snapshot_once(self):
         for cancelled in (False, True):

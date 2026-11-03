@@ -148,12 +148,16 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
             "context_builder": self.runner.context_builder,
             "usage_sink": recorded.add,
         })
-        with self.assertRaises(ProviderUnavailableError) as caught:
-            await DelegateTaskTool().execute({"task": "inspect", "max_turns": 2}, context)
+        result = await DelegateTaskTool().execute({"task": "inspect", "max_turns": 2}, context)
         self.assertEqual(request.await_count, 2)
         self.assertEqual(recorded.requests, 2)
         self.assertAlmostEqual(recorded.cost_usd, 0.02)
-        self.assertEqual(caught.exception.usage, recorded)
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.metadata["usage"], recorded.to_dict())
+        self.assertEqual(result.metadata["stop_cause"], "provider_failure")
+        self.assertEqual(result.metadata["provider_diagnostic"], {
+            "category": "unavailable", "provider": "gemini", "retryable": True,
+        })
 
     async def test_failed_delegated_request_enforces_parent_cost_limit(self):
         self.runner.config.agent.max_cost_usd = 0.1

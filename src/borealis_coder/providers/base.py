@@ -140,8 +140,9 @@ class Provider(abc.ABC):
             if error.usage is None and error_usage is not None:
                 error.usage = error_usage(error)
             if error.usage is None:
-                snapshot = latest_usage() if latest_usage is not None else None
-                error.usage = incomplete_usage() if snapshot is not None else Usage(cost_status="incomplete")
+                # A dispatched failure still consumed one physical request even
+                # when the provider supplied no billing or stream snapshot.
+                error.usage = incomplete_usage()
             record(self.normalize_cost(error.usage))
             raise
         finally:
