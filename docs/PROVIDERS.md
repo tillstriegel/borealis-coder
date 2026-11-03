@@ -109,6 +109,20 @@ adds first-class handling for OpenRouter rather than requiring a generic compati
 - explicit `usage = { include = true }` so budgeting has the best available accounting
 - `extra_body` as a forward-compatible escape hatch for newer OpenRouter extensions
 
+Tool-free Chat requests explicitly send `tools: []`, `tool_choice: "none"` and
+`parallel_tool_calls: false`. OpenRouter reapplies this policy after `extra_body`,
+including adapter recovery, so extensions cannot enable final-turn tools. Ordinary
+investigation retains its tool palette and requested reasoning effort. Empty-output
+recovery still explicitly selects OpenRouter reasoning effort `none`; unsupported
+reasoning-control recovery still omits the controls. These wire guarantees are
+covered by offline synthetic transports; live model conclusion quality requires a
+separately authorized provider pilot.
+
+Dispatched failures without a billing payload still count as one physical request
+with incomplete cost information. They do not fabricate token counts, cost or native
+billing records. Empty-after-recovery and known malformed Chat responses also carry
+stable diagnostic codes in delegated failure receipts.
+
 Example:
 
 ```toml

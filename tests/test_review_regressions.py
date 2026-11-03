@@ -245,18 +245,26 @@ class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
                 provider = ScriptedProvider(*actions)
                 budget = Budget.start(self.config.agent)
                 context = self.delegated(provider, budget)
+                result = await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': max_turns}, context)
                 if exhausted:
-                    with self.assertRaises(ProviderContextOverflowError):
-                        await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': max_turns}, context)
+                    self.assertTrue(result.is_error)
+                    self.assertEqual(result.metadata['completion_status'], 'incomplete')
+                    self.assertEqual(result.metadata['result_source'], 'runtime')
+                    self.assertEqual(result.metadata['stop_cause'], 'provider_failure')
+                    self.assertEqual(result.metadata['provider_diagnostic'], {
+                        'category': 'context_overflow', 'retryable': False,
+                    })
+                    self.assertEqual(result.metadata['turns'], 0)
                 else:
-                    result = await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': max_turns}, context)
+                    self.assertFalse(result.is_error)
                     self.assertIn('finished', result.output)
                     self.assertEqual(result.metadata['turns'], max_turns)
                 self.assertEqual(budget.model_requests, retries + 1 + int(before_synthesis))
                 requests = provider.seen[int(before_synthesis):]
                 limits = [r.metadata['resolved_limits']['effective_context_tokens'] for r in requests]
                 self.assertEqual(limits, sorted(set(limits), reverse=True))
-                self.assertTrue(all('final turn' in r.system for r in requests))
+                self.assertTrue(all(r.tools == [] and not r.parallel_tool_calls for r in requests))
+                self.assertTrue(all('remaining child turns including this one: 1.' in r.system for r in requests))
 
     def test_history_search_uses_literal_decoded_content(self):
         store = self.runner.sessions

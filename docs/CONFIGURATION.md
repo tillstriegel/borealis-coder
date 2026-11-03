@@ -77,7 +77,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `swarm_max_depth` | `2` | Maximum delegation depth, root = 0; `1` permits children only, `0` disables delegation. Integer 0–16. |
 | `swarm_max_descendants` | `8` | Cumulative admitted descendants per root run, excluding root; `0` disables delegation. Completed, failed, and cancelled children still consume admission. |
 | `swarm_max_concurrent` | `2` | Simultaneous delegated provider operations, including their retries/backoff and usage settlement. Positive integer. Slots are released before child tools run. |
-| `swarm_max_turns` | `6` | Per-child turn ceiling, integer 1–16; effective turns = min(requested `max_turns`, ceiling). Final turn has no tools. |
+| `swarm_max_turns` | `6` | Per-child turn ceiling, integer 1–16; effective turns = min(requested `max_turns`, ceiling). For limits of 3 or more, closure starts on the penultimate turn, leaving one possible repair. |
 | `swarm_allow_writes` | `false` | Permit built-in workspace file/patch tools in children and descendants, subject to inherited capability and normal policy. Does not grant shell, network, external mutations, or Script access. |
 | `max_repeated_calls` | `3` | Repeated identical call threshold for stuck detection. |
 | `auto_verify` | `true` | Run project verification after mutations. |
@@ -122,6 +122,12 @@ palette. Explicit discovery of a forbidden tool reports it unavailable; the exec
 guard remains independent. Script instructions and the root catalog are not child
 capabilities. Optional values use JSON `null`, not the literal string `"null"`.
 
+Root and nested schemas, discovery descriptions and prompts advertise the configured
+child-turn cap. Choose a scope that fits and return partial findings early. Legacy
+arguments up to 16 remain accepted but are clamped; delegation events and receipts
+record `requested_max_turns` and `effective_max_turns`. Schema construction does not
+change shared tool parameters or another run's configuration.
+
 Before child work starts, the run reserves one request for root synthesis and one
 for each active child's conclusion. Investigative work, nested admissions and
 retries cannot spend another agent's closure request. A child switches to a
@@ -131,8 +137,13 @@ are consumed on dispatch or released when the child settles. They do not increas
 the request ceiling or guarantee a successful model answer.
 
 Empty answers, raw tool protocol and incomplete provider output are not successful
-child findings. An early incomplete or malformed answer can use one remaining
-child turn for an explicit tool-free final handoff, never extra turns. If the
+child findings. With at least three effective turns, closure starts one turn early
+so a rejected conclusion can use one remaining turn for repair. An earlier invalid
+answer also permits at most one repair. Both closure and repair prohibit tools;
+rejected text and tool calls are not replayed or executed. A limit of two retains
+one investigative turn and one conclusion; a limit of one can only conclude from
+the supplied task. Repairs use existing turns and shared request/time/cost capacity,
+never extra allowance. If the
 model cannot conclude, a runtime-generated handoff reports the stop cause, task,
 latest attributed observations, known edits, verification limits and remaining
 work. It is marked `completion_status=incomplete`, `result_source=runtime`, not
@@ -141,6 +152,18 @@ without further model dispatch. Root stop reports likewise retain direct and
 delegated evidence. These guarantees require the process and durable store to
 remain available; they do not cover SIGKILL or storage failure. A
 `tool_call_id` is a history reference; it is not a `read_artifact` identifier.
+
+Provider failures retain `stop_cause=provider_failure` and a bounded
+`provider_diagnostic` in terminal events, receipts and the runtime handoff. It contains
+a stable category, retryability, valid HTTP status when available, and allowlisted
+provider/code identity. Unknown codes and arbitrary messages, headers, bodies and
+details are omitted. Structured values are redacted before JSON formatting, and the
+formatted diagnostic is bounded again. A provider failure before any completed tool
+also returns an incomplete receipt rather than exposing its exception text.
+The active diagnostic is retained before usage settlement, so a cost or cancellation
+stop keeps the provider evidence while preserving its own primary stop cause.
+A successful provider response clears any recovered diagnostic before settlement;
+later protocol or empty-output failures do not inherit an old overflow diagnosis.
 
 ## `[safety]`
 

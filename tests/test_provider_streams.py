@@ -1434,7 +1434,7 @@ class ProviderStreamTests(unittest.IsolatedAsyncioTestCase):
         assert unavailable.exception.usage is not None
         self.assertEqual(unavailable.exception.usage.input_tokens, 5)
         self.assertEqual(unavailable.exception.usage.output_tokens, 3)
-        self.assertEqual(unavailable.exception.usage.requests, 1)
+        self.assertEqual(unavailable.exception.usage.requests, 2)
         self.assertEqual(len(fake.calls), 2)
 
     async def test_chat_buffers_summary_from_abandoned_attempt(self) -> None:

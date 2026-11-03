@@ -151,6 +151,9 @@ class Tool:
             "parameters": self.parameters,
         }
 
+    def schema_for_config(self, config: Config) -> dict[str, Any]:
+        return self.schema()
+
 
 class FunctionTool(Tool):
     def __init__(
@@ -213,9 +216,9 @@ class ToolRegistry:
         if (config.script.tool_surface == "direct" or not config.script.enabled
                 or not isinstance(self.get("script"), ScriptTool)
                 or self.get("discover_tools") is None):
-            return self.schemas()
+            return [self._tools[name].schema_for_config(config) for name in sorted(self._tools)]
         native = {"script", "script_job", "discover_tools", "delegate_task"}
-        schemas = [self._tools[name].schema() for name in sorted(native & self._tools.keys())]
+        schemas = [self._tools[name].schema_for_config(config) for name in sorted(native & self._tools.keys())]
         names = self.names()
         for schema in schemas:
             if schema["name"] == "discover_tools":

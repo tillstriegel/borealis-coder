@@ -21,6 +21,7 @@ from borealis_coder.providers.mock import MockProvider
 from borealis_coder.providers.openai import OpenAICompatibleProvider
 from borealis_coder.providers.openrouter import OpenRouterProvider
 from borealis_coder.safety.redaction import Redactor
+from borealis_coder.sessions.store import SessionStore
 from tests.helpers import make_config
 from tests.test_compaction_v2 import _echo_evidence, _tool_cycle
 from tests.test_swarm import delegate, response
@@ -64,12 +65,187 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.changed_files, [])
         return rows
 
+    async def test_penultimate_closure_recovers_on_real_chat_wire_within_six_turns(self):
+        provider = OpenRouterProvider(ProviderConfig(
+            type="openrouter", base_url="https://synthetic.test", max_retries=0,
+        ))
+        self.addAsyncCleanup(provider.close)
+        self.runner.providers = [ProviderRoute("openrouter", "synthetic", provider)]
+        self.runner.config.agent.reasoning_effort = "high"
+        payloads = []
+        children = []
+
+        def wire(payload):
+            payloads.append(payload)
+            text = ""
+            calls = []
+            if "# Delegated role" not in payload["messages"][0]["content"]:
+                if not children:
+                    calls = [delegate(turns=16)]
+                else:
+                    text = "Combined source-backed result."
+            else:
+                children.append(payload)
+                self.assertEqual(payload["reasoning"], {"effort": "high"})
+                if payload["tools"]:
+                    calls = [read_call()]
+                    calls[0].id = f"read-{len(children)}"
+                    self.assertNotIn("tool_choice", payload)
+                elif sum(not p["tools"] for p in children) == 1:
+                    text = "<tool_call>REJECTED_PROTOCOL_PRIVATE"
+                else:
+                    self.assertTrue(any("alpha" in m.get("content", "") for m in payload["messages"] if m["role"] == "tool"))
+                    text = "evidence.txt:1 alpha confirmed; no files changed."
+            message: dict[str, Any] = {"content": text}
+            if calls:
+                message["tool_calls"] = [{"index": i, "id": c.id, "type": "function", "function": {
+                    "name": c.name, "arguments": json.dumps(c.arguments),
+                }} for i, c in enumerate(calls)]
+            return {"model": "synthetic", "choices": [{"message": message, "delta": message,
+                    "finish_reason": "tool_calls" if calls else "stop"}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "cost": 0.001}}
+
+        async def post(*args, **kwargs):
+            return HttpResponse(200, {}, wire(kwargs["payload"]), b"{}")
+
+        async def sse(*args, **kwargs):
+            yield SSEEvent("message", json.dumps(wire(kwargs["payload"])))
+            yield SSEEvent("message", "[DONE]")
+
+        provider.http.post_json = AsyncMock(side_effect=post)
+        provider.http.stream_sse = sse
+        result = await self.runner.run("Inspect and combine")
+        self.assertEqual(result.stop_reason.value, "end_turn", result.error)
+        rows = self.settled(result)
+        receipt = next(r for r in rows if r["tool_name"] == "delegate_task")
+        self.assertFalse(receipt["is_error"], receipt["output"])
+        self.assertEqual(receipt["metadata"]["result_source"], "model")
+        self.assertEqual(receipt["metadata"]["requested_max_turns"], 16)
+        self.assertEqual(receipt["metadata"]["effective_max_turns"], 6)
+        self.assertEqual(len(children), 6)
+        self.assertEqual(len(payloads), 8)
+        self.assertEqual(result.usage.requests, 8)
+        self.assertAlmostEqual(result.usage.cost_usd, 0.008)
+        self.assertEqual(len([r for r in rows if r["tool_name"] == "read_file"]), 4)
+        self.assertEqual(len([e for _, e in self.runner.sessions.events(result.session_id)
+                              if e.type == "model.attempt_usage"]), 8)
+        for payload in children[-2:]:
+            self.assertEqual(payload["tools"], [])
+            self.assertEqual(payload["tool_choice"], "none")
+            self.assertFalse(payload["parallel_tool_calls"])
+        self.assertNotIn("REJECTED_PROTOCOL_PRIVATE", json.dumps(children[-1]))
+        reopened = SessionStore(self.runner.sessions.path)
+        try:
+            stored = next(r for r in reopened.tool_calls(result.session_id)
+                          if r["tool_call_id"] == receipt["tool_call_id"])
+            self.assertEqual(stored["output"], receipt["output"])
+            event = next(e for _, e in reopened.events(result.session_id) if e.type == "delegate.completed")
+            self.assertEqual(event.data["result"], receipt["output"])
+        finally:
+            reopened.close()
+
+    async def test_repair_cannot_spend_reserved_root_closure(self):
+        for ceiling in (4, 5):
+            with self.subTest(ceiling=ceiling):
+                self.runner.config.agent.max_model_requests = ceiling
+                children = []
+
+                def handler(request, call, children=children):
+                    if not request.metadata.get("delegated"):
+                        if request.messages[-1].role != Role.TOOL:
+                            return response(calls=[delegate(turns=3)])
+                        self.assertEqual(request.tools, [])
+                        return response(text="Qualified parent result with preserved closure.")
+                    children.append(request)
+                    if len(children) == 1:
+                        return response(calls=[read_call()])
+                    self.assertEqual(request.tools, [])
+                    return response(text="<tool_call>rejected" if len(children) == 2 else
+                                    "evidence.txt:1 alpha confirmed.")
+
+                self.provider.handler = handler
+                budget = Budget.start(self.runner.config.agent)
+                with patch.object(Budget, "start", return_value=budget):
+                    result = await self.runner.run("Keep parent closure")
+                rows = self.settled(result)
+                receipt = next(r for r in rows if r["tool_name"] == "delegate_task")
+                self.assertEqual(receipt["is_error"], ceiling == 4)
+                self.assertEqual(len(children), ceiling - 2)
+                self.assertEqual(result.usage.requests, ceiling)
+                self.assertEqual(budget.model_requests, ceiling)
+                self.assertEqual(result.stop_reason.value, "end_turn")
+                self.assertEqual(budget._request_closures, set())
+
+    async def test_malformed_chat_diagnostic_reaches_durable_receipt_without_raw_body(self):
+        provider = OpenRouterProvider(ProviderConfig(
+            type="openrouter", base_url="https://synthetic.test", max_retries=0,
+        ))
+        self.addAsyncCleanup(provider.close)
+        self.runner.providers = [ProviderRoute("openrouter", "synthetic", provider)]
+        children = 0
+        payloads = []
+
+        def wire(payload):
+            nonlocal children
+            payloads.append(payload)
+            message: dict[str, Any] = {"content": ""}
+            if "# Delegated role" in payload["messages"][0]["content"]:
+                children += 1
+                if children == 1:
+                    call = read_call()
+                    message["tool_calls"] = [{"index": 0, "id": call.id, "type": "function", "function": {
+                        "name": call.name, "arguments": json.dumps(call.arguments),
+                    }}]
+                else:
+                    self.assertEqual(payload["tool_choice"], "none")
+                    return {"choices": [], "body": "PRIVATE_BODY_WITH_USER_CONTENT"}
+            elif not children:
+                call = delegate(turns=3)
+                message["tool_calls"] = [{"index": 0, "id": call.id, "type": "function", "function": {
+                    "name": call.name, "arguments": json.dumps(call.arguments),
+                }}]
+            else:
+                message["content"] = "Qualified result: " + payload["messages"][-1]["content"]
+            return {"choices": [{"message": message, "delta": message,
+                    "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1}}
+
+        async def post(*args, **kwargs):
+            return HttpResponse(200, {}, wire(kwargs["payload"]), b"{}")
+
+        async def sse(*args, **kwargs):
+            yield SSEEvent("message", json.dumps(wire(kwargs["payload"])))
+            yield SSEEvent("message", "[DONE]")
+
+        provider.http.post_json = AsyncMock(side_effect=post)
+        provider.http.stream_sse = sse
+        budget = Budget.start(self.runner.config.agent)
+        with patch.object(Budget, "start", return_value=budget):
+            result = await self.runner.run("Inspect malformed closure")
+        rows = self.settled(result)
+        receipt = next(r for r in rows if r["tool_name"] == "delegate_task")
+        self.assertEqual(receipt["metadata"]["provider_diagnostic"], {
+            "category": "provider_error", "retryable": False, "provider": "openrouter",
+            "code": "malformed_response",
+        })
+        self.assertIn("malformed_response", result.text)
+        self.assertEqual(len(payloads), 4)
+        self.assertEqual(budget.model_requests, 4)
+        self.assertEqual(result.usage.requests, 4)
+        self.assertEqual(result.usage.cost_status, "incomplete")
+        persisted = [e.to_dict() for _, e in self.runner.sessions.events(result.session_id)]
+        # The malformed response supplied no native billing record. Preserve
+        # that absence while counting the physical attempt in request usage.
+        self.assertEqual(sum(e["type"] == "model.attempt_usage" for e in persisted), 3)
+        self.assertNotIn("PRIVATE_BODY", json.dumps([persisted, rows, result.text]))
+
     async def test_restricted_prompt_discovery_and_real_read_agree(self):
         child_requests = []
 
         def handler(request, call):
             if not request.metadata.get("delegated"):
-                return response(calls=[delegate(turns=4)]) if call == 1 else response(text="Combined findings.")
+                # Three discovery/read steps plus closure and its reserved repair.
+                return response(calls=[delegate(turns=5)]) if call == 1 else response(text="Combined findings.")
             child_requests.append(request)
             n = len(child_requests)
             if n == 1:
@@ -106,7 +282,8 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
         def handler(request, call):
             nonlocal children
             if not request.metadata.get("delegated"):
-                return response(calls=[delegate(turns=3)]) if call == 1 else response(text="Qualified grep findings combined.")
+                # Two investigative calls must fit before the closure reservation.
+                return response(calls=[delegate(turns=4)]) if call == 1 else response(text="Qualified grep findings combined.")
             children += 1
             if children == 2:
                 self.assertTrue(request.messages[-1].is_error)
@@ -344,17 +521,26 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
         result = await asyncio.wait_for(self.runner.run("Combine two branches"), 5)
         self.assertEqual(result.stop_reason.value, "end_turn", result.error)
         self.assertIn("alpha", result.text)
-        self.assertEqual(len(payloads), 11)
-        self.assertEqual(result.usage.requests, 11)
-        self.assertAlmostEqual(result.usage.cost_usd, 0.011)
+        # The focused child's first conclusion now happens on turn two, so its
+        # healthy closure skips the old protocol response on an investigative turn.
+        self.assertEqual(len(payloads), 10)
+        self.assertEqual(result.usage.requests, 10)
+        self.assertAlmostEqual(result.usage.cost_usd, 0.010)
         native = [event for _, event in self.runner.sessions.events(result.session_id)
                   if event.type == "model.attempt_usage"]
-        self.assertEqual(len(native), 11)
+        self.assertEqual(len(native), 10)
         rows = self.settled(result)
         reads = [r for r in rows if r["tool_name"] == "read_file"]
         self.assertEqual(len(reads), 2)
         self.assertTrue(all(r["status"] == "completed" for r in reads))
         self.assertEqual(len([e for e in self.events if e.type == "delegate.failed"]), 1)
+        failed = next(e for e in self.events if e.type == "delegate.failed")
+        self.assertEqual(failed.data["provider_diagnostic"], {
+            "category": "unavailable", "provider": "openrouter", "retryable": False,
+            "code": "empty_after_recovery",
+        })
+        receipt = next(r for r in rows if r["tool_call_id"] == failed.data["parent_tool_call_id"])
+        self.assertEqual(receipt["metadata"]["provider_diagnostic"], failed.data["provider_diagnostic"])
         self.assertEqual(len([e for e in self.events if e.type == "delegate.completed"]), 2)
         public = json.dumps([e.to_dict() for e in self.events])
         self.assertNotIn("PRIVATE_REASONING_MUST_NOT_ESCAPE", public)
@@ -830,7 +1016,11 @@ class ReasoningWireRepairTests(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(provider=provider_type.name, stream=stream, cause=cause):
                         provider = provider_type(ProviderConfig(
                             type=provider_type.name, base_url="https://synthetic.test", max_retries=0,
-                            extra_body={"reasoning": {"enabled": True}} if provider_type is OpenRouterProvider and cause in {"empty", "unsupported"} else {},
+                            extra_body={
+                                "tools": [{"type": "function", "function": {"name": "forbidden"}}],
+                                "tool_choice": "required", "parallel_tool_calls": True,
+                                **({"reasoning": {"enabled": True}} if cause in {"empty", "unsupported"} else {}),
+                            } if provider_type is OpenRouterProvider else {},
                         ))
                         self.addAsyncCleanup(provider.close)
                         payloads = []
@@ -863,8 +1053,12 @@ class ReasoningWireRepairTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(answer.text, "Useful findings.")
                         count = 2 if cause in {"empty", "unsupported"} else 1
                         self.assertEqual(len(payloads), count)
+                        for payload in payloads:
+                            self.assertEqual(payload["tools"], [])
+                            self.assertEqual(payload["tool_choice"], "none")
+                            self.assertFalse(payload["parallel_tool_calls"])
                         self.assertEqual(len(attempts), count - 1)
-                        self.assertEqual(answer.usage.requests, 2 if cause == "empty" else 1)
+                        self.assertEqual(answer.usage.requests, count)
                         key = "reasoning" if provider_type is OpenRouterProvider else "reasoning_effort"
                         if cause == "empty" and provider_type is OpenRouterProvider:
                             self.assertEqual(payloads[1][key], {"effort": "none"})

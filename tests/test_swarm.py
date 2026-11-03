@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from borealis_coder.errors import (
 from borealis_coder.models import Effect, Message, ModelResponse, Role, ToolCall, ToolResult, Usage
 from borealis_coder.providers.mock import MockProvider
 from borealis_coder.tools import FunctionTool, object_schema
+from borealis_coder.tools.builtin import build_builtin_registry
 from borealis_coder.tools.delegate import DelegateTaskTool
 from borealis_coder.tools.verification import VerificationReport
 from tests.helpers import make_config
@@ -69,6 +71,47 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.usage.to_dict(), self.runner.sessions.usage(result.session_id).to_dict())
         if self.terminals():
             self.assertEqual(self.terminals()[-1].data["limits"]["active_requests"], 0)
+
+    async def test_configured_cap_reaches_root_nested_discovery_and_prompts_without_leaking(self):
+        for cap in (2, 6, 2):
+            for surface in ("direct", "ptc"):
+                with self.subTest(cap=cap, surface=surface):
+                    self.runner.config.agent.swarm_max_turns = cap
+                    self.runner.config.script.tool_surface = surface
+                    seen = []
+                    self.events.clear()
+
+                    def handler(request, call, cap=cap, seen=seen):
+                        depth = request.metadata.get("delegation_depth", 0)
+                        seen.append(depth)
+                        self.assertIn(f"Delegated child-turn cap: {cap}.", request.system)
+                        if request.tools:
+                            schema = next(t for t in request.tools if t["name"] == "delegate_task")
+                            self.assertEqual(schema["parameters"]["properties"]["max_turns"]["maximum"], cap)
+                            self.assertIn(f"at most {cap} child turns", schema["description"])
+                            self.assertIn("partial findings early", schema["description"])
+                        if request.messages[-1].role == Role.TOOL:
+                            if depth == 2:
+                                schema = json.loads(request.messages[-1].content)["tools"][0]
+                                self.assertEqual(schema["parameters"]["properties"]["max_turns"]["maximum"], cap)
+                                self.assertIn(f"at most {cap} child turns", schema["description"])
+                            return response(text="Completed scoped investigation.")
+                        if depth < 2:
+                            # Legacy callers can still request up to 16; the
+                            # operator's cap always wins and is recorded.
+                            return response(calls=[delegate(turns=16)])
+                        return response(calls=[ToolCall(name="discover_tools", arguments={
+                            "names": ["delegate_task"], "offset": 0,
+                        })])
+
+                    self.provider.handler = handler
+                    result = await self.runner.run("Inspect nested configuration")
+                    self.assertEqual(set(seen), {0, 1, 2})
+                    for event in self.starts():
+                        self.assertEqual(event.data["requested_max_turns"], 16)
+                        self.assertEqual(event.data["effective_max_turns"], cap)
+                    self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 16)
+                    self.assert_settled(result)
 
     async def test_three_levels_compose_evidence_exact_once_and_single_slot(self):
         self.runner.config.agent.swarm_max_concurrent = 1
@@ -711,6 +754,22 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SwarmConfigurationTests(unittest.TestCase):
+    def test_schema_views_are_isolated_between_configurations(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            registry = build_builtin_registry()
+            small = make_config(root, agent={"swarm_max_turns": 2})
+            default = make_config(root)
+            small_schema = next(s for s in registry.provider_schemas(small) if s["name"] == "delegate_task")
+            default_schema = next(s for s in registry.provider_schemas(default) if s["name"] == "delegate_task")
+            self.assertEqual(small_schema["parameters"]["properties"]["max_turns"]["maximum"], 2)
+            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 6)
+            small_schema["parameters"]["properties"]["max_turns"]["maximum"] = 1
+            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 6)
+            fresh = next(s for s in registry.provider_schemas(small) if s["name"] == "delegate_task")
+            self.assertEqual(fresh["parameters"]["properties"]["max_turns"]["maximum"], 2)
+            self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 16)
+
     def test_validated_trusted_configuration(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
             root = Path(td)

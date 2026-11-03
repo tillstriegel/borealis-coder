@@ -56,6 +56,11 @@ class OpenRouterProvider(OpenAIProvider):
             payload.pop("reasoning", None)
             if recovery == "disable":
                 payload["reasoning"] = {"effort": "none"}
+        if not request.tools:
+            # Apply after extensions, including on adapter-level recovery clones.
+            payload["tools"] = []
+            payload["tool_choice"] = "none"
+            payload["parallel_tool_calls"] = False
         return payload
 
     def _responses_payload(
