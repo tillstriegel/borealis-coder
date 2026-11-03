@@ -172,7 +172,11 @@ class ContextBuilder:
             "# Current execution policy\n"
             f"Safety mode: {self.config.safety.mode}; network: {self.config.safety.network}; sandbox: {self.config.sandbox.driver}"
             f"\nDelegated child-turn cap: {self.config.agent.swarm_max_turns}. "
-            "Choose a scope that fits; return partial findings early. Closure and repair share this cap."
+            "One turn is report-only, with no tools. Tool-based work needs at least two turns: "
+            "one investigation and one conclusion. For multiple sequential probes, allow enough "
+            "investigative turns plus closure and possible repair. Never exceed the configured cap; "
+            "a cap of one permits report-only work. Choose a scope that fits; return partial "
+            "findings early. Closure and repair share this cap."
         )
 
     def _git_status(self) -> tuple[str, set[str]]:

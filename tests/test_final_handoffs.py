@@ -268,6 +268,11 @@ class FinalHandoffTests(unittest.IsolatedAsyncioTestCase):
                         children.append(request)
                         if request.tools:
                             return response(calls=[read(f"read-{len(children)}")])
+                        self.assertIn("All tools are temporarily disabled", request.system)
+                        self.assertIn("not evidence of permanent capability absence", request.system)
+                        self.assertIn("Eligible investigative tools:", request.system)
+                        if closure_start == 0:
+                            self.assertIn("No completed tool observations", request.system)
                         self.assertNotIn("REJECTED_CANDIDATE", str(request.messages))
                         if len(children) > closure_start + 1 and terminal != "unrecoverable":
                             return response(text="shared.txt:1 inspected. No files changed; checks remain unverified.")

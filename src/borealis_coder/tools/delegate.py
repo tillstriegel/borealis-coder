@@ -70,7 +70,7 @@ def _partial_handoff(
 class DelegateTaskTool(Tool):
     name = "delegate_task"
     script_accessible = False
-    description = "Delegate a bounded task to an isolated subagent with inherited operator permissions and return its evidence-backed conclusion."
+    description = "Delegate a bounded task to an isolated subagent with inherited operator permissions and return its qualified conclusion. One turn is report-only with no tools; tool use needs at least two turns."
     effect = Effect.READ
     concurrent = True
     parameters = object_schema({
@@ -81,10 +81,12 @@ class DelegateTaskTool(Tool):
     def schema_for_config(self, config: Config) -> dict[str, Any]:
         schema = deepcopy(self.schema())
         cap = config.agent.swarm_max_turns
-        schema["parameters"]["properties"]["max_turns"]["maximum"] = cap
+        schema["parameters"]["properties"]["max_turns"].update(minimum=min(2, cap), maximum=cap)
         schema["description"] = (
-            f"Delegate at most {cap} child turns. Choose a scope that fits; return partial findings early. "
-            + self.description
+            f"Delegate at most {cap} child turns. One turn is report-only; tool use needs at least two turns. "
+            "Choose a scope that fits; return partial findings early. "
+            "Delegate a bounded task to an isolated subagent with inherited operator permissions "
+            "and return its qualified conclusion."
         )
         return schema
 
@@ -234,6 +236,7 @@ class DelegateTaskTool(Tool):
         observations: list[dict[str, Any]] = []
         overflow_retries = 0
         max_turns = min(int(arguments["max_turns"]), state.max_turns)
+        delegation_mode = "report_only" if max_turns == 1 else "investigation"
         turn_index = 0
         repair_answer = False
         diagnostic: dict[str, Any] | None = None
@@ -245,6 +248,8 @@ class DelegateTaskTool(Tool):
                                       {"usage": usage.to_dict(), "turns": turn_index,
                                        "requested_max_turns": int(arguments["max_turns"]),
                                        "effective_max_turns": max_turns,
+                                       "delegation_mode": delegation_mode,
+                                       "tool_observation_status": "recorded" if sources else "none",
                                        **({"provider_diagnostic": diagnostic} if diagnostic else {}),
                                        "evidence": list(sources), "observations": list(observations)})
             state.handoffs[context.metadata["delegation_call_id"]] = result
@@ -258,6 +263,18 @@ class DelegateTaskTool(Tool):
                       + "Helper, overflow and retry requests share the hard run ceiling. "
                       "Return partial findings and unresolved limits when work cannot finish.")
 
+        def closure_text() -> str:
+            return (
+                "\n\nThis is a conclusion or repair turn. All tools are temporarily disabled. "
+                "The empty current callable palette is not evidence of permanent capability absence. "
+                "Eligible investigative tools: " + ", ".join(tool.name for tool in tools) + ". "
+                + ("Use only the completed observations below as tool evidence. " if sources else
+                   "No completed tool observations are available. You must not claim that discovery, "
+                   "fetch or inspection was verified. Report only from supplied material and state "
+                   "what remains unverified. ")
+                + "Return the concise conclusion now without tool calls."
+            )
+
         incomplete("investigation_not_started")
         while turn_index < max_turns:
             # With three or more turns, leave one turn for a rejected conclusion.
@@ -266,7 +283,7 @@ class DelegateTaskTool(Tool):
             closure_messages = [messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]] if synthesis_turn else messages
             request = ProviderRequest(
                 model=route.model,
-                system=system + bounds_text() + ("\n\nThis is a conclusion turn. Do not request tools. Return the concise, evidence-backed conclusion now." if synthesis_turn else ""),
+                system=system + bounds_text() + (closure_text() if synthesis_turn else ""),
                 messages=closure_messages, tools=[] if synthesis_turn else schemas,
                 max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
                 reasoning_effort=context.config.agent.reasoning_effort or None,
@@ -286,7 +303,7 @@ class DelegateTaskTool(Tool):
                         synthesis_turn = True
                         request = replace(request, tools=[], parallel_tool_calls=False,
                                           messages=[messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]],
-                                          system=system + bounds_text() + "\n\nShared investigative capacity is exhausted. This is your final turn; return qualified findings without tools.")
+                                          system=system + bounds_text() + "\n\nShared investigative capacity is exhausted." + closure_text())
                         request = prepare_route_request(request, route.provider, context.config.agent, overflow_retry_count=overflow_retries)
                     reservation = budget.reserve_cost(route.provider, request) if budget else 0.0
                     cancelled_usage = Usage()
@@ -457,8 +474,12 @@ class DelegateTaskTool(Tool):
             # Assistant call IDs stay provider-native for continuation replay.
         metadata = {"usage": usage.to_dict(), "turns": turn_index, "evidence": sources,
                     "requested_max_turns": int(arguments["max_turns"]), "effective_max_turns": max_turns,
+                    "delegation_mode": delegation_mode,
+                    "tool_observation_status": "recorded" if sources else "none",
                     "completion_status": "completed", "result_source": "model"}
         if not final:
             return incomplete("turn_bound: no usable final answer within the delegated bounds")
-        return ToolResult("Delegation complete. Findings and source references:\n" + final
+        return ToolResult("Delegation complete. Findings and source references:\n"
+                          + ("No tools executed; discovery, fetch and inspection remain unverified.\n" if not sources else "")
+                          + final
                           + ("\nEvidence references (search_history.query accepts tool_call_id; read_artifact.artifact_id requires a non-null output_artifact.artifact_id, never tool_call_id): " + context.events.redactor.json(sources) if sources else ""), metadata=metadata)

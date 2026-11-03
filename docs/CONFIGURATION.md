@@ -123,7 +123,13 @@ guard remains independent. Script instructions and the root catalog are not chil
 capabilities. Optional values use JSON `null`, not the literal string `"null"`.
 
 Root and nested schemas, discovery descriptions and prompts advertise the configured
-child-turn cap. Choose a scope that fits and return partial findings early. Legacy
+child-turn cap. When the cap is at least two, the advertised minimum is two turns:
+one tool investigation and one model conclusion. Allocate more turns for multiple
+sequential probes and possible conclusion repair. For three or more turns, the
+last two are reserved for closure and possible repair. Choose a scope that fits
+and return partial findings early. A cap of one advertises a valid one-turn,
+report-only contract. Explicit one-turn requests remain accepted at runtime even
+when the advertised minimum is two; they are never increased automatically. Legacy
 arguments up to 16 remain accepted but are clamped; delegation events and receipts
 record `requested_max_turns` and `effective_max_turns`. Schema construction does not
 change shared tool parameters or another run's configuration.
@@ -142,7 +148,17 @@ so a rejected conclusion can use one remaining turn for repair. An earlier inval
 answer also permits at most one repair. Both closure and repair prohibit tools;
 rejected text and tool calls are not replayed or executed. A limit of two retains
 one investigative turn and one conclusion; a limit of one can only conclude from
-the supplied task. Repairs use existing turns and shared request/time/cost capacity,
+the supplied task, with all tools disabled. The conclusion prompt distinguishes
+this temporary empty palette from the eligible investigative tools; it does not
+prove those capabilities are absent. Without completed tool observations, the
+receipt states that discovery, fetch and inspection remain unverified. Receipts
+record `delegation_mode` (`report_only` for an effective one-turn limit, otherwise
+`investigation`) and `tool_observation_status` (`none` or `recorded`). Recorded
+observations can include errors; they are evidence of attempts, not proof that
+the requested work is verified. These fields do not replace completion status or
+the model/runtime result source. Shared capacity can force an investigation into
+closure before any tools execute, with the same unverified receipt warning.
+Repairs use existing turns and shared request/time/cost capacity,
 never extra allowance. If the
 model cannot conclude, a runtime-generated handoff reports the stop cause, task,
 latest attributed observations, known edits, verification limits and remaining
