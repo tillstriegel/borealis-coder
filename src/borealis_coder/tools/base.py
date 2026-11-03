@@ -260,9 +260,10 @@ class ToolRegistry:
             call.arguments = {**dict.fromkeys(tool.nullable_defaults), **call.arguments}
             validate_schema(call.arguments, tool.parameters, path="$arguments")
             if context.metadata.get("delegated"):
-                from .delegate import delegated_tool_allowed
+                from .delegate import delegated_tool_allowed, inherited_network_allowed
 
-                if not delegated_tool_allowed(tool, context.metadata.get("delegation_allow_writes", False)):
+                if not delegated_tool_allowed(tool, context.metadata.get("delegation_allow_writes", False),
+                                              inherited_network_allowed(context)):
                     raise PolicyError(f"Tool {call.name} is unavailable to this delegated capability")
             decision = context.policy.decide(
                 tool_name=tool.name,

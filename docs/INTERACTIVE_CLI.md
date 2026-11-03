@@ -80,7 +80,9 @@ private model reasoning or stream raw tool arguments to the terminal.
 
 The Aurora swarm tree appears automatically on delegation. It stays in a bounded
 region beside the editable prompt and preserves normal terminal scrollback.
-Rows show parent/child relationships, state, and `read-only` or `write` capability.
+Rows show parent/child relationships, state, and `read-only` or `write` workspace
+capability. Root `--network` separately permits inherited built-in `fetch_url`
+access; `--no-network` blocks descendant fetches. Shell and Script remain excluded.
 Selected detail shows bounded results, errors and evidence. The shared receipt
 shows cumulative admitted descendants (`Agents`), active delegated provider work,
 root request usage and authoritative root spend. The footer counts tree entries,

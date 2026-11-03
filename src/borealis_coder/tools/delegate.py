@@ -31,8 +31,15 @@ from ..util import finish_on_cancellation, json_dumps, new_id, truncate_text
 from .base import MutationScope, Tool, ToolContext, object_schema
 
 
-def delegated_tool_allowed(tool: Tool, allow_writes: bool) -> bool:
+def inherited_network_allowed(context: ToolContext) -> bool:
+    """Root config grants the initial permission; descendants can only retain it."""
+    inherited = context.metadata.get("delegation_allow_network", not context.metadata.get("delegated"))
+    return context.config.safety.network and inherited is True
+
+
+def delegated_tool_allowed(tool: Tool, allow_writes: bool, allow_network: bool = False) -> bool:
     """Keep this execution guard identical to the advertised child palette."""
+    from .fetch import FetchUrlTool
     from .filesystem import (
         DeleteFileTool,
         MakeDirectoryTool,
@@ -44,6 +51,10 @@ def delegated_tool_allowed(tool: Tool, allow_writes: bool) -> bool:
 
     if isinstance(tool, ScriptTool | ScriptJobTool):
         return False
+    if isinstance(tool, FetchUrlTool) or tool.name == FetchUrlTool.name:
+        return (allow_network and type(tool) is FetchUrlTool
+                and tool.effect == Effect.NETWORK
+                and tool.effective_mutation_scope == MutationScope.NONE)
     if isinstance(tool, DelegateTaskTool):
         return tool.effect == Effect.READ and tool.effective_mutation_scope == MutationScope.NONE
     if allow_writes and type(tool) in (
@@ -100,6 +111,7 @@ class DelegateTaskTool(Tool):
         delegation_id = new_id("delegate")
         delegated_run_id = f"{context.run_id}.{delegation_id}"
         allow_writes = state.allow_writes and context.metadata.get("delegation_allow_writes", True)
+        allow_network = inherited_network_allowed(context)
         lineage = {
             "delegation_id": delegation_id, "delegated_run_id": delegated_run_id,
             "parent_run_id": context.run_id,
@@ -107,6 +119,7 @@ class DelegateTaskTool(Tool):
             "parent_tool_call_id": context.tool_call_id, "depth": depth,
             "task": truncate_text(str(arguments["task"]), 160),
             "capability": "write" if allow_writes else "read-only",
+            "network_allowed": allow_network,
             "requested_max_turns": int(arguments["max_turns"]),
             "effective_max_turns": min(int(arguments["max_turns"]), state.max_turns),
         }
@@ -139,7 +152,8 @@ class DelegateTaskTool(Tool):
                 metadata={**context.metadata, "delegated": True,
                           "delegation_id": delegation_id, "delegation_depth": depth,
                           "delegation_call_id": context.tool_call_id,
-                          "delegation_allow_writes": allow_writes},
+                          "delegation_allow_writes": allow_writes,
+                          "delegation_allow_network": allow_network},
             )
             result = await self._investigate(arguments, delegated_context, state, emit)
             state.receipts[delegation_id] = truncate_text(context.events.redactor.text(result.output), 4_000)
@@ -190,12 +204,16 @@ class DelegateTaskTool(Tool):
         provider = cast(Provider, route.provider)
         tools = [tool for name in registry.names()
                  if (tool := registry.get(name)) is not None
-                 and delegated_tool_allowed(tool, context.metadata["delegation_allow_writes"])]
+                 and delegated_tool_allowed(tool, context.metadata["delegation_allow_writes"],
+                                            inherited_network_allowed(context))]
         schemas = [tool.schema_for_config(context.config) for tool in tools]
         system = await asyncio.to_thread(builder.system_prompt, query=str(arguments["task"]), direct=True)
         capability = "built-in workspace file edits" if context.metadata["delegation_allow_writes"] else "read-only investigation"
-        system += ("\n\n# Delegated role\nYour maximum capability is " + capability
-                   + ". Use only the available tools. You may delegate within shared operator limits. "
+        network = ("enabled for built-in fetch_url only" if inherited_network_allowed(context)
+                   else "disabled")
+        system += ("\n\n# Delegated role\nYour workspace capability is " + capability
+                   + ". Network access is " + network + ". Shell and Script are unavailable. "
+                   "Use only the available tools. You may delegate within shared operator limits. "
                    "Return a concise handoff with findings, relevant paths and line references, unresolved questions, and completion status.")
         messages = [Message(role=Role.USER, content=str(arguments["task"]))]
         failed_calls: dict[str, int] = {}
@@ -290,7 +308,8 @@ class DelegateTaskTool(Tool):
                 parallel_tool_calls=not synthesis_turn,
                 metadata={"parent_session_id": context.session_id, "delegated": True,
                           "provider_route": route.name, "delegation_id": context.metadata["delegation_id"],
-                          "delegation_depth": context.metadata["delegation_depth"]},
+                          "delegation_depth": context.metadata["delegation_depth"],
+                          "delegation_allow_network": inherited_network_allowed(context)},
             )
             request = prepare_route_request(request, route.provider, context.config.agent, overflow_retry_count=overflow_retries)
             await emit("delegate.state", state="waiting")

@@ -28,9 +28,10 @@ class DiscoverToolsTool(Tool):
             if tool is None:
                 return False
             if context.metadata.get("delegated"):
-                from .delegate import delegated_tool_allowed
+                from .delegate import delegated_tool_allowed, inherited_network_allowed
 
-                return delegated_tool_allowed(tool, context.metadata.get("delegation_allow_writes", False))
+                return delegated_tool_allowed(tool, context.metadata.get("delegation_allow_writes", False),
+                                               inherited_network_allowed(context))
             return True
 
         names = arguments["names"] or [name for name in registry.names() if available(name)]

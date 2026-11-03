@@ -102,6 +102,14 @@ external workspace-authority opt-in. Model arguments cannot change these limits
 or enable writes. `/swarm-writes on` enables file writes for future interactive
 turns in the current process; `/swarm-writes off` revokes them.
 
+Root `--network` grants inherited access to the built-in `fetch_url` only.
+`--no-network` blocks descendant fetches at every depth. Network permission is
+independent of `swarm_allow_writes`. A child with restricted network permission
+cannot regain it through tool arguments, nested delegation, or later changes to
+the shared network setting. Discovery and execution enforce the same boundary.
+Normal safety modes, approvals, public-address checks, redirect validation, and
+fetch limits still apply. Other network tools, shell, and Script remain excluded.
+
 Admission is atomic before child preparation. The total is cumulative, not a
 reusable pool. Each tool batch uses at most `parallel_reads` workers rather than
 allocating a task per requested call; admitted agent conversations are bounded

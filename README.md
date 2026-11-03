@@ -175,10 +175,14 @@ Common commands inside the shell:
 
 Delegation supports bounded recursive swarms. Defaults allow two levels, eight
 cumulative descendants, two simultaneous delegated provider operations, and six
-turns per child. Children are read-only by default. To allow built-in workspace
+turns per child. Children cannot edit files by default. To allow built-in workspace
 file edits, set `agent.swarm_allow_writes = true` in trusted configuration or use
 `/swarm-writes on` for future shell turns. Normal approvals, protected paths,
-checkpoints, and verification still apply; children cannot use shell or Script.
+checkpoints, and verification still apply. Root `--network` also lets children
+and deeper descendants use the built-in `fetch_url`; `--no-network` blocks it
+throughout the tree. A restricted child cannot regain network access through
+delegation. Fetches still require normal policy and approval checks and public
+URL validation. Other network tools, shell, and Script remain unavailable to children.
 Set `swarm_max_depth` or `swarm_max_descendants` to `0` to disable delegation.
 See [configuration](docs/CONFIGURATION.md#recursive-delegation).
 

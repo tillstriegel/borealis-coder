@@ -282,11 +282,18 @@ Also isolate the worker account, use read-only provider credentials where possib
 
 Recursive agents share the root's request/time/cost budgets and cannot change
 operator depth, cumulative descendant, provider concurrency or child-turn limits.
-Children default to read-only. Trusted `agent.swarm_allow_writes = true` permits
+Children cannot edit files by default. Trusted `agent.swarm_allow_writes = true` permits
 only built-in write, replace, delete, mkdir and patch tools. The registry checks
 the capability at execution as well as schema selection. Descendants cannot gain
 more authority than their parent. Plan mode, approvals, allowed roots, protected
 paths, stale hashes and checkpoints remain effective.
+
+Root `--network` grants descendants access to the exact built-in `fetch_url`.
+`--no-network` blocks it throughout the tree. An inherited network restriction
+cannot be raised by tool arguments, nested delegation, or later shared config
+changes. Missing inherited permission fails closed. Fetches retain normal policy,
+approval, public-address validation, pinned connections, redirect checks, and
+output/time limits. This permission does not grant other network tools.
 
 Delegates cannot use shell, Script/job control, or custom/external mutation tools.
 Each nested call uses the root runner's durable lifecycle; shared file changes
