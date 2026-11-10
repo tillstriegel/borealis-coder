@@ -131,6 +131,86 @@ def fake_auth(provider):
 
 
 class LateIntentRepairTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_steering_reaches_judge_and_next_run_gets_fresh_intent(self):
+        async with harness() as (root, runner, provider, _):
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_worker = runner._run_locked
+            original_complete = provider.complete
+
+            async def gated_worker(*args, **kwargs):
+                entered.set()
+                await release.wait()
+                return await original_worker(*args, **kwargs)
+
+            async def complete(request):
+                if request.metadata.get("purpose") == "smart_approval":
+                    intent = json.loads(request.messages[0].content)["user_intent"]
+                    provider.answers[:] = [
+                        ModelResponse(
+                            text=DENY if "Do not create sentinel." in intent else ALLOW,
+                            stop_reason="stop",
+                        )
+                    ]
+                return await original_complete(request)
+
+            runner._run_locked = gated_worker
+            provider.complete = complete
+            session = runner.sessions.create_session(
+                workspace=root,
+                provider="mock",
+                model=provider.config.model,
+            )
+            task = asyncio.create_task(runner.run("Create sentinel.", session_id=session.id))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                self.assertTrue(runner.accepts_steering(session.id))
+                runner.steer(session.id, "Do not create sentinel.")
+            finally:
+                release.set()
+                await asyncio.wait_for(task, 3)
+            self.assertFalse((root / "sentinel").exists())
+            self.assertEqual(
+                json.loads(provider.judgments[0].messages[0].content)["user_intent"],
+                ["Create sentinel.", "Do not create sentinel."],
+            )
+            self.assertEqual(runner._approval_intents, {})
+            provider.batches.append([shell_call(call_id="fresh-run")])
+            await runner.run("Create sentinel.", session_id=session.id)
+            self.assertTrue((root / "sentinel").exists())
+            self.assertEqual(
+                json.loads(provider.judgments[-1].messages[0].content)["user_intent"],
+                ["Create sentinel."],
+            )
+            self.assertEqual(runner._approval_intents, {})
+
+    async def test_startup_cancellation_cleans_up_approval_intent(self):
+        async with harness() as (root, runner, provider, _):
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_worker = runner._run_locked
+
+            async def blocked_worker(*args, **kwargs):
+                entered.set()
+                await release.wait()
+                return await original_worker(*args, **kwargs)
+
+            runner._run_locked = blocked_worker
+            session = runner.sessions.create_session(
+                workspace=root,
+                provider="mock",
+                model=provider.config.model,
+            )
+            task = asyncio.create_task(runner.run("Create sentinel.", session_id=session.id))
+            await asyncio.wait_for(entered.wait(), 3)
+            self.assertTrue(runner.accepts_steering(session.id))
+            task.cancel()
+            await asyncio.wait_for(task, 3)
+            self.assertEqual(runner._approval_intents, {})
+            self.assertFalse(runner.accepts_steering(session.id))
+            self.assertFalse((root / "sentinel").exists())
+            self.assertEqual(provider.judgments, [])
+
     async def test_cancelled_receipt_delivery_still_records_late_intent_denial(self):
         async with harness() as (root, runner, _, _):
 

@@ -616,6 +616,7 @@ class AgentRunner:
             raise SessionError(f"Session {session_id} is already running")
         async with lock:
             await asyncio.to_thread(self.sessions.acquire_run_lease, session_id)
+            self._approval_intents[session_id] = [prompt]
             self._accepting_steering.add(session_id)
             try:
                 run_id = new_id("run")
@@ -658,7 +659,6 @@ class AgentRunner:
                             self.sessions.update_session, session_id, status="idle"
                         )
                         self._cancel.pop(session_id, None)
-                        self._approval_intents.pop(session_id, None)
                         stop_reason = (
                             StopReason.BUDGET
                             if deadline_expired.is_set()
@@ -692,6 +692,7 @@ class AgentRunner:
                     return await self._await_run_finalization(startup_fallback())
             finally:
                 self._accepting_steering.discard(session_id)
+                self._approval_intents.pop(session_id, None)
                 await self._await_run_finalization(
                     asyncio.to_thread(self.sessions.release_run_lease, session_id)
                 )
@@ -820,8 +821,7 @@ class AgentRunner:
         context.metadata["before_model_request"] = budget.before_model_request
         from ..safety.smart import SmartApprovalJudge
 
-        approval_intents = [prompt]
-        self._approval_intents[session_id] = approval_intents
+        approval_intents = self._approval_intents[session_id]
         judge_route = self.providers[0]
         approvals.smart_callback = SmartApprovalJudge(
             judge_route.provider, judge_route.model, budget, usage_sink, context, approval_intents,
@@ -1291,7 +1291,6 @@ class AgentRunner:
                     if stop_reason == StopReason.MAX_TURNS:
                         self._accepting_steering.discard(session_id)
                     self._cancel.pop(session_id, None)
-                    self._approval_intents.pop(session_id, None)
                     approvals.smart_callback = None
                     queue = self._steering.get(session_id)
                     if queue is not None and queue.empty():
