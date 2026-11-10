@@ -113,7 +113,7 @@ class VerificationPlanner:
             return report
         for step in steps:
             decision = context.policy.decide(
-                tool_name="verify",
+                tool_name="shell",
                 effect=Effect.EXECUTE,
                 arguments={"command": step.command},
                 risk_hint="low",
@@ -134,6 +134,9 @@ class VerificationPlanner:
                         description=f"Run verification: {step.name}",
                         decision=decision,
                         arguments_preview=truncate_text(step.command, 4_000),
+                        arguments={"command": step.command, "cwd": str(self.workspace),
+                                   "timeout_seconds": step.timeout},
+                        tool_call_id=context.tool_call_id,
                     )
                 )
             except PolicyError as error:

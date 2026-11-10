@@ -86,7 +86,7 @@ async def build_runner(
             process_network_isolated=process_network_isolated,
         )
         approvals = ApprovalManager(
-            approval_callback, cache=config.safety.approval_cache == "session"
+            approval_callback, cache=config.safety.approval_cache == "session", safety=config.safety
         )
         process = build_process_driver(roots, config.safety, config.sandbox)
         checkpoints = CheckpointManager(

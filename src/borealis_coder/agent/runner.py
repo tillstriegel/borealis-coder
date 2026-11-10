@@ -475,6 +475,7 @@ class AgentRunner:
         ] = {}
         self._accepting_steering: set[str] = set()
         self._approval_managers: dict[str, ApprovalManager] = {}
+        self._approval_intents: dict[str, list[str]] = {}
         self.mcp_manager: MCPManager | None = None
         self._mutation_lock = asyncio.Lock()
         self._script_scopes: set[ScriptScope] = set()
@@ -529,6 +530,8 @@ class AgentRunner:
             raise ValueError("Steering prompt cannot be empty")
         if not self.accepts_steering(session_id):
             raise SessionError(f"Session {session_id} has no active run to steer")
+        if session_id in self._approval_intents:
+            self._approval_intents[session_id].append(prompt)
         self._steering.setdefault(session_id, asyncio.Queue()).put_nowait(
             (prompt, message_id, dict(metadata or {}))
         )
@@ -655,6 +658,7 @@ class AgentRunner:
                             self.sessions.update_session, session_id, status="idle"
                         )
                         self._cancel.pop(session_id, None)
+                        self._approval_intents.pop(session_id, None)
                         stop_reason = (
                             StopReason.BUDGET
                             if deadline_expired.is_set()
@@ -743,6 +747,7 @@ class AgentRunner:
             approvals = ApprovalManager(
                 self.tool_context.approvals.callback,
                 cache=self.tool_context.approvals.cache,
+                safety=self.config.safety,
             )
             self._approval_managers[session_id] = approvals
         else:
@@ -813,6 +818,14 @@ class AgentRunner:
         context.metadata["budget"] = budget
         context.metadata["usage_sink"] = usage_sink
         context.metadata["before_model_request"] = budget.before_model_request
+        from ..safety.smart import SmartApprovalJudge
+
+        approval_intents = [prompt]
+        self._approval_intents[session_id] = approval_intents
+        judge_route = self.providers[0]
+        approvals.smart_callback = SmartApprovalJudge(
+            judge_route.provider, judge_route.model, budget, usage_sink, context, approval_intents,
+        ).enforce
 
         scripts = self._new_script_scope(context, cancel)
         context.metadata["script_scope"] = scripts
@@ -1278,6 +1291,8 @@ class AgentRunner:
                     if stop_reason == StopReason.MAX_TURNS:
                         self._accepting_steering.discard(session_id)
                     self._cancel.pop(session_id, None)
+                    self._approval_intents.pop(session_id, None)
+                    approvals.smart_callback = None
                     queue = self._steering.get(session_id)
                     if queue is not None and queue.empty():
                         self._steering.pop(session_id, None)

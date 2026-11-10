@@ -170,7 +170,7 @@ later protocol or empty-output failures do not inherit an old overflow diagnosis
 | Key | Default | Meaning |
 |---|---:|---|
 | `mode` | `"workspace-write"` | `plan`, `workspace-write`, or `full`. |
-| `approval` | `"on-risk"` | `never`, `on-risk`, or `always`. |
+| `approval` | `"on-risk"` | `never`, `on-risk`, `always`, or `smart`. |
 | `network` | `false` | Hard gate for network effects. On the native driver, commands capable of opening their own sockets are rejected because host network isolation cannot be enforced. |
 | `allow_shell` | `true` | Hard gate for the shell tool. |
 | `allow_git_commit` | `false` | Hard gate for Git commits. |
@@ -185,8 +185,30 @@ later protocol or empty-output failures do not inherit an old overflow diagnosis
 | `checkpoint_retention_max_count` | `50` | Maximum complete checkpoints retained after creating a new checkpoint. |
 | `checkpoint_retention_max_bytes` | `250000000` | Maximum total bytes across complete checkpoints; the newest recovery point is always preserved. |
 | `checkpoint_retention_max_age_seconds` | `0` | Optional maximum checkpoint age; `0` disables age pruning. |
-| `approval_cache` | `"session"` | Cache matching approvals for the active session. |
+| `approval_cache` | `"session"` | Cache matching human approvals for the active session. Smart decisions are never cached. |
 | `protected_paths` | `.git`, checkpoint store | Glob patterns that file mutation tools may never write, delete, or patch. |
+
+### Approval modes
+
+`on-risk` remains the default. It asks a human for risky operations when an
+interactive channel exists and otherwise denies them. `always` also asks for
+low-risk tools. `never` denies operations that require approval; deterministic
+ALLOW operations can still run.
+
+Set `safety.approval = "smart"` in trusted configuration, `BOREALIS_APPROVAL=smart`,
+or `--approval smart` to review risky ASK operations automatically. ACP uses the
+same trusted configuration and never sends a client permission request in this
+mode. Workspace authority settings still require the existing external opt-in.
+
+Smart review uses the configured primary provider/model, including its trusted
+routing and pricing settings. No separate judge model is configured. Each review
+permits one provider attempt, requests at most 512 output tokens, and times out
+after 20 seconds or the remaining run time, whichever is shorter. Reviews share
+`max_model_requests`, `max_time_seconds`, and `max_cost_usd`, preserving reserved
+closure requests. Provider retries and client-side recovery are disabled for
+review. Tool/history overrides in `extra_body`, and provider web/plugin
+extensions, are rejected. Invalid, incomplete, missing, or failed judgments deny
+the operation without human fallback. Use `on-risk` for human review.
 
 ## `[sandbox]`
 

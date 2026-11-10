@@ -39,6 +39,7 @@ compaction_shadow_v2 = false
 
 [safety]
 mode = "workspace-write"
+# Use "smart" for automatic AI review of risky operations without human prompts.
 approval = "on-risk"
 network = false
 allow_shell = true

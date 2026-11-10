@@ -12,6 +12,7 @@ from ..config import ProviderConfig
 from ..errors import ProviderError, ProviderRateLimitError, ProviderUnavailableError
 from ..models import ContinuationState, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
+from .approval_envelope import validate_approval_envelope
 from .base import Provider, ProviderStreamEvent, classify_provider_error
 from .http import HttpClient
 
@@ -141,6 +142,7 @@ class OpenAIProvider(Provider):
                 raise ProviderError("OpenAI returned a non-object response", code="malformed_response")
             _raise_in_band_failure(response.data)
             result = self._parse_responses(response.data, retain_raw=True)
+            validate_approval_envelope(request, response.data, protocol="responses", usage=result.usage)
             record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
             return result
 
@@ -315,6 +317,7 @@ class OpenAIProvider(Provider):
                     _raise_in_band_failure(failed, default_message="Responses stream failed")
             if final_data:
                 result = self._parse_responses(final_data, retain_raw=True)
+                validate_approval_envelope(request, final_data, protocol="responses", usage=result.usage)
                 response_incomplete = _responses_data_is_incomplete(final_data)
                 if not result.text:
                     result.text = "".join(text_parts)
@@ -612,6 +615,7 @@ class OpenAIProvider(Provider):
                 raise ProviderError("OpenAI-compatible provider returned a non-object response", code="malformed_response")
             _raise_in_band_failure(response.data)
             result = self._parse_chat(response.data, retain_raw=True)
+            validate_approval_envelope(request, response.data, protocol="chat", usage=result.usage)
             record(self.normalize_cost(result.usage, model=self.response_billing_model(result.model)))
             return result
 

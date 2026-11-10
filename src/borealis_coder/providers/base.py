@@ -20,6 +20,7 @@ from ..errors import (
     ProviderUnavailableError,
 )
 from ..models import ModelResponse, ProviderRequest, Usage
+from .approval_envelope import validate_approval_request
 
 T = TypeVar("T")
 
@@ -57,6 +58,17 @@ class Provider(abc.ABC):
     @abc.abstractmethod
     async def complete(self, request: ProviderRequest) -> ModelResponse:
         raise NotImplementedError
+
+    async def complete_once(self, request: ProviderRequest) -> ModelResponse:
+        """Complete without adapter retry loops; the caller owns accounting and recovery."""
+        validate_approval_request(request, self.config)
+        token = self._retry_task.set(asyncio.current_task())
+        model_token = self.request_model.set(request.model)
+        try:
+            return await self.complete(request)
+        finally:
+            self.request_model.reset(model_token)
+            self._retry_task.reset(token)
 
     async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
         response = await self.complete(request)

@@ -209,6 +209,20 @@ Borealis applies policy before every tool invocation.
 
 The default is `workspace-write`, `approval = "on-risk"`, and `network = false`.
 
+Opt in to automatic AI review of risky operations:
+
+```sh
+borealis run --approval smart --non-interactive "Fix the failing tests"
+```
+
+`smart` sends policy ASK decisions to a separate, tool-free request using the
+configured primary provider and model. It never asks a human and fails closed on
+invalid replies, failures, or exhausted budgets. Low-risk ALLOW operations stay
+fast; DENY operations stay blocked. Reviews share run request/time/cost limits,
+add model cost, and are never cached. Network, shell, Git and file-tool path gates
+still apply. This is a fallible automatic reviewer, not a security boundary.
+See [the security model](docs/SECURITY_MODEL.md#smart-approvals) for details.
+
 Important invariants:
 
 1. Relative file paths resolve from the session workspace.

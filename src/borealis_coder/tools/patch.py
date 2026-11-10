@@ -56,6 +56,14 @@ class ApplyPatchTool(Tool):
         patch = str(arguments.get("patch") or "")
         return "high" if "*** Delete File:" in patch or "+++ /dev/null" in patch else "medium"
 
+    def preflight(self, arguments: dict[str, Any], context: ToolContext) -> None:
+        for item in parse_patch(str(arguments["patch"])):
+            path = item.new_path or item.old_path
+            if not path:
+                raise PatchError("File patch has no path")
+            target = context.roots.resolve(Path(path)).path
+            context.roots.assert_writable(target, context.config.safety.protected_paths)
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         patch_text = str(arguments["patch"])
         patches = parse_patch(patch_text)

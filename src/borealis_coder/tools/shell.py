@@ -31,6 +31,9 @@ class ShellTool(Tool):
     def approval_description(self, arguments: dict[str, Any]) -> str:
         return str(arguments.get("description") or arguments.get("command") or "Run shell command")
 
+    def preflight(self, arguments: dict[str, Any], context: ToolContext) -> None:
+        context.roots.resolve(arguments.get("cwd") or ".", must_exist=True, kind="dir")
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         cwd = context.roots.resolve(arguments.get("cwd") or ".", must_exist=True, kind="dir").path
         timeout = int(arguments.get("timeout_seconds") or context.config.safety.command_timeout_seconds)

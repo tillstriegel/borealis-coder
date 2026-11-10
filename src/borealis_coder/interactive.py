@@ -653,7 +653,7 @@ class InteractiveCLI:
             await self._set_choice(
                 args,
                 label="approval",
-                choices={"never", "on-risk", "always"},
+                choices={"never", "on-risk", "always", "smart"},
                 getter=lambda config: config.safety.approval,
                 setter=lambda config, value: setattr(config.safety, "approval", value),
             )
@@ -986,7 +986,7 @@ class InteractiveCLI:
                         ("/provider [NAME MODEL]", "inspect or switch provider route"),
                         ("/model [MODEL]", "inspect or switch active model"),
                         ("/mode [VALUE]", "plan | workspace-write | full"),
-                        ("/approval [VALUE]", "never | on-risk | always"),
+                        ("/approval [VALUE]", "never | on-risk | always | smart"),
                         ("/network [on|off]", "toggle model-initiated network tools"),
                         ("/verify [on|off]", "toggle post-change verification"),
                         ("/sandbox [VALUE]", "native | docker"),

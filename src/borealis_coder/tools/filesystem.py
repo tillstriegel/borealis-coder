@@ -183,6 +183,10 @@ class DeleteFileTool(Tool):
     def approval_description(self, arguments: dict[str, Any]) -> str:
         return f"Delete file {arguments.get('path')}"
 
+    def preflight(self, arguments: dict[str, Any], context: ToolContext) -> None:
+        resolved = context.roots.resolve(arguments["path"], must_exist=True, kind="file")
+        context.roots.assert_writable(resolved.path, context.config.safety.protected_paths)
+
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         async with workspace_transaction(context.workspace):
             resolved = context.roots.resolve(

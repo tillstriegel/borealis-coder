@@ -5,7 +5,9 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
+from ..config import SafetyConfig
 from ..errors import ApprovalDenied
 from .policy import PolicyAction, PolicyDecision
 
@@ -16,16 +18,23 @@ class ApprovalRequest:
     description: str
     decision: PolicyDecision
     arguments_preview: str
+    arguments: dict[str, Any] | None = None
+    tool_call_id: str = ""
 
 
 ApprovalCallback = Callable[[ApprovalRequest], bool | str | Awaitable[bool | str]]
 
 
 class ApprovalManager:
-    def __init__(self, callback: ApprovalCallback | None = None, *, cache: bool = True) -> None:
+    def __init__(
+        self, callback: ApprovalCallback | None = None, *, cache: bool = True,
+        safety: SafetyConfig | None = None,
+    ) -> None:
         self.callback = callback
         self.cache = cache
         self._approved: set[str] = set()
+        self.safety = safety
+        self.smart_callback: Callable[[ApprovalRequest], Awaitable[None]] | None = None
 
     async def enforce(self, request: ApprovalRequest) -> None:
         decision = request.decision
@@ -33,6 +42,11 @@ class ApprovalManager:
             return
         if decision.action == PolicyAction.DENY:
             raise ApprovalDenied(decision.reason)
+        if self.safety is not None and self.safety.approval == "smart":
+            if self.smart_callback is None:
+                raise ApprovalDenied("Smart approval unavailable: run with a configured judge provider.")
+            await self.smart_callback(request)
+            return
         key = decision.cache_key
         if key and key in self._approved:
             return

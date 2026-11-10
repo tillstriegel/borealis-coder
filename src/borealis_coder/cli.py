@@ -192,7 +192,7 @@ def _common_runtime_arguments(
     parser.add_argument("--model")
     parser.add_argument("--fallback", action="append", default=[])
     parser.add_argument("--mode", choices=["plan", "workspace-write", "full"])
-    parser.add_argument("--approval", choices=["never", "on-risk", "always"])
+    parser.add_argument("--approval", choices=["never", "on-risk", "always", "smart"])
     parser.add_argument("--network", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--sandbox", choices=["native", "docker"])
     parser.add_argument("--verify", action=argparse.BooleanOptionalAction, default=None)

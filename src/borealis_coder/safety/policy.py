@@ -63,8 +63,14 @@ class PolicyEngine:
         if tool_name == "shell":
             return self._command_decision(str(arguments.get("command") or ""))
         if tool_name == "verify" and arguments.get("command"):
-            return self._command_decision(str(arguments.get("command") or ""))
+            decision = self._command_decision(str(arguments.get("command") or ""))
+            if self.config.approval == "smart" and decision.action == PolicyAction.ASK:
+                # The planner reviews each exact command once, including detected steps.
+                return PolicyDecision(PolicyAction.ALLOW, "verification steps enforce command policy")
+            return decision
         if tool_name == "git_commit" and not self.config.allow_git_commit:
+            if self.config.approval == "smart":
+                return PolicyDecision(PolicyAction.DENY, "git commits require allow_git_commit in smart mode", "high")
             return self._ask_or_deny(tool_name, "git commits are disabled by default", "high")
         if tool_name == "git_push":
             if not self.config.allow_git_push or not self.config.network:
@@ -80,7 +86,7 @@ class PolicyEngine:
             )
         if self.config.approval == "always":
             return self._ask(tool_name, "approval is required for every tool", risk)
-        if self.config.approval == "on-risk" and risk in {"high", "critical"}:
+        if self.config.approval in {"on-risk", "smart"} and risk in {"high", "critical"}:
             return self._ask_or_deny(tool_name, f"{risk}-risk operation", risk)
         return PolicyDecision(PolicyAction.ALLOW, f"allowed {effect.value} operation", risk)
 
@@ -117,7 +123,7 @@ class PolicyEngine:
         return PolicyDecision(PolicyAction.ALLOW, assessment.reason, "low", key)
 
     def _ask_or_deny(self, name: str, reason: str, risk: str, key: str | None = None) -> PolicyDecision:
-        if self.config.approval == "never" or not self.interactive:
+        if self.config.approval == "never" or (not self.interactive and self.config.approval != "smart"):
             return PolicyDecision(PolicyAction.DENY, f"{reason}; no approval channel is available", risk, key)
         return self._ask(name, reason, risk, key)
 

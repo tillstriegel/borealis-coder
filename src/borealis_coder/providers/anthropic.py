@@ -10,6 +10,7 @@ from ..config import ProviderConfig
 from ..errors import ProviderError
 from ..models import Message, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
+from .approval_envelope import validate_approval_envelope
 from .base import Provider, ProviderStreamEvent
 from .http import HttpClient
 
@@ -75,11 +76,13 @@ class AnthropicProvider(Provider):
             )
             if not isinstance(response.data, dict):
                 raise ProviderError("Anthropic returned a non-object response")
-            return self._parse(
+            result = self._parse(
                 response.data,
                 retain_raw=True,
                 cache_ttl=str(request.metadata.get("prompt_cache_ttl") or "5m"),
             )
+            validate_approval_envelope(request, response.data, protocol="anthropic", usage=result.usage)
+            return result
 
         return await self.with_retries(operation, request=request)
 

@@ -70,7 +70,7 @@ class AgentConfig:
 @dataclass(slots=True)
 class SafetyConfig:
     mode: str = "workspace-write"  # plan | workspace-write | full
-    approval: str = "on-risk"  # never | on-risk | always
+    approval: str = "on-risk"  # never | on-risk | always | smart
     network: bool = False
     allow_shell: bool = True
     allow_git_commit: bool = False
@@ -659,8 +659,8 @@ def validate_config(config: Config) -> None:
         )
     if config.safety.mode not in {"plan", "workspace-write", "full"}:
         raise ConfigurationError("safety.mode must be plan, workspace-write, or full")
-    if config.safety.approval not in {"never", "on-risk", "always"}:
-        raise ConfigurationError("safety.approval must be never, on-risk, or always")
+    if config.safety.approval not in {"never", "on-risk", "always", "smart"}:
+        raise ConfigurationError("safety.approval must be never, on-risk, always, or smart")
     if config.safety.max_process_output_chars < 1:
         raise ConfigurationError("safety.max_process_output_chars must be positive")
     if config.agent.auto_verify_max_repair_cycles < 0:

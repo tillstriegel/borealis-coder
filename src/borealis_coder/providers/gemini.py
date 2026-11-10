@@ -11,6 +11,7 @@ from ..config import ProviderConfig
 from ..errors import ProviderError
 from ..models import ContinuationState, ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from ..util import json_dumps
+from .approval_envelope import validate_approval_envelope
 from .base import Provider, ProviderStreamEvent
 from .http import HttpClient
 
@@ -83,7 +84,9 @@ class GeminiProvider(Provider):
             )
             if not isinstance(response.data, dict):
                 raise ProviderError("Gemini returned a non-object response")
-            return self._parse(response.data, retain_raw=True)
+            result = self._parse(response.data, retain_raw=True)
+            validate_approval_envelope(request, response.data, protocol="gemini", usage=result.usage)
+            return result
 
         return await self.with_retries(operation, request=request)
 

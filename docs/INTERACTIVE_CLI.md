@@ -188,7 +188,7 @@ in bounded form.
 | `/provider NAME [MODEL]` | Switch route for future turns in this process. |
 | `/model [MODEL]` | Show or switch the active model. |
 | `/mode [VALUE]` | Show or change the safety mode. |
-| `/approval [VALUE]` | Show or change approval behavior. |
+| `/approval [VALUE]` | Show or change `never`, `on-risk`, `always`, or `smart`. |
 | `/network [on or off]` | Show or change model-initiated network access. |
 | `/verify [on or off]` | Show or change automatic verification. |
 | `/sandbox [VALUE]` | Show or change the process driver. |
@@ -197,6 +197,14 @@ in bounded form.
 | `/rollback [ID]` | List checkpoints or restore one. |
 | `/paste` | Read a multiline task until a line containing only `/end`. |
 | `/exit`, `/quit` | Close the shell. |
+
+Use `/approval smart` to let the configured primary model review risky policy
+ASK operations without a human prompt. Failures and invalid replies deny the
+operation. `/approval on-risk` restores human review. Switching rebuilds the
+runtime and clears previous approval grants. Smart decisions are never cached.
+Steering that arrives during review invalidates that decision; subsequent review
+includes the new user intent. Reviews add model requests and cost within the
+existing run limits.
 
 Use `//` to send a prompt that begins with a slash:
 
