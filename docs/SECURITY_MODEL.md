@@ -77,6 +77,46 @@ Hard gates are independent of interactive approval:
 
 An approval cannot silently override a disabled hard gate. The embedding application must change configuration deliberately.
 
+## Smart approvals
+
+`--approval smart` is an opt-in automatic reviewer for deterministic ASK
+operations. Deterministic ALLOW and DENY decisions do not call the judge. A
+separate request uses the configured primary provider/model with no tools or
+conversation continuation. It contains operator policy, workspace roots, the
+current run's user-authored request and steering, and redacted original tool
+arguments. It does not include the conversation transcript or repository files.
+Descriptions, commands, and other proposed arguments are untrusted data, not user
+authorization. Give explicit task scope when resuming work; prior-run prompts are
+not included in the review.
+
+The judge must return exactly `{"decision":"allow"}` or `{"decision":"deny"}`.
+Extra fields, duplicate fields, tool calls, incomplete responses, and unknown
+completion states fail closed. Missing context/provider, errors, timeout,
+cancellation, and exhausted root budgets cannot authorize execution. There is no
+human fallback or smart approval cache. A new user request received during review
+invalidates the result. Each review has a single provider attempt with a 20-second
+ceiling and shares root request/time/cost accounting, including failed attempts.
+Reserved final-answer requests remain available. Detected and explicit
+verification commands use the same review before each command executes.
+
+Judge replies must contain one text decision in the supported provider envelope;
+multiple completions and unexpected tool or content blocks are rejected. If user
+intent changes during delivery of an allow receipt, a final denial receipt links
+to it with `supersedes`, and the operation does not execute.
+
+Smart approval cannot override plan mode, disabled network/shell/Git gates,
+workspace roots, or protected file-tool targets. In smart mode the explicit
+`git_commit` tool also requires `allow_git_commit=true`; the human modes retain
+their existing explicit-commit approval behavior. Enabling a Git gate still
+requires review for risky commits/pushes. These controls do not add kernel path
+isolation to native shell commands or improve the command classifier.
+
+`approval.decided` events persist `source=AI`, the tool/call identity, allow/deny,
+and a fixed reason code. They do not contain the judge prompt, answer, or hidden
+reasoning. Existing redaction still applies to other tool events. Redaction and
+AI judgments can be wrong. Smart mode is not a security boundary and does not
+replace an OS sandbox or operator review of sensitive work.
+
 ## Script execution
 
 `script` runs JavaScript in a fresh QuickJS context in a dedicated Python

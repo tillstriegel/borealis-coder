@@ -243,9 +243,8 @@ class CheckpointManager:
             if entry.get("existed"):
                 assert blob_data is not None
                 atomic_write_bytes(path, blob_data, mode=entry.get("mode"))
-            elif path.exists():
-                if path.is_file() or path.is_symlink():
-                    path.unlink()
+            elif path.exists() and (path.is_file() or path.is_symlink()):
+                path.unlink()
         return checkpoint
 
     def prune(

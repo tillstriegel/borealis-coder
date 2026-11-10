@@ -144,6 +144,9 @@ class Tool:
     def approval_description(self, arguments: dict[str, Any]) -> str:
         return self.description or self.name
 
+    def preflight(self, arguments: dict[str, Any], context: ToolContext) -> None:
+        """Check hard path gates before automatic review; execution checks them again."""
+
     def schema(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -270,6 +273,8 @@ class ToolRegistry:
                 arguments=call.arguments,
                 risk_hint=tool.risk(call.arguments),
             )
+            if context.config.safety.approval == "smart" and decision.action.value == "ask":
+                tool.preflight(call.arguments, context)
             await context.events.emit(
                 "tool.policy", session_id=context.session_id, run_id=context.run_id,
                 tool_call_id=call.id, tool=call.name, decision=decision.action.value,
@@ -281,6 +286,7 @@ class ToolRegistry:
                     description=tool.approval_description(call.arguments),
                     decision=decision,
                     arguments_preview=truncate_text(json_dumps(call.arguments, pretty=True), 4_000),
+                    arguments=call.arguments, tool_call_id=call.id,
                 )
             )
             result = await tool.execute(call.arguments, context)
