@@ -417,6 +417,85 @@ class ChatGPTReplayRepairTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EnvelopeRepairTests(unittest.IsolatedAsyncioTestCase):
+    async def test_anthropic_tool_free_judge_omits_tool_choice_on_wire(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = make_context(Path(directory))
+            provider = AnthropicProvider(
+                ProviderConfig(
+                    type="anthropic",
+                    model="fixture-model",
+                    base_url="https://api.anthropic.com/v1",
+                )
+            )
+            budget = Budget.start(AgentConfig())
+            payloads = []
+
+            async def post_json(*args, **kwargs):
+                payload = kwargs["payload"]
+                payloads.append(payload)
+                self.assertEqual(payload["tools"], [])
+                self.assertNotIn("tool_choice", payload)
+                data = {
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "fixture-model",
+                    "content": [{"type": "text", "text": ALLOW}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                }
+                return HttpResponse(
+                    status=200, headers={}, data=data, raw=json.dumps(data).encode()
+                )
+
+            async def sink(usage):
+                budget.add_usage(usage)
+
+            provider.http.post_json = post_json
+            judge = SmartApprovalJudge(
+                provider,
+                "fixture-model",
+                budget,
+                sink,
+                context,
+                ["Create sentinel."],
+            )
+            try:
+                await judge.enforce(
+                    ApprovalRequest(
+                        "shell",
+                        "untrusted",
+                        PolicyDecision(PolicyAction.ASK, "risky"),
+                        "",
+                        arguments=shell_call().arguments,
+                    )
+                )
+                self.assertEqual(len(payloads), 1)
+                assert budget.usage is not None
+                self.assertEqual(budget.usage.requests, 1)
+            finally:
+                await provider.close()
+
+    async def test_anthropic_tools_keep_nonparallel_choice_control(self):
+        provider = AnthropicProvider(ProviderConfig(type="anthropic"))
+        try:
+            request = ProviderRequest(
+                model="fixture-model",
+                system="",
+                messages=[],
+                parallel_tool_calls=False,
+                tools=[{"name": "read", "parameters": {"type": "object", "properties": {}}}],
+            )
+            for stream in (False, True):
+                self.assertEqual(
+                    provider._payload(request, stream=stream)["tool_choice"],
+                    {
+                        "type": "auto",
+                        "disable_parallel_tool_use": True,
+                    },
+                )
+        finally:
+            await provider.close()
+
     async def check_wire(self, data, *, allowed, extra_body=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

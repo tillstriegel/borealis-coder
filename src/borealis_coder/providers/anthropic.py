@@ -61,7 +61,7 @@ class AnthropicProvider(Provider):
             payload["cache_control"] = cache_control
         if request.temperature is not None:
             payload["temperature"] = request.temperature
-        if not request.parallel_tool_calls:
+        if request.tools and not request.parallel_tool_calls:
             payload["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
         return payload
 

@@ -717,5 +717,5 @@ class SmartVerificationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         payload["proposal"]["arguments"]["command"], call.arguments["command"]
                     )
-                    self.assertEqual(payload["proposal"]["arguments"]["cwd"], str(root))
+                    self.assertEqual(payload["proposal"]["arguments"]["cwd"], str(root.resolve()))
                     self.assertEqual(receipts(runner)[0]["decision"], decision)
