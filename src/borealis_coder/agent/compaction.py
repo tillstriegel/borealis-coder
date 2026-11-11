@@ -494,6 +494,61 @@ def validate_tool_call_order(messages: list[Message]) -> None:
         index = cursor
 
 
+def abandoned_tool_call_results(
+    messages: list[Message],
+    *,
+    running_call_ids: set[str],
+) -> list[Message]:
+    """Complete only an unfinished trailing tool bundle from a prior run."""
+
+    index = len(messages) - 1
+    while index >= 0 and messages[index].role == Role.TOOL:
+        index -= 1
+    if index < 0 or not messages[index].tool_calls:
+        validate_tool_call_order(messages)
+        return []
+    assistant = messages[index]
+    if assistant.role != Role.ASSISTANT:
+        validate_tool_call_order(messages)
+        return []
+    observed_ids = {
+        message.tool_call_id
+        for message in messages[index + 1 :]
+        if message.role == Role.TOOL and message.tool_call_id
+    }
+    repairs = []
+    for call in assistant.tool_calls:
+        if call.id in observed_ids:
+            continue
+        execution_started = call.id in running_call_ids
+        repairs.append(
+            Message(
+                role=Role.TOOL,
+                content=(
+                    "Unknown outcome: the previous run ended after this tool call "
+                    "started but before its result was recorded. The tool may have "
+                    "executed."
+                    if execution_started
+                    else "Cancelled: the previous run ended before this tool call "
+                    "was executed."
+                ),
+                tool_call_id=call.id,
+                tool_name=call.name,
+                is_error=True,
+                metadata={
+                    **(
+                        {"unknown_outcome": True, "execution_started": True}
+                        if execution_started
+                        else {"cancelled": True, "not_started": True}
+                    ),
+                    "abandoned": True,
+                    "recovery": "previous_run_ended",
+                },
+            )
+        )
+    validate_tool_call_order([*messages, *repairs])
+    return repairs
+
 def bundle_conversation(messages: list[Message]) -> list[ConversationBundle]:
     """Group requests, tool cycles, steering, verification, and terminal responses."""
 

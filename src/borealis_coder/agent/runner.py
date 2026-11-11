@@ -88,6 +88,9 @@ from .compaction import (
     prune_provider_messages,
     validate_tool_call_order,
 )
+from .compaction import (
+    abandoned_tool_call_results as _abandoned_tool_call_results,
+)
 from .coordination import Coordination
 from .swarm import SwarmState, bounded_calls
 
@@ -388,62 +391,6 @@ def _validate_new_tool_call_ids(
         raise SessionError(
             f"Provider returned duplicate tool-call ID {duplicate_call_id!r}"
         )
-
-
-def _abandoned_tool_call_results(
-    messages: list[Message],
-    *,
-    running_call_ids: set[str],
-) -> list[Message]:
-    """Complete only an unfinished trailing tool bundle from a prior run."""
-
-    index = len(messages) - 1
-    while index >= 0 and messages[index].role == Role.TOOL:
-        index -= 1
-    if index < 0 or not messages[index].tool_calls:
-        validate_tool_call_order(messages)
-        return []
-    assistant = messages[index]
-    if assistant.role != Role.ASSISTANT:
-        validate_tool_call_order(messages)
-        return []
-    observed_ids = {
-        message.tool_call_id
-        for message in messages[index + 1 :]
-        if message.role == Role.TOOL and message.tool_call_id
-    }
-    repairs = []
-    for call in assistant.tool_calls:
-        if call.id in observed_ids:
-            continue
-        execution_started = call.id in running_call_ids
-        repairs.append(
-            Message(
-                role=Role.TOOL,
-                content=(
-                    "Unknown outcome: the previous run ended after this tool call "
-                    "started but before its result was recorded. The tool may have "
-                    "executed."
-                    if execution_started
-                    else "Cancelled: the previous run ended before this tool call "
-                    "was executed."
-                ),
-                tool_call_id=call.id,
-                tool_name=call.name,
-                is_error=True,
-                metadata={
-                    **(
-                        {"unknown_outcome": True, "execution_started": True}
-                        if execution_started
-                        else {"cancelled": True, "not_started": True}
-                    ),
-                    "abandoned": True,
-                    "recovery": "previous_run_ended",
-                },
-            )
-        )
-    validate_tool_call_order([*messages, *repairs])
-    return repairs
 
 
 class RequestPreparer:
@@ -2519,23 +2466,43 @@ class AgentRunner(RequestPreparer):
             messages,
             running_call_ids=running_call_ids,
         )
-        for repair in repairs:
+        rows_by_id = {str(row["tool_call_id"]): row for row in tool_call_rows}
+        saved_repairs = []
+        for message in messages:
+            if message.role != Role.TOOL or not message.metadata.get("abandoned"):
+                continue
+            row = rows_by_id.get(message.tool_call_id or "")
+            if row is None:
+                continue
+            if row["metadata"].get("workspace_change_tracking") == "incomplete":
+                self._mark_workspace_tracking_incomplete(context)
+            if row["status"] == "running":
+                saved_repairs.append(message)
+        # Store reconciliation may have closed a bundle before appending a
+        # historical notice. Settle its receipts here without changing those
+        # durable messages. Tool scopes and nested effects remain runner-owned.
+        for repair in [*saved_repairs, *repairs]:
             if repair.tool_call_id in running_call_ids:
+                metadata = {**rows_by_id[repair.tool_call_id]["metadata"], **repair.metadata}
                 tool = self.tools.get(repair.tool_name or "")
                 if (
-                    tool is None
+                    metadata.get("workspace_change_tracking") == "incomplete"
+                    or tool is None
                     or tool.effective_mutation_scope != MutationScope.NONE
                 ):
-                    repair.metadata["workspace_change_tracking"] = "incomplete"
+                    metadata["workspace_change_tracking"] = "incomplete"
                     self._mark_workspace_tracking_incomplete(context)
+                saved = repair in saved_repairs
+                if not saved:
+                    repair.metadata = metadata
                 await asyncio.to_thread(
                     self.sessions.complete_tool_call,
                     session_id,
                     repair.tool_call_id,
                     output=repair.content,
                     is_error=True,
-                    metadata=repair.metadata,
-                    message=repair,
+                    metadata=metadata,
+                    message=None if saved else repair,
                 )
             else:
                 await asyncio.to_thread(

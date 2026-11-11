@@ -599,6 +599,7 @@ class SessionStore:
 
     def get_session(self, session_id: str) -> SessionInfo:
         with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
             row = self._connection.execute(
                 "SELECT * FROM sessions WHERE id=?", (session_id,)
             ).fetchone()
@@ -619,6 +620,7 @@ class SessionStore:
         query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(max(1, limit))
         with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
             rows = self._connection.execute(query, params).fetchall()
             rows = [self._reconcile_running_row(row) for row in rows]
         return [_session_info(row) for row in rows]
@@ -655,7 +657,7 @@ class SessionStore:
         if not lease.acquire():
             return row
         try:
-            self.interrupt_coordination(session_id)
+            self._interrupt_coordination_locked(session_id)
             self._connection.execute(
                 "UPDATE sessions SET status='interrupted',updated_at=? "
                 "WHERE id=? AND status='running'",
@@ -813,50 +815,95 @@ class SessionStore:
 
     def interrupt_coordination(self, session_id: str) -> None:
         """Called only under the root run lease; never recreate a live worker."""
-        from ..models import Role
-
         with self._lock, self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
-            rows = self._connection.execute(
-                "SELECT * FROM coordination_children WHERE session_id=? AND state='running'", (session_id,),
-            ).fetchall()
-            for row in rows:
-                self._connection.execute(
-                    "UPDATE coordination_children SET state='interrupted' WHERE root_run_id=? AND handle=?",
-                    (row["root_run_id"], row["handle"]),
-                )
-            # Preserve pending work in its actual recipient's durable history. Only
-            # the root can resume; stopped children are historical conversations.
-            pending = self._connection.execute(
-                "SELECT * FROM coordination_messages WHERE session_id=? AND state='pending' ORDER BY sequence", (session_id,),
-            ).fetchall()
-            for row in pending:
-                child = self._connection.execute(
-                    "SELECT scope_id FROM coordination_children WHERE root_run_id=? AND handle=?",
-                    (row["root_run_id"], row["recipient"]),
-                ).fetchone()
-                scope = child[0] if child is not None else session_id
-                if self._connection.execute("SELECT 1 FROM sessions WHERE id=?", (scope,)).fetchone():
-                    self._append_message_locked(scope, Message(
-                        role=Role.ASSISTANT, id=row["message_id"],
-                        content="Interrupted previous run; historical coordination only.\n" + row["content"],
-                        metadata={"internal": "coordination", "coordination": True, "interrupted": True},
-                    ))
-                self._connection.execute("UPDATE coordination_messages SET state='interrupted' WHERE message_id=?", (row["message_id"],))
+            self._interrupt_coordination_locked(session_id)
+
+    def _interrupt_coordination_locked(self, session_id: str) -> None:
+        """Use the caller's lock and transaction for recovery and all deliveries."""
+        from ..models import Role
+
+        rows = self._connection.execute(
+            "SELECT * FROM coordination_children WHERE session_id=? AND state='running'", (session_id,),
+        ).fetchall()
+        for row in rows:
+            self._connection.execute(
+                "UPDATE coordination_children SET state='interrupted' WHERE root_run_id=? AND handle=?",
+                (row["root_run_id"], row["handle"]),
+            )
+        # Preserve pending work in its actual recipient's durable history. Only
+        # the root can resume; stopped children are historical conversations.
+        pending = self._connection.execute(
+            "SELECT * FROM coordination_messages WHERE session_id=? AND state='pending' ORDER BY sequence", (session_id,),
+        ).fetchall()
+        for row in pending:
+            child = self._connection.execute(
+                "SELECT scope_id FROM coordination_children WHERE root_run_id=? AND handle=?",
+                (row["root_run_id"], row["recipient"]),
+            ).fetchone()
+            scope = child[0] if child is not None else session_id
+            if self._connection.execute("SELECT 1 FROM sessions WHERE id=?", (scope,)).fetchone():
+                self._close_interrupted_bundle_locked(session_id, scope)
+                self._append_message_locked(scope, Message(
+                    role=Role.ASSISTANT, id=row["message_id"],
+                    content="Interrupted previous run; historical coordination only.\n" + row["content"],
+                    metadata={"internal": "coordination", "coordination": True, "interrupted": True},
+                ))
+            self._connection.execute("UPDATE coordination_messages SET state='interrupted' WHERE message_id=?", (row["message_id"],))
+        for row in self._connection.execute(
+            "SELECT * FROM coordination_children WHERE session_id=? AND delivered=0 AND state!='running'", (session_id,),
+        ).fetchall():
+            parent = self._connection.execute(
+                "SELECT scope_id FROM coordination_children WHERE root_run_id=? AND handle=?", (row["root_run_id"], row["parent"]),
+            ).fetchone()
+            scope = parent[0] if parent else session_id
+            if self._connection.execute("SELECT 1 FROM sessions WHERE id=?", (scope,)).fetchone():
+                self._close_interrupted_bundle_locked(session_id, scope)
+                self._append_message_locked(scope, Message(
+                    role=Role.ASSISTANT, id="terminal:" + row["handle"],
+                    content=f"Historical child {row['handle']}: {row['state']}. No tools or requests were replayed. Search retained receipt {row['handle']}.result before retrying.",
+                    metadata={"internal": "coordination", "coordination": True, "interrupted": True},
+                ))
+            self._connection.execute("UPDATE coordination_children SET delivered=1 WHERE root_run_id=? AND handle=?", (row["root_run_id"], row["handle"]))
+
+    def _close_interrupted_bundle_locked(self, session_id: str, scope: str) -> None:
+        """Close only a trailing bundle before a historical notice is appended.
+
+        Leave canonical receipts to the runner, which knows tool mutation scopes
+        and recovers nested effects. A child transcript uses local call IDs while
+        its receipts belong to the root and use namespaced IDs.
+        """
+        from ..agent.compaction import abandoned_tool_call_results
+
+        messages = [Message.from_dict(json.loads(row[0])) for row in self._connection.execute(
+            "SELECT payload_json FROM messages WHERE session_id=? ORDER BY sequence", (scope,),
+        )]
+        child = self._connection.execute(
+            "SELECT delegation_id FROM delegated_conversations WHERE scope_id=? AND root_session_id=?",
+            (scope, session_id),
+        ).fetchone()
+        prefix = child[0] + "." if child else ""
+        receipts = {
+            str(row["tool_call_id"])[len(prefix):]: row
             for row in self._connection.execute(
-                "SELECT * FROM coordination_children WHERE session_id=? AND delivered=0 AND state!='running'", (session_id,),
-            ).fetchall():
-                parent = self._connection.execute(
-                    "SELECT scope_id FROM coordination_children WHERE root_run_id=? AND handle=?", (row["root_run_id"], row["parent"]),
-                ).fetchone()
-                scope = parent[0] if parent else session_id
-                if self._connection.execute("SELECT 1 FROM sessions WHERE id=?", (scope,)).fetchone():
-                    self._append_message_locked(scope, Message(
-                        role=Role.ASSISTANT, id="terminal:" + row["handle"],
-                        content=f"Historical child {row['handle']}: {row['state']}. No tools or requests were replayed. Search retained receipt {row['handle']}.result before retrying.",
-                        metadata={"internal": "coordination", "coordination": True, "interrupted": True},
-                    ))
-                self._connection.execute("UPDATE coordination_children SET delivered=1 WHERE root_run_id=? AND handle=?", (row["root_run_id"], row["handle"]))
+                "SELECT * FROM tool_calls WHERE session_id=?", (session_id,),
+            )
+            if not child or (row["run_id"] == scope and str(row["tool_call_id"]).startswith(prefix))
+        }
+        repairs = abandoned_tool_call_results(messages, running_call_ids=set(receipts))
+        for repair in repairs:
+            receipt = receipts.get(repair.tool_call_id or "")
+            if receipt is not None:
+                metadata = json.loads(receipt["metadata_json"] or "{}")
+                if receipt["status"] != "running":
+                    # A child can crash after its canonical result commits but
+                    # before its conversation snapshot is appended.
+                    repair.content = receipt["output"] or ""
+                    repair.is_error = bool(receipt["is_error"])
+                    repair.metadata = metadata
+                else:
+                    repair.metadata = {**metadata, **repair.metadata}
+            self._append_message_locked(scope, repair)
 
     def replace_messages(self, session_id: str, messages: Iterable[Message]) -> None:
         del session_id, messages
