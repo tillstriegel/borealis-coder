@@ -34,7 +34,7 @@ ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
 _COMMAND_OPTIONS = (
     ("/help", "Show every command and keyboard control"),
     ("/swarm", "Toggle live swarm tree (F6 inspect, F7 hide)"),
-    ("/swarm-writes", "Show or change delegated file-write permission"),
+    ("/swarm-writes", "Show or change the delegated write ceiling"),
     ("/status", "Inspect runtime, safety, usage, and cache health"),
     ("/session", "Show the active workspace, route, and session"),
     ("/sessions", "Browse recent sessions in this workspace"),
@@ -618,7 +618,7 @@ class InteractiveCLI:
                 print("".join(fragment[1] for fragment in self.swarm.render(80, 20)))
         elif command == "/swarm-writes":
             await self._set_boolean(
-                args, label="delegated file writes",
+                args, label="delegated write ceiling (each child still needs capability=write)",
                 getter=lambda config: config.agent.swarm_allow_writes,
                 setter=lambda config, value: setattr(config.agent, "swarm_allow_writes", value),
             )
@@ -971,7 +971,7 @@ class InteractiveCLI:
                     "Session",
                     [
                         ("/swarm", "live tree · F6 inspect · F7 hide"),
-                        ("/swarm-writes [on|off]", "delegated file writes for future turns"),
+                        ("/swarm-writes [on|off]", "delegated write ceiling for future turns"),
                         ("/status", "runtime, safety, session, and usage"),
                         ("/session", "active workspace, route, and session"),
                         ("/sessions [N]", "recent sessions in this workspace"),

@@ -90,7 +90,7 @@ class SwarmView:
                 self.nodes[identifier] = AgentNode(
                     identifier, data.get("parent_delegation_id") or "root",
                     data["delegated_run_id"], data["depth"], literal(data["task"], 160).replace("\n", " "),
-                    data["capability"], "refused" if event.type.endswith("refused") else "waiting",
+                    data.get("capability", "not-admitted"), "refused" if event.type.endswith("refused") else "waiting",
                 )
             node = self.nodes.get(identifier)
             if node is not None:

@@ -264,7 +264,7 @@ class FinalHandoffTests(unittest.IsolatedAsyncioTestCase):
                     def handler(request, call, limit=limit, children=children,
                                 closure_start=closure_start, terminal=terminal):
                         if not request.metadata.get("delegated"):
-                            return response(calls=[delegate(turns=limit)]) if request.messages[-1].role != Role.TOOL else response(text="Qualified parent conclusion.")
+                            return response(calls=[delegate(turns=limit, capability="write")]) if request.messages[-1].role != Role.TOOL else response(text="Qualified parent conclusion.")
                         children.append(request)
                         if request.tools:
                             return response(calls=[read(f"read-{len(children)}")])
@@ -331,7 +331,7 @@ class FinalHandoffTests(unittest.IsolatedAsyncioTestCase):
                 def handler(request, call, terminal=terminal):
                     nonlocal children
                     if not request.metadata.get("delegated"):
-                        return response(text="Parent combined qualified partial evidence.") if request.messages[-1].role == Role.TOOL else response(calls=[delegate("Inspect shared.txt and verify", turns=2)])
+                        return response(text="Parent combined qualified partial evidence.") if request.messages[-1].role == Role.TOOL else response(calls=[delegate("Inspect shared.txt and verify", turns=2, capability="write")])
                     children += 1
                     if children == 1:
                         return response(calls=[read("read")])

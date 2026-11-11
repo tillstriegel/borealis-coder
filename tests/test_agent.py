@@ -2970,7 +2970,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     tool_calls=[
                         ToolCall(
                             name="delegate_task",
-                            arguments={"task": "read the example", "max_turns": 2},
+                            arguments={"task": "read the example", "max_turns": 2, "capability": "read-only"},
                         )
                     ]
                 ),
@@ -3050,6 +3050,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                                 arguments={
                                     "task": "read the example",
                                     "max_turns": 2,
+                                    "capability": "read-only",
                                 },
                             )
                         ]
@@ -3102,7 +3103,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     tool_calls=[
                         ToolCall(
                             name="delegate_task",
-                            arguments={"task": "read the example", "max_turns": 2},
+                            arguments={"task": "read the example", "max_turns": 2, "capability": "read-only"},
                         )
                     ]
                 ),
@@ -3135,7 +3136,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     tool_calls=[
                         ToolCall(
                             name="delegate_task",
-                            arguments={"task": "read the example", "max_turns": 1},
+                            arguments={"task": "read the example", "max_turns": 1, "capability": "read-only"},
                         )
                     ]
                 ),

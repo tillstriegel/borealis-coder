@@ -20,6 +20,8 @@ class ConfigTests(unittest.TestCase):
             name, provider = config.provider()
             self.assertEqual(name, "mock")
             self.assertEqual(provider.type, "mock")
+            self.assertEqual(config.agent.max_turns, 500)
+            self.assertEqual(config.agent.swarm_max_turns, 250)
 
     def test_auto_selects_openrouter_when_its_key_is_available(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(

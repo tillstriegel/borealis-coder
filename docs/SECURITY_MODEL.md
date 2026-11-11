@@ -322,11 +322,22 @@ Also isolate the worker account, use read-only provider credentials where possib
 
 Recursive agents share the root's request/time/cost budgets and cannot change
 operator depth, cumulative descendant, provider concurrency or child-turn limits.
-Children default to read-only. Trusted `agent.swarm_allow_writes = true` permits
-only built-in write, replace, delete, mkdir and patch tools. The registry checks
-the capability at execution as well as schema selection. Descendants cannot gain
-more authority than their parent. Plan mode, approvals, allowed roots, protected
-paths, stale hashes and checkpoints remain effective.
+Every `delegate_task` call requires `capability: "read-only"` or `"write"`.
+The caller selects read-only for investigation/review and write for implementation
+or file edits. Selection cannot exceed the parent's actual permissions: plan-mode
+parents and read-only descendants cannot grant write access. A rejected escalation
+starts no child, consumes no descendant admission and dispatches no child provider
+request. There is no silent downgrade or inference from task text.
+
+Trusted `agent.swarm_allow_writes` defaults to true and is only an operator ceiling;
+an explicit false (or `/swarm-writes off` for future interactive turns) rejects
+write delegation even from a writer. True does not select a child's capability.
+Write children get only built-in write, replace, delete, mkdir and patch tools.
+The registry enforces the selected capability at execution as well as schema
+selection, including hallucinated tool calls. Descendants cannot gain more
+authority than their parent. Plan mode, approvals, allowed roots, protected paths,
+stale hashes and checkpoints remain effective. Missing or invalid capability
+arguments fail schema validation; historical receipts remain historical data.
 
 Delegates cannot use shell, Script/job control, or custom/external mutation tools.
 Each nested call uses the root runner's durable lifecycle; shared file changes

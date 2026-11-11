@@ -25,8 +25,10 @@ from borealis_coder.tools.verification import VerificationReport
 from tests.helpers import make_config
 
 
-def delegate(task="child", turns=3, identifier="delegate"):
-    return ToolCall(id=identifier, name="delegate_task", arguments={"task": task, "max_turns": turns})
+def delegate(task="child", turns=3, identifier="delegate", *, capability="read-only"):
+    return ToolCall(id=identifier, name="delegate_task", arguments={
+        "task": task, "max_turns": turns, "capability": capability,
+    })
 
 
 def write(path="child.txt", content="child evidence\n", expected=None):
@@ -73,7 +75,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.terminals()[-1].data["limits"]["active_requests"], 0)
 
     async def test_configured_cap_reaches_root_nested_discovery_and_prompts_without_leaking(self):
-        for cap in (2, 6, 2):
+        for cap in (2, 250, 2):
             for surface in ("direct", "ptc"):
                 with self.subTest(cap=cap, surface=surface):
                     self.runner.config.agent.swarm_max_turns = cap
@@ -97,9 +99,9 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertIn(f"at most {cap} child turns", schema["description"])
                             return response(text="Completed scoped investigation.")
                         if depth < 2:
-                            # Legacy callers can still request up to 16; the
-                            # operator's cap always wins and is recorded.
-                            return response(calls=[delegate(turns=16)])
+                            # The configured cap always wins over the requested
+                            # turns and is recorded without changing the schema.
+                            return response(calls=[delegate(turns=250)])
                         return response(calls=[ToolCall(name="discover_tools", arguments={
                             "names": ["delegate_task"], "offset": 0,
                         })])
@@ -108,9 +110,9 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                     result = await self.runner.run("Inspect nested configuration")
                     self.assertEqual(set(seen), {0, 1, 2})
                     for event in self.starts():
-                        self.assertEqual(event.data["requested_max_turns"], 16)
+                        self.assertEqual(event.data["requested_max_turns"], 250)
                         self.assertEqual(event.data["effective_max_turns"], cap)
-                    self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 16)
+                    self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 250)
                     self.assert_settled(result)
 
     async def test_three_levels_compose_evidence_exact_once_and_single_slot(self):
@@ -202,8 +204,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.terminals()[0].type, "delegate.failed")
         self.assert_settled(result)
 
-    async def test_opt_in_child_and_grandchild_writes_are_durable_and_verified(self):
-        self.runner.config.agent.swarm_allow_writes = True
+    async def test_explicit_child_and_grandchild_writes_are_durable_and_verified(self):
         self.runner.config.agent.auto_verify = True
         verify = []
 
@@ -216,9 +217,9 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if request.messages[-1].role == Role.TOOL:
                 return response(text="Changes complete; " + request.messages[-1].content)
             if depth == 0:
-                return response(calls=[delegate()])
+                return response(calls=[delegate(capability="write")])
             if depth == 1:
-                return response(calls=[write("child.txt"), delegate("grandchild")])
+                return response(calls=[write("child.txt"), delegate("grandchild", capability="write")])
             return response(calls=[ToolCall(id="patch", name="apply_patch", arguments={
                 "patch": "*** Begin Patch\n*** Add File: grandchild.txt\n+grandchild evidence\n*** End Patch",
             })])
@@ -274,7 +275,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if depth == 1:
                 if interruption == "requests" and request.messages[-1].role == Role.TOOL:
                     return response(text="Nested change observed; current verification is required.")
-                return response(calls=[delegate("grandchild")])
+                return response(calls=[delegate("grandchild", capability="write")])
             if call == 1:
                 return response(calls=[write("first.txt", "verified revision\n")])
             if call == 2:
@@ -282,7 +283,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if call == 3:
                 return response(text="Checks passed for the first revision.")
             if call == 4:
-                return response(calls=[delegate()])
+                return response(calls=[delegate(capability="write")])
             if interruption == "requests" and call == 8:
                 return response(text="<tool_call>not a conclusion")
             self.fail("Unexpected provider work after interrupted delegation")
@@ -352,6 +353,8 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         config.agent.swarm_allow_writes = True
         session = self.runner.sessions.create_session(workspace=self.root, provider="mock", model="fixture")
         root_call = delegate(identifier="crashed-delegate")
+        # Historical pending calls predate the required choice; recovery must not replay or rewrite them.
+        del root_call.arguments["capability"]
         original = Message(role=Role.ASSISTANT, tool_calls=[root_call])
         self.runner.sessions.append_message(session.id, original)
         self.runner.sessions.start_tool_call(session.id, "crashed-root", root_call.id,
@@ -455,12 +458,18 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                         if request.metadata.get("delegated"):
                             child_results.append(request.messages[-1])
                         return response(text="Reviewed")
-                    return response(calls=[write(path)]) if request.metadata.get("delegated") else response(calls=[delegate()])
+                    return response(calls=[write(path)]) if request.metadata.get("delegated") else response(calls=[delegate(capability="write")])
 
                 self.provider.handler = handler
                 result = await self.runner.run("Check authority")
                 allowed = path == "allowed.txt"
-                self.assertEqual(child_results[0].is_error, not allowed)
+                if writes and mode != "plan":
+                    self.assertEqual(child_results[0].is_error, not allowed)
+                else:
+                    self.assertEqual(child_results, [])
+                    self.assertEqual(self.starts(), [])
+                    refusal = next(e for e in self.events if e.type == "delegate.refused")
+                    self.assertEqual(refusal.data["limits"]["admitted"], 0)
                 self.assertEqual(set(result.changed_files), {"allowed.txt"} if allowed else set())
                 self.assertFalse((self.root / "blocked.txt").exists())
                 self.assert_settled(result)
@@ -496,7 +505,8 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if request.messages[-1].role == Role.TOOL:
                 return response(text="Concluded")
             if not request.metadata.get("delegated"):
-                return response(calls=[delegate("one", identifier="one"), delegate("two", identifier="two")])
+                return response(calls=[delegate("one", identifier="one", capability="write"),
+                                       delegate("two", identifier="two", capability="write")])
             return response(calls=[write("shared.txt", request.messages[0].content, sha256_text("before"))])
 
         self.provider.handler = handler
@@ -736,7 +746,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("shell", names)
                 self.assertNotIn("plugin_write", names)
                 return response(calls=[ToolCall(name="plugin_write", arguments={}), ToolCall(name="script", arguments={"source": "text('no')", "background": False})])
-            return response(calls=[delegate()])
+            return response(calls=[delegate(capability="write")])
 
         self.provider.handler = handler
         result = await self.runner.run("Check tool boundary")
@@ -745,7 +755,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         self.assert_settled(result)
         self.provider.handler = None
         self.provider.enqueue(response(calls=[ToolCall(name="script", arguments={
-            "source": 'await tools.delegate_alias({task:"forbidden", max_turns:1});', "background": False,
+            "source": 'await tools.delegate_alias({task:"forbidden", max_turns:1, capability:"read-only"});', "background": False,
         })]), response(text="Script denied"))
         self.events.clear()
         result = await self.runner.run("Script alias")
@@ -763,19 +773,19 @@ class SwarmConfigurationTests(unittest.TestCase):
             small_schema = next(s for s in registry.provider_schemas(small) if s["name"] == "delegate_task")
             default_schema = next(s for s in registry.provider_schemas(default) if s["name"] == "delegate_task")
             self.assertEqual(small_schema["parameters"]["properties"]["max_turns"]["maximum"], 2)
-            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 6)
+            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 250)
             small_schema["parameters"]["properties"]["max_turns"]["maximum"] = 1
-            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 6)
+            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 250)
             fresh = next(s for s in registry.provider_schemas(small) if s["name"] == "delegate_task")
             self.assertEqual(fresh["parameters"]["properties"]["max_turns"]["maximum"], 2)
-            self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 16)
+            self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 250)
 
     def test_validated_trusted_configuration(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
             root = Path(td)
             for key, value in (("swarm_max_depth", -1), ("swarm_max_depth", 17),
                                ("swarm_max_descendants", 1.5), ("swarm_max_concurrent", 0),
-                               ("swarm_max_turns", 17), ("swarm_max_depth", True),
+                               ("swarm_max_turns", 251), ("swarm_max_depth", True),
                                ("swarm_allow_writes", "yes")):
                 with self.subTest(key=key, value=value), self.assertRaises(ConfigurationError):
                     make_config(root, agent={key: value})

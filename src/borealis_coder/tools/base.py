@@ -157,6 +157,9 @@ class Tool:
     def schema_for_config(self, config: Config) -> dict[str, Any]:
         return self.schema()
 
+    def schema_for_context(self, context: ToolContext) -> dict[str, Any]:
+        return self.schema_for_config(context.config)
+
 
 class FunctionTool(Tool):
     def __init__(

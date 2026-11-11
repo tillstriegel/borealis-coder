@@ -65,7 +65,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `small_model` | `""` | Optional cheaper/faster model for LLM compaction. Delegates use the primary route. |
 | `provider_fallbacks` | `[]` | Ordered provider route names tried after the primary route fails. |
 | `reasoning_effort` | `"medium"` | Adapter hint for providers/models that expose reasoning controls. |
-| `max_turns` | `60` | Maximum primary model turns per run. The final turn has tools disabled so the model can finish cleanly. |
+| `max_turns` | `500` | Maximum primary model turns per run. The final turn has tools disabled so the model can finish cleanly. |
 | `max_input_tokens` | `180000` | Context budget used for compaction and hard checks. |
 | `compact_at_ratio` | `0.82` | Compact when estimated context reaches this fraction of the input budget. |
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
@@ -77,8 +77,8 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `swarm_max_depth` | `2` | Maximum delegation depth, root = 0; `1` permits children only, `0` disables delegation. Integer 0–16. |
 | `swarm_max_descendants` | `8` | Cumulative admitted descendants per root run, excluding root; `0` disables delegation. Completed, failed, and cancelled children still consume admission. |
 | `swarm_max_concurrent` | `2` | Simultaneous delegated provider operations, including their retries/backoff and usage settlement. Positive integer. Slots are released before child tools run. |
-| `swarm_max_turns` | `6` | Per-child turn ceiling, integer 1–16; effective turns = min(requested `max_turns`, ceiling). For limits of 3 or more, closure starts on the penultimate turn, leaving one possible repair. |
-| `swarm_allow_writes` | `false` | Permit built-in workspace file/patch tools in children and descendants, subject to inherited capability and normal policy. Does not grant shell, network, external mutations, or Script access. |
+| `swarm_max_turns` | `250` | Per-child turn ceiling, integer 1–250; effective turns = min(requested `max_turns`, ceiling). For limits of 3 or more, closure starts on the penultimate turn, leaving one possible repair. |
+| `swarm_allow_writes` | `true` | Operator ceiling only: `false` rejects write delegation. Each call must still select `capability`; `true` does not grant writes to a read-only caller or child. Write children get only built-in file/patch tools under normal policy, never shell, network, external mutations, or Script. |
 | `max_repeated_calls` | `3` | Repeated identical call threshold for stuck detection. |
 | `auto_verify` | `true` | Run project verification after mutations. |
 | `auto_verify_max_seconds` | `900` | Verification time budget. |
@@ -95,12 +95,31 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 
 ### Recursive delegation
 
-`delegate_task(task, max_turns)` keeps a separate conversation at each depth.
+`delegate_task(task, max_turns, capability)` keeps a separate conversation at each
+depth. `capability` is required on every call and must be exactly `"read-only"` or
+`"write"`. Choose read-only for investigation/review, write for implementation/file
+edits. For example:
+
+```json
+{"task": "Review parser.py for defects without edits", "max_turns": 4, "capability": "read-only"}
+{"task": "Implement the parser fix and add a regression test", "max_turns": 6, "capability": "write"}
+```
+
+A workspace-write/full parent may select either capability without another
+opt-in. A plan-mode or read-only parent may select only read-only. Writer children
+may select readers or writers; a reader descendant cannot restore write access.
+A write request above the parent/operator ceiling is rejected before child
+preparation, descendant admission or provider work, not silently downgraded.
+Missing or invalid capability values fail schema validation, including old calls
+submitted again for execution; historical receipts are not rewritten.
+
 The limits above are trusted operator settings in the user config, explicit
 `--config`, or environment. Repository config cannot change them without the
 external workspace-authority opt-in. Model arguments cannot change these limits
-or enable writes. `/swarm-writes on` enables file writes for future interactive
-turns in the current process; `/swarm-writes off` revokes them.
+or raise the caller's ceiling. `swarm_allow_writes` defaults to true but an explicit
+false remains an operator opt-out. `/swarm-writes off` rejects write delegation
+for future interactive turns in this process; `/swarm-writes on` restores only the
+operator ceiling, not the selected capability or permission above the caller.
 
 Admission is atomic before child preparation. The total is cumulative, not a
 reusable pool. Each tool batch uses at most `parallel_reads` workers rather than
@@ -117,7 +136,7 @@ usage describes that agent's own requests; it is not another charge or a subtree
 sum. Cancellation and fatal budgets cancel and drain owned tool workers before
 returning. Delegation is local to a root run; it is not a persistent job service.
 
-Delegates receive direct-tool instructions and discovery filtered to their inherited
+Delegates receive direct-tool instructions and discovery filtered to their selected
 palette. Explicit discovery of a forbidden tool reports it unavailable; the execution
 guard remains independent. Script instructions and the root catalog are not child
 capabilities. Optional values use JSON `null`, not the literal string `"null"`.

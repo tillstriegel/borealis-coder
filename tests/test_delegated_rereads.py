@@ -34,7 +34,7 @@ class DelegatedRereadTests(unittest.IsolatedAsyncioTestCase):
         assert isinstance(provider, MockProvider)
         self.provider = provider
 
-    async def exercise(self, batches, *, standalone=False):
+    async def exercise(self, batches, *, standalone=False, capability="write"):
         observed = []
         child_turn = 0
 
@@ -42,7 +42,7 @@ class DelegatedRereadTests(unittest.IsolatedAsyncioTestCase):
             nonlocal child_turn
             validate_tool_call_order(request.messages)
             if not request.metadata.get("delegated"):
-                return response(text="Root complete.") if request.messages[-1].role == Role.TOOL else response(calls=[delegate(turns=12)])
+                return response(text="Root complete.") if request.messages[-1].role == Role.TOOL else response(calls=[delegate(turns=12, capability=capability)])
             known = {m.tool_call_id for m in observed}
             observed.extend(copy.deepcopy(m) for m in request.messages
                             if m.role == Role.TOOL and m.tool_call_id not in known)
@@ -56,7 +56,7 @@ class DelegatedRereadTests(unittest.IsolatedAsyncioTestCase):
             context = make_context(self.root, self.runner.config)
             context.metadata.update(provider_routes=self.runner.providers, tool_registry=self.runner.tools,
                                     context_builder=self.runner.context_builder)
-            result = await DelegateTaskTool().execute({"task": "inspect and edit", "max_turns": 12}, context)
+            result = await DelegateTaskTool().execute({"task": "inspect and edit", "max_turns": 12, "capability": capability}, context)
             self.assertFalse(result.is_error, result.output)
         else:
             result = await asyncio.wait_for(self.runner.run("Inspect and edit"), 10)
@@ -124,7 +124,7 @@ class DelegatedRereadTests(unittest.IsolatedAsyncioTestCase):
     async def test_read_only_success_can_be_repeated_without_mutation(self):
         self.runner.config.agent.swarm_allow_writes = False
         (self.root / "shared.txt").write_text("unchanged")
-        observed = await self.exercise([[read("first")], [read("second")]])
+        observed = await self.exercise([[read("first")], [read("second")]], capability="read-only")
         self.assertFalse(observed["second"].is_error, observed["second"].content)
         self.assertEqual(observed["first"].metadata["sha256"], observed["second"].metadata["sha256"])
 
@@ -137,13 +137,13 @@ class DelegatedRereadTests(unittest.IsolatedAsyncioTestCase):
             depth = request.metadata.get("delegation_depth", 0)
             tools = [m for m in request.messages if m.role == Role.TOOL]
             if depth == 0:
-                return response(text="Root complete.") if tools else response(calls=[delegate(turns=6)])
+                return response(text="Root complete.") if tools else response(calls=[delegate(turns=6, capability="write")])
             if depth == 2:
                 return response(text="Descendant edited.") if tools else response(calls=[write("shared.txt", "descendant", sha256_text("before"))])
             if not tools:
                 return response(calls=[read("first")])
             if len(tools) == 1:
-                return response(calls=[delegate("descendant", identifier="nested")])
+                return response(calls=[delegate("descendant", identifier="nested", capability="write")])
             if len(tools) == 2:
                 return response(calls=[read("second")])
             observed.extend(tools)
@@ -183,7 +183,7 @@ class DelegatedRereadTests(unittest.IsolatedAsyncioTestCase):
         def handler(request, call):
             if not request.metadata.get("delegated"):
                 return response(text="Root complete.") if request.messages[-1].role == Role.TOOL else response(calls=[
-                    delegate("reader", turns=4, identifier="reader"), delegate("writer", identifier="writer")])
+                    delegate("reader", turns=4, identifier="reader"), delegate("writer", identifier="writer", capability="write")])
             if request.messages[0].content == "writer":
                 return response(calls=[write("shared.txt", "sibling")])
             count = sum(m.role == Role.TOOL for m in request.messages)

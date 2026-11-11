@@ -92,15 +92,17 @@ async def demo(capture_dir: Path | None, columns: int, rows: int) -> None:
         release = asyncio.Event()
         held = asyncio.Event()
 
-        def call(task: str, identifier: str) -> ToolCall:
-            return ToolCall(id=identifier, name="delegate_task", arguments={"task": task, "max_turns": 4})
+        def call(task: str, identifier: str, *, capability: str = "read-only") -> ToolCall:
+            return ToolCall(id=identifier, name="delegate_task", arguments={
+                "task": task, "max_turns": 4, "capability": capability,
+            })
 
         def handler(request, count):
             task = request.messages[0].content
             if request.messages[-1].role == Role.TOOL:
                 return ModelResponse(text="Complete. " + request.messages[-1].content)
             if not request.metadata.get("delegated"):
-                return ModelResponse(tool_calls=[call("Implement example file", "build"),
+                return ModelResponse(tool_calls=[call("Implement example file", "build", capability="write"),
                                                 call("Inspect evidence", "inspect"), call("Report failure", "failure")])
             if task == "Implement example file":
                 return ModelResponse(tool_calls=[ToolCall(id="write", name="write_file", arguments={

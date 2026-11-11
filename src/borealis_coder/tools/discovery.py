@@ -41,8 +41,8 @@ class DiscoverToolsTool(Tool):
         for name in names[offset:offset + 32]:
             tool = registry.get(name) if available(name) else None
             entry = ({"name": name, "unavailable": True} if tool is None else {
-                **(tool.schema_for_config(context.config) if arguments["names"] else {
-                    "name": name, "description": tool.schema_for_config(context.config)["description"][:180],
+                **(tool.schema_for_context(context) if arguments["names"] else {
+                    "name": name, "description": tool.schema_for_context(context)["description"][:180],
                 }),
                 "script_accessible": tool.script_accessible,
                 "effect": tool.effect.value,

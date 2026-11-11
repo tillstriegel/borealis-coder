@@ -86,7 +86,7 @@ class BudgetLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.runner.config.agent.max_model_requests = 2
         self.provider.enqueue(
             ModelResponse(tool_calls=[ToolCall(
-                id="delegate", name="delegate_task", arguments={"task": "inspect", "max_turns": 3},
+                id="delegate", name="delegate_task", arguments={"task": "inspect", "max_turns": 3, "capability": "read-only"},
             )]),
             ModelResponse(text="Delegation was refused; no findings are available."),
         )

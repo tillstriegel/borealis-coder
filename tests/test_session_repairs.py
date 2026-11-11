@@ -66,6 +66,7 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
         return rows
 
     async def test_penultimate_closure_recovers_on_real_chat_wire_within_six_turns(self):
+        self.runner.config.agent.swarm_max_turns = 6
         provider = OpenRouterProvider(ProviderConfig(
             type="openrouter", base_url="https://synthetic.test", max_retries=0,
         ))
