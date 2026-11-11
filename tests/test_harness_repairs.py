@@ -316,12 +316,13 @@ const check = await tools.verify({command:COMMAND,timeout_seconds:30}); text(che
             try:
                 await runner.run("Inspect the workspace.")
                 names = {tool["name"] for tool in requests[0].tools}
-                self.assertEqual(names, {"script", "script_job", "discover_tools", "delegate_task"})
+                self.assertEqual(names, {"script", "script_job", "discover_tools", "delegate_task",
+                                         "delegate_start", "delegate_message", "delegate_wait"})
                 adapter = OpenAIProvider(ProviderConfig(type="openai", model="offline-serializer"))
                 try:
                     payload = adapter._responses_payload(requests[0])
                     serialized = json_dumps(payload)
-                    self.assertEqual(len(payload["tools"]), 4)
+                    self.assertEqual(len(payload["tools"]), 7)
                     self.assertEqual(adapter.request_bytes(requests[0]), len(serialized.encode("utf-8")))
                     self.assertGreater(estimate_request_tokens(requests[0].system, requests[0].messages, requests[0].tools), 0)
                 finally:

@@ -120,6 +120,18 @@ The root retains descendant tool lifecycle receipts without child TOOL messages 
 its conversation. Summary usage settles atomically in the child and root aggregates.
 Each child's receipt counts only its own main and helper requests.
 
+Live coordination uses a separate durable bounded queue. Context compaction does
+not consume pending messages. At a safe request boundary, the runtime atomically
+appends an attributed, untrusted assistant message to the recipient conversation
+and marks it delivered. Fresh coordination envelopes are retained in the next
+actual request even if full compaction removes other history; normal context
+limits still apply before provider dispatch. Earlier messages can be compacted
+and found with `search_history`. They never enter protected user objectives.
+Stable IDs prevent another delivery on incremental reuse or resume. Reopened
+pending work is historical/interrupted, not live execution. Terminal notifications
+point to scoped result receipts and handed-off artifacts rather than copying
+child transcripts into parent metadata.
+
 Summary requests share delegated provider slots through retry, backoff and usage
 settlement. Slots are released before child tools execute. Helpers consume physical
 request allowance without consuming a work turn or reserved child/ancestor conclusion

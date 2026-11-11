@@ -530,7 +530,7 @@ class SessionStoreTests(unittest.TestCase):
             version = legacy._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='version'"
             ).fetchone()[0]
-            self.assertEqual(version, "7")
+            self.assertEqual(version, "8")
             tables = {
                 row[0]
                 for row in legacy._connection.execute(

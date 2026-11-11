@@ -291,7 +291,7 @@ class DelegatedArtifactHandoffTests(unittest.IsolatedAsyncioTestCase):
             store.close()
             reopened = SessionStore(path)
             self.addCleanup(reopened.close)
-            self.assertEqual(reopened._connection.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0], '7')
+            self.assertEqual(reopened._connection.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0], '8')
             self.assertEqual(reopened.read_output_artifact('root-run.child', root, artifact['artifact_id'])['content'],
                              'Private existing output')
             with self.assertRaises(SessionError):
