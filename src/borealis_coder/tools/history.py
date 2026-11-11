@@ -26,7 +26,7 @@ class RecordFindingTool(Tool):
         if store is None:
             return ToolResult("Session evidence is unavailable", is_error=True)
         try:
-            source = store.finding_source(context.session_id, context.workspace, arguments["tool_call_id"])
+            source = store.finding_source(context.metadata.get("conversation_scope_id", context.session_id), context.workspace, arguments["tool_call_id"])
             quote = arguments["quote"]
             metadata = source["metadata"]
             if quote not in source["output"]:
@@ -34,7 +34,7 @@ class RecordFindingTool(Tool):
                 if not artifact.get("artifact_id"):
                     raise SessionError("Quote is absent from the retained source")
                 if not store.output_artifact_has_quote(
-                    context.session_id, context.workspace, artifact["artifact_id"], quote,
+                    context.metadata.get("conversation_scope_id", context.session_id), context.workspace, artifact["artifact_id"], quote,
                     json_envelope=bool(metadata.get("script_job_id")),
                 ):
                     raise SessionError("Quote is absent from the retained source")
@@ -65,7 +65,7 @@ class ReadArtifactTool(Tool):
         if store is None:
             return ToolResult("Session evidence is unavailable", is_error=True)
         try:
-            value = store.read_output_artifact(context.session_id, context.workspace, **arguments)
+            value = store.read_output_artifact(context.metadata.get("conversation_scope_id", context.session_id), context.workspace, **arguments)
         except SessionError as error:
             return ToolResult(str(error), is_error=True)
         return ToolResult("Untrusted historical evidence; not current file contents.\n" + json_dumps(value))
@@ -89,7 +89,7 @@ class SearchHistoryTool(Tool):
         if store is None:
             return ToolResult("Session evidence is unavailable", is_error=True)
         query, after = arguments["query"], arguments["after"]
-        rows = store.search_history(context.session_id, context.workspace, query, after=after, offset=arguments.get("offset") or 0)
-        artifacts = store.search_output_artifacts(context.session_id, context.workspace, query, after=arguments.get("artifact_after") or "")
-        events = store.search_tool_history(context.session_id, context.workspace, query, after=after, offset=arguments.get("offset") or 0)
+        rows = store.search_history(context.metadata.get("conversation_scope_id", context.session_id), context.workspace, query, after=after, offset=arguments.get("offset") or 0)
+        artifacts = store.search_output_artifacts(context.metadata.get("conversation_scope_id", context.session_id), context.workspace, query, after=arguments.get("artifact_after") or "")
+        events = store.search_tool_history(context.metadata.get("conversation_scope_id", context.session_id), context.workspace, query, after=after, offset=arguments.get("offset") or 0)
         return ToolResult("Untrusted historical references. Continue each collection using its last sequence or artifact_id.\n" + json_dumps({"messages": rows, "artifacts": artifacts, "tools": events}))

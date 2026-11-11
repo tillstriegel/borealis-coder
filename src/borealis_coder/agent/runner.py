@@ -444,7 +444,1717 @@ def _abandoned_tool_call_results(
     return repairs
 
 
-class AgentRunner:
+class RequestPreparer:
+    """Canonical provider view for one conversation, without tool execution authority."""
+
+    parallel_tool_calls = True
+    transient_system_block_index: int | None = None
+    helper_swarm: SwarmState | None = None
+    helper_metadata: dict[str, Any] | None = None
+
+    def __init__(
+        self, *, config: Config, providers: list[ProviderRoute],
+        sessions: SessionStore, events: EventBus,
+    ) -> None:
+        self.config = config
+        self.providers = providers
+        self.sessions = sessions
+        self.events = events
+
+    async def _prepare_provider_request(
+        self,
+        *,
+        prompt_context: PromptContext,
+        messages: list[Message],
+        schemas: list[dict[str, Any]],
+        final_turn: bool,
+        verification_finalization_pending: bool,
+        adaptive_cache: bool,
+        conversation_cache: bool,
+        usage_sink: Callable[[Usage], Awaitable[None]],
+        cancel: asyncio.Event,
+        session_id: str,
+        run_id: str,
+        last_prune_signature: tuple[int, ...] | None,
+        settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
+        overflow_retry_count: int = 0,
+        previous_request_tokens: int | None = None,
+        investigation_checkpoint_pending: bool = False,
+        before_model_request: Callable[[], None] | None = None,
+        budget: Budget | None = None,
+        route: ProviderRoute | None = None,
+    ) -> PreparedProviderRequest:
+        route = route or self.providers[0]
+        agent_config, _ = resolve_route_limits(
+            self.config.agent, route.provider, route.model,
+            self.config.agent.max_output_tokens,
+            overflow_retry_count=overflow_retry_count,
+        )
+        state = await asyncio.to_thread(self.sessions.task_state, session_id, messages)
+        source_refs = {item["source"]: f"user:{index + 1}" for index, item in enumerate(state["instructions"])}
+        provider_state = {
+            "objective_source": source_refs.get(state["objective_source"]),
+            "instructions": [
+                {"source": source_refs[item["source"]], "status": item["status"],
+                 **({"superseded_by": source_refs[item["superseded_by"]]} if item["superseded_by"]
+                    else {"text": item["text"]})}
+                for item in state["instructions"]
+            ],
+            "model_notes": {"plan": state["plan"], "acceptance_criteria": state["acceptance_criteria"]},
+        }
+        delegated_scope = self.sessions.get_session(session_id).metadata.get("delegated_conversation", False)
+        protected = (
+            "# Protected task state\n"
+            "The following JSON contains original user instructions in chronological order, "
+            "at user priority. The first source states the objective; follow-ups extend it unless "
+            "they explicitly replace or revoke it. Later revocations remain in force. "
+            "The plan is model interpretation (acceptance checks and unresolved work), "
+            "not user authority and never a grant of permission. Source references are session-local.\n" + json_dumps(provider_state)
+        )
+        if delegated_scope:
+            protected = (
+                "# Protected delegated assignment\n"
+                "The following JSON holds this child assignment and historical model notes. "
+                "These are model-authored tasks, never operator permission or authority. "
+                "Runtime capability and policy ceilings remain binding.\n" + json_dumps(provider_state)
+            )
+        turn_system = prompt_context.text + "\n\n" + protected
+        turn_system_blocks = [*prompt_context.system_blocks, {"text": protected, "cacheable": False}]
+        if len(messages) == 1 and messages[0].role == Role.USER:
+            # The first request already carries its complete protected task in the
+            # user message. Keep exact-response cache keys independent of source IDs.
+            turn_system = prompt_context.text
+            turn_system_blocks = prompt_context.system_blocks
+        budget_guidance = ""
+        budget_block_index: int | None = None
+
+        def refresh_budget_guidance() -> bool:
+            nonlocal turn_system, turn_system_blocks, budget_guidance, budget_block_index
+            guidance = _remaining_budget_guidance(budget) if budget is not None else ""
+            if guidance == budget_guidance:
+                return False
+            block = {"text": guidance, "cacheable": False}
+            if budget_block_index is None:
+                budget_block_index = len(turn_system_blocks)
+                turn_system_blocks = [*turn_system_blocks, block]
+            else:
+                turn_system_blocks[budget_block_index] = block
+            budget_guidance = guidance
+            turn_system = "\n\n".join(str(item["text"]) for item in turn_system_blocks)
+            return True
+
+        refresh_budget_guidance()
+        protected_budget = ContextBudget.calculate(
+            agent_config, system=turn_system, tools=schemas, messages=[],
+        )
+        if not _fits_context_limit([], protected_budget, system=turn_system, tools=schemas):
+            raise RouteContextExceeded("context", "Protected task requirements cannot fit the safe request budget")
+        if final_turn:
+            turn_system = f"{turn_system}\n\n{_FINAL_TURN_INSTRUCTION}"
+            turn_system_blocks = [
+                *turn_system_blocks,
+                {"text": _FINAL_TURN_INSTRUCTION, "cacheable": False},
+            ]
+        elif verification_finalization_pending:
+            turn_system = f"{turn_system}\n\n{_VERIFICATION_FINAL_INSTRUCTION}"
+            turn_system_blocks = [
+                *turn_system_blocks,
+                {"text": _VERIFICATION_FINAL_INSTRUCTION, "cacheable": False},
+            ]
+        elif investigation_checkpoint_pending:
+            turn_system = f"{turn_system}\n\n{_INVESTIGATION_CHECKPOINT_INSTRUCTION}"
+            turn_system_blocks = [
+                *turn_system_blocks,
+                {"text": _INVESTIGATION_CHECKPOINT_INSTRUCTION, "cacheable": False},
+            ]
+
+        request_messages, metrics = prune_provider_messages(messages)
+        validate_tool_call_order(request_messages)
+        budget_providers = tuple(item.provider.name for item in self.providers)
+        raw_budget = ContextBudget.calculate(
+            agent_config,
+            system=turn_system,
+            tools=schemas,
+            messages=messages,
+            providers=budget_providers,
+            overflow_retry_count=overflow_retry_count,
+        )
+        raw_estimated = raw_budget.estimated_total(messages)
+        context_budget = ContextBudget.calculate(
+            agent_config,
+            system=turn_system,
+            tools=schemas,
+            messages=request_messages,
+            providers=budget_providers,
+            overflow_retry_count=overflow_retry_count,
+        )
+        # Measure the provider view, including an existing summary, before
+        # deciding whether to compact. Durable history is only the source.
+        source_messages = request_messages
+        source_metrics = metrics
+        incremental = None
+        live_system = turn_system
+        if not overflow_retry_count:
+            incremental = await self._reuse_incremental_compaction(
+                session_id=session_id,
+                durable_messages=messages,
+                agent_config=agent_config,
+                base_system=turn_system,
+                base_system_blocks=turn_system_blocks,
+                tools=schemas,
+                prompt_cache_key=prompt_context.cache_routing_key,
+                conversation_cache=conversation_cache,
+                providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+                budget_guidance_index=budget_block_index,
+            )
+        if incremental is not None:
+            prior_artifact, request_messages, _, metrics = incremental
+            live_system = f"{turn_system}\n\n{prior_artifact.summary_text}"
+            context_budget = ContextBudget.calculate(
+                agent_config,
+                system=live_system,
+                tools=schemas,
+                messages=request_messages,
+                providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
+        estimated = context_budget.estimated_total(request_messages)
+        live_estimated_before = estimated
+        estimated_bytes = estimate_request_bytes(
+            live_system,
+            request_messages,
+            schemas,
+        )
+        tool_output_over_budget = (
+            metrics.tool_output_tokens_retained
+            >= self.config.context.compact_tool_output_tokens
+        )
+        compaction_reason: str | None = None
+        if overflow_retry_count:
+            compaction_reason = "provider_context_overflow"
+        elif estimated >= context_budget.trigger_tokens:
+            compaction_reason = "estimated_tokens"
+        elif estimated_bytes >= context_budget.trigger_bytes:
+            compaction_reason = "estimated_bytes"
+        elif tool_output_over_budget:
+            compaction_reason = "tool_output_volume"
+        if (
+            compaction_reason not in {None, "provider_context_overflow"}
+            and len(request_messages) == 1
+            and request_messages[0].role == Role.USER
+        ):
+            if _fits_context_limit(
+                request_messages,
+                context_budget,
+                system=turn_system,
+                tools=schemas,
+            ):
+                compaction_reason = None
+            else:
+                raise RouteContextExceeded(
+                    "context",
+                    f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
+                    f"exceeds context budget {agent_config.max_input_tokens} "
+                    "tokens (endpoint byte limits are checked separately)",
+                )
+        prune_signature = (
+            metrics.tokens_before,
+            metrics.tokens_after,
+            metrics.superseded_reads_removed,
+            metrics.repeated_outputs_removed,
+            metrics.tool_output_tokens_retained,
+        )
+        if (
+            prune_signature != last_prune_signature
+            and (metrics.superseded_reads_removed or metrics.repeated_outputs_removed)
+        ):
+            await self.events.emit(
+                "context.pruned",
+                session_id=session_id,
+                run_id=run_id,
+                compaction_reason=compaction_reason or "superseded_tool_outputs",
+                **metrics.to_dict(),
+            )
+
+        keep_recent = 12 if adaptive_cache else 18
+        compacted = False
+        compaction_artifact_id: str | None = None
+        compaction_context_hashes: dict[str, str] | None = None
+        compaction_metadata: dict[str, Any] | None = None
+        if compaction_reason is None and incremental is not None:
+            artifact, request_messages, compaction_context_hashes, _ = incremental
+            compaction_artifact_id = artifact.id
+            turn_system = f"{turn_system}\n\n{artifact.summary_text}"
+            turn_system_blocks = [
+                *turn_system_blocks,
+                {"text": artifact.summary_text, "cacheable": False},
+            ]
+            compacted = True
+            context_budget = ContextBudget.calculate(
+                agent_config,
+                system=turn_system,
+                tools=schemas,
+                messages=request_messages,
+                providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
+            estimated = context_budget.estimated_total(request_messages)
+            tool_tokens = sum(
+                estimate_tokens(message.content)
+                for message in request_messages
+                if message.role == Role.TOOL
+            )
+            compaction_metadata = {
+                "strategy": artifact.strategy,
+                "artifact_version": artifact.version,
+                "source_bundle_count": artifact.metadata.get(
+                    "source_bundle_count", 0
+                ),
+                "retained_bundle_count": artifact.metadata.get(
+                    "retained_bundle_count", 0
+                ),
+                "compacted_bundle_count": artifact.metadata.get(
+                    "compacted_bundle_count", 0
+                ),
+                "estimated_tokens_before": live_estimated_before,
+                "durable_estimated_tokens": raw_estimated,
+                "summary_tokens": estimate_tokens(artifact.summary_text),
+                "token_headroom": context_budget.trigger_tokens - estimated,
+                "tool_output_headroom": (
+                    self.config.context.compact_tool_output_tokens - tool_tokens
+                ),
+                "target_tokens": context_budget.target_tokens,
+                "estimated_tokens_after": estimated,
+                "reduction_percentage": 0.0,
+                "provider_overflow_retry_count": overflow_retry_count,
+                "artifact_reused": True,
+                "incremental_suffix_reused": True,
+                "fallback_reason": artifact.metadata.get("fallback_reason"),
+                "summarization_usage": Usage().to_dict(),
+                "summarization_latency_ms": 0,
+            }
+            await self.events.emit(
+                "context.reused",
+                session_id=session_id,
+                run_id=run_id,
+                compaction_reason=compaction_reason,
+                tokens_before=metrics.tokens_before,
+                tokens_after=estimate_request_tokens(
+                    artifact.summary_text, request_messages, []
+                ),
+                superseded_reads_removed=metrics.superseded_reads_removed,
+                tool_output_tokens_retained=tool_tokens,
+                messages=len(request_messages),
+                **compaction_metadata,
+            )
+        if compaction_reason is not None:
+            request_messages = source_messages
+            summary_usage = Usage()
+            summary_started_ms = monotonic_ms()
+            # Old continuation metadata may be compacted away. Do not reserve it
+            # before selecting bundles; validate the retained reserve below.
+            compaction_budget = ContextBudget.calculate(
+                agent_config,
+                system=turn_system,
+                tools=schemas,
+                messages=[],
+                providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
+            provider_message_target = compaction_budget.message_target_tokens
+            if tool_output_over_budget:
+                # Leave room for a large parallel tool batch before the next
+                # trigger. Tiny custom thresholds retain the legacy fallback.
+                configured_tool_target = (
+                    int(self.config.context.compact_tool_output_tokens * 0.25)
+                    if self.config.context.compact_tool_output_tokens >= 4_096
+                    else int(source_metrics.tokens_before * 0.85)
+                )
+                provider_message_target = min(
+                    provider_message_target,
+                    max(1_024, configured_tool_target),
+                )
+            if compaction_reason == "provider_context_overflow":
+                if previous_request_tokens is not None:
+                    overflow_target = (
+                        int(previous_request_tokens * 0.70)
+                        - compaction_budget.system_tokens
+                        - compaction_budget.tool_schema_tokens
+                    )
+                else:
+                    overflow_target = int(
+                        metrics.tokens_before * (0.70**overflow_retry_count)
+                    )
+                provider_message_target = min(
+                    provider_message_target,
+                    max(1_024, overflow_target),
+                )
+            provider_message_target_bytes = min(
+                compaction_budget.message_target_bytes,
+                provider_message_target * 4,
+            )
+            intended_strategy = (
+                "deterministic"
+                if agent_config.deterministic_compaction
+                or agent_config.compaction_version == 1
+                or compaction_reason == "provider_context_overflow"
+                else "llm"
+            )
+            artifact_version = agent_config.compaction_version
+            fingerprint = self._compaction_config_fingerprint(
+                compaction_budget,
+                intended_strategy,
+                artifact_version,
+                system=turn_system,
+                system_blocks=turn_system_blocks,
+                tools=schemas,
+                prompt_cache_key=prompt_context.cache_routing_key,
+                conversation_cache=conversation_cache,
+                budget_guidance_index=budget_block_index,
+            )
+            incremental_parent = await asyncio.to_thread(
+                self.sessions.latest_compaction_artifact,
+                session_id,
+                config_fingerprint=fingerprint,
+                strategy=intended_strategy,
+            )
+            if incremental_parent is None and intended_strategy == "llm":
+                incremental_parent = await asyncio.to_thread(
+                    self.sessions.latest_compaction_artifact,
+                    session_id,
+                    config_fingerprint=fingerprint,
+                    strategy="deterministic",
+                )
+            current_source_ids = [message.id for message in request_messages]
+            current_provider_source_hash = _stable_payload_hash(
+                [message.to_dict() for message in request_messages]
+            )
+            parent_is_prefix = bool(
+                incremental_parent is not None
+                and current_source_ids[: len(incremental_parent.source_message_ids)]
+                == incremental_parent.source_message_ids
+                and incremental_parent.metadata.get("provider_source_hash")
+                == _stable_payload_hash(
+                    [
+                        message.to_dict()
+                        for message in request_messages[
+                            : len(incremental_parent.source_message_ids)
+                        ]
+                    ]
+                )
+            )
+            parent_compacted_message_ids: list[str] | None = None
+            parent_evidence: CompactionEvidence | None = None
+            if parent_is_prefix and incremental_parent is not None:
+                parent_evidence = _incremental_parent_evidence(incremental_parent)
+                if parent_evidence is None:
+                    parent_is_prefix = False
+                else:
+                    recorded_compacted_ids = incremental_parent.metadata.get(
+                        "compacted_message_ids"
+                    )
+                    if isinstance(recorded_compacted_ids, list):
+                        parent_compacted_message_ids = [
+                            str(item) for item in recorded_compacted_ids
+                        ]
+                    else:
+                        recorded_retained_ids = incremental_parent.metadata.get(
+                            "retained_message_ids"
+                        )
+                        if isinstance(recorded_retained_ids, list):
+                            retained_id_set = {
+                                str(item) for item in recorded_retained_ids
+                            }
+                            parent_compacted_message_ids = [
+                                message_id
+                                for message_id in incremental_parent.source_message_ids
+                                if message_id not in retained_id_set
+                            ]
+                        else:
+                            parent_is_prefix = False
+            compaction_kwargs = {
+                "keep_recent": keep_recent,
+                "summary_tokens": provider_message_target,
+                "summary_bytes": provider_message_target_bytes,
+                "summarizer_input_tokens": (
+                    agent_config.compaction_summarizer_input_tokens
+                ),
+                "summarizer_total_input_tokens": (
+                    agent_config.compaction_summarizer_total_input_tokens
+                ),
+                "target_tokens": provider_message_target,
+                "target_bytes": provider_message_target_bytes,
+                "force": (
+                    tool_output_over_budget
+                    or compaction_reason == "provider_context_overflow"
+                ),
+                "base_evidence": parent_evidence if parent_is_prefix else None,
+                "base_source_message_ids": (
+                    incremental_parent.source_message_ids
+                    if parent_is_prefix and incremental_parent is not None
+                    else None
+                ),
+                "base_compacted_message_ids": (
+                    parent_compacted_message_ids if parent_is_prefix else None
+                ),
+            }
+            try:
+                if agent_config.compaction_version == 1:
+                    if agent_config.compaction_shadow_v2:
+                        try:
+                            shadow = compact_messages(
+                                request_messages,
+                                keep_recent=keep_recent,
+                                summary_tokens=provider_message_target,
+                                summary_bytes=provider_message_target_bytes,
+                                target_tokens=provider_message_target,
+                                target_bytes=provider_message_target_bytes,
+                                force=bool(compaction_kwargs["force"]),
+                            )
+                            shadow_metadata = shadow[0].metadata
+                            shadow_evidence = CompactionEvidence.from_dict(
+                                shadow_metadata.get("authoritative_evidence")
+                                or shadow_metadata.get("evidence")
+                            )
+                            critical_fact_count = sum(
+                                len(getattr(shadow_evidence, field))
+                                for field in (
+                                    "current_objective",
+                                    "user_constraints",
+                                    "files_changed",
+                                    "latest_verification",
+                                    "open_failures_and_blockers",
+                                    "pending_work",
+                                )
+                            )
+                            await self.events.emit(
+                                "context.compaction_shadow",
+                                session_id=session_id,
+                                run_id=run_id,
+                                artifact_version=2,
+                                strategy=shadow_metadata.get("strategy"),
+                                source_bundle_count=shadow_metadata.get(
+                                    "source_bundles", 0
+                                ),
+                                retained_bundle_count=shadow_metadata.get(
+                                    "retained_bundles", 0
+                                ),
+                                compacted_bundle_count=shadow_metadata.get(
+                                    "compacted_bundles", 0
+                                ),
+                                critical_fact_count=critical_fact_count,
+                                estimated_tokens_before=metrics.tokens_before,
+                                estimated_tokens_after=estimate_request_tokens(
+                                    "", shadow, []
+                                ),
+                                target_tokens=context_budget.target_tokens,
+                                below_target=(
+                                    estimate_request_tokens("", shadow, [])
+                                    <= provider_message_target
+                                ),
+                            )
+                        except CompactionError as shadow_error:
+                            await self.events.emit(
+                                "context.compaction_shadow",
+                                session_id=session_id,
+                                run_id=run_id,
+                                artifact_version=2,
+                                fallback_reason=type(shadow_error).__name__,
+                            )
+                    deterministic_messages = compact_messages_v1(
+                        request_messages,
+                        keep_recent=keep_recent,
+                        target_tokens=provider_message_target,
+                        target_bytes=provider_message_target_bytes,
+                        force=bool(compaction_kwargs["force"]),
+                    )
+                else:
+                    deterministic_messages = await compact_messages_with_summary(
+                        request_messages,
+                        None,
+                        **compaction_kwargs,
+                    )
+                target_adjustments = 0
+                while deterministic_messages != request_messages:
+                    retained = deterministic_messages[1:]
+                    retained_budget = ContextBudget.calculate(
+                        agent_config,
+                        system=turn_system,
+                        tools=schemas,
+                        messages=retained,
+                        providers=budget_providers,
+                        overflow_retry_count=overflow_retry_count,
+                    )
+                    next_targets = _next_compaction_targets(
+                        token_target=provider_message_target,
+                        byte_target=provider_message_target_bytes,
+                        compacted_messages=deterministic_messages,
+                        retained_budget=retained_budget,
+                        system=turn_system,
+                        tools=schemas,
+                    )
+                    if next_targets is None:
+                        break
+                    tighter_target, tighter_byte_target = next_targets
+                    target_adjustments += 1
+                    if target_adjustments > len(request_messages) + 1:
+                        raise CompactionSizeError(
+                            "Compaction target did not converge after continuation adjustment"
+                        )
+                    provider_message_target = tighter_target
+                    provider_message_target_bytes = tighter_byte_target
+                    compaction_kwargs["summary_tokens"] = tighter_target
+                    compaction_kwargs["summary_bytes"] = tighter_byte_target
+                    compaction_kwargs["target_tokens"] = tighter_target
+                    compaction_kwargs["target_bytes"] = tighter_byte_target
+                    if agent_config.compaction_version == 1:
+                        deterministic_messages = compact_messages_v1(
+                            request_messages,
+                            keep_recent=keep_recent,
+                            target_tokens=tighter_target,
+                            target_bytes=tighter_byte_target,
+                            force=bool(compaction_kwargs["force"]),
+                        )
+                    else:
+                        deterministic_messages = await compact_messages_with_summary(
+                            request_messages,
+                            None,
+                            **compaction_kwargs,
+                        )
+            except CompactionSizeError as error:
+                raise RouteContextExceeded("context", str(error)) from error
+            compacted_messages = deterministic_messages
+            if deterministic_messages != request_messages:
+                deterministic_artifact = deterministic_messages[0]
+                durable_by_id = {message.id: message for message in messages}
+                durable_source = [
+                    durable_by_id[str(message_id)]
+                    for message_id in deterministic_artifact.metadata[
+                        "source_message_ids"
+                    ]
+                    if str(message_id) in durable_by_id
+                ]
+                if len(durable_source) != len(
+                    deterministic_artifact.metadata["source_message_ids"]
+                ):
+                    raise CompactionError(
+                        "Compaction source IDs do not resolve to durable messages"
+                    )
+                durable_source_hash = hashlib.sha256(
+                    json_dumps([message.to_dict() for message in durable_source]).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                deterministic_artifact = replace(
+                    deterministic_artifact,
+                    metadata={
+                        **deterministic_artifact.metadata,
+                        "source_hash": durable_source_hash,
+                        "provider_source_hash": current_provider_source_hash,
+                    },
+                )
+                deterministic_messages = [
+                    deterministic_artifact,
+                    *deterministic_messages[1:],
+                ]
+                compacted_messages = deterministic_messages
+                reusable = await asyncio.to_thread(
+                    self.sessions.reusable_compaction_artifact,
+                    session_id,
+                    source_hash=str(deterministic_artifact.metadata["source_hash"]),
+                    config_fingerprint=fingerprint,
+                    strategy=intended_strategy,
+                )
+                if reusable is None and intended_strategy == "llm":
+                    reusable = await asyncio.to_thread(
+                        self.sessions.reusable_compaction_artifact,
+                        session_id,
+                        source_hash=str(deterministic_artifact.metadata["source_hash"]),
+                        config_fingerprint=fingerprint,
+                        strategy="deterministic",
+                    )
+                if reusable is not None and _artifact_provider_messages(
+                    reusable.metadata
+                ) != [message.to_dict() for message in deterministic_messages[1:]]:
+                    reusable = None
+                if reusable is not None and reusable.metadata.get(
+                    "provider_source_hash"
+                ) != current_provider_source_hash:
+                    reusable = None
+                if reusable is not None:
+                    compacted_messages = [
+                        replace(
+                            deterministic_artifact,
+                            content=reusable.summary_text,
+                            metadata={
+                                **deterministic_artifact.metadata,
+                                "strategy": reusable.strategy,
+                                "artifact_id": reusable.id,
+                                "artifact_reused": True,
+                                "fallback_reason": reusable.metadata.get(
+                                    "fallback_reason"
+                                ),
+                                "requested_strategy": reusable.metadata.get(
+                                    "requested_strategy", reusable.strategy
+                                ),
+                                "evidence": reusable.metadata.get(
+                                    "evidence",
+                                    deterministic_artifact.metadata.get("evidence", {}),
+                                ),
+                            },
+                        ),
+                        *deterministic_messages[1:],
+                    ]
+                elif (
+                    intended_strategy == "llm"
+                    and budget is not None
+                    and budget.last_request
+                ):
+                    # Preserve the final request for the answer, including any
+                    # Script notice that required this preparation to run again.
+                    compacted_messages = [
+                        replace(
+                            deterministic_artifact,
+                            metadata={
+                                **deterministic_artifact.metadata,
+                                "requested_strategy": intended_strategy,
+                                "fallback_reason": "final_request_reserved",
+                            },
+                        ),
+                        *deterministic_messages[1:],
+                    ]
+                elif intended_strategy == "llm":
+                    transcript_message_ids: set[str] | None = None
+                    source_ids = [
+                        str(item)
+                        for item in deterministic_artifact.metadata[
+                            "source_message_ids"
+                        ]
+                    ]
+                    if (
+                        parent_is_prefix
+                        and incremental_parent is not None
+                        and parent_compacted_message_ids is not None
+                        and source_ids[: len(incremental_parent.source_message_ids)]
+                        == incremental_parent.source_message_ids
+                    ):
+                        previously_compacted_ids = set(parent_compacted_message_ids)
+                        transcript_message_ids = {
+                            str(item)
+                            for item in deterministic_artifact.metadata.get(
+                                "compacted_message_ids", []
+                            )
+                            if str(item) not in previously_compacted_ids
+                        }
+                    compacted_messages = await compact_messages_with_summary(
+                        request_messages,
+                        self._summarizer(
+                            usage_sink,
+                            cancel,
+                            summary_usage,
+                            session_id=session_id,
+                            settled_usage_sink=settled_usage_sink,
+                            before_model_request=before_model_request,
+                        ),
+                        transcript_message_ids=transcript_message_ids,
+                        **compaction_kwargs,
+                    )
+                    if compacted_messages != request_messages:
+                        compacted_messages = [
+                            replace(
+                                compacted_messages[0],
+                                metadata={
+                                    **compacted_messages[0].metadata,
+                                    "source_hash": durable_source_hash,
+                                },
+                            ),
+                            *compacted_messages[1:],
+                        ]
+            if compacted_messages != request_messages:
+                artifact_messages = [
+                    message
+                    for message in compacted_messages
+                    if message.role == Role.SYSTEM and message.metadata.get("compacted")
+                ]
+                if len(artifact_messages) != 1:
+                    raise CompactionError(
+                        "Compaction must produce exactly one synthetic system artifact"
+                    )
+                artifact_message = artifact_messages[0]
+                retained_messages = [
+                    message for message in compacted_messages if message is not artifact_message
+                ]
+                if refresh_budget_guidance():
+                    compaction_budget = ContextBudget.calculate(
+                        agent_config, system=turn_system, tools=schemas,
+                        messages=request_messages, providers=budget_providers,
+                        overflow_retry_count=overflow_retry_count,
+                    )
+                try:
+                    artifact_message, retained_messages = (
+                        _fit_artifact_to_request_byte_target(
+                            artifact=artifact_message,
+                            retained_messages=retained_messages,
+                            deterministic_messages=deterministic_messages,
+                            system=turn_system,
+                            tools=schemas,
+                            target_bytes=compaction_budget.target_bytes,
+                        )
+                    )
+                except CompactionSizeError as error:
+                    raise RouteContextExceeded("context", str(error)) from error
+                validate_tool_call_order(retained_messages)
+                artifact_message, reused = await self._record_or_reuse_compaction_artifact(
+                    session_id=session_id,
+                    source_messages=request_messages,
+                    artifact_message=artifact_message,
+                    retained_messages=retained_messages,
+                    context_budget=compaction_budget,
+                    summary_usage=summary_usage,
+                    base_system=turn_system,
+                    base_system_blocks=turn_system_blocks,
+                    tools=schemas,
+                    prompt_cache_key=prompt_context.cache_routing_key,
+                    conversation_cache=conversation_cache,
+                    budget_guidance_index=budget_block_index,
+                )
+                compaction_artifact_id = str(artifact_message.metadata["artifact_id"])
+                compaction_context_hashes = dict(
+                    artifact_message.metadata["compacted_context_hashes"]
+                )
+                turn_system = f"{turn_system}\n\n{artifact_message.content}"
+                turn_system_blocks = [
+                    *turn_system_blocks,
+                    {"text": artifact_message.content, "cacheable": False},
+                ]
+                request_messages = retained_messages
+                compacted = True
+                context_budget = ContextBudget.calculate(
+                    agent_config,
+                    system=turn_system,
+                    tools=schemas,
+                    messages=request_messages,
+                    providers=budget_providers,
+                    overflow_retry_count=overflow_retry_count,
+                )
+                tool_tokens = sum(
+                    estimate_tokens(message.content)
+                    for message in request_messages
+                    if message.role == Role.TOOL
+                )
+                estimated = context_budget.estimated_total(request_messages)
+                if estimated > context_budget.target_tokens:
+                    raise CompactionError(
+                        f"Compacted request size {estimated} exceeds calculated target "
+                        f"{context_budget.target_tokens}"
+                    )
+                estimated_bytes = estimate_request_bytes(
+                    turn_system,
+                    request_messages,
+                    schemas,
+                )
+                if estimated_bytes > context_budget.target_bytes:
+                    raise CompactionError(
+                        f"Compacted request size {estimated_bytes} bytes exceeds calculated "
+                        f"target {context_budget.target_bytes} bytes"
+                    )
+                tokens_after = estimated
+                conversation_tokens_after = estimate_request_tokens(
+                    artifact_message.content, request_messages, []
+                )
+                reduction = (
+                    1.0 - (tokens_after / live_estimated_before)
+                    if live_estimated_before
+                    else 0.0
+                )
+                compaction_metadata = {
+                    "strategy": artifact_message.metadata.get("strategy"),
+                    "artifact_version": artifact_message.metadata.get(
+                        "artifact_version", 2
+                    ),
+                    "source_bundle_count": artifact_message.metadata.get(
+                        "source_bundles", 0
+                    ),
+                    "retained_bundle_count": artifact_message.metadata.get(
+                        "retained_bundles", 0
+                    ),
+                    "compacted_bundle_count": artifact_message.metadata.get(
+                        "compacted_bundles", 0
+                    ),
+                    "estimated_tokens_before": live_estimated_before,
+                    "durable_estimated_tokens": raw_estimated,
+                    "target_tokens": context_budget.target_tokens,
+                    "message_target_tokens": provider_message_target,
+                    "summary_tokens": estimate_tokens(artifact_message.content),
+                    "token_headroom": context_budget.trigger_tokens - tokens_after,
+                    "tool_output_headroom": (
+                        self.config.context.compact_tool_output_tokens - tool_tokens
+                    ),
+                    "estimated_tokens_after": tokens_after,
+                    "reduction_percentage": round(reduction * 100, 2),
+                    "provider_overflow_retry_count": overflow_retry_count,
+                    "artifact_reused": reused,
+                    "fallback_reason": (
+                        artifact_message.metadata.get("fallback_reason")
+                        or (
+                            "provider_context_overflow"
+                            if compaction_reason == "provider_context_overflow"
+                            else None
+                        )
+                    ),
+                    "summarization_usage": summary_usage.to_dict(),
+                    "summarization_latency_ms": monotonic_ms() - summary_started_ms,
+                }
+                await self.events.emit(
+                    "context.reused" if reused else "context.compacted",
+                    session_id=session_id,
+                    run_id=run_id,
+                    compaction_reason=compaction_reason,
+                    tokens_before=metrics.tokens_before,
+                    tokens_after=conversation_tokens_after,
+                    superseded_reads_removed=metrics.superseded_reads_removed,
+                    tool_output_tokens_retained=tool_tokens,
+                    messages=len(request_messages),
+                    **compaction_metadata,
+                )
+        if refresh_budget_guidance():
+            context_budget = ContextBudget.calculate(
+                agent_config, system=turn_system, tools=schemas,
+                messages=request_messages, providers=budget_providers,
+                overflow_retry_count=overflow_retry_count,
+            )
+            estimated = context_budget.estimated_total(request_messages)
+        estimated_bytes = estimate_request_bytes(
+            turn_system,
+            request_messages,
+            schemas,
+        )
+        if not _fits_context_limit(
+            request_messages,
+            context_budget,
+            system=turn_system,
+            tools=schemas,
+        ):
+            raise RouteContextExceeded(
+                "context",
+                f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
+                f"exceeds context budget {agent_config.max_input_tokens} "
+                "tokens (endpoint byte limits are checked separately)",
+            )
+        request = ProviderRequest(
+            model=route.model,
+            system=turn_system,
+            messages=request_messages,
+            tools=schemas,
+            max_output_tokens=agent_config.max_output_tokens,
+            reasoning_effort=agent_config.reasoning_effort or None,
+            parallel_tool_calls=self.parallel_tool_calls,
+            metadata={
+                "session_id": session_id,
+                "run_id": run_id,
+                "provider_route": route.name,
+                "protected_task_state": len(messages) > 1,
+                "prompt_cache_key": prompt_context.cache_routing_key,
+                "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
+                "prompt_cache_ttl": self.config.cache.anthropic_ttl,
+                "anthropic_conversation_cache": conversation_cache,
+                "system_blocks": turn_system_blocks,
+                **(
+                    {"compaction_artifact_id": compaction_artifact_id}
+                    if compaction_artifact_id is not None
+                    else {}
+                ),
+                **(
+                    {"compacted_context_hashes": compaction_context_hashes}
+                    if compaction_context_hashes is not None
+                    else {}
+                ),
+            },
+        )
+        request = prepare_route_request(request, route.provider, self.config.agent,
+                                        overflow_retry_count=overflow_retry_count)
+        return PreparedProviderRequest(
+            request, estimated, compacted, prune_signature, compaction_metadata
+        )
+
+    async def _reuse_incremental_compaction(
+        self,
+        *,
+        session_id: str,
+        durable_messages: list[Message],
+        agent_config: AgentConfig,
+        base_system: str,
+        base_system_blocks: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        prompt_cache_key: str,
+        conversation_cache: bool,
+        providers: tuple[str, ...],
+        overflow_retry_count: int,
+        budget_guidance_index: int | None = None,
+    ) -> tuple[CompactionArtifact, list[Message], dict[str, str], ContextPruneMetrics] | None:
+        """Reconstruct the working view; the caller checks its size limits."""
+
+        strategy = (
+            "deterministic"
+            if self.config.agent.deterministic_compaction
+            or self.config.agent.compaction_version == 1
+            else "llm"
+        )
+        compaction_budget = ContextBudget.calculate(
+            agent_config,
+            system=base_system,
+            tools=tools,
+            messages=[],
+            providers=providers,
+            overflow_retry_count=overflow_retry_count,
+        )
+        fingerprint = self._compaction_config_fingerprint(
+            compaction_budget,
+            strategy,
+            self.config.agent.compaction_version,
+            system=base_system,
+            system_blocks=base_system_blocks,
+            tools=tools,
+            prompt_cache_key=prompt_cache_key,
+            conversation_cache=conversation_cache,
+            budget_guidance_index=budget_guidance_index,
+        )
+        artifact = await asyncio.to_thread(
+            self.sessions.latest_compaction_artifact,
+            session_id,
+            config_fingerprint=fingerprint,
+            strategy=strategy,
+        )
+        if artifact is None and strategy == "llm":
+            artifact = await asyncio.to_thread(
+                self.sessions.latest_compaction_artifact,
+                session_id,
+                config_fingerprint=fingerprint,
+                strategy="deterministic",
+            )
+        if artifact is None:
+            return None
+
+        position_by_id = {
+            message.id: index for index, message in enumerate(durable_messages)
+        }
+        try:
+            source_positions = [
+                position_by_id[message_id]
+                for message_id in artifact.source_message_ids
+            ]
+        except KeyError:
+            return None
+        if source_positions != sorted(source_positions):
+            return None
+        suffix = durable_messages[source_positions[-1] + 1 :] if source_positions else []
+
+        try:
+            retained = [
+                Message.from_dict(item)
+                for item in _artifact_provider_messages(artifact.metadata)
+            ]
+            carried, metrics = prune_provider_messages([*retained, *suffix])
+            validate_tool_call_order(carried)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        contexts = self._compaction_provider_contexts(
+            session_id=session_id,
+            summary_text=artifact.summary_text,
+            provider_messages=[message.to_dict() for message in carried],
+            base_system=base_system,
+            base_system_blocks=base_system_blocks,
+            tools=tools,
+            prompt_cache_key=prompt_cache_key,
+            conversation_cache=conversation_cache,
+        )
+        hashes = {
+            str(context["provider_route"]): _stable_payload_hash(context)
+            for context in contexts
+        }
+        return artifact, carried, hashes, metrics
+
+    async def _record_or_reuse_compaction_artifact(
+        self,
+        *,
+        session_id: str,
+        source_messages: list[Message],
+        artifact_message: Message,
+        retained_messages: list[Message],
+        context_budget: ContextBudget,
+        summary_usage: Usage,
+        base_system: str,
+        base_system_blocks: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        prompt_cache_key: str = "",
+        conversation_cache: bool = False,
+        budget_guidance_index: int | None = None,
+    ) -> tuple[Message, bool]:
+        """Reuse an exact immutable artifact or persist the exact new provider context."""
+
+        strategy = str(artifact_message.metadata.get("strategy") or "deterministic")
+        requested_strategy = str(
+            artifact_message.metadata.get("requested_strategy") or strategy
+        )
+        artifact_version = int(artifact_message.metadata.get("artifact_version", 2))
+        config_fingerprint = self._compaction_config_fingerprint(
+            context_budget,
+            requested_strategy,
+            artifact_version,
+            system=base_system,
+            system_blocks=base_system_blocks,
+            tools=tools,
+            prompt_cache_key=prompt_cache_key,
+            conversation_cache=conversation_cache,
+            budget_guidance_index=budget_guidance_index,
+        )
+        source_hash = str(artifact_message.metadata["source_hash"])
+        provider_source_hash = _stable_payload_hash(
+            [message.to_dict() for message in source_messages]
+        )
+        reusable = await asyncio.to_thread(
+            self.sessions.reusable_compaction_artifact,
+            session_id,
+            source_hash=source_hash,
+            config_fingerprint=config_fingerprint,
+            strategy=strategy,
+        )
+        provider_messages = [message.to_dict() for message in retained_messages]
+        reusable_provider_contexts = (
+            self._compaction_provider_contexts(
+                session_id=session_id,
+                summary_text=reusable.summary_text,
+                provider_messages=provider_messages,
+                base_system=base_system,
+                base_system_blocks=base_system_blocks,
+                tools=tools,
+                prompt_cache_key=prompt_cache_key,
+                conversation_cache=conversation_cache,
+            )
+            if reusable is not None
+            else None
+        )
+        if (
+            reusable is not None
+            and _artifact_provider_messages(reusable.metadata) == provider_messages
+            and reusable.metadata.get("provider_source_hash") == provider_source_hash
+            and _artifact_provider_contexts(reusable.metadata) == reusable_provider_contexts
+        ):
+            return (
+                replace(
+                    artifact_message,
+                    content=reusable.summary_text,
+                    metadata={
+                        **artifact_message.metadata,
+                        "artifact_id": reusable.id,
+                        "artifact_reused": True,
+                        "compacted_context_hashes": reusable.metadata[
+                            "compacted_context_hashes"
+                        ],
+                    },
+                ),
+                True,
+            )
+
+        source_ids = [str(item) for item in artifact_message.metadata["source_message_ids"]]
+        source_id_set = set(source_ids)
+        source = [message for message in source_messages if message.id in source_id_set]
+        sequenced = await asyncio.to_thread(self.sessions.sequenced_messages, session_id)
+        sequence_by_id = {message.id: sequence for sequence, message in sequenced}
+        sequences = [sequence_by_id[item] for item in source_ids if item in sequence_by_id]
+        parent = await asyncio.to_thread(
+            self.sessions.latest_compaction_artifact,
+            session_id,
+            config_fingerprint=config_fingerprint,
+            strategy=strategy,
+        )
+        if parent is None and requested_strategy == "llm":
+            parent = await asyncio.to_thread(
+                self.sessions.latest_compaction_artifact,
+                session_id,
+                config_fingerprint=config_fingerprint,
+                strategy="deterministic",
+            )
+        parent_id: str | None = None
+        if parent is not None:
+            parent_source_length = len(parent.source_message_ids)
+            current_provider_prefix_hash = _stable_payload_hash(
+                [
+                    message.to_dict()
+                    for message in source_messages[:parent_source_length]
+                ]
+            )
+            if (
+                source_ids[:parent_source_length] == parent.source_message_ids
+                and parent.metadata.get("provider_source_hash")
+                == current_provider_prefix_hash
+            ):
+                parent_id = parent.id
+        provider_contexts = self._compaction_provider_contexts(
+            session_id=session_id,
+            summary_text=artifact_message.content,
+            provider_messages=provider_messages,
+            base_system=base_system,
+            base_system_blocks=base_system_blocks,
+            tools=tools,
+            prompt_cache_key=prompt_cache_key,
+            conversation_cache=conversation_cache,
+        )
+        provider_context = provider_contexts[0]
+        provider_names = tuple(route.provider.name for route in self.providers)
+        source_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=base_system,
+            tools=tools,
+            messages=source,
+            providers=provider_names,
+        )
+        compacted_system = f"{base_system}\n\n{artifact_message.content}"
+        artifact_budget = ContextBudget.calculate(
+            self.config.agent,
+            system=compacted_system,
+            tools=tools,
+            messages=retained_messages,
+            providers=provider_names,
+        )
+        artifact = CompactionArtifact(
+            session_id=session_id,
+            version=artifact_version,
+            strategy=strategy,
+            source_message_ids=source_ids,
+            source_hash=source_hash,
+            summary_text=artifact_message.content,
+            provider=(
+                self.providers[0].name if requested_strategy == "llm" else None
+            ),
+            model=(
+                str(
+                    artifact_message.metadata.get("summarizer_model")
+                    or self.config.agent.small_model
+                    or self.providers[0].model
+                )
+                if requested_strategy == "llm"
+                else None
+            ),
+            config_fingerprint=config_fingerprint,
+            estimated_tokens_before=source_budget.estimated_total(source),
+            estimated_tokens_after=artifact_budget.estimated_total(retained_messages),
+            usage=summary_usage,
+            source_start_sequence=min(sequences) if sequences else None,
+            source_end_sequence=max(sequences) if sequences else None,
+            parent_artifact_id=parent_id,
+            metadata={
+                "source_bundle_count": artifact_message.metadata.get("source_bundles", 0),
+                "retained_bundle_count": artifact_message.metadata.get(
+                    "retained_bundles", 0
+                ),
+                "compacted_bundle_count": artifact_message.metadata.get(
+                    "compacted_bundles", 0
+                ),
+                "retained_message_ids": [message.id for message in retained_messages],
+                "compacted_message_ids": [
+                    str(item)
+                    for item in artifact_message.metadata.get(
+                        "compacted_message_ids", []
+                    )
+                ],
+                "provider_source_hash": provider_source_hash,
+                "provider_contexts": provider_contexts,
+                "compacted_context_hash": _stable_payload_hash(provider_context),
+                "compacted_context_hashes": {
+                    str(context["provider_route"]): _stable_payload_hash(context)
+                    for context in provider_contexts
+                },
+                "evidence": artifact_message.metadata.get("evidence", {}),
+                "authoritative_evidence": artifact_message.metadata.get(
+                    "authoritative_evidence",
+                    artifact_message.metadata.get("evidence", {}),
+                ),
+                "fallback_reason": artifact_message.metadata.get("fallback_reason"),
+                "requested_strategy": requested_strategy,
+                "summarizer_requested_model": artifact_message.metadata.get(
+                    "summarizer_requested_model",
+                    (
+                        self.config.agent.small_model or self.providers[0].model
+                        if requested_strategy == "llm"
+                        else None
+                    ),
+                ),
+                "summarizer_models": artifact_message.metadata.get(
+                    "summarizer_models", []
+                ),
+                "context_budget": asdict(context_budget),
+            },
+        )
+        await asyncio.to_thread(self.sessions.append_compaction_artifact, artifact)
+        return (
+            replace(
+                artifact_message,
+                metadata={
+                    **artifact_message.metadata,
+                    "artifact_id": artifact.id,
+                    "artifact_reused": False,
+                    "compacted_context_hashes": artifact.metadata[
+                        "compacted_context_hashes"
+                    ],
+                },
+            ),
+            False,
+        )
+
+    def _compaction_provider_contexts(
+        self,
+        *,
+        session_id: str,
+        summary_text: str,
+        provider_messages: list[dict[str, Any]],
+        base_system: str,
+        base_system_blocks: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        prompt_cache_key: str,
+        conversation_cache: bool,
+    ) -> list[dict[str, Any]]:
+        """Build the exact model-affecting context for every configured route."""
+
+        system_blocks = [
+            *base_system_blocks,
+            {"text": summary_text, "cacheable": False},
+        ]
+        return [
+            {
+                "provider": route.provider.name,
+                "provider_route": route.name,
+                "model": route.model,
+                "provider_config_fingerprint": (
+                    self._provider_request_config_fingerprint(route)
+                ),
+                "system": f"{base_system}\n\n{summary_text}",
+                "system_blocks": system_blocks,
+                "messages": provider_messages,
+                "tools": tools,
+                "max_output_tokens": resolve_route_limits(
+                    self.config.agent, route.provider, route.model,
+                    self.config.agent.max_output_tokens,
+                )[0].max_output_tokens,
+                "temperature": None,
+                "reasoning_effort": self.config.agent.reasoning_effort or None,
+                "parallel_tool_calls": self.parallel_tool_calls,
+                "response_schema": None,
+                "metadata": {
+                    "session_id": session_id,
+                    "prompt_cache_key": prompt_cache_key,
+                    "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
+                    "prompt_cache_ttl": self.config.cache.anthropic_ttl,
+                    "anthropic_conversation_cache": conversation_cache,
+                    "system_blocks": system_blocks,
+                    "provider_route": route.name,
+                },
+            }
+            for route in self.providers
+        ]
+
+    @staticmethod
+    def _provider_request_config_fingerprint(route: ProviderRoute) -> str:
+        """Hash provider settings that can change the model-facing request."""
+
+        config = route.provider.config
+        payload = {
+            "type": config.type,
+            "base_url": config.base_url,
+            "api_style": getattr(route.provider, "api_style", config.api_style),
+            "headers": config.headers,
+            "site_url": config.site_url,
+            "app_name": config.app_name,
+            "model_fallbacks": config.model_fallbacks,
+            "provider_preferences": config.provider_preferences,
+            "extra_body": config.extra_body,
+        }
+        return _stable_payload_hash(payload)
+
+    def _compaction_config_fingerprint(
+        self,
+        context_budget: ContextBudget,
+        strategy: str,
+        artifact_version: int = 2,
+        *,
+        system: str,
+        system_blocks: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        prompt_cache_key: str = "",
+        conversation_cache: bool = False,
+        budget_guidance_index: int | None = None,
+    ) -> str:
+        if budget_guidance_index is not None or self.transient_system_block_index is not None:
+            # Only the block inserted by this preparation is transient. Keep
+            # every user/security instruction and the actual provider hashes.
+            system_blocks = [
+                block for index, block in enumerate(system_blocks)
+                if index not in {budget_guidance_index, self.transient_system_block_index}
+            ]
+            system = "\n\n".join(str(block["text"]) for block in system_blocks)
+            system_tokens = estimate_tokens(system)
+            context_budget = replace(
+                context_budget,
+                system_tokens=system_tokens,
+                message_target_tokens=max(
+                    1, context_budget.target_tokens - system_tokens
+                    - context_budget.tool_schema_tokens
+                    - context_budget.provider_framing_tokens
+                    - context_budget.continuation_state_tokens,
+                ),
+                message_target_bytes=max(
+                    1, context_budget.target_bytes
+                    - estimate_request_bytes(system, [], tools)
+                    + estimate_request_bytes("", [], []),
+                ),
+            )
+        fingerprint_payload = {
+            "artifact_version": artifact_version,
+            "strategy": strategy,
+            "prompt_version": 3,
+            "provider_context": {
+                "routes": [
+                    {
+                        "provider": route.provider.name,
+                        "provider_route": route.name,
+                        "model": route.model,
+                        "provider_config_fingerprint": (
+                            self._provider_request_config_fingerprint(route)
+                        ),
+                    }
+                    for route in self.providers
+                ],
+                "system_hash": _stable_payload_hash(system),
+                "system_blocks_hash": _stable_payload_hash(system_blocks),
+                "tool_schema_hash": _stable_payload_hash(tools),
+                "prompt_cache_key_hash": _stable_payload_hash(prompt_cache_key),
+                "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
+                "prompt_cache_ttl": self.config.cache.anthropic_ttl,
+                "conversation_cache": conversation_cache,
+            },
+            "context_budget": {
+                "input_limit": context_budget.input_limit,
+                "reserved_output_tokens": context_budget.reserved_output_tokens,
+                "system_tokens": context_budget.system_tokens,
+                "tool_schema_tokens": context_budget.tool_schema_tokens,
+                "continuation_state_tokens": context_budget.continuation_state_tokens,
+                "target_tokens": context_budget.target_tokens,
+                "message_target_tokens": context_budget.message_target_tokens,
+                "hard_bytes": context_budget.hard_bytes,
+                "trigger_bytes": context_budget.trigger_bytes,
+                "target_bytes": context_budget.target_bytes,
+                "message_target_bytes": context_budget.message_target_bytes,
+            },
+            "summary_model": (
+                self.config.agent.small_model or self.providers[0].model
+                if strategy == "llm"
+                else None
+            ),
+            "config": {
+                "compaction_target_ratio": self.config.agent.compaction_target_ratio,
+                "compaction_safety_margin_tokens": (
+                    context_budget.safety_margin_tokens
+                ),
+                "compaction_provider_framing_tokens": (
+                    context_budget.provider_framing_tokens
+                ),
+                "compaction_summarizer_input_tokens": (
+                    self.config.agent.compaction_summarizer_input_tokens
+                ),
+                "compaction_summarizer_total_input_tokens": (
+                    self.config.agent.compaction_summarizer_total_input_tokens
+                ),
+                "max_output_tokens": self.config.agent.max_output_tokens,
+            },
+        }
+        return hashlib.sha256(
+            json_dumps(fingerprint_payload).encode("utf-8")
+        ).hexdigest()
+
+    def _compaction_summary_cache_key(
+        self,
+        route: ProviderRoute,
+        request: ProviderRequest,
+    ) -> str:
+        request_messages = [
+            {
+                "role": message.role.value,
+                "content": message.content,
+                "tool_calls": [call.to_dict() for call in message.tool_calls],
+                "tool_call_id": message.tool_call_id,
+                "tool_name": message.tool_name,
+                "is_error": message.is_error,
+                "metadata": message.metadata,
+            }
+            for message in request.messages
+        ]
+        payload = {
+            "version": _COMPACTION_SUMMARY_CACHE_VERSION,
+            "provider": route.provider.name,
+            "provider_route": route.name,
+            "provider_config_fingerprint": (
+                self._provider_request_config_fingerprint(route)
+            ),
+            "model": request.model,
+            "request": {
+                "system": request.system,
+                "messages": request_messages,
+                "tools": request.tools,
+                "max_output_tokens": request.max_output_tokens,
+                "temperature": request.temperature,
+                "reasoning_effort": request.reasoning_effort,
+                "parallel_tool_calls": request.parallel_tool_calls,
+                "response_schema": request.response_schema,
+                "metadata": request.metadata,
+            },
+        }
+        return "compaction_summary:" + _stable_payload_hash(payload)
+
+    def _summarizer(
+        self,
+        usage_sink: Callable[[Usage], Awaitable[None]],
+        cancel: asyncio.Event,
+        usage_collector: Usage | None = None,
+        *,
+        session_id: str | None = None,
+        settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
+        before_model_request: Callable[[], None] | None = None,
+    ) -> Callable[[str], Awaitable[SummarizerResult]] | None:
+        """Build an LLM-backed compaction summarizer from the primary route.
+
+        Uses the small model when configured (cheap summarization), falling back
+        to the primary model. Returns None when compaction should stay purely
+        deterministic (as configured, or when no provider route is available).
+        """
+        if self.config.agent.deterministic_compaction or not self.providers:
+            return None
+        route = self.providers[0]
+
+        async def summarize(transcript: str) -> SummarizerResult:
+            request = ProviderRequest(
+                model=self.config.agent.small_model or route.model,
+                system=COMPACTION_SUMMARIZER_SYSTEM,
+                messages=[Message(role=Role.USER, content=transcript)],
+                max_output_tokens=min(4_000, self.config.agent.max_output_tokens),
+                response_schema=COMPACTION_RESPONSE_SCHEMA,
+                metadata={"purpose": "compaction_summary", **(self.helper_metadata or {})},
+            )
+            request = prepare_route_request(request, route.provider, self.config.agent)
+            cache_key = self._compaction_summary_cache_key(route, request)
+            try:
+                cached = (
+                    await asyncio.to_thread(
+                        self.sessions.get_compaction_summary,
+                        session_id,
+                        cache_key,
+                    )
+                    if session_id is not None
+                    else None
+                )
+            except Exception as error:
+                raise SessionError("Could not read the compaction summary cache") from error
+            if (
+                isinstance(cached, dict)
+                and cached.get("version") == _COMPACTION_SUMMARY_CACHE_VERSION
+            ):
+                assert session_id is not None
+                try:
+                    cached, original_usage, _ = await asyncio.to_thread(
+                        self.sessions.settle_compaction_summary_usage,
+                        session_id,
+                        cache_key,
+                    )
+                except Exception as error:
+                    raise SessionError(
+                        "Could not settle cached compaction summary usage"
+                    ) from error
+                cache_usage = Usage(
+                    cost_status="known",
+                    application_cache_hits=1,
+                    application_cache_saved_tokens=original_usage.total_tokens,
+                    application_cache_saved_cost_usd=original_usage.cost_usd,
+                )
+                if usage_collector is not None:
+                    usage_collector.add(original_usage)
+                await usage_sink(cache_usage)
+                if cancel.is_set():
+                    raise Cancelled("Run cancelled")
+                return SummarizerResult(
+                    text=str(cached.get("text") or ""),
+                    model=str(cached.get("model") or request.model),
+                    requested_model=str(
+                        cached.get("requested_model") or request.model
+                    ),
+                )
+            request_budget = getattr(before_model_request, "__self__", None)
+            reservation = request_budget.reserve_cost(route.provider, request) if isinstance(request_budget, Budget) else 0.0
+            cancelled_usage = Usage()
+
+            def observe_usage(usage: Usage) -> None:
+                cancelled_usage.add(usage)
+                if isinstance(request_budget, Budget):
+                    request_budget.hold_usage(cancelled_usage)
+
+            def account_summary() -> None:
+                # Helpers own no closure reservation. Keep the bound budget for
+                # cost holds/checks; a callback wrapper would hide that owner.
+                if isinstance(request_budget, Budget):
+                    request_budget.before_model_request(closure=False)
+                elif before_model_request is not None:
+                    before_model_request()
+
+            async def send_summary() -> ModelResponse:
+                account_summary()
+                return await route.provider.complete(request)
+
+            async def complete_summary() -> ModelResponse:
+                if cancel.is_set():
+                    raise Cancelled("Run cancelled")
+                return await route.provider.with_retries(
+                    send_summary, on_usage=observe_usage,
+                    before_recovery=account_summary, request=request,
+                    check_usage=(lambda _, owner=request_budget: owner.check_unsettled(cancelled_usage)) if isinstance(request_budget, Budget) else None,
+                )
+
+            request_task = asyncio.create_task(complete_summary())
+            cancel_task = asyncio.create_task(cancel.wait())
+
+            async def record_failed_usage(usage: Usage) -> None:
+                if isinstance(request_budget, Budget):
+                    request_budget.release_usage(cancelled_usage)
+                if usage_collector is not None:
+                    usage_collector.add(usage)
+                await usage_sink(usage)
+
+            try:
+                try:
+                    done, _ = await asyncio.wait(
+                        {request_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if request_task not in done and cancel_task in done:
+                        raise Cancelled("Run cancelled")
+                    response = await request_task
+                finally:
+                    cancel_task.cancel()
+                    if not request_task.done():
+                        request_task.cancel()
+                    await asyncio.gather(request_task, cancel_task, return_exceptions=True)
+                    if isinstance(request_budget, Budget):
+                        request_budget.release_cost(reservation)
+            except (Cancelled, asyncio.CancelledError):
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
+                raise
+            except BudgetExceeded:
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
+                raise
+            except ProviderError as error:
+                if error.usage is not None:
+                    await finish_on_cancellation(record_failed_usage(error.usage))
+                raise
+            except Exception:
+                if not cancelled_usage.is_empty:
+                    with contextlib.suppress(BudgetExceeded):
+                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
+                raise
+
+            async def transfer_usage(usage: Usage, sink: Callable[[Usage], Awaitable[None]] = usage_sink) -> None:
+                if isinstance(request_budget, Budget):
+                    request_budget.release_usage(cancelled_usage)
+                await sink(usage)
+
+            async def settle_completed_response() -> None:
+                # Cache first so a budget stop can resume without another provider call.
+                if session_id is not None:
+                    try:
+                        owns_cache_entry = await asyncio.to_thread(
+                            self.sessions.put_pending_compaction_summary,
+                            session_id,
+                            cache_key,
+                            {
+                                "version": _COMPACTION_SUMMARY_CACHE_VERSION,
+                                "text": response.text,
+                                "model": response.model or request.model,
+                                "requested_model": request.model,
+                                "usage": asdict(response.usage),
+                            },
+                        )
+                    except Exception as cache_error:
+                        if usage_collector is not None:
+                            usage_collector.add(response.usage)
+                        await transfer_usage(response.usage)
+                        raise SessionError(
+                            "Could not persist the pending compaction summary"
+                        ) from cache_error
+                    if owns_cache_entry:
+                        try:
+                            await asyncio.to_thread(
+                                self.sessions.settle_compaction_summary_usage,
+                                session_id,
+                                cache_key,
+                            )
+                        except Exception as error:
+                            raise SessionError(
+                                "Could not settle compaction summary usage"
+                            ) from error
+                        # This run incurred the provider charge even if another
+                        # process settled the durable cache entry first.
+                        if settled_usage_sink is not None:
+                            await transfer_usage(response.usage, settled_usage_sink)
+                    else:
+                        try:
+                            await asyncio.to_thread(
+                                self.sessions.settle_compaction_summary_usage,
+                                session_id,
+                                cache_key,
+                            )
+                        except Exception as error:
+                            await transfer_usage(response.usage)
+                            raise SessionError(
+                                "Could not settle the winning compaction summary usage"
+                            ) from error
+                        await transfer_usage(response.usage)
+                else:
+                    await transfer_usage(response.usage)
+                if usage_collector is not None:
+                    usage_collector.add(response.usage)
+
+            try:
+                await finish_on_cancellation(settle_completed_response())
+            finally:
+                if isinstance(request_budget, Budget):
+                    request_budget.release_usage(cancelled_usage)
+            if cancel.is_set():
+                raise Cancelled("Run cancelled")
+            return SummarizerResult(
+                text=response.text,
+                model=response.model or request.model,
+                requested_model=request.model,
+            )
+
+        async def summarize_in_slot(transcript: str) -> SummarizerResult:
+            swarm = self.helper_swarm
+            if swarm is None:
+                return await summarize(transcript)
+            async with swarm.provider_slots:
+                swarm.active_requests += 1
+                try:
+                    if cancel.is_set():
+                        raise Cancelled("Run cancelled")
+                    return await summarize(transcript)
+                finally:
+                    swarm.active_requests -= 1
+
+        return summarize_in_slot
+
+
+class AgentRunner(RequestPreparer):
     def __init__(
         self,
         *,
@@ -607,6 +2317,8 @@ class AgentRunner:
             session_id = session.id
         else:
             session = await asyncio.to_thread(self.sessions.get_session, session_id)
+            if session.metadata.get("delegated_conversation"):
+                raise SessionError("Internal delegated conversations cannot be resumed as root sessions")
             if Path(session.workspace).resolve() != self.workspace:
                 raise SessionError(
                     f"Session workspace is {session.workspace}, not {self.workspace}"
@@ -727,6 +2439,53 @@ class AgentRunner:
         except asyncio.CancelledError:
             return task.result()
 
+    async def _prepare_delegated_request(
+        self, request: ProviderRequest, child_context: ToolContext,
+        child_usage_sink: Callable[[Usage], Awaitable[None]],
+        child_settled_usage_sink: Callable[[Usage], Awaitable[None]],
+        overflow_retry_count: int, *, cancel: asyncio.Event, prompt_context: PromptContext,
+    ) -> ProviderRequest:
+        """Prepare one isolated child snapshot with the canonical pipeline."""
+        scope_id = child_context.run_id
+        await asyncio.to_thread(
+            self.sessions.ensure_delegated_conversation,
+            child_context.session_id, scope_id, child_context.metadata["delegation_id"],
+            child_context.metadata["delegation_depth"],
+            delegation_call_id=child_context.metadata.get("delegation_call_id"),
+        )
+        await asyncio.to_thread(self.sessions.sync_conversation_messages, scope_id, request.messages)
+        preparer = RequestPreparer(
+            config=replace(self.config, agent=replace(
+                self.config.agent, max_output_tokens=request.max_output_tokens)),
+            providers=self.providers, sessions=self.sessions, events=self.events,
+        )
+        preparer.parallel_tool_calls = request.parallel_tool_calls
+        preparer.helper_swarm = child_context.metadata["swarm_state"]
+        preparer.helper_metadata = {
+            "session_id": scope_id, "run_id": child_context.run_id,
+            **{key: request.metadata[key] for key in ("delegated", "delegation_id", "delegation_depth")},
+        }
+        # Only the explicitly supplied runtime bounds block is transient. Repository
+        # text and role/capability instructions remain part of the fingerprint.
+        if prompt_context.text != request.system:
+            raise SessionError("Delegated prompt blocks do not match the provider request")
+        preparer.transient_system_block_index = len(prompt_context.system_blocks) - 1
+        adaptive_cache = self._low_cache_effectiveness(
+            await asyncio.to_thread(self.sessions.usage, scope_id))
+        prepared = await preparer._prepare_provider_request(
+            prompt_context=prompt_context, messages=request.messages, schemas=request.tools,
+            final_turn=False, verification_finalization_pending=False,
+            adaptive_cache=adaptive_cache,
+            conversation_cache=(self.config.cache.prompt_cache_enabled
+                                and self.config.cache.conversation_cache_enabled and not adaptive_cache),
+            usage_sink=child_usage_sink, settled_usage_sink=child_settled_usage_sink,
+            cancel=cancel, session_id=scope_id, run_id=child_context.run_id,
+            last_prune_signature=None, before_model_request=child_context.metadata.get("before_model_request"),
+            overflow_retry_count=overflow_retry_count,
+        )
+        return replace(prepared.request, metadata={**prepared.request.metadata, **request.metadata,
+                                                   "session_id": scope_id})
+
     async def _run_locked(
         self,
         prompt: str,
@@ -815,9 +2574,22 @@ class AgentRunner:
                         context, lifecycle_only=nested_context.lifecycle_uncertainty_only,
                     )
 
+        async def prepare_delegate(
+            request: ProviderRequest, child_context: ToolContext,
+            child_usage_sink: Callable[[Usage], Awaitable[None]],
+            child_settled_usage_sink: Callable[[Usage], Awaitable[None]],
+            overflow_retry_count: int, prompt_context: PromptContext,
+        ) -> ProviderRequest:
+            return await self._prepare_delegated_request(
+                request, child_context, child_usage_sink, child_settled_usage_sink,
+                overflow_retry_count, cancel=cancel, prompt_context=prompt_context,
+            )
+
+        context.metadata["delegate_prepare"] = prepare_delegate
         context.metadata["delegate_execute"] = delegate_execute
         context.metadata["budget"] = budget
         context.metadata["usage_sink"] = usage_sink
+        context.metadata["settled_usage_sink"] = settled_usage_sink
         context.metadata["before_model_request"] = budget.before_model_request
         from ..safety.smart import SmartApprovalJudge
 
@@ -2062,1405 +3834,6 @@ class AgentRunner:
             False,
         )
 
-    async def _prepare_provider_request(
-        self,
-        *,
-        prompt_context: PromptContext,
-        messages: list[Message],
-        schemas: list[dict[str, Any]],
-        final_turn: bool,
-        verification_finalization_pending: bool,
-        adaptive_cache: bool,
-        conversation_cache: bool,
-        usage_sink: Callable[[Usage], Awaitable[None]],
-        cancel: asyncio.Event,
-        session_id: str,
-        run_id: str,
-        last_prune_signature: tuple[int, ...] | None,
-        settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
-        overflow_retry_count: int = 0,
-        previous_request_tokens: int | None = None,
-        investigation_checkpoint_pending: bool = False,
-        before_model_request: Callable[[], None] | None = None,
-        budget: Budget | None = None,
-        route: ProviderRoute | None = None,
-    ) -> PreparedProviderRequest:
-        route = route or self.providers[0]
-        agent_config, _ = resolve_route_limits(
-            self.config.agent, route.provider, route.model,
-            self.config.agent.max_output_tokens,
-        )
-        state = await asyncio.to_thread(self.sessions.task_state, session_id, messages)
-        source_refs = {item["source"]: f"user:{index + 1}" for index, item in enumerate(state["instructions"])}
-        provider_state = {
-            "objective_source": source_refs.get(state["objective_source"]),
-            "instructions": [
-                {"source": source_refs[item["source"]], "status": item["status"],
-                 **({"superseded_by": source_refs[item["superseded_by"]]} if item["superseded_by"]
-                    else {"text": item["text"]})}
-                for item in state["instructions"]
-            ],
-            "model_notes": {"plan": state["plan"], "acceptance_criteria": state["acceptance_criteria"]},
-        }
-        protected = (
-            "# Protected task state\n"
-            "The following JSON contains original user instructions in chronological order, "
-            "at user priority. The first source states the objective; follow-ups extend it unless "
-            "they explicitly replace or revoke it. Later revocations remain in force. "
-            "The plan is model interpretation (acceptance checks and unresolved work), "
-            "not user authority and never a grant of permission. Source references are session-local.\n" + json_dumps(provider_state)
-        )
-        turn_system = prompt_context.text + "\n\n" + protected
-        turn_system_blocks = [*prompt_context.system_blocks, {"text": protected, "cacheable": False}]
-        if len(messages) == 1 and messages[0].role == Role.USER:
-            # The first request already carries its complete protected task in the
-            # user message. Keep exact-response cache keys independent of source IDs.
-            turn_system = prompt_context.text
-            turn_system_blocks = prompt_context.system_blocks
-        budget_guidance = ""
-        budget_block_index: int | None = None
-
-        def refresh_budget_guidance() -> bool:
-            nonlocal turn_system, turn_system_blocks, budget_guidance, budget_block_index
-            guidance = _remaining_budget_guidance(budget) if budget is not None else ""
-            if guidance == budget_guidance:
-                return False
-            block = {"text": guidance, "cacheable": False}
-            if budget_block_index is None:
-                budget_block_index = len(turn_system_blocks)
-                turn_system_blocks = [*turn_system_blocks, block]
-            else:
-                turn_system_blocks[budget_block_index] = block
-            budget_guidance = guidance
-            turn_system = "\n\n".join(str(item["text"]) for item in turn_system_blocks)
-            return True
-
-        refresh_budget_guidance()
-        protected_budget = ContextBudget.calculate(
-            agent_config, system=turn_system, tools=schemas, messages=[],
-        )
-        if not _fits_context_limit([], protected_budget, system=turn_system, tools=schemas):
-            raise RouteContextExceeded("context", "Protected task requirements cannot fit the safe request budget")
-        if final_turn:
-            turn_system = f"{turn_system}\n\n{_FINAL_TURN_INSTRUCTION}"
-            turn_system_blocks = [
-                *turn_system_blocks,
-                {"text": _FINAL_TURN_INSTRUCTION, "cacheable": False},
-            ]
-        elif verification_finalization_pending:
-            turn_system = f"{turn_system}\n\n{_VERIFICATION_FINAL_INSTRUCTION}"
-            turn_system_blocks = [
-                *turn_system_blocks,
-                {"text": _VERIFICATION_FINAL_INSTRUCTION, "cacheable": False},
-            ]
-        elif investigation_checkpoint_pending:
-            turn_system = f"{turn_system}\n\n{_INVESTIGATION_CHECKPOINT_INSTRUCTION}"
-            turn_system_blocks = [
-                *turn_system_blocks,
-                {"text": _INVESTIGATION_CHECKPOINT_INSTRUCTION, "cacheable": False},
-            ]
-
-        request_messages, metrics = prune_provider_messages(messages)
-        validate_tool_call_order(request_messages)
-        budget_providers = tuple(item.provider.name for item in self.providers)
-        raw_budget = ContextBudget.calculate(
-            agent_config,
-            system=turn_system,
-            tools=schemas,
-            messages=messages,
-            providers=budget_providers,
-            overflow_retry_count=overflow_retry_count,
-        )
-        raw_estimated = raw_budget.estimated_total(messages)
-        context_budget = ContextBudget.calculate(
-            agent_config,
-            system=turn_system,
-            tools=schemas,
-            messages=request_messages,
-            providers=budget_providers,
-            overflow_retry_count=overflow_retry_count,
-        )
-        # Measure the provider view, including an existing summary, before
-        # deciding whether to compact. Durable history is only the source.
-        source_messages = request_messages
-        source_metrics = metrics
-        incremental = None
-        live_system = turn_system
-        if not overflow_retry_count:
-            incremental = await self._reuse_incremental_compaction(
-                session_id=session_id,
-                durable_messages=messages,
-                agent_config=agent_config,
-                base_system=turn_system,
-                base_system_blocks=turn_system_blocks,
-                tools=schemas,
-                prompt_cache_key=prompt_context.cache_routing_key,
-                conversation_cache=conversation_cache,
-                providers=budget_providers,
-                overflow_retry_count=overflow_retry_count,
-                budget_guidance_index=budget_block_index,
-            )
-        if incremental is not None:
-            prior_artifact, request_messages, _, metrics = incremental
-            live_system = f"{turn_system}\n\n{prior_artifact.summary_text}"
-            context_budget = ContextBudget.calculate(
-                agent_config,
-                system=live_system,
-                tools=schemas,
-                messages=request_messages,
-                providers=budget_providers,
-                overflow_retry_count=overflow_retry_count,
-            )
-        estimated = context_budget.estimated_total(request_messages)
-        live_estimated_before = estimated
-        estimated_bytes = estimate_request_bytes(
-            live_system,
-            request_messages,
-            schemas,
-        )
-        tool_output_over_budget = (
-            metrics.tool_output_tokens_retained
-            >= self.config.context.compact_tool_output_tokens
-        )
-        compaction_reason: str | None = None
-        if overflow_retry_count:
-            compaction_reason = "provider_context_overflow"
-        elif estimated >= context_budget.trigger_tokens:
-            compaction_reason = "estimated_tokens"
-        elif estimated_bytes >= context_budget.trigger_bytes:
-            compaction_reason = "estimated_bytes"
-        elif tool_output_over_budget:
-            compaction_reason = "tool_output_volume"
-        if (
-            compaction_reason not in {None, "provider_context_overflow"}
-            and len(request_messages) == 1
-            and request_messages[0].role == Role.USER
-        ):
-            if _fits_context_limit(
-                request_messages,
-                context_budget,
-                system=turn_system,
-                tools=schemas,
-            ):
-                compaction_reason = None
-            else:
-                raise RouteContextExceeded(
-                    "context",
-                    f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
-                    f"exceeds context budget {agent_config.max_input_tokens} "
-                    "tokens (endpoint byte limits are checked separately)",
-                )
-        prune_signature = (
-            metrics.tokens_before,
-            metrics.tokens_after,
-            metrics.superseded_reads_removed,
-            metrics.repeated_outputs_removed,
-            metrics.tool_output_tokens_retained,
-        )
-        if (
-            prune_signature != last_prune_signature
-            and (metrics.superseded_reads_removed or metrics.repeated_outputs_removed)
-        ):
-            await self.events.emit(
-                "context.pruned",
-                session_id=session_id,
-                run_id=run_id,
-                compaction_reason=compaction_reason or "superseded_tool_outputs",
-                **metrics.to_dict(),
-            )
-
-        keep_recent = 12 if adaptive_cache else 18
-        compacted = False
-        compaction_artifact_id: str | None = None
-        compaction_context_hashes: dict[str, str] | None = None
-        compaction_metadata: dict[str, Any] | None = None
-        if compaction_reason is None and incremental is not None:
-            artifact, request_messages, compaction_context_hashes, _ = incremental
-            compaction_artifact_id = artifact.id
-            turn_system = f"{turn_system}\n\n{artifact.summary_text}"
-            turn_system_blocks = [
-                *turn_system_blocks,
-                {"text": artifact.summary_text, "cacheable": False},
-            ]
-            compacted = True
-            context_budget = ContextBudget.calculate(
-                agent_config,
-                system=turn_system,
-                tools=schemas,
-                messages=request_messages,
-                providers=budget_providers,
-                overflow_retry_count=overflow_retry_count,
-            )
-            estimated = context_budget.estimated_total(request_messages)
-            tool_tokens = sum(
-                estimate_tokens(message.content)
-                for message in request_messages
-                if message.role == Role.TOOL
-            )
-            compaction_metadata = {
-                "strategy": artifact.strategy,
-                "artifact_version": artifact.version,
-                "source_bundle_count": artifact.metadata.get(
-                    "source_bundle_count", 0
-                ),
-                "retained_bundle_count": artifact.metadata.get(
-                    "retained_bundle_count", 0
-                ),
-                "compacted_bundle_count": artifact.metadata.get(
-                    "compacted_bundle_count", 0
-                ),
-                "estimated_tokens_before": live_estimated_before,
-                "durable_estimated_tokens": raw_estimated,
-                "summary_tokens": estimate_tokens(artifact.summary_text),
-                "token_headroom": context_budget.trigger_tokens - estimated,
-                "tool_output_headroom": (
-                    self.config.context.compact_tool_output_tokens - tool_tokens
-                ),
-                "target_tokens": context_budget.target_tokens,
-                "estimated_tokens_after": estimated,
-                "reduction_percentage": 0.0,
-                "provider_overflow_retry_count": overflow_retry_count,
-                "artifact_reused": True,
-                "incremental_suffix_reused": True,
-                "fallback_reason": artifact.metadata.get("fallback_reason"),
-                "summarization_usage": Usage().to_dict(),
-                "summarization_latency_ms": 0,
-            }
-            await self.events.emit(
-                "context.reused",
-                session_id=session_id,
-                run_id=run_id,
-                compaction_reason=compaction_reason,
-                tokens_before=metrics.tokens_before,
-                tokens_after=estimate_request_tokens(
-                    artifact.summary_text, request_messages, []
-                ),
-                superseded_reads_removed=metrics.superseded_reads_removed,
-                tool_output_tokens_retained=tool_tokens,
-                messages=len(request_messages),
-                **compaction_metadata,
-            )
-        if compaction_reason is not None:
-            request_messages = source_messages
-            summary_usage = Usage()
-            summary_started_ms = monotonic_ms()
-            # Old continuation metadata may be compacted away. Do not reserve it
-            # before selecting bundles; validate the retained reserve below.
-            compaction_budget = ContextBudget.calculate(
-                agent_config,
-                system=turn_system,
-                tools=schemas,
-                messages=[],
-                providers=budget_providers,
-                overflow_retry_count=overflow_retry_count,
-            )
-            provider_message_target = compaction_budget.message_target_tokens
-            if tool_output_over_budget:
-                # Leave room for a large parallel tool batch before the next
-                # trigger. Tiny custom thresholds retain the legacy fallback.
-                configured_tool_target = (
-                    int(self.config.context.compact_tool_output_tokens * 0.25)
-                    if self.config.context.compact_tool_output_tokens >= 4_096
-                    else int(source_metrics.tokens_before * 0.85)
-                )
-                provider_message_target = min(
-                    provider_message_target,
-                    max(1_024, configured_tool_target),
-                )
-            if compaction_reason == "provider_context_overflow":
-                if previous_request_tokens is not None:
-                    overflow_target = (
-                        int(previous_request_tokens * 0.70)
-                        - compaction_budget.system_tokens
-                        - compaction_budget.tool_schema_tokens
-                    )
-                else:
-                    overflow_target = int(
-                        metrics.tokens_before * (0.70**overflow_retry_count)
-                    )
-                provider_message_target = min(
-                    provider_message_target,
-                    max(1_024, overflow_target),
-                )
-            provider_message_target_bytes = min(
-                compaction_budget.message_target_bytes,
-                provider_message_target * 4,
-            )
-            intended_strategy = (
-                "deterministic"
-                if agent_config.deterministic_compaction
-                or agent_config.compaction_version == 1
-                or compaction_reason == "provider_context_overflow"
-                else "llm"
-            )
-            artifact_version = agent_config.compaction_version
-            fingerprint = self._compaction_config_fingerprint(
-                compaction_budget,
-                intended_strategy,
-                artifact_version,
-                system=turn_system,
-                system_blocks=turn_system_blocks,
-                tools=schemas,
-                prompt_cache_key=prompt_context.cache_routing_key,
-                conversation_cache=conversation_cache,
-                budget_guidance_index=budget_block_index,
-            )
-            incremental_parent = await asyncio.to_thread(
-                self.sessions.latest_compaction_artifact,
-                session_id,
-                config_fingerprint=fingerprint,
-                strategy=intended_strategy,
-            )
-            if incremental_parent is None and intended_strategy == "llm":
-                incremental_parent = await asyncio.to_thread(
-                    self.sessions.latest_compaction_artifact,
-                    session_id,
-                    config_fingerprint=fingerprint,
-                    strategy="deterministic",
-                )
-            current_source_ids = [message.id for message in request_messages]
-            current_provider_source_hash = _stable_payload_hash(
-                [message.to_dict() for message in request_messages]
-            )
-            parent_is_prefix = bool(
-                incremental_parent is not None
-                and current_source_ids[: len(incremental_parent.source_message_ids)]
-                == incremental_parent.source_message_ids
-                and incremental_parent.metadata.get("provider_source_hash")
-                == _stable_payload_hash(
-                    [
-                        message.to_dict()
-                        for message in request_messages[
-                            : len(incremental_parent.source_message_ids)
-                        ]
-                    ]
-                )
-            )
-            parent_compacted_message_ids: list[str] | None = None
-            parent_evidence: CompactionEvidence | None = None
-            if parent_is_prefix and incremental_parent is not None:
-                parent_evidence = _incremental_parent_evidence(incremental_parent)
-                if parent_evidence is None:
-                    parent_is_prefix = False
-                else:
-                    recorded_compacted_ids = incremental_parent.metadata.get(
-                        "compacted_message_ids"
-                    )
-                    if isinstance(recorded_compacted_ids, list):
-                        parent_compacted_message_ids = [
-                            str(item) for item in recorded_compacted_ids
-                        ]
-                    else:
-                        recorded_retained_ids = incremental_parent.metadata.get(
-                            "retained_message_ids"
-                        )
-                        if isinstance(recorded_retained_ids, list):
-                            retained_id_set = {
-                                str(item) for item in recorded_retained_ids
-                            }
-                            parent_compacted_message_ids = [
-                                message_id
-                                for message_id in incremental_parent.source_message_ids
-                                if message_id not in retained_id_set
-                            ]
-                        else:
-                            parent_is_prefix = False
-            compaction_kwargs = {
-                "keep_recent": keep_recent,
-                "summary_tokens": provider_message_target,
-                "summary_bytes": provider_message_target_bytes,
-                "summarizer_input_tokens": (
-                    agent_config.compaction_summarizer_input_tokens
-                ),
-                "summarizer_total_input_tokens": (
-                    agent_config.compaction_summarizer_total_input_tokens
-                ),
-                "target_tokens": provider_message_target,
-                "target_bytes": provider_message_target_bytes,
-                "force": (
-                    tool_output_over_budget
-                    or compaction_reason == "provider_context_overflow"
-                ),
-                "base_evidence": parent_evidence if parent_is_prefix else None,
-                "base_source_message_ids": (
-                    incremental_parent.source_message_ids
-                    if parent_is_prefix and incremental_parent is not None
-                    else None
-                ),
-                "base_compacted_message_ids": (
-                    parent_compacted_message_ids if parent_is_prefix else None
-                ),
-            }
-            try:
-                if agent_config.compaction_version == 1:
-                    if agent_config.compaction_shadow_v2:
-                        try:
-                            shadow = compact_messages(
-                                request_messages,
-                                keep_recent=keep_recent,
-                                summary_tokens=provider_message_target,
-                                summary_bytes=provider_message_target_bytes,
-                                target_tokens=provider_message_target,
-                                target_bytes=provider_message_target_bytes,
-                                force=bool(compaction_kwargs["force"]),
-                            )
-                            shadow_metadata = shadow[0].metadata
-                            shadow_evidence = CompactionEvidence.from_dict(
-                                shadow_metadata.get("authoritative_evidence")
-                                or shadow_metadata.get("evidence")
-                            )
-                            critical_fact_count = sum(
-                                len(getattr(shadow_evidence, field))
-                                for field in (
-                                    "current_objective",
-                                    "user_constraints",
-                                    "files_changed",
-                                    "latest_verification",
-                                    "open_failures_and_blockers",
-                                    "pending_work",
-                                )
-                            )
-                            await self.events.emit(
-                                "context.compaction_shadow",
-                                session_id=session_id,
-                                run_id=run_id,
-                                artifact_version=2,
-                                strategy=shadow_metadata.get("strategy"),
-                                source_bundle_count=shadow_metadata.get(
-                                    "source_bundles", 0
-                                ),
-                                retained_bundle_count=shadow_metadata.get(
-                                    "retained_bundles", 0
-                                ),
-                                compacted_bundle_count=shadow_metadata.get(
-                                    "compacted_bundles", 0
-                                ),
-                                critical_fact_count=critical_fact_count,
-                                estimated_tokens_before=metrics.tokens_before,
-                                estimated_tokens_after=estimate_request_tokens(
-                                    "", shadow, []
-                                ),
-                                target_tokens=context_budget.target_tokens,
-                                below_target=(
-                                    estimate_request_tokens("", shadow, [])
-                                    <= provider_message_target
-                                ),
-                            )
-                        except CompactionError as shadow_error:
-                            await self.events.emit(
-                                "context.compaction_shadow",
-                                session_id=session_id,
-                                run_id=run_id,
-                                artifact_version=2,
-                                fallback_reason=type(shadow_error).__name__,
-                            )
-                    deterministic_messages = compact_messages_v1(
-                        request_messages,
-                        keep_recent=keep_recent,
-                        target_tokens=provider_message_target,
-                        target_bytes=provider_message_target_bytes,
-                        force=bool(compaction_kwargs["force"]),
-                    )
-                else:
-                    deterministic_messages = await compact_messages_with_summary(
-                        request_messages,
-                        None,
-                        **compaction_kwargs,
-                    )
-                target_adjustments = 0
-                while deterministic_messages != request_messages:
-                    retained = deterministic_messages[1:]
-                    retained_budget = ContextBudget.calculate(
-                        agent_config,
-                        system=turn_system,
-                        tools=schemas,
-                        messages=retained,
-                        providers=budget_providers,
-                        overflow_retry_count=overflow_retry_count,
-                    )
-                    next_targets = _next_compaction_targets(
-                        token_target=provider_message_target,
-                        byte_target=provider_message_target_bytes,
-                        compacted_messages=deterministic_messages,
-                        retained_budget=retained_budget,
-                        system=turn_system,
-                        tools=schemas,
-                    )
-                    if next_targets is None:
-                        break
-                    tighter_target, tighter_byte_target = next_targets
-                    target_adjustments += 1
-                    if target_adjustments > len(request_messages) + 1:
-                        raise CompactionSizeError(
-                            "Compaction target did not converge after continuation adjustment"
-                        )
-                    provider_message_target = tighter_target
-                    provider_message_target_bytes = tighter_byte_target
-                    compaction_kwargs["summary_tokens"] = tighter_target
-                    compaction_kwargs["summary_bytes"] = tighter_byte_target
-                    compaction_kwargs["target_tokens"] = tighter_target
-                    compaction_kwargs["target_bytes"] = tighter_byte_target
-                    if agent_config.compaction_version == 1:
-                        deterministic_messages = compact_messages_v1(
-                            request_messages,
-                            keep_recent=keep_recent,
-                            target_tokens=tighter_target,
-                            target_bytes=tighter_byte_target,
-                            force=bool(compaction_kwargs["force"]),
-                        )
-                    else:
-                        deterministic_messages = await compact_messages_with_summary(
-                            request_messages,
-                            None,
-                            **compaction_kwargs,
-                        )
-            except CompactionSizeError as error:
-                raise RouteContextExceeded("context", str(error)) from error
-            compacted_messages = deterministic_messages
-            if deterministic_messages != request_messages:
-                deterministic_artifact = deterministic_messages[0]
-                durable_by_id = {message.id: message for message in messages}
-                durable_source = [
-                    durable_by_id[str(message_id)]
-                    for message_id in deterministic_artifact.metadata[
-                        "source_message_ids"
-                    ]
-                    if str(message_id) in durable_by_id
-                ]
-                if len(durable_source) != len(
-                    deterministic_artifact.metadata["source_message_ids"]
-                ):
-                    raise CompactionError(
-                        "Compaction source IDs do not resolve to durable messages"
-                    )
-                durable_source_hash = hashlib.sha256(
-                    json_dumps([message.to_dict() for message in durable_source]).encode(
-                        "utf-8"
-                    )
-                ).hexdigest()
-                deterministic_artifact = replace(
-                    deterministic_artifact,
-                    metadata={
-                        **deterministic_artifact.metadata,
-                        "source_hash": durable_source_hash,
-                        "provider_source_hash": current_provider_source_hash,
-                    },
-                )
-                deterministic_messages = [
-                    deterministic_artifact,
-                    *deterministic_messages[1:],
-                ]
-                compacted_messages = deterministic_messages
-                reusable = await asyncio.to_thread(
-                    self.sessions.reusable_compaction_artifact,
-                    session_id,
-                    source_hash=str(deterministic_artifact.metadata["source_hash"]),
-                    config_fingerprint=fingerprint,
-                    strategy=intended_strategy,
-                )
-                if reusable is None and intended_strategy == "llm":
-                    reusable = await asyncio.to_thread(
-                        self.sessions.reusable_compaction_artifact,
-                        session_id,
-                        source_hash=str(deterministic_artifact.metadata["source_hash"]),
-                        config_fingerprint=fingerprint,
-                        strategy="deterministic",
-                    )
-                if reusable is not None and _artifact_provider_messages(
-                    reusable.metadata
-                ) != [message.to_dict() for message in deterministic_messages[1:]]:
-                    reusable = None
-                if reusable is not None and reusable.metadata.get(
-                    "provider_source_hash"
-                ) != current_provider_source_hash:
-                    reusable = None
-                if reusable is not None:
-                    compacted_messages = [
-                        replace(
-                            deterministic_artifact,
-                            content=reusable.summary_text,
-                            metadata={
-                                **deterministic_artifact.metadata,
-                                "strategy": reusable.strategy,
-                                "artifact_id": reusable.id,
-                                "artifact_reused": True,
-                                "fallback_reason": reusable.metadata.get(
-                                    "fallback_reason"
-                                ),
-                                "requested_strategy": reusable.metadata.get(
-                                    "requested_strategy", reusable.strategy
-                                ),
-                                "evidence": reusable.metadata.get(
-                                    "evidence",
-                                    deterministic_artifact.metadata.get("evidence", {}),
-                                ),
-                            },
-                        ),
-                        *deterministic_messages[1:],
-                    ]
-                elif (
-                    intended_strategy == "llm"
-                    and budget is not None
-                    and budget.last_request
-                ):
-                    # Preserve the final request for the answer, including any
-                    # Script notice that required this preparation to run again.
-                    compacted_messages = [
-                        replace(
-                            deterministic_artifact,
-                            metadata={
-                                **deterministic_artifact.metadata,
-                                "requested_strategy": intended_strategy,
-                                "fallback_reason": "final_request_reserved",
-                            },
-                        ),
-                        *deterministic_messages[1:],
-                    ]
-                elif intended_strategy == "llm":
-                    transcript_message_ids: set[str] | None = None
-                    source_ids = [
-                        str(item)
-                        for item in deterministic_artifact.metadata[
-                            "source_message_ids"
-                        ]
-                    ]
-                    if (
-                        parent_is_prefix
-                        and incremental_parent is not None
-                        and parent_compacted_message_ids is not None
-                        and source_ids[: len(incremental_parent.source_message_ids)]
-                        == incremental_parent.source_message_ids
-                    ):
-                        previously_compacted_ids = set(parent_compacted_message_ids)
-                        transcript_message_ids = {
-                            str(item)
-                            for item in deterministic_artifact.metadata.get(
-                                "compacted_message_ids", []
-                            )
-                            if str(item) not in previously_compacted_ids
-                        }
-                    compacted_messages = await compact_messages_with_summary(
-                        request_messages,
-                        self._summarizer(
-                            usage_sink,
-                            cancel,
-                            summary_usage,
-                            session_id=session_id,
-                            settled_usage_sink=settled_usage_sink,
-                            before_model_request=before_model_request,
-                        ),
-                        transcript_message_ids=transcript_message_ids,
-                        **compaction_kwargs,
-                    )
-                    if compacted_messages != request_messages:
-                        compacted_messages = [
-                            replace(
-                                compacted_messages[0],
-                                metadata={
-                                    **compacted_messages[0].metadata,
-                                    "source_hash": durable_source_hash,
-                                },
-                            ),
-                            *compacted_messages[1:],
-                        ]
-            if compacted_messages != request_messages:
-                artifact_messages = [
-                    message
-                    for message in compacted_messages
-                    if message.role == Role.SYSTEM and message.metadata.get("compacted")
-                ]
-                if len(artifact_messages) != 1:
-                    raise CompactionError(
-                        "Compaction must produce exactly one synthetic system artifact"
-                    )
-                artifact_message = artifact_messages[0]
-                retained_messages = [
-                    message for message in compacted_messages if message is not artifact_message
-                ]
-                if refresh_budget_guidance():
-                    compaction_budget = ContextBudget.calculate(
-                        agent_config, system=turn_system, tools=schemas,
-                        messages=request_messages, providers=budget_providers,
-                        overflow_retry_count=overflow_retry_count,
-                    )
-                try:
-                    artifact_message, retained_messages = (
-                        _fit_artifact_to_request_byte_target(
-                            artifact=artifact_message,
-                            retained_messages=retained_messages,
-                            deterministic_messages=deterministic_messages,
-                            system=turn_system,
-                            tools=schemas,
-                            target_bytes=compaction_budget.target_bytes,
-                        )
-                    )
-                except CompactionSizeError as error:
-                    raise RouteContextExceeded("context", str(error)) from error
-                validate_tool_call_order(retained_messages)
-                artifact_message, reused = await self._record_or_reuse_compaction_artifact(
-                    session_id=session_id,
-                    source_messages=request_messages,
-                    artifact_message=artifact_message,
-                    retained_messages=retained_messages,
-                    context_budget=compaction_budget,
-                    summary_usage=summary_usage,
-                    base_system=turn_system,
-                    base_system_blocks=turn_system_blocks,
-                    tools=schemas,
-                    prompt_cache_key=prompt_context.cache_routing_key,
-                    conversation_cache=conversation_cache,
-                    budget_guidance_index=budget_block_index,
-                )
-                compaction_artifact_id = str(artifact_message.metadata["artifact_id"])
-                compaction_context_hashes = dict(
-                    artifact_message.metadata["compacted_context_hashes"]
-                )
-                turn_system = f"{turn_system}\n\n{artifact_message.content}"
-                turn_system_blocks = [
-                    *turn_system_blocks,
-                    {"text": artifact_message.content, "cacheable": False},
-                ]
-                request_messages = retained_messages
-                compacted = True
-                context_budget = ContextBudget.calculate(
-                    agent_config,
-                    system=turn_system,
-                    tools=schemas,
-                    messages=request_messages,
-                    providers=budget_providers,
-                    overflow_retry_count=overflow_retry_count,
-                )
-                tool_tokens = sum(
-                    estimate_tokens(message.content)
-                    for message in request_messages
-                    if message.role == Role.TOOL
-                )
-                estimated = context_budget.estimated_total(request_messages)
-                if estimated > context_budget.target_tokens:
-                    raise CompactionError(
-                        f"Compacted request size {estimated} exceeds calculated target "
-                        f"{context_budget.target_tokens}"
-                    )
-                estimated_bytes = estimate_request_bytes(
-                    turn_system,
-                    request_messages,
-                    schemas,
-                )
-                if estimated_bytes > context_budget.target_bytes:
-                    raise CompactionError(
-                        f"Compacted request size {estimated_bytes} bytes exceeds calculated "
-                        f"target {context_budget.target_bytes} bytes"
-                    )
-                tokens_after = estimated
-                conversation_tokens_after = estimate_request_tokens(
-                    artifact_message.content, request_messages, []
-                )
-                reduction = (
-                    1.0 - (tokens_after / live_estimated_before)
-                    if live_estimated_before
-                    else 0.0
-                )
-                compaction_metadata = {
-                    "strategy": artifact_message.metadata.get("strategy"),
-                    "artifact_version": artifact_message.metadata.get(
-                        "artifact_version", 2
-                    ),
-                    "source_bundle_count": artifact_message.metadata.get(
-                        "source_bundles", 0
-                    ),
-                    "retained_bundle_count": artifact_message.metadata.get(
-                        "retained_bundles", 0
-                    ),
-                    "compacted_bundle_count": artifact_message.metadata.get(
-                        "compacted_bundles", 0
-                    ),
-                    "estimated_tokens_before": live_estimated_before,
-                    "durable_estimated_tokens": raw_estimated,
-                    "target_tokens": context_budget.target_tokens,
-                    "message_target_tokens": provider_message_target,
-                    "summary_tokens": estimate_tokens(artifact_message.content),
-                    "token_headroom": context_budget.trigger_tokens - tokens_after,
-                    "tool_output_headroom": (
-                        self.config.context.compact_tool_output_tokens - tool_tokens
-                    ),
-                    "estimated_tokens_after": tokens_after,
-                    "reduction_percentage": round(reduction * 100, 2),
-                    "provider_overflow_retry_count": overflow_retry_count,
-                    "artifact_reused": reused,
-                    "fallback_reason": (
-                        artifact_message.metadata.get("fallback_reason")
-                        or (
-                            "provider_context_overflow"
-                            if compaction_reason == "provider_context_overflow"
-                            else None
-                        )
-                    ),
-                    "summarization_usage": summary_usage.to_dict(),
-                    "summarization_latency_ms": monotonic_ms() - summary_started_ms,
-                }
-                await self.events.emit(
-                    "context.reused" if reused else "context.compacted",
-                    session_id=session_id,
-                    run_id=run_id,
-                    compaction_reason=compaction_reason,
-                    tokens_before=metrics.tokens_before,
-                    tokens_after=conversation_tokens_after,
-                    superseded_reads_removed=metrics.superseded_reads_removed,
-                    tool_output_tokens_retained=tool_tokens,
-                    messages=len(request_messages),
-                    **compaction_metadata,
-                )
-        if refresh_budget_guidance():
-            context_budget = ContextBudget.calculate(
-                agent_config, system=turn_system, tools=schemas,
-                messages=request_messages, providers=budget_providers,
-                overflow_retry_count=overflow_retry_count,
-            )
-            estimated = context_budget.estimated_total(request_messages)
-        estimated_bytes = estimate_request_bytes(
-            turn_system,
-            request_messages,
-            schemas,
-        )
-        if not _fits_context_limit(
-            request_messages,
-            context_budget,
-            system=turn_system,
-            tools=schemas,
-        ):
-            raise RouteContextExceeded(
-                "context",
-                f"Estimated request size {estimated} tokens/{estimated_bytes} bytes "
-                f"exceeds context budget {agent_config.max_input_tokens} "
-                "tokens (endpoint byte limits are checked separately)",
-            )
-        request = ProviderRequest(
-            model=route.model,
-            system=turn_system,
-            messages=request_messages,
-            tools=schemas,
-            max_output_tokens=agent_config.max_output_tokens,
-            reasoning_effort=agent_config.reasoning_effort or None,
-            parallel_tool_calls=True,
-            metadata={
-                "session_id": session_id,
-                "run_id": run_id,
-                "provider_route": route.name,
-                "protected_task_state": len(messages) > 1,
-                "prompt_cache_key": prompt_context.cache_routing_key,
-                "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
-                "prompt_cache_ttl": self.config.cache.anthropic_ttl,
-                "anthropic_conversation_cache": conversation_cache,
-                "system_blocks": turn_system_blocks,
-                **(
-                    {"compaction_artifact_id": compaction_artifact_id}
-                    if compaction_artifact_id is not None
-                    else {}
-                ),
-                **(
-                    {"compacted_context_hashes": compaction_context_hashes}
-                    if compaction_context_hashes is not None
-                    else {}
-                ),
-            },
-        )
-        request = prepare_route_request(request, route.provider, self.config.agent)
-        return PreparedProviderRequest(
-            request, estimated, compacted, prune_signature, compaction_metadata
-        )
-
-    async def _reuse_incremental_compaction(
-        self,
-        *,
-        session_id: str,
-        durable_messages: list[Message],
-        agent_config: AgentConfig,
-        base_system: str,
-        base_system_blocks: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        prompt_cache_key: str,
-        conversation_cache: bool,
-        providers: tuple[str, ...],
-        overflow_retry_count: int,
-        budget_guidance_index: int | None = None,
-    ) -> tuple[CompactionArtifact, list[Message], dict[str, str], ContextPruneMetrics] | None:
-        """Reconstruct the working view; the caller checks its size limits."""
-
-        strategy = (
-            "deterministic"
-            if self.config.agent.deterministic_compaction
-            or self.config.agent.compaction_version == 1
-            else "llm"
-        )
-        compaction_budget = ContextBudget.calculate(
-            agent_config,
-            system=base_system,
-            tools=tools,
-            messages=[],
-            providers=providers,
-            overflow_retry_count=overflow_retry_count,
-        )
-        fingerprint = self._compaction_config_fingerprint(
-            compaction_budget,
-            strategy,
-            self.config.agent.compaction_version,
-            system=base_system,
-            system_blocks=base_system_blocks,
-            tools=tools,
-            prompt_cache_key=prompt_cache_key,
-            conversation_cache=conversation_cache,
-            budget_guidance_index=budget_guidance_index,
-        )
-        artifact = await asyncio.to_thread(
-            self.sessions.latest_compaction_artifact,
-            session_id,
-            config_fingerprint=fingerprint,
-            strategy=strategy,
-        )
-        if artifact is None and strategy == "llm":
-            artifact = await asyncio.to_thread(
-                self.sessions.latest_compaction_artifact,
-                session_id,
-                config_fingerprint=fingerprint,
-                strategy="deterministic",
-            )
-        if artifact is None:
-            return None
-
-        position_by_id = {
-            message.id: index for index, message in enumerate(durable_messages)
-        }
-        try:
-            source_positions = [
-                position_by_id[message_id]
-                for message_id in artifact.source_message_ids
-            ]
-        except KeyError:
-            return None
-        if source_positions != sorted(source_positions):
-            return None
-        suffix = durable_messages[source_positions[-1] + 1 :] if source_positions else []
-
-        try:
-            retained = [
-                Message.from_dict(item)
-                for item in _artifact_provider_messages(artifact.metadata)
-            ]
-            carried, metrics = prune_provider_messages([*retained, *suffix])
-            validate_tool_call_order(carried)
-        except (KeyError, TypeError, ValueError):
-            return None
-
-        contexts = self._compaction_provider_contexts(
-            session_id=session_id,
-            summary_text=artifact.summary_text,
-            provider_messages=[message.to_dict() for message in carried],
-            base_system=base_system,
-            base_system_blocks=base_system_blocks,
-            tools=tools,
-            prompt_cache_key=prompt_cache_key,
-            conversation_cache=conversation_cache,
-        )
-        hashes = {
-            str(context["provider_route"]): _stable_payload_hash(context)
-            for context in contexts
-        }
-        return artifact, carried, hashes, metrics
-
-    async def _record_or_reuse_compaction_artifact(
-        self,
-        *,
-        session_id: str,
-        source_messages: list[Message],
-        artifact_message: Message,
-        retained_messages: list[Message],
-        context_budget: ContextBudget,
-        summary_usage: Usage,
-        base_system: str,
-        base_system_blocks: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        prompt_cache_key: str = "",
-        conversation_cache: bool = False,
-        budget_guidance_index: int | None = None,
-    ) -> tuple[Message, bool]:
-        """Reuse an exact immutable artifact or persist the exact new provider context."""
-
-        strategy = str(artifact_message.metadata.get("strategy") or "deterministic")
-        requested_strategy = str(
-            artifact_message.metadata.get("requested_strategy") or strategy
-        )
-        artifact_version = int(artifact_message.metadata.get("artifact_version", 2))
-        config_fingerprint = self._compaction_config_fingerprint(
-            context_budget,
-            requested_strategy,
-            artifact_version,
-            system=base_system,
-            system_blocks=base_system_blocks,
-            tools=tools,
-            prompt_cache_key=prompt_cache_key,
-            conversation_cache=conversation_cache,
-            budget_guidance_index=budget_guidance_index,
-        )
-        source_hash = str(artifact_message.metadata["source_hash"])
-        provider_source_hash = _stable_payload_hash(
-            [message.to_dict() for message in source_messages]
-        )
-        reusable = await asyncio.to_thread(
-            self.sessions.reusable_compaction_artifact,
-            session_id,
-            source_hash=source_hash,
-            config_fingerprint=config_fingerprint,
-            strategy=strategy,
-        )
-        provider_messages = [message.to_dict() for message in retained_messages]
-        reusable_provider_contexts = (
-            self._compaction_provider_contexts(
-                session_id=session_id,
-                summary_text=reusable.summary_text,
-                provider_messages=provider_messages,
-                base_system=base_system,
-                base_system_blocks=base_system_blocks,
-                tools=tools,
-                prompt_cache_key=prompt_cache_key,
-                conversation_cache=conversation_cache,
-            )
-            if reusable is not None
-            else None
-        )
-        if (
-            reusable is not None
-            and _artifact_provider_messages(reusable.metadata) == provider_messages
-            and reusable.metadata.get("provider_source_hash") == provider_source_hash
-            and _artifact_provider_contexts(reusable.metadata) == reusable_provider_contexts
-        ):
-            return (
-                replace(
-                    artifact_message,
-                    content=reusable.summary_text,
-                    metadata={
-                        **artifact_message.metadata,
-                        "artifact_id": reusable.id,
-                        "artifact_reused": True,
-                        "compacted_context_hashes": reusable.metadata[
-                            "compacted_context_hashes"
-                        ],
-                    },
-                ),
-                True,
-            )
-
-        source_ids = [str(item) for item in artifact_message.metadata["source_message_ids"]]
-        source_id_set = set(source_ids)
-        source = [message for message in source_messages if message.id in source_id_set]
-        sequenced = await asyncio.to_thread(self.sessions.sequenced_messages, session_id)
-        sequence_by_id = {message.id: sequence for sequence, message in sequenced}
-        sequences = [sequence_by_id[item] for item in source_ids if item in sequence_by_id]
-        parent = await asyncio.to_thread(
-            self.sessions.latest_compaction_artifact,
-            session_id,
-            config_fingerprint=config_fingerprint,
-            strategy=strategy,
-        )
-        if parent is None and requested_strategy == "llm":
-            parent = await asyncio.to_thread(
-                self.sessions.latest_compaction_artifact,
-                session_id,
-                config_fingerprint=config_fingerprint,
-                strategy="deterministic",
-            )
-        parent_id: str | None = None
-        if parent is not None:
-            parent_source_length = len(parent.source_message_ids)
-            current_provider_prefix_hash = _stable_payload_hash(
-                [
-                    message.to_dict()
-                    for message in source_messages[:parent_source_length]
-                ]
-            )
-            if (
-                source_ids[:parent_source_length] == parent.source_message_ids
-                and parent.metadata.get("provider_source_hash")
-                == current_provider_prefix_hash
-            ):
-                parent_id = parent.id
-        provider_contexts = self._compaction_provider_contexts(
-            session_id=session_id,
-            summary_text=artifact_message.content,
-            provider_messages=provider_messages,
-            base_system=base_system,
-            base_system_blocks=base_system_blocks,
-            tools=tools,
-            prompt_cache_key=prompt_cache_key,
-            conversation_cache=conversation_cache,
-        )
-        provider_context = provider_contexts[0]
-        provider_names = tuple(route.provider.name for route in self.providers)
-        source_budget = ContextBudget.calculate(
-            self.config.agent,
-            system=base_system,
-            tools=tools,
-            messages=source,
-            providers=provider_names,
-        )
-        compacted_system = f"{base_system}\n\n{artifact_message.content}"
-        artifact_budget = ContextBudget.calculate(
-            self.config.agent,
-            system=compacted_system,
-            tools=tools,
-            messages=retained_messages,
-            providers=provider_names,
-        )
-        artifact = CompactionArtifact(
-            session_id=session_id,
-            version=artifact_version,
-            strategy=strategy,
-            source_message_ids=source_ids,
-            source_hash=source_hash,
-            summary_text=artifact_message.content,
-            provider=(
-                self.providers[0].name if requested_strategy == "llm" else None
-            ),
-            model=(
-                str(
-                    artifact_message.metadata.get("summarizer_model")
-                    or self.config.agent.small_model
-                    or self.providers[0].model
-                )
-                if requested_strategy == "llm"
-                else None
-            ),
-            config_fingerprint=config_fingerprint,
-            estimated_tokens_before=source_budget.estimated_total(source),
-            estimated_tokens_after=artifact_budget.estimated_total(retained_messages),
-            usage=summary_usage,
-            source_start_sequence=min(sequences) if sequences else None,
-            source_end_sequence=max(sequences) if sequences else None,
-            parent_artifact_id=parent_id,
-            metadata={
-                "source_bundle_count": artifact_message.metadata.get("source_bundles", 0),
-                "retained_bundle_count": artifact_message.metadata.get(
-                    "retained_bundles", 0
-                ),
-                "compacted_bundle_count": artifact_message.metadata.get(
-                    "compacted_bundles", 0
-                ),
-                "retained_message_ids": [message.id for message in retained_messages],
-                "compacted_message_ids": [
-                    str(item)
-                    for item in artifact_message.metadata.get(
-                        "compacted_message_ids", []
-                    )
-                ],
-                "provider_source_hash": provider_source_hash,
-                "provider_contexts": provider_contexts,
-                "compacted_context_hash": _stable_payload_hash(provider_context),
-                "compacted_context_hashes": {
-                    str(context["provider_route"]): _stable_payload_hash(context)
-                    for context in provider_contexts
-                },
-                "evidence": artifact_message.metadata.get("evidence", {}),
-                "authoritative_evidence": artifact_message.metadata.get(
-                    "authoritative_evidence",
-                    artifact_message.metadata.get("evidence", {}),
-                ),
-                "fallback_reason": artifact_message.metadata.get("fallback_reason"),
-                "requested_strategy": requested_strategy,
-                "summarizer_requested_model": artifact_message.metadata.get(
-                    "summarizer_requested_model",
-                    (
-                        self.config.agent.small_model or self.providers[0].model
-                        if requested_strategy == "llm"
-                        else None
-                    ),
-                ),
-                "summarizer_models": artifact_message.metadata.get(
-                    "summarizer_models", []
-                ),
-                "context_budget": asdict(context_budget),
-            },
-        )
-        await asyncio.to_thread(self.sessions.append_compaction_artifact, artifact)
-        return (
-            replace(
-                artifact_message,
-                metadata={
-                    **artifact_message.metadata,
-                    "artifact_id": artifact.id,
-                    "artifact_reused": False,
-                    "compacted_context_hashes": artifact.metadata[
-                        "compacted_context_hashes"
-                    ],
-                },
-            ),
-            False,
-        )
-
-    def _compaction_provider_contexts(
-        self,
-        *,
-        session_id: str,
-        summary_text: str,
-        provider_messages: list[dict[str, Any]],
-        base_system: str,
-        base_system_blocks: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        prompt_cache_key: str,
-        conversation_cache: bool,
-    ) -> list[dict[str, Any]]:
-        """Build the exact model-affecting context for every configured route."""
-
-        system_blocks = [
-            *base_system_blocks,
-            {"text": summary_text, "cacheable": False},
-        ]
-        return [
-            {
-                "provider": route.provider.name,
-                "provider_route": route.name,
-                "model": route.model,
-                "provider_config_fingerprint": (
-                    self._provider_request_config_fingerprint(route)
-                ),
-                "system": f"{base_system}\n\n{summary_text}",
-                "system_blocks": system_blocks,
-                "messages": provider_messages,
-                "tools": tools,
-                "max_output_tokens": self.config.agent.max_output_tokens,
-                "temperature": None,
-                "reasoning_effort": self.config.agent.reasoning_effort or None,
-                "parallel_tool_calls": True,
-                "response_schema": None,
-                "metadata": {
-                    "session_id": session_id,
-                    "prompt_cache_key": prompt_cache_key,
-                    "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
-                    "prompt_cache_ttl": self.config.cache.anthropic_ttl,
-                    "anthropic_conversation_cache": conversation_cache,
-                    "system_blocks": system_blocks,
-                    "provider_route": route.name,
-                },
-            }
-            for route in self.providers
-        ]
-
-    @staticmethod
-    def _provider_request_config_fingerprint(route: ProviderRoute) -> str:
-        """Hash provider settings that can change the model-facing request."""
-
-        config = route.provider.config
-        payload = {
-            "type": config.type,
-            "base_url": config.base_url,
-            "api_style": getattr(route.provider, "api_style", config.api_style),
-            "headers": config.headers,
-            "site_url": config.site_url,
-            "app_name": config.app_name,
-            "model_fallbacks": config.model_fallbacks,
-            "provider_preferences": config.provider_preferences,
-            "extra_body": config.extra_body,
-        }
-        return _stable_payload_hash(payload)
-
-    def _compaction_config_fingerprint(
-        self,
-        context_budget: ContextBudget,
-        strategy: str,
-        artifact_version: int = 2,
-        *,
-        system: str,
-        system_blocks: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        prompt_cache_key: str = "",
-        conversation_cache: bool = False,
-        budget_guidance_index: int | None = None,
-    ) -> str:
-        if budget_guidance_index is not None:
-            # Only the block inserted by this preparation is transient. Keep
-            # every user/security instruction and the actual provider hashes.
-            system_blocks = [
-                block for index, block in enumerate(system_blocks)
-                if index != budget_guidance_index
-            ]
-            system = "\n\n".join(str(block["text"]) for block in system_blocks)
-            system_tokens = estimate_tokens(system)
-            context_budget = replace(
-                context_budget,
-                system_tokens=system_tokens,
-                message_target_tokens=max(
-                    1, context_budget.target_tokens - system_tokens
-                    - context_budget.tool_schema_tokens
-                    - context_budget.provider_framing_tokens
-                    - context_budget.continuation_state_tokens,
-                ),
-                message_target_bytes=max(
-                    1, context_budget.target_bytes
-                    - estimate_request_bytes(system, [], tools)
-                    + estimate_request_bytes("", [], []),
-                ),
-            )
-        fingerprint_payload = {
-            "artifact_version": artifact_version,
-            "strategy": strategy,
-            "prompt_version": 3,
-            "provider_context": {
-                "routes": [
-                    {
-                        "provider": route.provider.name,
-                        "provider_route": route.name,
-                        "model": route.model,
-                        "provider_config_fingerprint": (
-                            self._provider_request_config_fingerprint(route)
-                        ),
-                    }
-                    for route in self.providers
-                ],
-                "system_hash": _stable_payload_hash(system),
-                "system_blocks_hash": _stable_payload_hash(system_blocks),
-                "tool_schema_hash": _stable_payload_hash(tools),
-                "prompt_cache_key_hash": _stable_payload_hash(prompt_cache_key),
-                "prompt_cache_enabled": self.config.cache.prompt_cache_enabled,
-                "prompt_cache_ttl": self.config.cache.anthropic_ttl,
-                "conversation_cache": conversation_cache,
-            },
-            "context_budget": {
-                "input_limit": context_budget.input_limit,
-                "reserved_output_tokens": context_budget.reserved_output_tokens,
-                "system_tokens": context_budget.system_tokens,
-                "tool_schema_tokens": context_budget.tool_schema_tokens,
-                "continuation_state_tokens": context_budget.continuation_state_tokens,
-                "target_tokens": context_budget.target_tokens,
-                "message_target_tokens": context_budget.message_target_tokens,
-                "hard_bytes": context_budget.hard_bytes,
-                "trigger_bytes": context_budget.trigger_bytes,
-                "target_bytes": context_budget.target_bytes,
-                "message_target_bytes": context_budget.message_target_bytes,
-            },
-            "summary_model": (
-                self.config.agent.small_model or self.providers[0].model
-                if strategy == "llm"
-                else None
-            ),
-            "config": {
-                "compaction_target_ratio": self.config.agent.compaction_target_ratio,
-                "compaction_safety_margin_tokens": (
-                    context_budget.safety_margin_tokens
-                ),
-                "compaction_provider_framing_tokens": (
-                    context_budget.provider_framing_tokens
-                ),
-                "compaction_summarizer_input_tokens": (
-                    self.config.agent.compaction_summarizer_input_tokens
-                ),
-                "compaction_summarizer_total_input_tokens": (
-                    self.config.agent.compaction_summarizer_total_input_tokens
-                ),
-                "max_output_tokens": self.config.agent.max_output_tokens,
-            },
-        }
-        return hashlib.sha256(
-            json_dumps(fingerprint_payload).encode("utf-8")
-        ).hexdigest()
-
     async def _drain_steering(self, session_id: str, run_id: str, messages: list[Message]) -> bool:
         queue = self._steering.get(session_id)
         if queue is None:
@@ -3803,270 +4176,6 @@ class AgentRunner:
             },
         }
         return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
-
-    def _compaction_summary_cache_key(
-        self,
-        route: ProviderRoute,
-        request: ProviderRequest,
-    ) -> str:
-        request_messages = [
-            {
-                "role": message.role.value,
-                "content": message.content,
-                "tool_calls": [call.to_dict() for call in message.tool_calls],
-                "tool_call_id": message.tool_call_id,
-                "tool_name": message.tool_name,
-                "is_error": message.is_error,
-                "metadata": message.metadata,
-            }
-            for message in request.messages
-        ]
-        payload = {
-            "version": _COMPACTION_SUMMARY_CACHE_VERSION,
-            "provider": route.provider.name,
-            "provider_route": route.name,
-            "provider_config_fingerprint": (
-                self._provider_request_config_fingerprint(route)
-            ),
-            "model": request.model,
-            "request": {
-                "system": request.system,
-                "messages": request_messages,
-                "tools": request.tools,
-                "max_output_tokens": request.max_output_tokens,
-                "temperature": request.temperature,
-                "reasoning_effort": request.reasoning_effort,
-                "parallel_tool_calls": request.parallel_tool_calls,
-                "response_schema": request.response_schema,
-                "metadata": request.metadata,
-            },
-        }
-        return "compaction_summary:" + _stable_payload_hash(payload)
-
-    def _summarizer(
-        self,
-        usage_sink: Callable[[Usage], Awaitable[None]],
-        cancel: asyncio.Event,
-        usage_collector: Usage | None = None,
-        *,
-        session_id: str | None = None,
-        settled_usage_sink: Callable[[Usage], Awaitable[None]] | None = None,
-        before_model_request: Callable[[], None] | None = None,
-    ) -> Callable[[str], Awaitable[SummarizerResult]] | None:
-        """Build an LLM-backed compaction summarizer from the primary route.
-
-        Uses the small model when configured (cheap summarization), falling back
-        to the primary model. Returns None when compaction should stay purely
-        deterministic (as configured, or when no provider route is available).
-        """
-        if self.config.agent.deterministic_compaction or not self.providers:
-            return None
-        route = self.providers[0]
-
-        async def summarize(transcript: str) -> SummarizerResult:
-            request = ProviderRequest(
-                model=self.config.agent.small_model or route.model,
-                system=COMPACTION_SUMMARIZER_SYSTEM,
-                messages=[Message(role=Role.USER, content=transcript)],
-                max_output_tokens=min(4_000, self.config.agent.max_output_tokens),
-                response_schema=COMPACTION_RESPONSE_SCHEMA,
-                metadata={"purpose": "compaction_summary"},
-            )
-            request = prepare_route_request(request, route.provider, self.config.agent)
-            cache_key = self._compaction_summary_cache_key(route, request)
-            try:
-                cached = (
-                    await asyncio.to_thread(
-                        self.sessions.get_compaction_summary,
-                        session_id,
-                        cache_key,
-                    )
-                    if session_id is not None
-                    else None
-                )
-            except Exception as error:
-                raise SessionError("Could not read the compaction summary cache") from error
-            if (
-                isinstance(cached, dict)
-                and cached.get("version") == _COMPACTION_SUMMARY_CACHE_VERSION
-            ):
-                assert session_id is not None
-                try:
-                    cached, original_usage, _ = await asyncio.to_thread(
-                        self.sessions.settle_compaction_summary_usage,
-                        session_id,
-                        cache_key,
-                    )
-                except Exception as error:
-                    raise SessionError(
-                        "Could not settle cached compaction summary usage"
-                    ) from error
-                cache_usage = Usage(
-                    cost_status="known",
-                    application_cache_hits=1,
-                    application_cache_saved_tokens=original_usage.total_tokens,
-                    application_cache_saved_cost_usd=original_usage.cost_usd,
-                )
-                if usage_collector is not None:
-                    usage_collector.add(original_usage)
-                await usage_sink(cache_usage)
-                if cancel.is_set():
-                    raise Cancelled("Run cancelled")
-                return SummarizerResult(
-                    text=str(cached.get("text") or ""),
-                    model=str(cached.get("model") or request.model),
-                    requested_model=str(
-                        cached.get("requested_model") or request.model
-                    ),
-                )
-            request_budget = getattr(before_model_request, "__self__", None)
-            reservation = request_budget.reserve_cost(route.provider, request) if isinstance(request_budget, Budget) else 0.0
-            cancelled_usage = Usage()
-
-            def observe_usage(usage: Usage) -> None:
-                cancelled_usage.add(usage)
-                if isinstance(request_budget, Budget):
-                    request_budget.hold_usage(cancelled_usage)
-
-            def account_summary() -> None:
-                # Helpers own no closure reservation. Keep the bound budget for
-                # cost holds/checks; a callback wrapper would hide that owner.
-                if isinstance(request_budget, Budget):
-                    request_budget.before_model_request(closure=False)
-                elif before_model_request is not None:
-                    before_model_request()
-
-            async def send_summary() -> ModelResponse:
-                account_summary()
-                return await route.provider.complete(request)
-
-            request_task = asyncio.create_task(route.provider.with_retries(
-                send_summary,
-                on_usage=observe_usage,
-                before_recovery=account_summary,
-                request=request,
-                check_usage=(lambda _: request_budget.check_unsettled(cancelled_usage)) if isinstance(request_budget, Budget) else None,
-            ))
-            cancel_task = asyncio.create_task(cancel.wait())
-
-            async def record_failed_usage(usage: Usage) -> None:
-                if isinstance(request_budget, Budget):
-                    request_budget.release_usage(cancelled_usage)
-                if usage_collector is not None:
-                    usage_collector.add(usage)
-                await usage_sink(usage)
-
-            try:
-                try:
-                    done, _ = await asyncio.wait(
-                        {request_task, cancel_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if request_task not in done and cancel_task in done:
-                        raise Cancelled("Run cancelled")
-                    response = await request_task
-                finally:
-                    cancel_task.cancel()
-                    if not request_task.done():
-                        request_task.cancel()
-                    await asyncio.gather(request_task, cancel_task, return_exceptions=True)
-                    if isinstance(request_budget, Budget):
-                        request_budget.release_cost(reservation)
-            except (Cancelled, asyncio.CancelledError):
-                if not cancelled_usage.is_empty:
-                    with contextlib.suppress(BudgetExceeded):
-                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
-                raise
-            except BudgetExceeded:
-                if not cancelled_usage.is_empty:
-                    with contextlib.suppress(BudgetExceeded):
-                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
-                raise
-            except ProviderError as error:
-                if error.usage is not None:
-                    await finish_on_cancellation(record_failed_usage(error.usage))
-                raise
-            except Exception:
-                if not cancelled_usage.is_empty:
-                    with contextlib.suppress(BudgetExceeded):
-                        await finish_on_cancellation(record_failed_usage(cancelled_usage))
-                raise
-
-            async def transfer_usage(usage: Usage, sink: Callable[[Usage], Awaitable[None]] = usage_sink) -> None:
-                if isinstance(request_budget, Budget):
-                    request_budget.release_usage(cancelled_usage)
-                await sink(usage)
-
-            async def settle_completed_response() -> None:
-                # Cache first so a budget stop can resume without another provider call.
-                if session_id is not None:
-                    try:
-                        owns_cache_entry = await asyncio.to_thread(
-                            self.sessions.put_pending_compaction_summary,
-                            session_id,
-                            cache_key,
-                            {
-                                "version": _COMPACTION_SUMMARY_CACHE_VERSION,
-                                "text": response.text,
-                                "model": response.model or request.model,
-                                "requested_model": request.model,
-                                "usage": asdict(response.usage),
-                            },
-                        )
-                    except Exception as cache_error:
-                        if usage_collector is not None:
-                            usage_collector.add(response.usage)
-                        await transfer_usage(response.usage)
-                        raise SessionError(
-                            "Could not persist the pending compaction summary"
-                        ) from cache_error
-                    if owns_cache_entry:
-                        try:
-                            await asyncio.to_thread(
-                                self.sessions.settle_compaction_summary_usage,
-                                session_id,
-                                cache_key,
-                            )
-                        except Exception as error:
-                            raise SessionError(
-                                "Could not settle compaction summary usage"
-                            ) from error
-                        # This run incurred the provider charge even if another
-                        # process settled the durable cache entry first.
-                        if settled_usage_sink is not None:
-                            await transfer_usage(response.usage, settled_usage_sink)
-                    else:
-                        try:
-                            await asyncio.to_thread(
-                                self.sessions.settle_compaction_summary_usage,
-                                session_id,
-                                cache_key,
-                            )
-                        except Exception as error:
-                            await transfer_usage(response.usage)
-                            raise SessionError(
-                                "Could not settle the winning compaction summary usage"
-                            ) from error
-                        await transfer_usage(response.usage)
-                else:
-                    await transfer_usage(response.usage)
-                if usage_collector is not None:
-                    usage_collector.add(response.usage)
-
-            try:
-                await finish_on_cancellation(settle_completed_response())
-            finally:
-                if isinstance(request_budget, Budget):
-                    request_budget.release_usage(cancelled_usage)
-            if cancel.is_set():
-                raise Cancelled("Run cancelled")
-            return SummarizerResult(
-                text=response.text,
-                model=response.model or request.model,
-                requested_model=request.model,
-            )
-
-        return summarize
 
     def _low_cache_effectiveness(self, usage: Usage) -> bool:
         return bool(

@@ -62,7 +62,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 |---|---:|---|
 | `provider` | `"auto"` | Provider route name. Auto checks API-key providers, then a usable ChatGPT/Codex login, then local compatible and mock routes. |
 | `model` | `""` | Global model override. Empty uses the selected provider’s model. |
-| `small_model` | `""` | Optional cheaper/faster model for LLM compaction. Delegates use the primary route. |
+| `small_model` | `""` | Optional cheaper/faster model for LLM compaction, including child summaries. Delegated work uses the primary route. |
 | `provider_fallbacks` | `[]` | Ordered provider route names tried after the primary route fails. |
 | `reasoning_effort` | `"medium"` | Adapter hint for providers/models that expose reasoning controls. |
 | `max_turns` | `500` | Maximum primary model turns per run. The final turn has tools disabled so the model can finish cleanly. |

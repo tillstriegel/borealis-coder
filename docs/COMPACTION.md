@@ -95,6 +95,43 @@ An artifact is reusable only when its source-content hash, strategy, prompt vers
 
 LLM compaction uses a strict JSON schema and bounded complete requests. Output must retain every structured source field and may contain only source-backed historical excerpts. Empty, malformed, invented, over-budget, cancelled, or overflowing summaries use the deterministic artifact. Usage from completed or failed summary requests is recorded before an error is propagated.
 
+## Delegated conversations
+
+Application delegates and grandchildren use the same request preparer and configured
+strategy as the main agent, including proactive triggers, targets, deterministic
+fallback, exact reuse and incremental summaries. A configured `small_model` also
+applies to their optional LLM summaries. Each child has an immutable conversation
+scope derived from its delegated run ID. Its assignment, messages, task state,
+summary cache and artifact chain stay separate from the root and every other child.
+Assignments and model notes cannot grant operator permission. Historical evidence
+reads and selected quotes stay within that child scope. A runtime handoff exposes
+only its returned, receipt-backed output artifacts to the immediate parent. Nested
+handoffs can forward those same references. The links preserve original ownership,
+retained bytes, metadata and storage quotas across reopen; they do not expose other
+child artifacts or transcripts, or give descendants access to ancestor evidence.
+Recipient `search_history` searches include these explicitly handed-off artifacts
+under the same access rules as `read_artifact`; private child history stays scoped.
+
+SQLite stores these internal conversations separately from publicly selectable root
+sessions. Reopening a saved child snapshot can reuse its exact provider view without
+another summary charge. This storage does not resume child execution or replay tools;
+normal root resume and abandoned-delegation recovery keep their existing behavior.
+The root retains descendant tool lifecycle receipts without child TOOL messages in
+its conversation. Summary usage settles atomically in the child and root aggregates.
+Each child's receipt counts only its own main and helper requests.
+
+Summary requests share delegated provider slots through retry, backoff and usage
+settlement. Slots are released before child tools execute. Helpers consume physical
+request allowance without consuming a work turn or reserved child/ancestor conclusion
+requests. Preparation rechecks admission before dispatch and rebuilds a tool-free
+conclusion when investigative capacity is exhausted. Persisted provider contexts
+include the actual capability, bounds, conclusion role, tools and output reservation.
+Compaction events identify the child scope and run without exposing summary text.
+
+Standalone tool registries without an application request preparer retain endpoint
+fitting only. Their requests explicitly report `compaction_support = endpoint_only`;
+they do not provide durable full compaction.
+
 ## Evaluation and release gates
 
 Run the fixed offline structural corpus:
