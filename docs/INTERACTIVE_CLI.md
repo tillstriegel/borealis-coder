@@ -92,6 +92,14 @@ Unknown spend is labelled; per-agent usage
 is never summed into the root receipt again. At most 256 nodes are retained in the
 view, with an omission count. Session events retain the full lineage.
 
+Coordinated children also show short attributed findings, questions, steering,
+blocked/waiting states and terminal results in the same inspector. The root shows
+when it is waiting for a child event. These are agent messages, not user approval
+or proof that work succeeded. With `delegate_start`, the parent can reply or relay
+a finding while siblings are still working. `delegate_wait` sleeps until an event;
+it does not poll the provider. Delivery occurs at the next real request boundary.
+See [coordination examples and fixed limits](CONFIGURATION.md#recursive-delegation).
+
 | Control | Action |
 |---|---|
 | F6 | Show/focus the swarm inspector; press again to return to input. |

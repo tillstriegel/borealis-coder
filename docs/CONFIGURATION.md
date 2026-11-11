@@ -112,6 +112,74 @@ edits. For example:
 {"task": "Implement the parser fix and add a regression test", "max_turns": 6, "capability": "write"}
 ```
 
+For work that needs early findings or questions, use `delegate_start` with the
+same arguments. It returns `{"handle":"delegate_…","state":"running"}` without
+joining the child. Continue independent work, launch siblings, or use
+`delegate_wait({})` when only an event can advance the task. This waits for a
+message or terminal result, not all siblings. It uses no model request and holds
+no provider slot. A recoverable failed child still consumes admission; a parent
+can start a replacement while unrelated children continue.
+
+Example calls, in order (replace handles with the returned runtime handles):
+
+```text
+parent: delegate_start({"task":"Inspect parser cases","max_turns":12,"capability":"read-only"})
+parent: delegate_start({"task":"Inspect serializer cases","max_turns":12,"capability":"read-only"})
+child A: delegate_message({"recipient":"parent","kind":"question","message":"Which parser case has priority?"})
+child A: delegate_wait({})
+parent: delegate_wait({})
+parent: delegate_message({"recipient":"<A handle>","kind":"reply","message":"Inspect case two first."})
+child A: delegate_message({"recipient":"parent","kind":"finding","message":"Case two needs an empty-value check."})
+parent: delegate_message({"recipient":"<B handle>","kind":"finding","message":"Check whether empty values also affect serialization."})
+parent: delegate_wait({})
+```
+
+Children send `finding`, `question`, or `blocked` to `parent`. Parents send
+`finding`, `reply`, or `steering` to one owned immediate child. The runtime derives
+identity and lineage. There is no sibling addressing or broadcast. A synchronous
+`delegate_task` child cannot ask its joined parent a question or wait for its
+answer; it returns unresolved questions in its conclusion instead. It can still
+coordinate its own background descendants. Idle waits with no active child,
+pending event, or outstanding question return an explicit error.
+
+Messages arrive once, with stable IDs, in framed assistant-side context at the
+recipient's next actual request boundary. Message/wait calls in a child batch form
+ordered barriers, so a question commits before its following wait. They do not
+become user objectives.
+Delivery is not acceptance. Messages do not preempt a running model request or
+file operation. No transcript is forwarded, no response is automatic, and no
+helper call is needed for delivery. A model's reaction uses its normal turn,
+request and cost budgets. Use messages only for decisions, findings and blocks;
+routine progress belongs in the observer's existing tool/lifecycle events.
+
+Fixed coordination limits avoid extra settings:
+
+| Boundary | Limit |
+| --- | --- |
+| Message text | 2,048 UTF-8 bytes, checked before redaction |
+| Complete redacted message with attribution and framing | min(4,096 bytes, `context.tool_output_chars`) |
+| One recipient delivery | min(16,384 bytes, `context.tool_output_chars`) |
+| Pending notifications per recipient | 32 |
+| Retained notifications per root run, including delivered ones | 256 |
+| Terminal results | Separate reserved rows, bounded by cumulative descendant admission and existing artifact quotas |
+
+Oversized or full-queue sends return a refusal and do not queue a partial message.
+The caller can shorten the exchange or return a terminal handoff. Terminal
+delivery is independent of the notification quota. Background launch requires
+`tool_output_chars >= 512` to fit an attributed terminal envelope. Terminal notices
+name a `<handle>.result` receipt; use `search_history` with that source ID, or the
+returned artifact references, to inspect evidence beyond the preview.
+
+One run-local supervisor owns all background children. Before final synthesis and
+verification, the parent services early questions and settles descendants. At a
+hard turn/request limit it cancels and drains them and returns an incomplete
+handoff. Cancellation, time and cost stops close admission and drain the tree;
+provider failure local to one child permits recovery. No writer remains after
+the parent completes or `runner.close()` returns. SQLite schema 8 adds bounded
+coordination queues and child lifecycle rows. Resume marks old pending workers
+interrupted, preserves undelivered messages as historical recipient context,
+and never replays child tools or paid requests.
+
 A workspace-write/full parent may select either capability without another
 opt-in. A plan-mode or read-only parent may select only read-only. Writer children
 may select readers or writers; a reader descendant cannot restore write access.
@@ -257,7 +325,7 @@ external authority opt-in as safety settings. Defaults:
 | Key | Default | Meaning |
 |---|---:|---|
 | `enabled` | `true` | Expose `script` and `script_job`. Requires the declared quickjs-ng dependency. |
-| `tool_surface` | `"ptc"` | Normal provider surface: `script`, `script_job`, `discover_tools`, and `delegate_task` when available. `"direct"` exposes the full registry for legacy integrations. Disabling Script or using a restricted registry without its audited executor deliberately falls back to direct schemas. |
+| `tool_surface` | `"ptc"` | Normal provider surface: `script`, `script_job`, `discover_tools`, `delegate_task`, `delegate_start`, `delegate_message`, and `delegate_wait` when available. `"direct"` exposes the full registry for legacy integrations. Disabling Script or using a restricted registry without its audited executor deliberately falls back to direct schemas. |
 | `source_bytes` | `256000` | UTF-8 source ceiling per program. |
 | `memory_bytes` | `64000000` | QuickJS heap ceiling per worker. |
 | `stack_bytes` | `512000` | QuickJS stack ceiling. |

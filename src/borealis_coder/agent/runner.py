@@ -51,6 +51,7 @@ from ..safety.redaction import StreamingRedactor
 from ..sessions import SessionStore
 from ..tools import MutationScope, ToolContext, ToolRegistry, VerificationPlanner
 from ..tools.base import bound_tool_output
+from ..tools.delegate import DelegateMessageTool, DelegateWaitTool
 from ..tools.script import ScriptJobTool, ScriptScope, ScriptTool
 from ..util import (
     estimate_tokens,
@@ -87,6 +88,10 @@ from .compaction import (
     prune_provider_messages,
     validate_tool_call_order,
 )
+from .compaction import (
+    abandoned_tool_call_results as _abandoned_tool_call_results,
+)
+from .coordination import Coordination
 from .swarm import SwarmState, bounded_calls
 
 if TYPE_CHECKING:
@@ -388,62 +393,6 @@ def _validate_new_tool_call_ids(
         )
 
 
-def _abandoned_tool_call_results(
-    messages: list[Message],
-    *,
-    running_call_ids: set[str],
-) -> list[Message]:
-    """Complete only an unfinished trailing tool bundle from a prior run."""
-
-    index = len(messages) - 1
-    while index >= 0 and messages[index].role == Role.TOOL:
-        index -= 1
-    if index < 0 or not messages[index].tool_calls:
-        validate_tool_call_order(messages)
-        return []
-    assistant = messages[index]
-    if assistant.role != Role.ASSISTANT:
-        validate_tool_call_order(messages)
-        return []
-    observed_ids = {
-        message.tool_call_id
-        for message in messages[index + 1 :]
-        if message.role == Role.TOOL and message.tool_call_id
-    }
-    repairs = []
-    for call in assistant.tool_calls:
-        if call.id in observed_ids:
-            continue
-        execution_started = call.id in running_call_ids
-        repairs.append(
-            Message(
-                role=Role.TOOL,
-                content=(
-                    "Unknown outcome: the previous run ended after this tool call "
-                    "started but before its result was recorded. The tool may have "
-                    "executed."
-                    if execution_started
-                    else "Cancelled: the previous run ended before this tool call "
-                    "was executed."
-                ),
-                tool_call_id=call.id,
-                tool_name=call.name,
-                is_error=True,
-                metadata={
-                    **(
-                        {"unknown_outcome": True, "execution_started": True}
-                        if execution_started
-                        else {"cancelled": True, "not_started": True}
-                    ),
-                    "abandoned": True,
-                    "recovery": "previous_run_ended",
-                },
-            )
-        )
-    validate_tool_call_order([*messages, *repairs])
-    return repairs
-
-
 class RequestPreparer:
     """Canonical provider view for one conversation, without tool execution authority."""
 
@@ -568,6 +517,10 @@ class RequestPreparer:
                 {"text": _INVESTIGATION_CHECKPOINT_INSTRUCTION, "cacheable": False},
             ]
 
+        last_response = max((index for index, message in enumerate(messages)
+                             if message.role == Role.ASSISTANT and not message.metadata.get("coordination")), default=-1)
+        fresh_coordination = [message for message in messages[last_response + 1:]
+                              if message.metadata.get("coordination")]
         request_messages, metrics = prune_provider_messages(messages)
         validate_tool_call_order(request_messages)
         budget_providers = tuple(item.provider.name for item in self.providers)
@@ -1318,7 +1271,15 @@ class RequestPreparer:
                     messages=len(request_messages),
                     **compaction_metadata,
                 )
-        if refresh_budget_guidance():
+        retained_ids = {message.id for message in request_messages}
+        missing_coordination = [message for message in fresh_coordination if message.id not in retained_ids]
+        if missing_coordination:
+            request_messages = [*request_messages, *missing_coordination]
+            # This view differs from the stored compaction context. Keep the source
+            # artifact for history, but do not claim an exact cached view match.
+            compaction_artifact_id = None
+            compaction_context_hashes = None
+        if refresh_budget_guidance() or missing_coordination:
             context_budget = ContextBudget.calculate(
                 agent_config, system=turn_system, tools=schemas,
                 messages=request_messages, providers=budget_providers,
@@ -2486,53 +2447,101 @@ class AgentRunner(RequestPreparer):
         return replace(prepared.request, metadata={**prepared.request.metadata, **request.metadata,
                                                    "session_id": scope_id})
 
-    async def _run_locked(
-        self,
-        prompt: str,
-        session_id: str,
-        *,
-        run_id: str,
-        deadline_expired: asyncio.Event,
-        worker_started: asyncio.Event,
-        terminal_started: asyncio.Event,
-        user_message_id: str | None,
-        user_metadata: dict[str, Any] | None,
-        existing_session: bool,
-    ) -> AgentResult:
-        worker_started.set()
-        cancel = asyncio.Event()
-        self._cancel[session_id] = cancel
-        approvals = self._approval_managers.get(session_id)
-        if approvals is None:
-            approvals = ApprovalManager(
-                self.tool_context.approvals.callback,
-                cache=self.tool_context.approvals.cache,
-                safety=self.config.safety,
-            )
-            self._approval_managers[session_id] = approvals
-        else:
-            approvals.callback = self.tool_context.approvals.callback
-        context = ToolContext(
-            workspace=self.tool_context.workspace,
-            roots=self.tool_context.roots,
-            config=self.tool_context.config,
-            events=self.tool_context.events,
-            policy=self.tool_context.policy,
-            approvals=approvals,
-            process=self.tool_context.process,
-            checkpoints=self.tool_context.checkpoints,
+    async def _start_run_conversation(
+        self, context: ToolContext, prompt: str, existing_session: bool,
+        user_message_id: str | None, user_metadata: dict[str, Any] | None,
+    ) -> list[Message]:
+        """Recover historical work under the lease, then append the actual user turn."""
+        session_id, run_id = context.session_id, context.run_id
+        await asyncio.to_thread(self.sessions.interrupt_coordination, session_id)
+        messages = await asyncio.to_thread(self.sessions.messages, session_id)
+        tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
+        await self._recover_nested_calls(tool_call_rows, context)
+        running_call_ids = {
+            str(row["tool_call_id"])
+            for row in tool_call_rows
+            if row["status"] == "running"
+        }
+        repairs = _abandoned_tool_call_results(
+            messages,
+            running_call_ids=running_call_ids,
+        )
+        rows_by_id = {str(row["tool_call_id"]): row for row in tool_call_rows}
+        saved_repairs = []
+        for message in messages:
+            if message.role != Role.TOOL or not message.metadata.get("abandoned"):
+                continue
+            row = rows_by_id.get(message.tool_call_id or "")
+            if row is None:
+                continue
+            if row["metadata"].get("workspace_change_tracking") == "incomplete":
+                self._mark_workspace_tracking_incomplete(context)
+            if row["status"] == "running":
+                saved_repairs.append(message)
+        # Store reconciliation may have closed a bundle before appending a
+        # historical notice. Settle its receipts here without changing those
+        # durable messages. Tool scopes and nested effects remain runner-owned.
+        for repair in [*saved_repairs, *repairs]:
+            if repair.tool_call_id in running_call_ids:
+                metadata = {**rows_by_id[repair.tool_call_id]["metadata"], **repair.metadata}
+                tool = self.tools.get(repair.tool_name or "")
+                if (
+                    metadata.get("workspace_change_tracking") == "incomplete"
+                    or tool is None
+                    or tool.effective_mutation_scope != MutationScope.NONE
+                ):
+                    metadata["workspace_change_tracking"] = "incomplete"
+                    self._mark_workspace_tracking_incomplete(context)
+                saved = repair in saved_repairs
+                if not saved:
+                    repair.metadata = metadata
+                await asyncio.to_thread(
+                    self.sessions.complete_tool_call,
+                    session_id,
+                    repair.tool_call_id,
+                    output=repair.content,
+                    is_error=True,
+                    metadata=metadata,
+                    message=None if saved else repair,
+                )
+            else:
+                await asyncio.to_thread(
+                    self.sessions.append_message,
+                    session_id,
+                    repair,
+                )
+        messages.extend(repairs)
+        durable_user_metadata = dict(user_metadata or {})
+        if existing_session and is_recovery_continuation_prompt(prompt):
+            durable_user_metadata["recovery_continuation"] = {"prompt": "continue"}
+        user = Message(
+            id=user_message_id or new_id("msg"),
+            role=Role.USER,
+            content=prompt,
+            metadata=durable_user_metadata,
+        )
+        messages.append(user)
+        await asyncio.to_thread(self.sessions.append_message, session_id, user)
+        await asyncio.to_thread(self.sessions.update_session, session_id, status="running")
+        await self.events.emit(
+            "run.started",
             session_id=session_id,
             run_id=run_id,
-            changed_files=set(),
-            changed_roots=set(),
-            metadata=dict(self.tool_context.metadata),
+            prompt=prompt,
         )
-        context.metadata["session_store"] = self.sessions
-        context.metadata["run_task"] = prompt
-        context.metadata["context_builder"] = self.context_builder
-        context.metadata["provider_routes"] = self.providers
-        context.metadata["tool_registry"] = self.tools
-        budget = Budget.start(self.config.agent)
+        await self.events.emit(
+            "swarm.started", session_id=session_id, run_id=run_id,
+            task=truncate_text(prompt, 160), limits=context.metadata["swarm_state"].limits(),
+            max_model_requests=self.config.agent.max_model_requests,
+        )
+        return messages
+
+    def _configure_delegation(
+        self, context: ToolContext, budget: Budget, cancel: asyncio.Event,
+    ) -> tuple[Callable[..., Awaitable[None]], Callable[[Usage], Awaitable[None]]]:
+        """Wire the shared child executor, preparer and single accounting sink."""
+        session_id = context.session_id
+        run_id = context.run_id
 
         async def usage_sink(usage: Usage, *, reservation: float = 0.0) -> None:
             budget.release_cost(reservation)
@@ -2591,6 +2600,59 @@ class AgentRunner(RequestPreparer):
         context.metadata["usage_sink"] = usage_sink
         context.metadata["settled_usage_sink"] = settled_usage_sink
         context.metadata["before_model_request"] = budget.before_model_request
+        return usage_sink, settled_usage_sink
+
+    async def _run_locked(
+        self,
+        prompt: str,
+        session_id: str,
+        *,
+        run_id: str,
+        deadline_expired: asyncio.Event,
+        worker_started: asyncio.Event,
+        terminal_started: asyncio.Event,
+        user_message_id: str | None,
+        user_metadata: dict[str, Any] | None,
+        existing_session: bool,
+    ) -> AgentResult:
+        worker_started.set()
+        cancel = asyncio.Event()
+        self._cancel[session_id] = cancel
+        approvals = self._approval_managers.get(session_id)
+        if approvals is None:
+            approvals = ApprovalManager(
+                self.tool_context.approvals.callback,
+                cache=self.tool_context.approvals.cache,
+                safety=self.config.safety,
+            )
+            self._approval_managers[session_id] = approvals
+        else:
+            approvals.callback = self.tool_context.approvals.callback
+        context = ToolContext(
+            workspace=self.tool_context.workspace,
+            roots=self.tool_context.roots,
+            config=self.tool_context.config,
+            events=self.tool_context.events,
+            policy=self.tool_context.policy,
+            approvals=approvals,
+            process=self.tool_context.process,
+            checkpoints=self.tool_context.checkpoints,
+            session_id=session_id,
+            run_id=run_id,
+            changed_files=set(),
+            changed_roots=set(),
+            metadata=dict(self.tool_context.metadata),
+        )
+        context.metadata["session_store"] = self.sessions
+        context.metadata["run_task"] = prompt
+        context.metadata["context_builder"] = self.context_builder
+        context.metadata["provider_routes"] = self.providers
+        context.metadata["tool_registry"] = self.tools
+        budget = Budget.start(self.config.agent)
+
+        usage_sink, settled_usage_sink = self._configure_delegation(context, budget, cancel)
+        coordination = Coordination(context, cancel)
+        context.metadata["coordination"] = coordination
         from ..safety.smart import SmartApprovalJudge
 
         approval_intents = self._approval_intents[session_id]
@@ -2609,6 +2671,7 @@ class AgentRunner(RequestPreparer):
         error_message: str | None = None
         verification: dict[str, Any] | None = None
         mutation_revision = 0
+        mutation_revision_seen = 0
         verified_revision = -1
         repair_cycles = 0
         awaiting_repair = False
@@ -2625,65 +2688,8 @@ class AgentRunner(RequestPreparer):
 
         self._script_scopes.add(scripts)
         try:
-            messages = await asyncio.to_thread(self.sessions.messages, session_id)
-            tool_call_rows = await asyncio.to_thread(self.sessions.tool_calls, session_id)
-            await self._recover_nested_calls(tool_call_rows, context)
-            running_call_ids = {
-                str(row["tool_call_id"])
-                for row in tool_call_rows
-                if row["status"] == "running"
-            }
-            repairs = _abandoned_tool_call_results(
-                messages,
-                running_call_ids=running_call_ids,
-            )
-            for repair in repairs:
-                if repair.tool_call_id in running_call_ids:
-                    tool = self.tools.get(repair.tool_name or "")
-                    if (
-                        tool is None
-                        or tool.effective_mutation_scope != MutationScope.NONE
-                    ):
-                        repair.metadata["workspace_change_tracking"] = "incomplete"
-                        self._mark_workspace_tracking_incomplete(context)
-                    await asyncio.to_thread(
-                        self.sessions.complete_tool_call,
-                        session_id,
-                        repair.tool_call_id,
-                        output=repair.content,
-                        is_error=True,
-                        metadata=repair.metadata,
-                        message=repair,
-                    )
-                else:
-                    await asyncio.to_thread(
-                        self.sessions.append_message,
-                        session_id,
-                        repair,
-                    )
-            messages.extend(repairs)
-            durable_user_metadata = dict(user_metadata or {})
-            if existing_session and is_recovery_continuation_prompt(prompt):
-                durable_user_metadata["recovery_continuation"] = {"prompt": "continue"}
-            user = Message(
-                id=user_message_id or new_id("msg"),
-                role=Role.USER,
-                content=prompt,
-                metadata=durable_user_metadata,
-            )
-            messages.append(user)
-            await asyncio.to_thread(self.sessions.append_message, session_id, user)
-            await asyncio.to_thread(self.sessions.update_session, session_id, status="running")
-            await self.events.emit(
-                "run.started",
-                session_id=session_id,
-                run_id=run_id,
-                prompt=prompt,
-            )
-            await self.events.emit(
-                "swarm.started", session_id=session_id, run_id=run_id,
-                task=truncate_text(prompt, 160), limits=context.metadata["swarm_state"].limits(),
-                max_model_requests=self.config.agent.max_model_requests,
+            messages = await self._start_run_conversation(
+                context, prompt, existing_session, user_message_id, user_metadata,
             )
             prompt_context = await asyncio.to_thread(
                 self.context_builder.build, query=prompt,
@@ -2721,6 +2727,7 @@ class AgentRunner(RequestPreparer):
 
             async def prepare_route(route: ProviderRoute) -> ProviderRequest:
                 nonlocal compacted, last_prune_signature, previous_request_tokens, mutation_revision
+                coordination.check()
                 if context.metadata["swarm_state"].admitted > 0:
                     # A preceding root tool turn/retry may have consumed its old
                     # reservation. Every preparation must protect the next combine.
@@ -2780,6 +2787,13 @@ class AgentRunner(RequestPreparer):
 
             while True:
                 self._check_cancel(cancel)
+                coordination.check()
+                (mutation_revision, mutation_revision_seen, verification_finalization_pending,
+                 verification_final_answer_safe) = self._coordination_revision(
+                    coordination, mutation_revision, mutation_revision_seen,
+                    verification_finalization_pending, verification_final_answer_safe,
+                )
+                await coordination.deliver(context, messages)
                 budget.before_turn()
                 final_turn = budget.turns == self.config.agent.max_turns
                 last_request = budget.last_request
@@ -2804,7 +2818,7 @@ class AgentRunner(RequestPreparer):
 
                 assistant_message_id = new_id("msg")
                 buffer_candidate_output = bool(
-                    scripts.active
+                    coordination.has_workers(scripts.active)
                     or verification_finalization_pending
                     or awaiting_repair
                     or context.mutation_tracking == "incomplete"
@@ -2883,7 +2897,7 @@ class AgentRunner(RequestPreparer):
                     continue
                 response_tool_calls = assistant.tool_calls
                 if response.text:
-                    final_text = response.text
+                    final_text = coordination.candidate_text(response.text)
                 final_response_incomplete = final_turn and response_incomplete
                 if final_turn and (response_tool_calls or final_response_incomplete):
                     recovery_message = max_turns_recovery_message(
@@ -2901,6 +2915,7 @@ class AgentRunner(RequestPreparer):
                     )
                 if usage_budget_error is not None:
                     raise usage_budget_error
+                coordination.check()
                 if response_incomplete:
                     # Preserve provider-selected continuation state, but use the
                     # remaining allowance for an explicit text-only handoff.
@@ -2916,7 +2931,8 @@ class AgentRunner(RequestPreparer):
                     continue
                 if not response_tool_calls:
                     completed_scripts = await self._await_until_cancelled(
-                        self._script_notifications(scripts, messages, wait=True), cancel
+                        self._candidate_notifications(scripts, coordination, context, messages, cancel,
+                                                      final_turn or budget.last_request), cancel
                     )
                     mutation_revision += completed_scripts
                     if completed_scripts and not final_turn:
@@ -2990,6 +3006,9 @@ class AgentRunner(RequestPreparer):
                         verification_finalization_pending = False
                         verification_final_answer_safe = False
                         awaiting_repair = False
+                last_batch_signature, repeated_batch_count = self._coordination_batch_reset(
+                    tool_messages, last_batch_signature, repeated_batch_count,
+                )
                 investigation_progress.observe_results(tool_messages)
                 steered = await self._drain_steering(session_id, run_id, messages)
                 investigation_progress.reset_if(steered)
@@ -3000,24 +3019,8 @@ class AgentRunner(RequestPreparer):
             ):
                 verification = await self._verify_changes(context, cancel)
                 verified_revision = mutation_revision
-        except Cancelled as error:
-            stop_reason = StopReason.CANCELLED
-            error_message = str(error)
-        except BudgetExceeded as error:
-            if error.kind == "stuck":
-                stop_reason = StopReason.STUCK
-            elif error.kind == "turns":
-                stop_reason = StopReason.MAX_TURNS
-            else:
-                stop_reason = StopReason.BUDGET
-            error_message = str(error)
-        except asyncio.CancelledError:
-            if deadline_expired.is_set():
-                stop_reason = StopReason.BUDGET
-                error_message = f"Maximum {self.config.agent.max_time_seconds}s run time reached"
-            else:
-                stop_reason = StopReason.CANCELLED
-                error_message = "Run cancelled"
+        except (Cancelled, BudgetExceeded, asyncio.CancelledError) as error:
+            stop_reason, error_message = self._run_stop(error, coordination, deadline_expired)
         except Exception as error:
             stop_reason = StopReason.ERROR
             error_message = f"{type(error).__name__}: {error}"
@@ -3028,7 +3031,9 @@ class AgentRunner(RequestPreparer):
             # an empty startup context if its caller is cancelled here.
             async def finalize() -> AgentResult:
                 nonlocal verification, verified_revision, error_message, final_text
+                await coordination.close()
                 await scripts.close()
+                terminal_revision = mutation_revision + context.metadata["swarm_state"].mutations - mutation_revision_seen
                 budget.release_closure("root")
                 self._script_scopes.discard(scripts)
                 verification, verified_revision, error_message = (
@@ -3036,7 +3041,7 @@ class AgentRunner(RequestPreparer):
                         stop_reason=stop_reason,
                         verification=verification,
                         verified_revision=verified_revision,
-                        mutation_revision=mutation_revision,
+                        mutation_revision=terminal_revision,
                         error_message=error_message,
                         context=context,
                         cancel=cancel,
@@ -3053,7 +3058,7 @@ class AgentRunner(RequestPreparer):
                     final_text, verification = await self._finish_run_output(
                         messages=messages, context=context, session_id=session_id, run_id=run_id,
                         turn=budget.turns, final_text=final_text, verification=verification,
-                        verified_revision=verified_revision, mutation_revision=mutation_revision,
+                        verified_revision=verified_revision, mutation_revision=terminal_revision,
                         stop_reason=stop_reason, error_message=error_message,
                         verification_final_answer_safe=verification_final_answer_safe,
                     )
@@ -3103,6 +3108,47 @@ class AgentRunner(RequestPreparer):
 
             result = await self._await_run_finalization(finalize())
         return result
+
+    def _run_stop(
+        self, error: BaseException, coordination: Coordination, deadline_expired: asyncio.Event,
+    ) -> tuple[StopReason, str]:
+        cause = coordination.fatal or error
+        if isinstance(cause, BudgetExceeded):
+            reason = (StopReason.STUCK if cause.kind == "stuck" else
+                      StopReason.MAX_TURNS if cause.kind == "turns" else StopReason.BUDGET)
+            return reason, str(cause)
+        if deadline_expired.is_set():
+            return StopReason.BUDGET, f"Maximum {self.config.agent.max_time_seconds}s run time reached"
+        return StopReason.CANCELLED, str(cause) if isinstance(cause, Cancelled) else "Run cancelled"
+
+    @staticmethod
+    def _coordination_revision(
+        coordination: Coordination, revision: int, seen: int, pending: bool, safe: bool,
+    ) -> tuple[int, int, bool, bool]:
+        current = coordination.context.metadata["swarm_state"].mutations
+        if current != seen:
+            return revision + current - seen, current, False, False
+        return revision, seen, pending, safe
+
+    @staticmethod
+    def _coordination_batch_reset(
+        messages: list[Message], signature: str | None, count: int,
+    ) -> tuple[str | None, int]:
+        if any(message.tool_name == "delegate_wait" and not message.is_error for message in messages):
+            return None, 0
+        return signature, count
+
+    async def _candidate_notifications(
+        self, scripts: ScriptScope, coordination: Coordination, context: ToolContext,
+        messages: list[Message], cancel: asyncio.Event, at_limit: bool,
+    ) -> int:
+        delivered = 0
+        if coordination.active(coordination.root) or coordination.pending(coordination.root):
+            if at_limit:
+                raise BudgetExceeded("turns", "Run incomplete: active or queued delegation work at the synthesis limit")
+            await self._await_until_cancelled(coordination.wait(context), cancel)
+            delivered = int(await coordination.deliver(context, messages))
+        return delivered + await self._script_notifications(scripts, messages, wait=not bool(delivered))
 
     async def _record_model_response(
         self, *, response: ModelResponse, used_route: ProviderRoute,
@@ -3422,6 +3468,16 @@ class AgentRunner(RequestPreparer):
             delegated = bool(metadata.get("delegation_id"))
             script = bool(metadata.get("script_job_id"))
             if not (delegated or script):
+                continue
+            if row["tool_name"] == "delegate_result" and metadata.get("coordination_terminal"):
+                # A terminal storage receipt cannot mutate the workspace. Recover
+                # original file/tool receipts below, never replay this summary.
+                if row["status"] == "running":
+                    await asyncio.to_thread(
+                        self.sessions.complete_tool_call, context.session_id, row["tool_call_id"],
+                        output="Terminal result storage interrupted; inspect original evidence receipts.",
+                        is_error=True, metadata={**metadata, "recovery": "previous_run_ended"},
+                    )
                 continue
             if row["status"] == "running":
                 tool = self.tools.get(row["tool_name"])
@@ -4449,7 +4505,9 @@ class AgentRunner(RequestPreparer):
                 self._check_cancel(cancel)
                 if isinstance(script_scope, ScriptScope):
                     script_scope.check()
-                if isinstance(self.tools.get(call.name), ScriptTool | ScriptJobTool):
+                # Keep communication ordered, but do not retain the workspace
+                # lock while waiting for a child that may need it to write.
+                if isinstance(self.tools.get(call.name), ScriptTool | ScriptJobTool | DelegateMessageTool | DelegateWaitTool):
                     messages[call.id] = await self._execute_one(call, context, cancel)
                 else:
                     async with self._mutation_lock:

@@ -322,7 +322,7 @@ Also isolate the worker account, use read-only provider credentials where possib
 
 Recursive agents share the root's request/time/cost budgets and cannot change
 operator depth, cumulative descendant, provider concurrency or child-turn limits.
-Every `delegate_task` call requires `capability: "read-only"` or `"write"`.
+Every `delegate_task` or `delegate_start` call requires `capability: "read-only"` or `"write"`.
 The caller selects read-only for investigation/review and write for implementation
 or file edits. Selection cannot exceed the parent's actual permissions: plan-mode
 parents and read-only descendants cannot grant write access. A rejected escalation
@@ -346,3 +346,22 @@ locks cover individual operations rather than recursive conversations. Fatal
 budgets and cancellation drain child work and settle billable usage before the
 root finishes. Task/result text in the swarm view is bounded, redacted through the
 EventBus, and rendered literally with control/bidi characters neutralized.
+
+Coordination sender, recipient and lineage are runtime identities. A child can
+notify only its immediate parent; a parent can steer only its owned immediate
+children in the same live run. Guessing a sibling, ancestor or foreign handle
+grants nothing. Parent relays are explicit, selected messages. Their text remains
+untrusted model work, never operator authorization, approval intent or a new user
+objective. There is no automatic response or broadcast. Message IDs, quoted source
+IDs and artifact IDs do not grant evidence access. Only the existing receipt-bound
+terminal handoff grants parent reads/search/quotes; original ownership and quota
+limits remain. Failed terminal evidence remains readable when handed off, but is
+not a successful finding source.
+
+Coordination tools are native-only and cannot run inside Script. Advertised child
+schemas and execution guards share the same capability check. Notification size,
+inbox and retention limits return explicit backpressure; reserved terminal results
+are not dropped when an inbox is full. Delivery acknowledges arrival only. The
+run owner cancels/drains descendants at shared stops and final exit. Reopening
+SQLite preserves historical messages and marks pending workers interrupted;
+it does not restore live workers or replay effects.

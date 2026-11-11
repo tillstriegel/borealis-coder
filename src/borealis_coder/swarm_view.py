@@ -77,6 +77,11 @@ class SwarmView:
             self.requests = data["model_requests"]
             self.limits = data["limits"]
             return True
+        if event.type == "swarm.coordination" and event.run_id == self.root_run:
+            if node := self.nodes.get("root"):
+                node.state = str(data["state"])
+                node.detail = literal(data["result"])
+            return True
         if event.type.startswith("delegate."):
             if not str(data.get("delegated_run_id", "")).startswith(self.root_run + ".") or not self.root_run:
                 return False

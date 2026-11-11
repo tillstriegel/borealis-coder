@@ -223,7 +223,7 @@ class ToolRegistry:
                 or not isinstance(self.get("script"), ScriptTool)
                 or self.get("discover_tools") is None):
             return [self._tools[name].schema_for_config(config) for name in sorted(self._tools)]
-        native = {"script", "script_job", "discover_tools", "delegate_task"}
+        native = {"script", "script_job", "discover_tools", "delegate_task", "delegate_start", "delegate_message", "delegate_wait"}
         schemas = [self._tools[name].schema_for_config(config) for name in sorted(native & self._tools.keys())]
         names = self.names()
         for schema in schemas:
