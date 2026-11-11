@@ -25,8 +25,10 @@ from borealis_coder.tools.verification import VerificationReport
 from tests.helpers import make_config
 
 
-def delegate(task="child", turns=3, identifier="delegate"):
-    return ToolCall(id=identifier, name="delegate_task", arguments={"task": task, "max_turns": turns})
+def delegate(task="child", turns=3, identifier="delegate", *, capability="read-only"):
+    return ToolCall(id=identifier, name="delegate_task", arguments={
+        "task": task, "max_turns": turns, "capability": capability,
+    })
 
 
 def write(path="child.txt", content="child evidence\n", expected=None):
@@ -202,8 +204,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.terminals()[0].type, "delegate.failed")
         self.assert_settled(result)
 
-    async def test_opt_in_child_and_grandchild_writes_are_durable_and_verified(self):
-        self.runner.config.agent.swarm_allow_writes = True
+    async def test_explicit_child_and_grandchild_writes_are_durable_and_verified(self):
         self.runner.config.agent.auto_verify = True
         verify = []
 
@@ -216,9 +217,9 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if request.messages[-1].role == Role.TOOL:
                 return response(text="Changes complete; " + request.messages[-1].content)
             if depth == 0:
-                return response(calls=[delegate()])
+                return response(calls=[delegate(capability="write")])
             if depth == 1:
-                return response(calls=[write("child.txt"), delegate("grandchild")])
+                return response(calls=[write("child.txt"), delegate("grandchild", capability="write")])
             return response(calls=[ToolCall(id="patch", name="apply_patch", arguments={
                 "patch": "*** Begin Patch\n*** Add File: grandchild.txt\n+grandchild evidence\n*** End Patch",
             })])
@@ -274,7 +275,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if depth == 1:
                 if interruption == "requests" and request.messages[-1].role == Role.TOOL:
                     return response(text="Nested change observed; current verification is required.")
-                return response(calls=[delegate("grandchild")])
+                return response(calls=[delegate("grandchild", capability="write")])
             if call == 1:
                 return response(calls=[write("first.txt", "verified revision\n")])
             if call == 2:
@@ -282,7 +283,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if call == 3:
                 return response(text="Checks passed for the first revision.")
             if call == 4:
-                return response(calls=[delegate()])
+                return response(calls=[delegate(capability="write")])
             if interruption == "requests" and call == 8:
                 return response(text="<tool_call>not a conclusion")
             self.fail("Unexpected provider work after interrupted delegation")
@@ -352,6 +353,8 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         config.agent.swarm_allow_writes = True
         session = self.runner.sessions.create_session(workspace=self.root, provider="mock", model="fixture")
         root_call = delegate(identifier="crashed-delegate")
+        # Historical pending calls predate the required choice; recovery must not replay or rewrite them.
+        del root_call.arguments["capability"]
         original = Message(role=Role.ASSISTANT, tool_calls=[root_call])
         self.runner.sessions.append_message(session.id, original)
         self.runner.sessions.start_tool_call(session.id, "crashed-root", root_call.id,
@@ -455,12 +458,18 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                         if request.metadata.get("delegated"):
                             child_results.append(request.messages[-1])
                         return response(text="Reviewed")
-                    return response(calls=[write(path)]) if request.metadata.get("delegated") else response(calls=[delegate()])
+                    return response(calls=[write(path)]) if request.metadata.get("delegated") else response(calls=[delegate(capability="write")])
 
                 self.provider.handler = handler
                 result = await self.runner.run("Check authority")
                 allowed = path == "allowed.txt"
-                self.assertEqual(child_results[0].is_error, not allowed)
+                if writes and mode != "plan":
+                    self.assertEqual(child_results[0].is_error, not allowed)
+                else:
+                    self.assertEqual(child_results, [])
+                    self.assertEqual(self.starts(), [])
+                    refusal = next(e for e in self.events if e.type == "delegate.refused")
+                    self.assertEqual(refusal.data["limits"]["admitted"], 0)
                 self.assertEqual(set(result.changed_files), {"allowed.txt"} if allowed else set())
                 self.assertFalse((self.root / "blocked.txt").exists())
                 self.assert_settled(result)
@@ -496,7 +505,8 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             if request.messages[-1].role == Role.TOOL:
                 return response(text="Concluded")
             if not request.metadata.get("delegated"):
-                return response(calls=[delegate("one", identifier="one"), delegate("two", identifier="two")])
+                return response(calls=[delegate("one", identifier="one", capability="write"),
+                                       delegate("two", identifier="two", capability="write")])
             return response(calls=[write("shared.txt", request.messages[0].content, sha256_text("before"))])
 
         self.provider.handler = handler
@@ -736,7 +746,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("shell", names)
                 self.assertNotIn("plugin_write", names)
                 return response(calls=[ToolCall(name="plugin_write", arguments={}), ToolCall(name="script", arguments={"source": "text('no')", "background": False})])
-            return response(calls=[delegate()])
+            return response(calls=[delegate(capability="write")])
 
         self.provider.handler = handler
         result = await self.runner.run("Check tool boundary")
@@ -745,7 +755,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
         self.assert_settled(result)
         self.provider.handler = None
         self.provider.enqueue(response(calls=[ToolCall(name="script", arguments={
-            "source": 'await tools.delegate_alias({task:"forbidden", max_turns:1});', "background": False,
+            "source": 'await tools.delegate_alias({task:"forbidden", max_turns:1, capability:"read-only"});', "background": False,
         })]), response(text="Script denied"))
         self.events.clear()
         result = await self.runner.run("Script alias")

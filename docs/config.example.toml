@@ -16,7 +16,7 @@ swarm_max_depth = 2
 swarm_max_descendants = 8 # Cumulative admissions; excludes root, never recycled.
 swarm_max_concurrent = 2 # Delegated provider work only, released before tools.
 swarm_max_turns = 6
-swarm_allow_writes = false # Trusted opt-in for built-in file/patch tools only.
+swarm_allow_writes = true # Operator ceiling only; false rejects capability="write" delegation.
 max_input_tokens = 180000
 compact_at_ratio = 0.82
 max_output_tokens = 16000

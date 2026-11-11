@@ -178,7 +178,7 @@ class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
                             self.routes(provider, ScriptedProvider(asyncio.CancelledError()))
                         await self.complete()
                     elif path == 'delegate':
-                        await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1}, self.delegated(provider, Budget.start(self.config.agent)))
+                        await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1, 'capability': 'read-only'}, self.delegated(provider, Budget.start(self.config.agent)))
                     else:
                         summarize = self.runner._summarizer(self.settle, asyncio.Event())
                         assert summarize
@@ -224,7 +224,7 @@ class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
                     context = self.delegated(provider, Budget.start(self.config.agent))
                     context.metadata['usage_sink'] = settle_and_cancel
                     with self.assertRaises(asyncio.CancelledError):
-                        await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1}, context)
+                        await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1, 'capability': 'read-only'}, context)
                 else:
                     summarize = self.runner._summarizer(settle_and_cancel, cancel)
                     assert summarize
@@ -245,7 +245,7 @@ class ReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
                 provider = ScriptedProvider(*actions)
                 budget = Budget.start(self.config.agent)
                 context = self.delegated(provider, budget)
-                result = await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': max_turns}, context)
+                result = await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': max_turns, 'capability': 'read-only'}, context)
                 if exhausted:
                     self.assertTrue(result.is_error)
                     self.assertEqual(result.metadata['completion_status'], 'incomplete')

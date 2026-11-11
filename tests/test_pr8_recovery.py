@@ -185,7 +185,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             context.metadata.update(provider_routes=self.runner.providers, tool_registry=ToolRegistry([]),
                 context_builder=SimpleNamespace(system_prompt=lambda **_: 'Inspect'), usage_sink=self.settle,
                 budget=self.budget, before_model_request=self.budget.before_model_request)
-            return await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1}, context)
+            return await DelegateTaskTool().execute({'task': 'Inspect', 'max_turns': 1, 'capability': 'read-only'}, context)
 
     def assert_settled(self, cost, requests, status):
         self.assertEqual(self.settlements, 1)

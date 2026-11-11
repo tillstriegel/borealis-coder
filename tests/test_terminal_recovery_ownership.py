@@ -42,7 +42,7 @@ class TerminalCancellationOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
             runner.events.subscribe(observe)
             provider.handler = lambda request, call: response(calls=[
-                write("survived.txt", "retained evidence\n") if request.metadata.get("delegated") else delegate()
+                write("survived.txt", "retained evidence\n") if request.metadata.get("delegated") else delegate(capability="write")
             ])
             try:
                 with patch.object(provider, "complete", side_effect=complete):
@@ -97,7 +97,7 @@ class TerminalCancellationOwnershipTests(unittest.IsolatedAsyncioTestCase):
             def handler(request, call):
                 if request.metadata.get("delegated"):
                     return response(text="Child wrote evidence.") if request.messages[-1].role == Role.TOOL else response(calls=[write("survived.txt", "retained evidence\n")])
-                return response(text="Final checked answer.") if any(m.role == Role.TOOL for m in request.messages) else response(calls=[delegate()])
+                return response(text="Final checked answer.") if any(m.role == Role.TOOL for m in request.messages) else response(calls=[delegate(capability="write")])
 
             provider.handler = handler
 

@@ -232,7 +232,7 @@ class FileToolTests(unittest.IsolatedAsyncioTestCase):
             ("repo_map", {"query": "query", "max_chars": 1000}, builder.repo_map, "build", "map"),
             ("read_skill", {"name": "example"}, builder.skills, "get", None),
             ("read_instructions", {"path": "."}, builder.instructions, "for_path", []),
-            ("delegate_task", {"task": "inspect", "max_turns": 1}, builder, "system_prompt", "system"),
+            ("delegate_task", {"task": "inspect", "max_turns": 1, "capability": "read-only"}, builder, "system_prompt", "system"),
         )
         for name, arguments, owner, method, value in cases:
             with self.subTest(tool=name):

@@ -35,7 +35,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def delegation():
         return ModelResponse(tool_calls=[ToolCall(
-            name="delegate_task", arguments={"task": "inspect the workspace", "max_turns": 3},
+            name="delegate_task", arguments={"task": "inspect the workspace", "max_turns": 3, "capability": "read-only"},
         )])
 
     def delegate_result(self, session_id):
@@ -47,7 +47,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
     async def test_parallel_delegations_report_their_own_parent_calls(self):
         ready = threading.Barrier(2)
         calls = [
-            ToolCall(id=name, name="delegate_task", arguments={"task": name, "max_turns": 1})
+            ToolCall(id=name, name="delegate_task", arguments={"task": name, "max_turns": 1, "capability": "read-only"})
             for name in ("first", "second")
         ]
 
@@ -94,7 +94,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
             "tool_registry": self.runner.tools,
             "context_builder": self.runner.context_builder,
         })
-        result = await DelegateTaskTool().execute({"task": "inspect", "max_turns": 2}, context)
+        result = await DelegateTaskTool().execute({"task": "inspect", "max_turns": 2, "capability": "read-only"}, context)
         self.assertFalse(result.is_error)
         self.assertIn("Investigation complete.", result.output)
         self.assertEqual(request.await_count, 2)
@@ -148,7 +148,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
             "context_builder": self.runner.context_builder,
             "usage_sink": recorded.add,
         })
-        result = await DelegateTaskTool().execute({"task": "inspect", "max_turns": 2}, context)
+        result = await DelegateTaskTool().execute({"task": "inspect", "max_turns": 2, "capability": "read-only"}, context)
         self.assertEqual(request.await_count, 2)
         self.assertEqual(recorded.requests, 2)
         self.assertAlmostEqual(recorded.cost_usd, 0.02)
@@ -284,7 +284,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
         })
         self.provider.enqueue(ModelResponse(text="Conclusion", usage=Usage(cost_usd=0.05)))
         task = asyncio.create_task(DelegateTaskTool().execute(
-            {"task": "inspect", "max_turns": 1}, context,
+            {"task": "inspect", "max_turns": 1, "capability": "read-only"}, context,
         ))
         try:
             await asyncio.wait_for(started.wait(), timeout=2)

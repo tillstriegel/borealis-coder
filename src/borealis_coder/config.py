@@ -45,7 +45,7 @@ class AgentConfig:
     swarm_max_descendants: int = 8
     swarm_max_concurrent: int = 2
     swarm_max_turns: int = 6
-    swarm_allow_writes: bool = False
+    swarm_allow_writes: bool = True
     max_input_tokens: int = 180_000
     compact_at_ratio: float = 0.82
     max_output_tokens: int = 16_000

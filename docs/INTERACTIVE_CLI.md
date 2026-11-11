@@ -80,7 +80,9 @@ private model reasoning or stream raw tool arguments to the terminal.
 
 The Aurora swarm tree appears automatically on delegation. It stays in a bounded
 region beside the editable prompt and preserves normal terminal scrollback.
-Rows show parent/child relationships, state, and `read-only` or `write` capability.
+Rows show parent/child relationships, state, and the admitted `read-only` or `write`
+capability. A refused request has no admitted capability (`not-admitted`); its
+detail explains the requested and available capability when escalation was denied.
 Selected detail shows bounded results, errors and evidence. The shared receipt
 shows cumulative admitted descendants (`Agents`), active delegated provider work,
 root request usage and authoritative root spend. The footer counts tree entries,
@@ -97,7 +99,7 @@ view, with an omission count. Session events retain the full lineage.
 | Page Up / Page Down | Scroll selected evidence. |
 | Enter / Escape | Return to the current input draft and cursor. |
 | F7 or `/swarm` | Toggle the tree, including during active work. |
-| `/swarm-writes [on or off]` | Inspect/change file-write permission for future turns in this process. |
+| `/swarm-writes [on or off]` | Inspect/change the operator write ceiling for future turns in this process. Off rejects write delegation; on does not select any child's capability. |
 
 Ctrl+C, approvals, EOF and queued follow-ups keep their existing behavior.
 Resize preserves selection and the draft. Narrow screens clip rows and scroll the
@@ -177,7 +179,7 @@ in bounded form.
 |---|---|
 | `/help` | Show the built-in command reference. |
 | `/swarm` | Toggle the live tree; F6 focuses it during work. |
-| `/swarm-writes [on or off]` | Show/change delegated file-write permission for future turns. |
+| `/swarm-writes [on or off]` | Show/change the delegated write ceiling for future turns; each call still selects its capability. |
 | `/status` | Show route, safety, sandbox, verification, session, and cumulative usage. |
 | `/session` | Show the current workspace, provider, model, and session ID. |
 | `/sessions [N]` | List up to N recent sessions for this workspace. |

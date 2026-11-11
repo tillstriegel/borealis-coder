@@ -175,17 +175,22 @@ Common commands inside the shell:
 
 Delegation supports bounded recursive swarms. Defaults allow two levels, eight
 cumulative descendants, two simultaneous delegated provider operations, and six
-turns per child. Children are read-only by default. To allow built-in workspace
-file edits, set `agent.swarm_allow_writes = true` in trusted configuration or use
-`/swarm-writes on` for future shell turns. Normal approvals, protected paths,
-checkpoints, and verification still apply; children cannot use shell or Script.
+turns per child. Every `delegate_task` call must explicitly select
+`capability: "read-only"` for investigation/review or `capability: "write"` for
+implementation/file edits. A child cannot exceed its parent's permissions;
+requests above that ceiling fail before admission, without a silent downgrade.
+Normal workspace-write/full parents can select write without another opt-in.
+Trusted `agent.swarm_allow_writes = false` or `/swarm-writes off` disables write
+delegation for future runs. This operator ceiling defaults to true; it does not
+select any child's capability. Normal approvals, protected paths, checkpoints,
+and verification still apply; children cannot use shell, network, or Script.
 Set `swarm_max_depth` or `swarm_max_descendants` to `0` to disable delegation.
 See [configuration](docs/CONFIGURATION.md#recursive-delegation).
 
 The live Aurora swarm tree appears when delegation starts. Press **F6** to inspect
 agents with arrows, **Left/Right** to fold/expand, **Page Up/Down** for evidence,
 and **Enter** to return to your draft. **F7** or `/swarm` toggles the view. The tree
-shows inherited permissions, live state, and shared limits without replacing
+shows admitted capabilities, live state, and shared limits without replacing
 terminal scrollback. See [interactive controls](docs/INTERACTIVE_CLI.md#live-swarm-view).
 
 Press Ctrl+C while a turn is running to cancel that turn and retain the shell and

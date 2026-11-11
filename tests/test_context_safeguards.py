@@ -183,7 +183,7 @@ class EvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.context.metadata.update(provider_routes=[ProviderRoute('mock', 'small', provider)], tool_registry=registry,
                                      context_builder=SimpleNamespace(system_prompt=lambda **_: 'Read-only investigation'),
                                      budget=budget, usage_sink=settle, before_model_request=budget.before_model_request)
-        result = await DelegateTaskTool().execute({'task': 'Inspect the evidence.', 'max_turns': 3}, self.context)
+        result = await DelegateTaskTool().execute({'task': 'Inspect the evidence.', 'max_turns': 3, 'capability': 'read-only'}, self.context)
         self.assertFalse(result.is_error)
         self.assertEqual(writes, [])
         self.assertEqual(budget.model_requests, 2)
