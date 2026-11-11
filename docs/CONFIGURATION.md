@@ -65,7 +65,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `small_model` | `""` | Optional cheaper/faster model for LLM compaction. Delegates use the primary route. |
 | `provider_fallbacks` | `[]` | Ordered provider route names tried after the primary route fails. |
 | `reasoning_effort` | `"medium"` | Adapter hint for providers/models that expose reasoning controls. |
-| `max_turns` | `60` | Maximum primary model turns per run. The final turn has tools disabled so the model can finish cleanly. |
+| `max_turns` | `500` | Maximum primary model turns per run. The final turn has tools disabled so the model can finish cleanly. |
 | `max_input_tokens` | `180000` | Context budget used for compaction and hard checks. |
 | `compact_at_ratio` | `0.82` | Compact when estimated context reaches this fraction of the input budget. |
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
@@ -77,7 +77,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `swarm_max_depth` | `2` | Maximum delegation depth, root = 0; `1` permits children only, `0` disables delegation. Integer 0–16. |
 | `swarm_max_descendants` | `8` | Cumulative admitted descendants per root run, excluding root; `0` disables delegation. Completed, failed, and cancelled children still consume admission. |
 | `swarm_max_concurrent` | `2` | Simultaneous delegated provider operations, including their retries/backoff and usage settlement. Positive integer. Slots are released before child tools run. |
-| `swarm_max_turns` | `6` | Per-child turn ceiling, integer 1–16; effective turns = min(requested `max_turns`, ceiling). For limits of 3 or more, closure starts on the penultimate turn, leaving one possible repair. |
+| `swarm_max_turns` | `250` | Per-child turn ceiling, integer 1–250; effective turns = min(requested `max_turns`, ceiling). For limits of 3 or more, closure starts on the penultimate turn, leaving one possible repair. |
 | `swarm_allow_writes` | `true` | Operator ceiling only: `false` rejects write delegation. Each call must still select `capability`; `true` does not grant writes to a read-only caller or child. Write children get only built-in file/patch tools under normal policy, never shell, network, external mutations, or Script. |
 | `max_repeated_calls` | `3` | Repeated identical call threshold for stuck detection. |
 | `auto_verify` | `true` | Run project verification after mutations. |

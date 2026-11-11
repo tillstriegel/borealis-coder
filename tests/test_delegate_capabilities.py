@@ -55,6 +55,35 @@ class DelegateCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("caller", schema["description"])
         self.assertIn(f"Available capability ceiling: {available}.", schema["description"])
 
+    async def test_default_child_turn_limit_allows_work_past_legacy_cap(self):
+        child_requests = []
+
+        def handler(request, call):
+            if request.metadata.get("delegated"):
+                child_requests.append(request)
+                if len(child_requests) <= 17:
+                    tool_call = write(path=f"turn-{len(child_requests)}.txt")
+                    tool_call.id = f"write-{len(child_requests)}"
+                    return response(calls=[tool_call])
+                return response(text="All child writes completed.")
+            if request.messages[-1].role == Role.TOOL:
+                return response(text="Child changes checked.")
+            return response(calls=[delegate("write", turns=250)])
+
+        self.provider.handler = handler
+        result = await self.runner.run("Implement files across more than sixteen child turns")
+        expected = {f"turn-{number}.txt" for number in range(1, 18)}
+        self.assertEqual(set(result.changed_files), expected)
+        self.assertTrue(all((self.root / name).read_text() == "child evidence\n" for name in expected))
+        self.assertEqual(len(child_requests), 18)
+        started = self.starts()
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].data["requested_max_turns"], 250)
+        self.assertEqual(started[0].data["effective_max_turns"], 250)
+        for request in child_requests:
+            schema = next(tool for tool in request.tools if tool["name"] == "delegate_task")
+            self.assertEqual(schema["parameters"]["properties"]["max_turns"]["maximum"], 250)
+
     async def test_default_parent_can_explicitly_delegate_real_write(self):
         def handler(request, call):
             if request.messages[-1].role == Role.TOOL:

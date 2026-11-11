@@ -75,7 +75,7 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.terminals()[-1].data["limits"]["active_requests"], 0)
 
     async def test_configured_cap_reaches_root_nested_discovery_and_prompts_without_leaking(self):
-        for cap in (2, 6, 2):
+        for cap in (2, 250, 2):
             for surface in ("direct", "ptc"):
                 with self.subTest(cap=cap, surface=surface):
                     self.runner.config.agent.swarm_max_turns = cap
@@ -99,9 +99,9 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertIn(f"at most {cap} child turns", schema["description"])
                             return response(text="Completed scoped investigation.")
                         if depth < 2:
-                            # Legacy callers can still request up to 16; the
-                            # operator's cap always wins and is recorded.
-                            return response(calls=[delegate(turns=16)])
+                            # The configured cap always wins over the requested
+                            # turns and is recorded without changing the schema.
+                            return response(calls=[delegate(turns=250)])
                         return response(calls=[ToolCall(name="discover_tools", arguments={
                             "names": ["delegate_task"], "offset": 0,
                         })])
@@ -110,9 +110,9 @@ class SwarmTests(unittest.IsolatedAsyncioTestCase):
                     result = await self.runner.run("Inspect nested configuration")
                     self.assertEqual(set(seen), {0, 1, 2})
                     for event in self.starts():
-                        self.assertEqual(event.data["requested_max_turns"], 16)
+                        self.assertEqual(event.data["requested_max_turns"], 250)
                         self.assertEqual(event.data["effective_max_turns"], cap)
-                    self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 16)
+                    self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 250)
                     self.assert_settled(result)
 
     async def test_three_levels_compose_evidence_exact_once_and_single_slot(self):
@@ -773,19 +773,19 @@ class SwarmConfigurationTests(unittest.TestCase):
             small_schema = next(s for s in registry.provider_schemas(small) if s["name"] == "delegate_task")
             default_schema = next(s for s in registry.provider_schemas(default) if s["name"] == "delegate_task")
             self.assertEqual(small_schema["parameters"]["properties"]["max_turns"]["maximum"], 2)
-            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 6)
+            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 250)
             small_schema["parameters"]["properties"]["max_turns"]["maximum"] = 1
-            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 6)
+            self.assertEqual(default_schema["parameters"]["properties"]["max_turns"]["maximum"], 250)
             fresh = next(s for s in registry.provider_schemas(small) if s["name"] == "delegate_task")
             self.assertEqual(fresh["parameters"]["properties"]["max_turns"]["maximum"], 2)
-            self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 16)
+            self.assertEqual(DelegateTaskTool.parameters["properties"]["max_turns"]["maximum"], 250)
 
     def test_validated_trusted_configuration(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
             root = Path(td)
             for key, value in (("swarm_max_depth", -1), ("swarm_max_depth", 17),
                                ("swarm_max_descendants", 1.5), ("swarm_max_concurrent", 0),
-                               ("swarm_max_turns", 17), ("swarm_max_depth", True),
+                               ("swarm_max_turns", 251), ("swarm_max_depth", True),
                                ("swarm_allow_writes", "yes")):
                 with self.subTest(key=key, value=value), self.assertRaises(ConfigurationError):
                     make_config(root, agent={key: value})

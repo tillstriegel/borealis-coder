@@ -90,7 +90,7 @@ class DelegateTaskTool(Tool):
     concurrent = True
     parameters = object_schema({
         "task": {"type": "string", "minLength": 1, "maxLength": 8000},
-        "max_turns": {"type": "integer", "minimum": 1, "maximum": 16},
+        "max_turns": {"type": "integer", "minimum": 1, "maximum": 250},
         "capability": {
             "type": "string", "enum": ["read-only", "write"],
             "description": "Required for every delegation: read-only for investigation/review; "
