@@ -85,7 +85,8 @@ capability. A refused request has no admitted capability (`not-admitted`); its
 detail explains the requested and available capability when escalation was denied.
 Selected detail shows bounded results, errors and evidence. The shared receipt
 shows cumulative admitted descendants (`Agents`), active delegated provider work,
-root request usage and authoritative root spend. The footer counts tree entries,
+root request usage and authoritative root spend. A disabled request-count cap
+is shown as `unlimited`. The footer counts tree entries,
 including the root and refusals but excluding descendants hidden by folding.
 Unknown spend is labelled; per-agent usage
 is never summed into the root receipt again. At most 256 nodes are retained in the

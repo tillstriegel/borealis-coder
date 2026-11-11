@@ -85,16 +85,28 @@ class Budget:
             raise RuntimeError("Cannot retry a model turn before it starts")
         self.turns -= 1
 
-    def remaining_requests(self, owner: str | None = None) -> int:
-        """Unconsumed capacity, excluding other agents' reserved closure requests."""
+    @property
+    def last_request(self) -> bool:
+        """Whether the finite run ceiling leaves at most one request in total."""
+        return (self.config.max_model_requests > 0
+                and self.model_requests + 1 >= self.config.max_model_requests)
+
+    def remaining_requests(self, owner: str | None = None) -> int | None:
+        """Capacity excluding other closures; None means no request-count cap."""
+        if self.config.max_model_requests == 0:
+            return None
         return max(0, self.config.max_model_requests - self.model_requests
                    - len(self._request_closures - ({owner} if owner else set())))
+
+    def has_request_capacity(self, owner: str | None = None) -> bool:
+        remaining = self.remaining_requests(owner)
+        return remaining is None or remaining > 0
 
     def reserve_closure(self, owner: str) -> bool:
         # Synchronous admission/consumption makes sibling races atomic on the loop.
         if owner in self._request_closures:
             return True
-        if not self.remaining_requests():
+        if not self.has_request_capacity():
             return False
         self._request_closures.add(owner)
         return True
@@ -105,7 +117,7 @@ class Budget:
     def before_model_request(self, owner: str = "root", *, closure: bool = True) -> None:
         """Reserve one logical provider request across the whole run."""
 
-        if not self.remaining_requests(owner if closure else None):
+        if not self.has_request_capacity(owner if closure else None):
             raise BudgetExceeded(
                 "model_requests",
                 max_model_requests_recovery_message(

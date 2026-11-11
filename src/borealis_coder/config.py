@@ -39,7 +39,7 @@ class AgentConfig:
     provider_fallbacks: list[str] = field(default_factory=list)
     reasoning_effort: str = "medium"
     max_turns: int = 500
-    max_model_requests: int = 40
+    max_model_requests: int = 2500
     max_read_only_turns: int = 8
     swarm_max_depth: int = 2
     swarm_max_descendants: int = 8
@@ -625,8 +625,9 @@ def validate_config(config: Config) -> None:
         raise ConfigurationError("agent.swarm_max_turns cannot exceed 250")
     if config.agent.max_turns < 1:
         raise ConfigurationError("agent.max_turns must be positive")
-    if config.agent.max_model_requests < 1:
-        raise ConfigurationError("agent.max_model_requests must be positive")
+    request_limit = config.agent.max_model_requests
+    if isinstance(request_limit, bool) or not isinstance(request_limit, int) or request_limit < 0:
+        raise ConfigurationError("agent.max_model_requests must be an integer >= 0 (0 is unlimited)")
     if config.agent.max_read_only_turns < 1:
         raise ConfigurationError("agent.max_read_only_turns must be positive")
     if config.agent.max_time_seconds < 1:

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 from borealis_coder.agent import build_runner, validate_tool_call_order
 from borealis_coder.agent.budget import Budget
 from borealis_coder.agent.runner import ProviderRoute
-from borealis_coder.config import ProviderConfig
+from borealis_coder.config import AgentConfig, ProviderConfig
 from borealis_coder.errors import BudgetExceeded, ProviderError, ProviderUnavailableError
 from borealis_coder.models import ModelResponse, ProviderRequest, Role, ToolCall, Usage
 from borealis_coder.providers.http import HttpResponse, SSEEvent
@@ -756,8 +756,11 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
     async def test_compaction_rearms_root_closure_after_another_root_tool_turn(self):
         await self._check_compaction_helper_retry(continued=True)
 
-    async def _check_compaction_helper_retry(self, *, continued):
-        self.runner.config.agent.max_model_requests = 5 + int(continued)
+    async def test_unlimited_compaction_helper_retry_keeps_root_tools(self):
+        await self._check_compaction_helper_retry(continued=False, unlimited=True)
+
+    async def _check_compaction_helper_retry(self, *, continued, unlimited=False):
+        self.runner.config.agent.max_model_requests = 0 if unlimited else 5 + int(continued)
         self.runner.config.context.compact_tool_output_tokens = 100_000
         session = self.runner.sessions.create_session(workspace=self.root, provider="mock", model="deterministic")
         for index in range(14):
@@ -789,7 +792,7 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
                 self.runner.config.agent.deterministic_compaction = False
                 self.runner.config.context.compact_tool_output_tokens = 10
                 return response(calls=[read_call()])
-            self.assertEqual(request.tools, [])
+            self.assertEqual(bool(request.tools), unlimited)
             self.assertIn("alpha", request.system + str([m.content for m in request.messages]))
             return response(text="Qualified root result: alpha confirmed; helper summary unavailable.")
 
@@ -799,15 +802,15 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
             result = await self.runner.run("Inspect and combine", session_id=session.id)
         self.assertEqual(result.stop_reason.value, "end_turn", result.error)
         self.assertIn("alpha", result.text)
-        self.assertEqual(len(summaries), 1)
-        self.assertEqual(budget.model_requests, 5 + int(continued))
-        self.assertEqual(result.usage.requests, 5 + int(continued))
-        self.assertAlmostEqual(result.usage.cost_usd, 0.06 + 0.01 * int(continued))
+        self.assertEqual(len(summaries), 3 if unlimited else 1)
+        self.assertEqual(budget.model_requests, 5 + int(continued) + (2 if unlimited else 0))
+        self.assertEqual(result.usage.requests, 5 + int(continued) + (2 if unlimited else 0))
+        self.assertAlmostEqual(result.usage.cost_usd, 0.06 + 0.01 * int(continued) + (0.04 if unlimited else 0))
         self.assertFalse(budget._request_closures)
         self.assertEqual(budget.pending_cost_usd, 0)
         self.assertFalse(budget._held_usage)
         artifact = self.runner.sessions.compaction_artifacts(result.session_id)[-1]
-        self.assertEqual(artifact.metadata["fallback_reason"], "summarizer_request_capacity")
+        self.assertEqual(artifact.metadata["fallback_reason"], "summarizer_provider_error" if unlimited else "summarizer_request_capacity")
         self.settled(result)
 
     async def test_root_final_dispatch_policy_reaches_wire_and_mutation_guard(self):
@@ -960,8 +963,9 @@ class SessionRepairTests(unittest.IsolatedAsyncioTestCase):
 class ReasoningWireRepairTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_on_empty_recovery_and_budget_refusal_settle_once(self):
         for stream in (False, True):
-            for refuse in (False, True):
-                with self.subTest(stream=stream, refuse=refuse):
+            for limit in (0, 1, 2):
+                refuse = limit == 1
+                with self.subTest(stream=stream, limit=limit):
                     provider = OpenRouterProvider(ProviderConfig(type="openrouter", base_url="https://synthetic.test", max_retries=0))
                     self.addAsyncCleanup(provider.close)
                     payloads = []
@@ -980,9 +984,8 @@ class ReasoningWireRepairTests(unittest.IsolatedAsyncioTestCase):
                         yield SSEEvent("message", json.dumps(wire(kwargs["payload"])))
                         yield SSEEvent("message", "[DONE]")
 
-                    def before_recovery(refuse=refuse):
-                        if refuse:
-                            raise BudgetExceeded("model_requests", "Synthetic hard request ceiling")
+                    budget = Budget.start(AgentConfig(max_model_requests=limit))
+                    budget.before_model_request()
 
                     async def run(stream=stream, provider=provider, request=request):
                         if stream:
@@ -995,7 +998,7 @@ class ReasoningWireRepairTests(unittest.IsolatedAsyncioTestCase):
                     def observe_usage(usage, observed=observed):
                         observed.add(usage)
 
-                    with provider.observe_requests(observe_usage, None, before_recovery):
+                    with provider.observe_requests(observe_usage, None, budget.before_model_request):
                         if refuse:
                             with self.assertRaises(BudgetExceeded):
                                 await run()
@@ -1007,6 +1010,7 @@ class ReasoningWireRepairTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("reasoning", payloads[0])
                     self.assertEqual(len(payloads), 1 if refuse else 2)
                     self.assertEqual(observed.requests, len(payloads))
+                    self.assertEqual(budget.model_requests, len(payloads))
                     if not refuse:
                         self.assertEqual(payloads[1]["reasoning"], {"effort": "none"})
 

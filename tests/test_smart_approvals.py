@@ -221,7 +221,7 @@ class SmartApprovalBoundaryTests(unittest.IsolatedAsyncioTestCase):
         error = ProviderUnavailableError(
             secret, retryable=True, usage=Usage(requests=1, cost_usd=0.01, cost_status="known")
         )
-        async with harness(answers=[error]) as (root, runner, provider, humans):
+        async with harness(answers=[error], agent={"max_model_requests": 0}) as (root, runner, provider, humans):
             provider.config.max_retries = 3
             result = await runner.run("Create sentinel.")
             self.assertFalse((root / "sentinel").exists())
@@ -235,7 +235,7 @@ class SmartApprovalBoundaryTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_adapter_recovery_is_blocked(self):
-        async with harness() as (root, runner, provider, _):
+        async with harness(agent={"max_model_requests": 0}) as (root, runner, provider, _):
             provider.recover = True
             result = await runner.run("Create sentinel.")
             self.assertFalse((root / "sentinel").exists())
@@ -398,7 +398,7 @@ class SmartApprovalBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_dollar_budget_blocks_dispatch_and_over_budget_allow(self):
         for cost in (0.0, 0.2):
             with self.subTest(cost=cost):
-                async with harness(agent={"max_cost_usd": 0.1}) as (root, runner, provider, _):
+                async with harness(agent={"max_cost_usd": 0.1, "max_model_requests": 0}) as (root, runner, provider, _):
                     provider.judge_cost = cost
                     if cost == 0:
                         # Primary admission is free; require priced helper admission.
@@ -414,7 +414,7 @@ class SmartApprovalBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(receipts(runner)[0]["reason"], "budget_exhausted")
 
     async def test_timeout_cancels_provider_and_accounts_attempt(self):
-        async with harness() as (root, runner, provider, humans):
+        async with harness(agent={"max_model_requests": 0}) as (root, runner, provider, humans):
             provider.wait = True
             with patch("borealis_coder.safety.smart.JUDGE_TIMEOUT_SECONDS", 0.03):
                 result = await runner.run("Create sentinel.")
@@ -424,7 +424,7 @@ class SmartApprovalBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(humans, [])
 
     async def test_cancellation_propagates_without_execution(self):
-        async with harness() as (root, runner, provider, humans):
+        async with harness(agent={"max_model_requests": 0}) as (root, runner, provider, humans):
             provider.wait = True
             task = asyncio.create_task(runner.run("Create sentinel."))
             await asyncio.wait_for(provider.entered.wait(), 3)
@@ -437,7 +437,7 @@ class SmartApprovalBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(humans, [])
 
     async def test_root_deadline_cancels_judge(self):
-        async with harness(agent={"max_time_seconds": 1}) as (root, runner, provider, _):
+        async with harness(agent={"max_time_seconds": 1, "max_model_requests": 0}) as (root, runner, provider, _):
             provider.wait = True
             result = await runner.run("Create sentinel.")
             self.assertFalse((root / "sentinel").exists())

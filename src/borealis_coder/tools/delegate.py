@@ -292,18 +292,23 @@ class DelegateTaskTool(Tool):
             return result
 
         def bounds_text() -> str:
+            requests = ""
+            if budget:
+                if budget.remaining_requests() is None:
+                    requests = "Shared requests: unlimited. Helper, overflow and retry requests are still accounted. "
+                else:
+                    requests = (f"Shared unreserved requests: {budget.remaining_requests()}; "
+                                f"available for this agent's closure: {budget.remaining_requests(context.metadata['delegation_id'])}. "
+                                "Helper, overflow and retry requests share the hard run ceiling. ")
             return (f"\n\n# Delegation bounds\nDepth {context.metadata['delegation_depth']} of {state.max_depth}; "
                       f"remaining child turns including this one: {max_turns - turn_index}. "
-                      + (f"Shared unreserved requests: {budget.remaining_requests()}; "
-                         f"available for this agent's closure: {budget.remaining_requests(context.metadata['delegation_id'])}. " if budget else "")
-                      + "Helper, overflow and retry requests share the hard run ceiling. "
-                      "Return partial findings and unresolved limits when work cannot finish.")
+                      + requests + "Return partial findings and unresolved limits when work cannot finish.")
 
         incomplete("investigation_not_started")
         while turn_index < max_turns:
             # With three or more turns, leave one turn for a rejected conclusion.
             synthesis_turn = (repair_answer or turn_index >= closure_start
-                              or bool(budget and not budget.remaining_requests()))
+                              or bool(budget and not budget.has_request_capacity()))
             closure_messages = [messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]] if synthesis_turn else messages
             request = ProviderRequest(
                 model=route.model,
@@ -323,7 +328,7 @@ class DelegateTaskTool(Tool):
                 try:
                     # Siblings can spend the last investigative request while
                     # this child waits for a provider slot (including capacity 1).
-                    if budget and not synthesis_turn and not budget.remaining_requests():
+                    if budget and not synthesis_turn and not budget.has_request_capacity():
                         synthesis_turn = True
                         request = replace(request, tools=[], parallel_tool_calls=False,
                                           messages=[messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]],
@@ -372,7 +377,7 @@ class DelegateTaskTool(Tool):
                             with contextlib.suppress(BudgetExceeded):
                                 await record_usage(cancelled_usage)
                         if error.kind == "model_requests":
-                            if not synthesis_turn and budget and budget.remaining_requests(context.metadata["delegation_id"]):
+                            if not synthesis_turn and budget and budget.has_request_capacity(context.metadata["delegation_id"]):
                                 repair_answer = True
                                 turn_index += 1
                                 continue

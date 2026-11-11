@@ -937,7 +937,7 @@ class AgentRunner:
                 # Preparation helpers, retries and adapter recovery all spend
                 # physical requests. Decide at dispatch, not at turn selection.
                 if (context.metadata["swarm_state"].admitted > 0
-                        and budget.model_requests + 1 >= self.config.agent.max_model_requests):
+                        and budget.last_request):
                     tools_disabled = True
                     request.tools = []
                     request.parallel_tool_calls = False
@@ -975,7 +975,7 @@ class AgentRunner:
                         before_model_request=budget.before_model_request,
                         budget=budget,
                     )
-                    if budget.model_requests + 1 >= self.config.agent.max_model_requests:
+                    if budget.last_request:
                         notices = await self._await_until_cancelled(
                             self._script_notifications(scripts, messages, wait=True), cancel
                         )
@@ -986,7 +986,7 @@ class AgentRunner:
                 if _remaining_budget_guidance(budget):
                     await self.events.emit(
                         "run.budget_checkpoint", session_id=session_id, run_id=run_id,
-                        remaining_model_requests=max(0, self.config.agent.max_model_requests - budget.model_requests),
+                        remaining_model_requests=budget.remaining_requests("root"),
                         remaining_primary_turns=max(0, self.config.agent.max_turns - budget.turns + 1),
                         tools_available=bool(schemas),
                     )
@@ -1010,7 +1010,7 @@ class AgentRunner:
                 self._check_cancel(cancel)
                 budget.before_turn()
                 final_turn = budget.turns == self.config.agent.max_turns
-                last_request = budget.model_requests + 1 >= self.config.agent.max_model_requests
+                last_request = budget.last_request
                 mutation_revision += await self._await_until_cancelled(
                     self._script_notifications(scripts, messages, wait=final_turn or last_request), cancel
                 )
@@ -2701,7 +2701,7 @@ class AgentRunner:
                 elif (
                     intended_strategy == "llm"
                     and budget is not None
-                    and budget.model_requests + 1 >= agent_config.max_model_requests
+                    and budget.last_request
                 ):
                     # Preserve the final request for the answer, including any
                     # Script notice that required this preparation to run again.
@@ -5269,13 +5269,13 @@ def _is_cacheable_response(response: ModelResponse) -> bool:
 
 
 def _remaining_budget_guidance(budget: Budget) -> str:
-    requests = max(0, budget.config.max_model_requests - budget.model_requests)
+    requests = budget.remaining_requests("root")
     turns = max(0, budget.config.max_turns - budget.turns + 1)
-    if requests > 2 and turns > 2:
+    if (requests is None or requests > 2) and turns > 2:
         return ""
     return (
         "# Remaining run budget\n"
-        f"Remaining logical requests including this request: {requests}. "
+        f"Remaining logical requests including this request: {requests if requests is not None else 'unlimited'}. "
         f"Remaining primary turns including this turn: {turns}.\n"
         "Answer now if the evidence is sufficient. Avoid redundant coverage checks or "
         "re-reading established evidence. Otherwise take only the next necessary step "

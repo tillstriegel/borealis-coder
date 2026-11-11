@@ -9,7 +9,7 @@ small_model = ""
 provider_fallbacks = ["anthropic"]
 reasoning_effort = "medium"
 max_turns = 500
-max_model_requests = 40
+max_model_requests = 2500 # 0 disables the shared request-count cap
 max_read_only_turns = 8
 # Root depth is 0. Set depth or descendants to 0 to disable delegation.
 swarm_max_depth = 2

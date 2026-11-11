@@ -71,7 +71,7 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `max_output_tokens` | `16000` | Requested per-turn output ceiling. |
 | `max_time_seconds` | `3600` | End-to-end run wall-time ceiling. |
 | `max_cost_usd` | `0.0` | Opt-in cumulative dollar ceiling. Positive limits require configured pricing. |
-| `max_model_requests` | `40` | Hard parent, delegate, summarizer, retry and recovery request ceiling for one run. Guidance shows remaining capacity. After delegation, the final root request is synthesis-only; closure reservations stay within this ceiling. Non-delegating investigation checkpoints keep tools available. |
+| `max_model_requests` | `2500` | Shared parent, delegate, summarizer, retry, recovery and approval-judge request ceiling for one run; `0` disables only this request-count cap. Guidance shows remaining capacity. With a finite cap after delegation, the last available root request is synthesis-only; closure reservations stay within that cap. Non-delegating investigation checkpoints keep tools available. |
 | `max_read_only_turns` | `8` | Investigation checkpoint interval in tool rounds without file changes. Guidance asks for findings or a concrete next step; tools remain available. Novel successful output resets the stalled-round counter. Repeated-call and global budgets still stop admission. |
 | `parallel_reads` | `8` | Maximum concurrent read-only tool calls. |
 | `swarm_max_depth` | `2` | Maximum delegation depth, root = 0; `1` permits children only, `0` disables delegation. Integer 0–16. |
@@ -92,6 +92,13 @@ Scalar strings are coerced to booleans, integers, floats, or null where unambigu
 | `compaction_summarizer_input_tokens` | `32000` | Maximum input tokens for one summary chunk. |
 | `compaction_summarizer_total_input_tokens` | `96000` | Maximum input tokens across all summary chunks. |
 | `compaction_shadow_v2` | `false` | Generate safe v2 size metrics while compatibility v1 remains active. |
+
+The fixed request default is `2500`, matching 500 primary turns plus eight
+descendants with 250 turns each. Helpers, retries, and approval reviews also use
+requests, so this count does not guarantee that every configured turn can run.
+Set `BOREALIS_CFG__AGENT__MAX_MODEL_REQUESTS=0` to disable the request-count cap.
+Positive integer values, including smaller explicit limits, remain authoritative.
+Turn, descendant, depth, concurrency, time, cost, and safety limits still apply.
 
 ### Recursive delegation
 
@@ -224,8 +231,9 @@ routing and pricing settings. No separate judge model is configured. Each review
 permits one provider attempt, requests at most 512 output tokens, and times out
 after 20 seconds or the remaining run time, whichever is shorter. Reviews share
 `max_model_requests`, `max_time_seconds`, and `max_cost_usd`, preserving reserved
-closure requests. Provider retries and client-side recovery are disabled for
-review. Tool/history overrides in `extra_body`, and provider web/plugin
+closure requests when the request cap is finite. Setting `max_model_requests = 0`
+does not waive time, cost, or approval checks. Provider retries and client-side
+recovery are disabled for review. Tool/history overrides in `extra_body`, and provider web/plugin
 extensions, are rejected. Invalid, incomplete, missing, or failed judgments deny
 the operation without human fallback. Use `on-risk` for human review.
 

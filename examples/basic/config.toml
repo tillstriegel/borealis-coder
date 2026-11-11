@@ -3,7 +3,7 @@ provider = "openai"
 model = "gpt-5.4-mini"
 provider_fallbacks = ["anthropic"]
 max_turns = 500
-max_model_requests = 40
+max_model_requests = 2500 # 0 disables the shared request-count cap
 max_read_only_turns = 8
 max_cost_usd = 15.0
 

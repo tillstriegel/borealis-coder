@@ -84,7 +84,12 @@ novel result content counts as evidence; call IDs, durations and timestamp
 metadata do not. Repeated-call and hard request/turn/time/cost budgets remain
 independent. Only hard final turns and verification finalization disable tools.
 
-When at most two logical requests or primary turns remain, a short budget reminder
+The shared request-count cap defaults to 2500; `max_model_requests = 0` disables
+only that cap. Accounting, closure ownership, and other run limits remain active.
+Unlimited remaining request capacity is represented internally by `None` and in
+JSON checkpoints by `null`, while configuration and start events retain `0`.
+
+When at most two capped logical requests or primary turns remain, a short budget reminder
 states the remaining counts and asks for an answer from sufficient evidence.
 It keeps ordinary tools available and discourages redundant coverage checks.
 Counts include the current request/turn and refresh after compaction helpers use

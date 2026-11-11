@@ -22,6 +22,27 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(provider.type, "mock")
             self.assertEqual(config.agent.max_turns, 500)
             self.assertEqual(config.agent.swarm_max_turns, 250)
+            self.assertEqual(config.agent.max_model_requests, 2500)
+
+    def test_optional_request_limit_loading(self):
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
+            root = Path(td)
+            path = root / "limits.toml"
+            for limit in (0, 1, 2, 40, 2500, 3000):
+                with self.subTest(limit=limit):
+                    path.write_text(f"[agent]\nmax_model_requests={limit}\n")
+                    config = load_config(root, explicit_path=path, ensure_storage=False)
+                    self.assertEqual(config.agent.max_model_requests, limit)
+                    config = load_config(root, overrides={"agent": {"max_model_requests": limit}}, ensure_storage=False)
+                    self.assertEqual(config.agent.max_model_requests, limit)
+            with patch.dict(os.environ, {"BOREALIS_CFG__AGENT__MAX_MODEL_REQUESTS": "0"}):
+                self.assertEqual(load_config(root, ensure_storage=False).agent.max_model_requests, 0)
+
+    def test_request_limit_rejects_invalid_types(self):
+        with tempfile.TemporaryDirectory() as td:
+            for limit in (-1, True, False, 1.5, 0.0, float("inf"), float("nan"), "0", None, [], {}):
+                with self.subTest(limit=limit), self.assertRaisesRegex(ConfigurationError, "max_model_requests"):
+                    load_config(Path(td), overrides={"agent": {"max_model_requests": limit}}, ensure_storage=False)
 
     def test_auto_selects_openrouter_when_its_key_is_available(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(
@@ -141,7 +162,6 @@ class ConfigTests(unittest.TestCase):
 
     def test_fail_open_resource_limits_must_be_positive(self):
         cases = (
-            ("agent", "max_model_requests", 0),
             ("agent", "max_read_only_turns", 0),
             ("safety", "max_process_output_chars", 0),
             ("sandbox", "process_cpu_seconds", -1),

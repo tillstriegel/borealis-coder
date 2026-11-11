@@ -161,16 +161,17 @@ class SwarmView:
         status = self.usage.get("cost_status", "unknown")
         spend = f"${cost:.4f}" if status in {"known", "estimated"} else f"${cost:.4f} + unknown"
         limits = self.limits
+        request_limit = "unlimited" if self.request_limit == 0 else str(self.request_limit)
         summary = (f"Agents {limits.get('admitted', 0)}/{limits.get('max_descendants', '?')} · "
                    f"provider {limits.get('active_requests', 0)}/{limits.get('max_concurrent', '?')} · "
-                   f"requests {self.requests}/{self.request_limit} · {spend}")
+                   f"requests {self.requests}/{request_limit} · {spend}")
         lines: list[tuple[str, str]] = [
             ("class:swarm.title", "╭─ SWARM  " + ("[focus] " if self.focused else "") + "F6 inspect · F7 hide"),
             ("class:swarm.muted", " " + summary if width >= 90 else
              f" Agents {limits.get('admitted', 0)}/{limits.get('max_descendants', '?')} · provider {limits.get('active_requests', 0)}/{limits.get('max_concurrent', '?')}"),
         ]
         if width < 90:
-            lines.append(("class:swarm.muted", f" Root requests {self.requests}/{self.request_limit} · {spend}"))
+            lines.append(("class:swarm.muted", f" Root requests {self.requests}/{request_limit} · {spend}"))
         tree_height = max(1, min(len(rows), height - len(lines) - 4))
         selected_index = next((i for i, row in enumerate(rows) if row.id == self.selected), 0)
         start = max(0, selected_index - tree_height + 1)

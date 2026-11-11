@@ -209,6 +209,14 @@ class ScriptRepairTests(unittest.IsolatedAsyncioTestCase):
     async def test_last_turn_sees_background_failure_and_publishes_acp_answer(self):
         await self.final_turn(fail=True)
 
+    async def test_unlimited_last_turn_drains_background_success(self):
+        self.config.agent.max_model_requests = 0
+        await self.final_turn()
+
+    async def test_unlimited_last_turn_drains_background_failure(self):
+        self.config.agent.max_model_requests = 0
+        await self.final_turn(fail=True)
+
     async def test_last_turn_cannot_synthesize_without_remaining_request_budget(self):
         await self.final_turn(request_budget=True)
 
