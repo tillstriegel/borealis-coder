@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,13 +91,15 @@ class DelegatedArtifactHandoffTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(nested=nested), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 (root/'source.txt').write_text('preview filler\n' * 2000 + FACT + '\n' + 'tail filler\n' * 2000)
-                runner = await build_runner(root, config=make_config(root, context={'tool_output_chars': 2000}), interactive=False)
+                # Keep structured search results intact; the source fact still lies
+                # beyond both ends of the bounded file preview, asserted below.
+                runner = await build_runner(root, config=make_config(root, context={'tool_output_chars': 8000}), interactive=False)
                 self.addAsyncCleanup(runner.close)
                 provider = runner.providers[0].provider
                 assert isinstance(provider, MockProvider)
-                references, reads, findings, leaf_previews = {}, {}, {}, []
+                references, searches, reads, findings, leaf_previews = {}, {}, {}, {}, []
 
-                def handler(request, call, nested=nested, references=references, reads=reads,
+                def handler(request, call, nested=nested, references=references, searches=searches, reads=reads,
                             findings=findings, leaf_previews=leaf_previews):
                     depth = request.metadata.get('delegation_depth', 0)
                     last = request.messages[-1]
@@ -116,8 +119,17 @@ class DelegatedArtifactHandoffTests(unittest.IsolatedAsyncioTestCase):
                         if not refs:
                             return response('No usable source reference was returned.')
                         references[depth] = refs[0]
+                        return response(calls=[ToolCall(id=f'search-{depth}', name='search_history', arguments={
+                            'query': FACT, 'after': 0, 'offset': 0, 'artifact_after': None})])
+                    if last.tool_name == 'search_history':
+                        payload = json.loads(last.content.split('\n', 1)[1])
+                        matches = [item for item in payload['artifacts']
+                                   if item['artifact_id'] == references[depth]['output_artifact']['artifact_id']]
+                        searches[depth] = matches
+                        if not matches:
+                            return response('The retained artifact cannot be recovered through history search.')
                         return response(calls=[ToolCall(id=f'artifact-{depth}', name='read_artifact', arguments={
-                            'artifact_id': refs[0]['output_artifact']['artifact_id'],
+                            'artifact_id': matches[0]['artifact_id'],
                             'offset': 0, 'limit': 1000, 'query': FACT})])
                     if last.tool_name == 'read_artifact':
                         reads[depth] = last
@@ -131,6 +143,10 @@ class DelegatedArtifactHandoffTests(unittest.IsolatedAsyncioTestCase):
                 provider.handler = handler
                 result = await asyncio.wait_for(runner.run('Inspect delegated retained evidence.'), 15)
                 expected_receivers = {0, 1} if nested else {0}
+                self.assertEqual(set(searches), expected_receivers, result.text)
+                for matches in searches.values():
+                    self.assertEqual(len(matches), 1, result.text)
+                    self.assertIn(FACT, matches[0]['preview'])
                 self.assertEqual(set(reads), expected_receivers, result.text)
                 self.assertEqual(set(findings), expected_receivers, result.text)
                 self.assertEqual(result.text, 'Verified retained source value 731; evidence review complete.')
@@ -207,6 +223,21 @@ class DelegatedArtifactHandoffTests(unittest.IsolatedAsyncioTestCase):
                 store.ensure_delegated_conversation(session.id, donor, 'one', 1, delegation_call_id='two')
             for _ in range(2):
                 store.handoff_output_artifacts(donor, session.id, root, 'one', [returned, structured])
+            matches = store.search_output_artifacts(session.id, root, 'snowman')
+            self.assertEqual([row['artifact_id'] for row in matches], sorted([returned_id, structured_id]))
+            self.assertTrue(all('snowman' in row['preview'] for row in matches))
+            continuation = store.search_output_artifacts(session.id, root, 'snowman',
+                                                         after=matches[0]['artifact_id'])
+            self.assertEqual(continuation, matches[1:])
+            self.assertEqual(store.search_output_artifacts(session.id, root, returned_id)[0]['artifact_id'], returned_id)
+            self.assertEqual(store.search_output_artifacts(session.id, root, 'Ancestor private output')[0]['artifact_id'],
+                             root_artifact['artifact_id'])
+            for scope, query in ((session.id, 'Unreturned private output'), (session.id, 'Sibling private output'),
+                                 (sibling, returned_id), (donor, 'Sibling private output'),
+                                 (donor, 'Ancestor private output')):
+                self.assertEqual(store.search_output_artifacts(scope, root, query), [])
+            with self.assertRaises(SessionError):
+                store.search_output_artifacts(session.id, root/'wrong-workspace', 'snowman')
             value = store.read_output_artifact(session.id, root, returned_id, limit=1000)
             self.assertEqual({key: value[key] for key in returned['output_artifact']}, returned['output_artifact'])
             self.assertEqual(value['content'], store.read_output_artifact(donor, root, returned_id, limit=1000)['content'])
@@ -233,6 +264,7 @@ class DelegatedArtifactHandoffTests(unittest.IsolatedAsyncioTestCase):
             reopened = SessionStore(path)
             self.addCleanup(reopened.close)
             reopened.handoff_output_artifacts(donor, session.id, root, 'one', [returned])
+            self.assertEqual(reopened.search_output_artifacts(session.id, root, 'snowman'), matches)
             self.assertEqual(reopened.read_output_artifact(session.id, root, returned_id, limit=1000), value)
             self.assertEqual([s.id for s in reopened.list_sessions()], [session.id])
             self.assertEqual(reopened.finding_source(session.id, root, 'one.read')['metadata']['output_artifact'],

@@ -109,6 +109,8 @@ only its returned, receipt-backed output artifacts to the immediate parent. Nest
 handoffs can forward those same references. The links preserve original ownership,
 retained bytes, metadata and storage quotas across reopen; they do not expose other
 child artifacts or transcripts, or give descendants access to ancestor evidence.
+Recipient `search_history` searches include these explicitly handed-off artifacts
+under the same access rules as `read_artifact`; private child history stays scoped.
 
 SQLite stores these internal conversations separately from publicly selectable root
 sessions. Reopening a saved child snapshot can reuse its exact provider view without

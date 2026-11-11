@@ -1758,9 +1758,12 @@ class SessionStore:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT metadata_json, instr(content,?) - 1 AS offset, "
-                "substr(content,max(1,instr(content,?)),500) AS preview FROM output_artifacts "
-                "WHERE session_id=? AND artifact_id>? AND (instr(content,?)>0 OR instr(metadata_json,?)>0) "
-                "ORDER BY artifact_id LIMIT 20", (query, query, session_id, after, query, query),
+                "substr(content,max(1,instr(content,?)),500) AS preview FROM output_artifacts AS artifact "
+                "WHERE (session_id=? OR EXISTS (SELECT 1 FROM delegated_artifact_handoffs AS handoff "
+                "WHERE handoff.recipient_scope_id=? AND handoff.owner_scope_id=artifact.session_id "
+                "AND handoff.artifact_id=artifact.artifact_id)) "
+                "AND artifact_id>? AND (instr(content,?)>0 OR instr(metadata_json,?)>0) "
+                "ORDER BY artifact_id LIMIT 20", (query, query, session_id, session_id, after, query, query),
             ).fetchall()
         return [{**json.loads(row["metadata_json"]), "offset": max(0, row["offset"]), "preview": row["preview"]} for row in rows]
 
