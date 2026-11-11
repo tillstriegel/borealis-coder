@@ -1145,7 +1145,10 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
             provider = runner.providers[0].provider
             assert isinstance(provider, MockProvider)
 
+            entered = asyncio.Event()
+
             async def wait_forever(_request):
+                entered.set()
                 await asyncio.Event().wait()
 
             try:
@@ -1158,13 +1161,33 @@ class RuntimeFeatureTests(unittest.IsolatedAsyncioTestCase):
                         return outcome if isinstance(outcome, str) else await outcome
 
                     task = asyncio.create_task(run_summary())
-                    await asyncio.sleep(0)
+                    await asyncio.wait_for(entered.wait(), timeout=1)
                     cancel.set()
                     with self.assertRaises(Cancelled):
                         await asyncio.wait_for(task, timeout=1)
                 usage_sink.assert_awaited_once()
                 assert usage_sink.await_args is not None
                 self.assertEqual(usage_sink.await_args.args[0].cost_status, "incomplete")
+            finally:
+                await runner.close()
+
+    async def test_runner_pre_cancelled_compaction_does_not_dispatch_or_bill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = make_config(root, agent={"deterministic_compaction": False})
+            runner = await build_runner(root, config=config, interactive=False)
+            cancel = asyncio.Event()
+            cancel.set()
+            usage_sink = AsyncMock()
+            provider = runner.providers[0].provider
+            try:
+                with patch.object(provider, "complete", new_callable=AsyncMock) as complete:
+                    summarize = runner._summarizer(usage_sink, cancel)
+                    assert summarize is not None
+                    with self.assertRaises(Cancelled):
+                        await asyncio.wait_for(summarize("old conversation"), timeout=1)
+                    complete.assert_not_awaited()
+                usage_sink.assert_not_awaited()
             finally:
                 await runner.close()
 

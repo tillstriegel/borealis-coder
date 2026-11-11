@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from borealis_coder.agent import build_runner, validate_tool_call_order
+from borealis_coder.agent.answers import CLOSURE_INSTRUCTION
 from borealis_coder.agent.budget import Budget
 from borealis_coder.errors import ProviderContextOverflowError, ProviderError
 from borealis_coder.events import Redactor
@@ -305,8 +306,9 @@ class FinalHandoffTests(unittest.IsolatedAsyncioTestCase):
                 return ModelResponse(text="rejected incomplete candidate", stop_reason="length", usage=Usage(requests=1))
             self.assertEqual(request.tools, [])
             self.assertFalse(request.parallel_tool_calls)
-            self.assertTrue(any(m.role == Role.USER and "final handoff" in m.content.lower()
-                                for m in request.messages))
+            # Persistent child history stays append-only. The runtime closure
+            # instruction is protected system context, not a synthetic user grant.
+            self.assertIn(CLOSURE_INSTRUCTION, request.system)
             self.assertFalse(any("rejected incomplete candidate" in m.content for m in request.messages))
             return response(text="shared.txt:1 was inspected; no files changed. Remaining checks are not performed.")
 

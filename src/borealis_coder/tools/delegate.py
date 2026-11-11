@@ -14,6 +14,7 @@ from ..agent.answers import CLOSURE_INSTRUCTION, protocol_answer, runtime_handof
 from ..agent.budget import prepare_route_request
 from ..agent.swarm import SwarmState, bounded_calls
 from ..config import Config
+from ..context import PromptContext
 from ..errors import BudgetExceeded, Cancelled, ProviderContextOverflowError, ProviderError
 from ..models import (
     Effect,
@@ -147,6 +148,17 @@ class DelegateTaskTool(Tool):
                                       **lineage, limits=state.limits(),
                                       model_requests=budget.model_requests if budget else 0, **data)
 
+        async def handoff_artifacts(result: ToolResult) -> None:
+            store = context.metadata.get("session_store")
+            references = [reference for reference in result.metadata.get("evidence", [])
+                          if (reference.get("output_artifact") or {}).get("artifact_id")]
+            if store is not None and callable(context.metadata.get("delegate_prepare")) and references:
+                await finish_on_cancellation(asyncio.to_thread(
+                    store.handoff_output_artifacts, delegated_run_id,
+                    context.metadata.get("conversation_scope_id", context.session_id),
+                    context.workspace, context.tool_call_id, references,
+                ))
+
         if allow_writes and available != "write":
             refusal = f"Delegation capability rejected: requested {requested}; available {available}"
             await emit("delegate.refused", error=refusal)
@@ -178,6 +190,7 @@ class DelegateTaskTool(Tool):
                           "delegation_allow_writes": allow_writes},
             )
             result = await self._investigate(arguments, delegated_context, state, emit)
+            await handoff_artifacts(result)
             state.receipts[delegation_id] = truncate_text(context.events.redactor.text(result.output), 4_000)
             await emit("delegate.failed" if result.is_error else "delegate.completed",
                        result=truncate_text(result.output, context.config.context.tool_output_chars),
@@ -196,6 +209,7 @@ class DelegateTaskTool(Tool):
             prior = state.handoffs.get(context.tool_call_id)
             result = _partial_handoff(str(arguments["task"]), cause, context,
                                       {**(prior.metadata if prior else {}), **lineage})
+            await handoff_artifacts(result)
             state.handoffs[context.tool_call_id] = result
             state.receipts[delegation_id] = truncate_text(result.output, 4_000)
             await finish_on_cancellation(emit(
@@ -218,6 +232,8 @@ class DelegateTaskTool(Tool):
         builder = context.metadata.get("context_builder")
         usage_sink = context.metadata.get("usage_sink")
         before_model_request = cast(Callable[[], None] | None, context.metadata.get("before_model_request"))
+        prepare_delegate = cast(Callable[..., Awaitable[ProviderRequest]] | None,
+                                context.metadata.get("delegate_prepare"))
         execute_nested = cast(Callable[[ToolCall, ToolContext], Awaitable[ToolResult]] | None,
                               context.metadata.get("delegate_execute"))
         if not routes or registry is None or builder is None:
@@ -237,6 +253,9 @@ class DelegateTaskTool(Tool):
                    "You may delegate within shared operator limits. "
                    "Return a concise handoff with findings, relevant paths and line references, unresolved questions, and completion status.")
         messages = [Message(role=Role.USER, content=str(arguments["task"]))]
+        if callable(prepare_delegate):
+            context.metadata["conversation_scope_id"] = context.run_id
+        context.metadata.pop("plan", None)
         failed_calls: dict[str, int] = {}
         usage = Usage()  # This agent's provider usage only. The root sink owns all billing.
         budget = context.metadata.get("budget")
@@ -259,6 +278,9 @@ class DelegateTaskTool(Tool):
 
             async def settle() -> None:
                 nonlocal reservation
+                store = context.metadata.get("session_store")
+                if callable(prepare_delegate) and store is not None:
+                    await asyncio.to_thread(store.add_usage, context.run_id, increment)
                 if budget:
                     budget.release_cost(reservation)
                     budget.release_usage(cancelled_usage)
@@ -269,6 +291,37 @@ class DelegateTaskTool(Tool):
                         await result
             await finish_on_cancellation(settle())
             await emit("delegate.usage", provider=route.name, model=route.model, usage=increment.to_dict())
+
+        async def helper_usage(increment: Usage, *, settled: bool = False) -> None:
+            # Successful cached helpers already charged their isolated store row.
+            # All physical charges still reach the root sink exactly once.
+            usage.add(increment)
+            store = context.metadata.get("session_store")
+            if store is not None and not settled:
+                await asyncio.to_thread(store.add_usage, context.run_id, increment)
+            prior = state.handoffs.get(context.metadata["delegation_call_id"])
+            if prior is not None:
+                prior.metadata["usage"] = usage.to_dict()
+            sink = context.metadata.get("settled_usage_sink") if settled else usage_sink
+            if callable(sink):
+                result = sink(increment)
+                if asyncio.iscoroutine(result):
+                    await result
+            await emit("delegate.usage", provider=route.name, model=route.model,
+                       purpose="compaction_summary", usage=increment.to_dict())
+
+        async def settled_helper_usage(increment: Usage) -> None:
+            await helper_usage(increment, settled=True)
+
+        async def prepare(request: ProviderRequest) -> ProviderRequest:
+            if callable(prepare_delegate):
+                return await prepare_delegate(request, context, helper_usage,
+                                              settled_helper_usage, overflow_retries, prompt_context)
+            # Standalone registries without an application preparer retain bounded
+            # endpoint fitting, but cannot promise durable/full compaction.
+            fitted = prepare_route_request(request, route.provider, context.config.agent,
+                                           overflow_retry_count=overflow_retries)
+            return replace(fitted, metadata={**fitted.metadata, "compaction_support": "endpoint_only"})
 
         final = ""
         sources: list[dict[str, Any]] = []
@@ -304,15 +357,23 @@ class DelegateTaskTool(Tool):
                       f"remaining child turns including this one: {max_turns - turn_index}. "
                       + requests + "Return partial findings and unresolved limits when work cannot finish.")
 
+        prompt_context = PromptContext(stable=system)
         incomplete("investigation_not_started")
         while turn_index < max_turns:
             # With three or more turns, leave one turn for a rejected conclusion.
             synthesis_turn = (repair_answer or turn_index >= closure_start
                               or bool(budget and not budget.has_request_capacity()))
-            closure_messages = [messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]] if synthesis_turn else messages
+            closure_messages = (
+                [messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]]
+                if synthesis_turn and not callable(prepare_delegate) else messages
+            )
+            prompt_context = PromptContext(
+                stable=system + ("\n\n" + CLOSURE_INSTRUCTION if synthesis_turn else ""),
+                dynamic=bounds_text().removeprefix("\n\n"),
+            )
             request = ProviderRequest(
                 model=route.model,
-                system=system + bounds_text() + ("\n\nThis is a conclusion turn. Do not request tools. Return the concise, evidence-backed conclusion now." if synthesis_turn else ""),
+                system=prompt_context.text,
                 messages=closure_messages, tools=[] if synthesis_turn else schemas,
                 max_output_tokens=min(context.config.agent.max_output_tokens, 8000),
                 reasoning_effort=context.config.agent.reasoning_effort or None,
@@ -321,19 +382,17 @@ class DelegateTaskTool(Tool):
                           "provider_route": route.name, "delegation_id": context.metadata["delegation_id"],
                           "delegation_depth": context.metadata["delegation_depth"]},
             )
-            request = prepare_route_request(request, route.provider, context.config.agent, overflow_retry_count=overflow_retries)
+            request = await prepare(request)
             await emit("delegate.state", state="waiting")
             async with state.provider_slots:
                 state.active_requests += 1
                 try:
-                    # Siblings can spend the last investigative request while
-                    # this child waits for a provider slot (including capacity 1).
+                    # Preparation can spend shared capacity; siblings can also
+                    # consume it while we wait. Release the slot before preparing
+                    # the tool-free conclusion, including its own artifact.
                     if budget and not synthesis_turn and not budget.has_request_capacity():
-                        synthesis_turn = True
-                        request = replace(request, tools=[], parallel_tool_calls=False,
-                                          messages=[messages[0], Message(role=Role.USER, content=CLOSURE_INSTRUCTION), *messages[1:]],
-                                          system=system + bounds_text() + "\n\nShared investigative capacity is exhausted. This is your final turn; return qualified findings without tools.")
-                        request = prepare_route_request(request, route.provider, context.config.agent, overflow_retry_count=overflow_retries)
+                        repair_answer = True
+                        continue
                     reservation = budget.reserve_cost(route.provider, request) if budget else 0.0
                     cancelled_usage = Usage()
                     usage_recorded = False
@@ -407,11 +466,12 @@ class DelegateTaskTool(Tool):
             if not response.incomplete and not response.tool_calls:
                 if usable_answer(response.text):
                     final = response.text
+                    messages.append(Message(role=Role.ASSISTANT, content=final))
                     break
                 if not repair_answer and turn_index < max_turns:
                     repair_answer = True
-                    messages.append(Message(role=Role.USER, content=
-                        CLOSURE_INSTRUCTION))
+                    if not callable(prepare_delegate):
+                        messages.append(Message(role=Role.USER, content=CLOSURE_INSTRUCTION))
                     continue
                 return incomplete(invalid_cause)
             if response.incomplete or synthesis_turn:
@@ -426,6 +486,9 @@ class DelegateTaskTool(Tool):
                 if continuation is not None:
                     assistant.metadata["continuation_state"] = continuation
             messages.append(assistant)
+            store = context.metadata.get("session_store")
+            if callable(prepare_delegate) and store is not None:
+                await asyncio.to_thread(store.sync_conversation_messages, context.run_id, messages)
 
             calls: list[ToolCall] = []
             originals: list[ToolCall] = []
@@ -486,10 +549,16 @@ class DelegateTaskTool(Tool):
                     if item.id not in completed:
                         continue
                     observed = completed[item.id]
-                    sources.append({"tool_call_id": item.id, "tool": item.name, "is_error": observed.is_error,
-                                    **{key: observed.metadata[key] for key in
-                                    ("path", "sha256", "output_artifact", "delegation_id") if key in observed.metadata}})
-                    observations.append({**sources[-1],
+                    source = {"tool_call_id": item.id, "tool": item.name, "is_error": observed.is_error,
+                              **{key: observed.metadata[key] for key in
+                                 ("path", "sha256", "output_artifact", "delegation_id") if key in observed.metadata}}
+                    sources.append(source)
+                    # Forward only artifact references from the nested runtime
+                    # handoff. The store validates their existing receipt/access.
+                    if isinstance(registry.get(item.name), DelegateTaskTool):
+                        sources.extend(dict(reference) for reference in observed.metadata.get("evidence", [])
+                                       if (reference.get("output_artifact") or {}).get("artifact_id"))
+                    observations.append({**source,
                                          "is_error": observed.is_error,
                                          "excerpt": truncate_text(context.events.redactor.text(observed.output), 600)})
                 receipt = context.events.redactor.text(incomplete("investigation not concluded").output)
@@ -501,6 +570,9 @@ class DelegateTaskTool(Tool):
                 messages.append(Message(role=Role.TOOL, content=result.output, tool_call_id=original.id,
                                         tool_name=call.name, is_error=result.is_error, metadata=result.metadata))
             # Assistant call IDs stay provider-native for continuation replay.
+        store = context.metadata.get("session_store")
+        if callable(prepare_delegate) and store is not None:
+            await asyncio.to_thread(store.sync_conversation_messages, context.run_id, messages)
         metadata = {"usage": usage.to_dict(), "turns": turn_index, "evidence": sources,
                     "requested_max_turns": int(arguments["max_turns"]), "effective_max_turns": max_turns,
                     "completion_status": "completed", "result_source": "model"}

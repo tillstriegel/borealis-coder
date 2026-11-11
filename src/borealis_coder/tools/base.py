@@ -89,7 +89,7 @@ class ToolContext:
                 for redactor in redactors.values():
                     captured.append(redactor.flush(mask_incomplete=status != "complete" or capture_limited))
                 artifact = store.save_output_artifact(
-                    self.session_id, self.workspace, "".join(captured), source=self.tool_call_id,
+                    self.metadata.get("conversation_scope_id", self.session_id), self.workspace, "".join(captured), source=self.tool_call_id,
                     redactor=self.events.redactor, status="quota_limited" if capture_limited else status,
                     observed_bytes=observed_bytes, collection_status=status,
                 )
@@ -334,7 +334,7 @@ def bound_tool_output(result: ToolResult, context: ToolContext, limit: int) -> T
     store = context.metadata.get("session_store")
     if (len(result.output) > limit or result.metadata.get("collection_status") == "partial") and store is not None and artifact is None:
         artifact = store.save_output_artifact(
-            context.session_id, context.workspace, result.output,
+            context.metadata.get("conversation_scope_id", context.session_id), context.workspace, result.output,
             source=context.tool_call_id, redactor=context.events.redactor,
             status=result.metadata.get("collection_status", "complete"),
             observed_bytes=result.metadata.get("observed_bytes"),

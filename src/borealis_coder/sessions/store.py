@@ -18,7 +18,7 @@ from ..errors import SessionError
 from ..models import CompactionArtifact, Event, Message, SessionInfo, Usage
 from ..util import ensure_private_directory, ensure_private_file, json_dumps, new_id, utc_now
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _DEDUPLICATED_PROVIDER_CONTEXT_STORAGE = "deduplicated-v1"
 _EVENT_EXPORT_PAGE_SIZE = 1_000
 
@@ -270,11 +270,25 @@ class SessionStore:
                 metadata_json TEXT NOT NULL,
                 PRIMARY KEY(session_id, artifact_id)
             );
+            CREATE TABLE IF NOT EXISTS delegated_artifact_handoffs (
+                recipient_scope_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                owner_scope_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                PRIMARY KEY(recipient_scope_id, artifact_id),
+                FOREIGN KEY(owner_scope_id, artifact_id)
+                    REFERENCES output_artifacts(session_id, artifact_id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS key_values (
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 key TEXT NOT NULL,
                 value_json TEXT NOT NULL,
                 PRIMARY KEY(session_id, key)
+            );
+            CREATE TABLE IF NOT EXISTS delegated_conversations (
+                scope_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                delegation_id TEXT NOT NULL,
+                depth INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS compaction_artifacts (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -494,6 +508,70 @@ class SessionStore:
             self._connection.execute("INSERT INTO usage(session_id) VALUES(?)", (session_id,))
         return self.get_session(session_id)
 
+    def ensure_delegated_conversation(
+        self, root_session_id: str, scope_id: str, delegation_id: str, depth: int,
+        *, delegation_call_id: str | None = None,
+    ) -> None:
+        """Create a hidden durable conversation. This never resumes child execution."""
+        root = self.get_session(root_session_id)
+        if root.metadata.get("delegated_conversation"):
+            raise SessionError("Delegated conversations require a root session owner")
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                "SELECT root_session_id,delegation_id,depth FROM delegated_conversations WHERE scope_id=?",
+                (scope_id,),
+            ).fetchone()
+            if row is not None:
+                if tuple(row) != (root_session_id, delegation_id, depth):
+                    raise SessionError("Delegated conversation identity mismatch")
+                if delegation_call_id is not None:
+                    saved = self._connection.execute(
+                        "SELECT metadata_json FROM sessions WHERE id=?", (scope_id,),
+                    ).fetchone()
+                    metadata = json.loads(saved[0])
+                    if metadata.get("delegation_call_id") not in (None, delegation_call_id):
+                        raise SessionError("Delegated conversation call identity mismatch")
+                    metadata["delegation_call_id"] = delegation_call_id
+                    self._connection.execute("UPDATE sessions SET metadata_json=? WHERE id=?",
+                                             (json_dumps(metadata), scope_id))
+                return
+            now = utc_now()
+            self._connection.execute(
+                "INSERT INTO sessions(id,workspace,title,provider,model,status,created_at,updated_at,metadata_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (scope_id, root.workspace, "Internal delegated conversation", root.provider,
+                 root.model, "idle", now, now, json_dumps({
+                     "delegated_conversation": True, "root_session_id": root_session_id,
+                     "delegation_id": delegation_id, "depth": depth,
+                     "delegation_call_id": delegation_call_id,
+                 })),
+            )
+            self._connection.execute("INSERT INTO usage(session_id) VALUES(?)", (scope_id,))
+            self._connection.execute(
+                "INSERT INTO delegated_conversations VALUES(?,?,?,?)",
+                (scope_id, root_session_id, delegation_id, depth),
+            )
+
+    def sync_conversation_messages(self, scope_id: str, messages: list[Message]) -> None:
+        """Append a validated snapshot suffix; never replace an earlier child message."""
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            if self._connection.execute(
+                "SELECT 1 FROM delegated_conversations WHERE scope_id=?", (scope_id,),
+            ).fetchone() is None:
+                raise SessionError("Unknown delegated conversation")
+            saved = [Message.from_dict(json.loads(row[0])) for row in self._connection.execute(
+                "SELECT payload_json FROM messages WHERE session_id=? ORDER BY sequence", (scope_id,),
+            )]
+            if any(
+                left.to_dict() != right.to_dict()
+                for left, right in zip(saved, messages, strict=False)
+            ):
+                raise SessionError("Delegated conversation snapshot is not append-only")
+            for message in messages[len(saved):]:
+                self._append_message_locked(scope_id, message)
+
     def get_session(self, session_id: str) -> SessionInfo:
         with self._lock, self._connection:
             row = self._connection.execute(
@@ -507,10 +585,11 @@ class SessionStore:
     def list_sessions(
         self, *, workspace: Path | None = None, limit: int = 100
     ) -> list[SessionInfo]:
-        query = "SELECT * FROM sessions"
+        query = ("SELECT * FROM sessions WHERE NOT EXISTS "
+                 "(SELECT 1 FROM delegated_conversations WHERE scope_id=sessions.id)")
         params: list[Any] = []
         if workspace is not None:
-            query += " WHERE workspace=?"
+            query += " AND workspace=?"
             params.append(str(workspace.resolve()))
         query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(max(1, limit))
@@ -601,6 +680,10 @@ class SessionStore:
 
     def delete_session(self, session_id: str) -> None:
         with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM sessions WHERE id IN "
+                "(SELECT scope_id FROM delegated_conversations WHERE root_session_id=?)", (session_id,),
+            )
             cursor = self._connection.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             if cursor.rowcount == 0:
                 raise SessionError(f"Unknown session: {session_id}")
@@ -1185,9 +1268,19 @@ class SessionStore:
         """Read one completed source from the owning session, not a global history scan."""
         self.authorize_workspace(session_id, workspace)
         with self._lock:
+            scope = self._connection.execute(
+                "SELECT root_session_id,delegation_id FROM delegated_conversations WHERE scope_id=?", (session_id,),
+            ).fetchone()
+            owner = str(scope[0]) if scope is not None else session_id
+            scoped_call_id = str(scope[1]) + "." + call_id if scope is not None else call_id
+            run_scope = session_id if scope is not None else None
             row = self._connection.execute(
                 "SELECT tool_name,output,is_error,status,metadata_json FROM tool_calls "
-                "WHERE session_id=? AND tool_call_id=?", (session_id, call_id),
+                "WHERE session_id=? AND tool_call_id IN (?,?) AND (? IS NULL OR run_id=? "
+                "OR EXISTS (SELECT 1 FROM delegated_artifact_handoffs AS handoff "
+                "WHERE handoff.recipient_scope_id=? AND handoff.owner_scope_id=tool_calls.run_id "
+                "AND handoff.artifact_id=json_extract(tool_calls.metadata_json,'$.output_artifact.artifact_id')))",
+                (owner, call_id, scoped_call_id, run_scope, run_scope, session_id),
             ).fetchone()
         if row is None or row["status"] != "completed" or row["is_error"]:
             raise SessionError("Finding source must be a successful completed call in this session")
@@ -1318,6 +1411,11 @@ class SessionStore:
                     f"Compaction summary {key!r} changed during usage settlement"
                 )
             self._add_usage_locked(session_id, usage)
+            scope = self._connection.execute(
+                "SELECT root_session_id FROM delegated_conversations WHERE scope_id=?", (session_id,),
+            ).fetchone()
+            if scope is not None:
+                self._add_usage_locked(str(scope[0]), usage)
             return value, usage, True
 
     def usage(self, session_id: str) -> Usage:
@@ -1482,6 +1580,83 @@ class SessionStore:
         if Path(self.get_session(session_id).workspace).resolve() != workspace.resolve():
             raise SessionError("Session does not belong to this workspace")
 
+    def _output_artifact_owner_locked(self, scope_id: str, artifact_id: str) -> str:
+        rows = self._connection.execute(
+            "SELECT session_id FROM output_artifacts AS artifact WHERE artifact_id=? "
+            "AND (session_id=? OR EXISTS (SELECT 1 FROM delegated_artifact_handoffs AS handoff "
+            "WHERE handoff.recipient_scope_id=? AND handoff.owner_scope_id=artifact.session_id "
+            "AND handoff.artifact_id=artifact.artifact_id))",
+            (artifact_id, scope_id, scope_id),
+        ).fetchall()
+        if len(rows) != 1:
+            raise SessionError("Artifact missing or unavailable in this session")
+        return str(rows[0][0])
+
+    def handoff_output_artifacts(
+        self, sender_scope_id: str, recipient_scope_id: str, workspace: Path,
+        delegation_call_id: str, evidence: list[dict[str, Any]],
+    ) -> None:
+        """Expose only receipt-backed artifacts returned to this child's immediate parent.
+
+        Links retain original ownership, shape and storage quotas; they copy no output.
+        Model text and arbitrary artifact IDs cannot create handoff authority.
+        """
+        self.authorize_workspace(sender_scope_id, workspace)
+        self.authorize_workspace(recipient_scope_id, workspace)
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            child = self._connection.execute(
+                "SELECT root_session_id,delegation_id FROM delegated_conversations WHERE scope_id=?",
+                (sender_scope_id,),
+            ).fetchone()
+            if child is None:
+                raise SessionError("Artifact handoff requires a delegated conversation")
+            sender = self._connection.execute(
+                "SELECT metadata_json FROM sessions WHERE id=?", (sender_scope_id,),
+            ).fetchone()
+            if json.loads(sender[0]).get("delegation_call_id") != delegation_call_id:
+                raise SessionError("Artifact handoff does not match the delegation call identity")
+            parent_call = self._connection.execute(
+                "SELECT run_id FROM tool_calls WHERE session_id=? AND tool_call_id=?",
+                (child[0], delegation_call_id),
+            ).fetchone()
+            if parent_call is None or sender_scope_id != str(parent_call[0]) + "." + str(child[1]):
+                raise SessionError("Artifact handoff does not match the delegation receipt")
+            parent = self._connection.execute(
+                "SELECT root_session_id FROM delegated_conversations WHERE scope_id=?", (parent_call[0],),
+            ).fetchone()
+            expected_recipient = str(parent_call[0]) if parent is not None else str(child[0])
+            if recipient_scope_id != expected_recipient or (parent is not None and parent[0] != child[0]):
+                raise SessionError("Artifact handoff must target the immediate parent")
+            for reference in evidence:
+                artifact_id = (reference.get("output_artifact") or {}).get("artifact_id")
+                if not artifact_id:
+                    continue
+                owner = self._output_artifact_owner_locked(sender_scope_id, artifact_id)
+                source = self._connection.execute(
+                    "SELECT metadata_json FROM tool_calls WHERE session_id=? AND run_id=? "
+                    "AND tool_call_id=? AND status IN ('completed','error')",
+                    (child[0], owner, reference.get("tool_call_id")),
+                ).fetchone()
+                artifact = self._connection.execute(
+                    "SELECT metadata_json FROM output_artifacts WHERE session_id=? AND artifact_id=?",
+                    (owner, artifact_id),
+                ).fetchone()
+                if (source is None or artifact is None
+                        or json.loads(artifact[0]).get("source") != reference.get("tool_call_id")
+                        or (json.loads(source[0]).get("output_artifact") or {}).get("artifact_id") != artifact_id):
+                    raise SessionError("Artifact handoff source is not a completed evidence receipt")
+                existing = self._connection.execute(
+                    "SELECT owner_scope_id FROM delegated_artifact_handoffs "
+                    "WHERE recipient_scope_id=? AND artifact_id=?", (recipient_scope_id, artifact_id),
+                ).fetchone()
+                if existing is not None and existing[0] != owner:
+                    raise SessionError("Artifact handoff ownership cannot change")
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO delegated_artifact_handoffs VALUES(?,?,?)",
+                    (recipient_scope_id, owner, artifact_id),
+                )
+
     def output_artifact_has_quote(
         self, session_id: str, workspace: Path, artifact_id: str, quote: str,
         *, json_envelope: bool = False,
@@ -1505,11 +1680,12 @@ class SessionStore:
             parameters.append(quote)
             partial_content = "CASE WHEN NOT json_valid(content) THEN content END"
         with self._lock:
+            owner = self._output_artifact_owner_locked(session_id, artifact_id)
             row = self._connection.execute(
                 f"SELECT {expression} AS matched, {partial_content} AS partial_content, "
                 "metadata_json FROM output_artifacts "
                 "WHERE session_id=? AND artifact_id=?",
-                [*parameters, session_id, artifact_id],
+                [*parameters, owner, artifact_id],
             ).fetchone()
         if row is None:
             raise SessionError("Artifact missing or unavailable in this session")
@@ -1525,9 +1701,10 @@ class SessionStore:
         if offset < 0 or not 1 <= limit <= 16_000:
             raise SessionError("Invalid artifact range")
         with self._lock:
+            owner = self._output_artifact_owner_locked(session_id, artifact_id)
             row = self._connection.execute(
                 "SELECT content, metadata_json FROM output_artifacts WHERE session_id=? AND artifact_id=?",
-                (session_id, artifact_id),
+                (owner, artifact_id),
             ).fetchone()
         if row is None:
             raise SessionError("Artifact missing or unavailable in this session")
@@ -1549,11 +1726,17 @@ class SessionStore:
         if offset < 0:
             raise SessionError("History offset must be nonnegative")
         with self._lock:
+            scope = self._connection.execute(
+                "SELECT root_session_id FROM delegated_conversations WHERE scope_id=?", (session_id,),
+            ).fetchone()
+            owner = str(scope[0]) if scope is not None else session_id
+            run_scope = session_id if scope is not None else None
             rows = self._connection.execute(
                 "SELECT sequence,payload_json FROM events WHERE session_id=? AND sequence>? "
+                "AND (? IS NULL OR run_id=?) "
                 "AND type='tool.completed' AND (instr(json_extract(payload_json,'$.data.output'),?)>0 "
                 "OR json_extract(payload_json,'$.data.tool_call_id')=?) ORDER BY sequence LIMIT 20",
-                (session_id, after, query, query),
+                (owner, after, run_scope, run_scope, query, query),
             ).fetchall()
         results = []
         for row in rows:
