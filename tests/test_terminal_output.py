@@ -106,6 +106,8 @@ class TerminalOutputTests(unittest.TestCase):
                 self.check_terminal(width, cpr)
 
     def check_terminal(self, width: int, cpr: bool) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PTY acceptance requires POSIX")
         import fcntl
         import pty
         import termios
