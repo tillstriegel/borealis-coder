@@ -1224,6 +1224,7 @@ class CLITests(unittest.TestCase):
                 history_enabled=False,
             )
             runner = SimpleNamespace(
+                sessions=SimpleNamespace(usage=Mock(return_value=Usage())),
                 accepts_steering=Mock(side_effect=lambda session_id: session_id == "sess_test"),
                 queued_prompts=Mock(return_value=1),
                 steer=Mock(),
@@ -2007,6 +2008,7 @@ class CLITests(unittest.TestCase):
                 )
                 runner = SimpleNamespace(
                     run=AsyncMock(return_value=result),
+                    sessions=SimpleNamespace(usage=Mock(return_value=Usage())),
                     reclaim_steering=Mock(return_value=["late direction"]),
                 )
                 shell.runner = cast(Any, runner)
