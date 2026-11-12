@@ -39,6 +39,7 @@ class _UsageObservation:
     check_usage: Callable[[], None] | None
     before_recovery: Callable[[], None] | None = None
     prepare_recovery: Callable[[ProviderRequest], None] | None = None
+    on_dispatch: Callable[[ProviderRequest], Awaitable[None]] | None = None
     handled: bool = False
 
 
@@ -97,9 +98,10 @@ class Provider(abc.ABC):
         before_recovery: Callable[[], None] | None = None,
         *,
         prepare_recovery: Callable[[ProviderRequest], None] | None = None,
+        on_dispatch: Callable[[ProviderRequest], Awaitable[None]] | None = None,
     ) -> Iterator[_UsageObservation]:
         existing = self._usage_observation.get()
-        observation = existing or _UsageObservation(on_usage, check_usage, before_recovery, prepare_recovery)
+        observation = existing or _UsageObservation(on_usage, check_usage, before_recovery, prepare_recovery, on_dispatch)
         token = self._usage_observation.set(observation)
         try:
             yield observation
@@ -115,6 +117,14 @@ class Provider(abc.ABC):
                 observation.prepare_recovery(request)
             if observation.before_recovery is not None:
                 observation.before_recovery()
+
+    async def before_request(self, request: ProviderRequest, *, recovery: bool = False) -> None:
+        """Finish synchronous recovery admission, then await dispatch observers."""
+        if recovery:
+            self.before_recovery_request(request)
+        observation = self._usage_observation.get()
+        if observation is not None and observation.on_dispatch is not None:
+            await observation.on_dispatch(request)
 
     @contextmanager
     def request_attempt(

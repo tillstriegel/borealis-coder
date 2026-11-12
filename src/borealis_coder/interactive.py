@@ -20,12 +20,13 @@ from .agent import AgentRunner, build_runner
 from .config import Config
 from .diagnostics import run_diagnostics
 from .errors import BorealisError, ConfigurationError, SessionError
-from .models import AgentResult, Event, Role
+from .models import AgentResult, Event, Role, Usage
 from .safety import ApprovalRequest
 from .swarm_view import SwarmView
 from .terminal import AuroraUI, ConsoleRenderer, ReadlineHistory
 from .terminal_input import LineBufferedStdout, TerminalInput, TerminalInputInterrupted
 from .tools._workspace_lock import workspace_transaction
+from .usage_view import UsageView
 from .util import truncate_text
 
 ApprovalCallback = Callable[[ApprovalRequest], bool | str | Any]
@@ -102,6 +103,8 @@ class InteractiveCLI:
         ] = asyncio.Queue()
         self._input: TerminalInput | None = None
         self.swarm = SwarmView()
+        self.usage_view = UsageView()
+        self._root_run_id: str | None = None
 
     @property
     def ui(self) -> AuroraUI:
@@ -110,6 +113,7 @@ class InteractiveCLI:
     async def run(self) -> int:
         self.runner = await self._new_runner(self.config)
         await self._select_initial_session()
+        await self._refresh_usage()
         self._print_banner()
         history_file = self.config.storage_dir / "cli-history"
         if not self._concurrent_input():
@@ -130,6 +134,7 @@ class InteractiveCLI:
                 self._input = TerminalInput(
                     history_file,
                     swarm=self.swarm,
+                    usage=self.usage_view,
                     history_enabled=self.history_enabled,
                     completions=_COMMANDS,
                     completion_descriptions=_COMMAND_DESCRIPTIONS,
@@ -522,6 +527,7 @@ class InteractiveCLI:
             return
         runner = self._require_runner()
         self.renderer.reset_turn()
+        self._root_run_id = None
         self._active_session_id = self.session_id
         self._interrupt_count = 0
         task = asyncio.create_task(runner.run(prompt, session_id=self.session_id))
@@ -557,6 +563,7 @@ class InteractiveCLI:
                 if reclaimed:
                     self._pending_follow_ups[0:0] = reclaimed
             self.renderer.finish_turn()
+            await self._refresh_usage()
         self.session_id = result.session_id
         if result.text and not self.renderer.has_rendered(result.text):
             print(result.text)
@@ -624,6 +631,8 @@ class InteractiveCLI:
             )
         elif command in {"/new", "/clear"}:
             self.session_id = None
+            self.usage_view.clear_context()
+            await self._refresh_usage()
             self.ui.notice(
                 "success",
                 "Started a fresh conversation",
@@ -710,6 +719,8 @@ class InteractiveCLI:
                     f"Session workspace is {info.workspace}, not {self.workspace}"
                 )
         self.session_id = info.id
+        self.usage_view.clear_context()
+        await self._refresh_usage()
         if announce:
             self.ui.notice(
                 "success",
@@ -899,6 +910,8 @@ class InteractiveCLI:
         self.runner = replacement
         self.config = candidate
         await previous.close()
+        self.usage_view.clear_context()
+        await self._refresh_usage()
         self.ui.notice("success", "Runtime updated", description)
 
     def _print_tools(self, filter_text: str) -> None:
@@ -1010,11 +1023,34 @@ class InteractiveCLI:
             "type during a turn to steer · Ctrl+C cancels · // sends a literal slash",
         )
 
+    async def _refresh_usage(self) -> None:
+        # Read only at lifecycle boundaries, off the render/event-loop thread.
+        self.usage_view.usage = (
+            await asyncio.to_thread(self._require_runner().sessions.usage, self.session_id)
+            if self.session_id else Usage()
+        )
+        if self._input is not None:
+            self._input.invalidate()
+
     async def _observe(self, event: Event) -> None:
         if event.type == "run.started" and event.session_id:
+            # Delegated runs have their own run IDs and must not own this HUD.
+            if self._root_run_id is not None and event.run_id != self._root_run_id:
+                return
+            self._root_run_id = event.run_id
             self._active_session_id = event.session_id
             self.session_id = event.session_id
+            self.usage_view.clear_context()
+            await self._refresh_usage()
             self._flush_follow_ups()
+        if event.session_id != self.session_id or event.run_id != self._root_run_id:
+            return
+        if event.type == "context.usage":
+            self.usage_view.context_tokens = event.data["estimated_input_tokens"]
+            self.usage_view.context_limit = event.data["effective_context_tokens"]
+            await self._refresh_usage()
+        elif event.type in {"usage.settled", "swarm.updated", "model.completed", "run.completed"}:
+            await self._refresh_usage()
 
     def _primary_route(self):  # type: ignore[no-untyped-def]
         return self._require_runner().providers[0]

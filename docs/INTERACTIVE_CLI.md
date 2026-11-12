@@ -76,6 +76,52 @@ non-color output uses a persistent heartbeat every ten seconds instead.
 These messages describe observable runtime state. Borealis does not expose
 private model reasoning or stream raw tool arguments to the terminal.
 
+## Bottom input and session usage
+
+On capable terminals, the editable form stays at the physical bottom while idle
+and while output streams. The HUD sits immediately above it. The compact form
+leaves recent output visible above input; older output enters normal terminal
+scrollback once. Completion menus open above the input. Long drafts
+scroll within the form; the swarm view yields space as the draft grows and hides
+when there is too little room. Resize keeps the draft, cursor and focus.
+
+- `Context est.` shows the latest prepared root request as a progress bar and
+  percentage of its resolved effective context budget. It includes system text,
+  tools, retained messages and request framing. It is a conservative estimate,
+  not cumulative usage. Compaction and route limits are applied before measuring.
+  Before a request, after resume, and after a model/provider change, it shows
+  `Context unavailable` until a new request supplies evidence.
+- `Cache read` is cumulative cached input tokens divided by cumulative input
+  tokens in the active saved session. It is weighted across requests and shows
+  `n/a` before any input tokens are recorded. Response-cache hits are separate.
+- `Tokens` uses the canonical session usage total, including billed helper and
+  delegated work once. It updates as usage settles, including failure or
+  cancellation, and survives subsequent turns and resume. `/new` and `/clear`
+  start a fresh total without deleting the previous session.
+
+At narrow widths the HUD uses two lines. `NO_COLOR` keeps it monochrome. Dumb
+terminals, redirected streams and JSON use the existing serial output.
+
+For an offline streaming/input check (mock provider only):
+
+```bash
+PYTHONPATH=src python -m scripts.input_demo
+PYTHONPATH=src python -m scripts.input_demo --capture-dir /path/to/captures --width 48
+```
+
+The capture mode exports the prompt-toolkit form cells, text and SVG for idle,
+streaming, resized and completed frames, and checks cursor-preserving editing.
+These compositor captures contain only the form. The emitted-ANSI acceptance
+test uses a real PTY and a terminal emulator to check visible stdout, scrollback,
+approvals, resize and editing together:
+
+```bash
+PYTHONPATH=src python -m unittest tests.test_terminal_output
+```
+
+The emulator is a development dependency. To save its visible-screen/history
+snapshots and raw ANSI, set `BOREALIS_TERMINAL_CAPTURE_DIR` to a capture directory.
+
 ## Live swarm view
 
 The Aurora swarm tree appears automatically on delegation. It stays in a bounded

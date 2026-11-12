@@ -2561,7 +2561,12 @@ class AgentRunner(RequestPreparer):
                 raise budget_error
 
         async def settled_usage_sink(usage: Usage) -> None:
-            budget.add_usage(usage)
+            try:
+                budget.add_usage(usage)
+            finally:
+                # The summary transaction already charged the root ledger,
+                # including summaries from delegated conversation scopes.
+                await self.events.emit("usage.settled", session_id=session_id, run_id=run_id)
 
         context.metadata["swarm_state"] = SwarmState.start(self.config.agent)
 
@@ -4040,6 +4045,7 @@ class AgentRunner(RequestPreparer):
                     # Old cache entries predate terminal-answer validation.
                     cached = None
                 if cached is not None:
+                    await self._emit_context_usage(route, routed, session_id, run_id)
                     original_usage = Usage.from_dict(cached.get("usage"))
                     payload = cached.get("response") or {}
                     usage = Usage(
@@ -4242,6 +4248,23 @@ class AgentRunner(RequestPreparer):
             and usage.cache_write_tokens > usage.cached_input_tokens
         )
 
+    async def _emit_context_usage(
+        self, route: ProviderRoute, request: ProviderRequest, session_id: str, run_id: str,
+    ) -> None:
+        # Only the root completion path calls this. Measure after compaction,
+        # protected-state restoration and dispatch-time schema removal.
+        occupancy = ContextBudget.calculate(
+            self.config.agent, system=request.system,
+            tools=[*request.tools, *([{"response_schema": request.response_schema}]
+                                    if request.response_schema else [])],
+            messages=request.messages, provider=route.provider.name,
+        ).estimated_total(request.messages)
+        await self.events.emit(
+            "context.usage", session_id=session_id, run_id=run_id,
+            estimated_input_tokens=occupancy,
+            effective_context_tokens=request.metadata.get("resolved_limits", {}).get("effective_context_tokens"),
+        )
+
     async def _stream_route(
         self,
         route: ProviderRoute,
@@ -4283,13 +4306,18 @@ class AgentRunner(RequestPreparer):
                     usage_collector.add(usage)
                     if budget:
                         budget.hold_usage(usage_collector)
+            async def on_dispatch(actual: ProviderRequest) -> None:
+                await self._emit_context_usage(route, actual, session_id, run_id)
+
             with route.provider.observe_requests(
                 record_usage,
                 (lambda: budget.check_unsettled(usage_collector if usage_collector is not None else failed_usage)) if budget else None,
                 budget.before_model_request if budget else None,
                 prepare_recovery=prepare_dispatch,
+                on_dispatch=on_dispatch,
             ) as observation:
                 try:
+                    await route.provider.before_request(request)
 
                     async def consume() -> ModelResponse | None:
                         nonlocal actionable_emitted, completed

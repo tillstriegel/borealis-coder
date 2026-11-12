@@ -80,7 +80,7 @@ class ChatGPTProvider(OpenAIProvider):
                     raise
                 # A 401/403 can arrive before the JWT expiry timestamp. Refresh once
                 # and replay only because the stream emitted no user-visible content.
-                self.before_recovery_request(request)
+                await self.before_request(request, recovery=True)
                 continue
         raise ProviderAuthenticationError(
             "ChatGPT authentication failed after refreshing credentials. Run `borealis auth login`."

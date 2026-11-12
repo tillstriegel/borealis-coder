@@ -119,7 +119,7 @@ class OpenAIProvider(Provider):
                 raise
             if error.usage is not None:
                 prior_usage.add(error.usage)
-        self.before_recovery_request(request)
+        await self.before_request(request, recovery=True)
         try:
             response = await self._complete_responses_once(request, include_reasoning_summary=False)
         except ProviderError as error:
@@ -169,7 +169,7 @@ class OpenAIProvider(Provider):
                 raise
             if error.usage is not None:
                 prior_usage.add(error.usage)
-        self.before_recovery_request(request)
+        await self.before_request(request, recovery=True)
         try:
             async for event in self._stream_responses_committed_once(
                 request, include_reasoning_summary=False,
@@ -589,7 +589,7 @@ class OpenAIProvider(Provider):
                     code="empty_response",
                 )
             prior_usage.add(response.usage)
-        self.before_recovery_request(fallback)
+        await self.before_request(fallback, recovery=True)
         try:
             response = await self._complete_chat_once(fallback)
         except ProviderError as error:
@@ -670,7 +670,7 @@ class OpenAIProvider(Provider):
         if recover_empty and not actionable_output_emitted and empty_response:
             pending_reasoning.clear()
             fallback_output_emitted = False
-            self.before_recovery_request(fallback)
+            await self.before_request(fallback, recovery=True)
             try:
                 async for event in self._stream_chat_once(fallback):
                     if event.type == "reasoning_summary_delta" and not fallback_output_emitted:

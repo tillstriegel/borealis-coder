@@ -18,14 +18,22 @@ from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input import Input
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
+from prompt_toolkit.layout.containers import (
+    ConditionalContainer,
+    FloatContainer,
+    HSplit,
+    VerticalAlign,
+    Window,
+)
 from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.output import Output
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.output import ColorDepth, Output
 from prompt_toolkit.patch_stdout import StdoutProxy
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 
 from .swarm_view import SwarmView
+from .usage_view import UsageView
 
 _HISTORY_TIMESTAMP = re.compile(r"^# \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 _LIBEDIT_HEADER = "_HiStOrY_V2_"
@@ -144,21 +152,23 @@ class TerminalInput:
         input: Input | None = None,
         output: Output | None = None,
         swarm: SwarmView | None = None,
+        usage: UsageView | None = None,
     ) -> None:
         self.swarm = swarm or SwarmView()
+        self.usage = usage or UsageView()
         bindings = KeyBindings()
 
         @bindings.add("f6")
         def focus_swarm(event):
             self.swarm.visible = True
-            self.swarm.focused = not self.swarm.focused
+            self.swarm.focused = not self.swarm.focused if self._inspector_visible() else False
 
         @bindings.add("f7")
         def toggle_swarm(event):
             self.swarm.visible = not self.swarm.visible
             self.swarm.focused = False
 
-        focused = Condition(lambda: self.swarm.visible and self.swarm.focused)
+        focused = Condition(lambda: self._inspector_visible() and self.swarm.focused)
 
         @bindings.add("up", filter=focused)
         @bindings.add("down", filter=focused)
@@ -199,29 +209,104 @@ class TerminalInput:
                 "swarm.title": "ansicyan bold", "swarm.muted": "ansibrightblack",
                 "swarm.text": "", "swarm.selected": "ansigreen bold",
             }) if "NO_COLOR" not in os.environ and os.getenv("TERM") != "dumb" else Style([]),
+            color_depth=ColorDepth.DEPTH_1_BIT if "NO_COLOR" in os.environ else None,
             history=history,
             completer=completer,
             complete_while_typing=True,
             complete_style=CompleteStyle.MULTI_COLUMN,
-            reserve_space_for_menu=8,
+            reserve_space_for_menu=0,
             input=input,
             output=output,
         )
         layout = self._session.app.layout
-        layout.container = HSplit([
+        # Render only the form, leaving recent stdout untouched above it.
+        # Pin on entry/resize; normal-screen scrolling then keeps both stdout
+        # and the compact form visible when StdoutProxy prints above the app.
+        layout.current_window.dont_extend_height = Condition(lambda: True)
+        layout.current_window.height = lambda: Dimension(
+            min=1, max=max(1, self._session.app.output.get_size().rows - 3)
+        )
+        self._form = layout.container
+        # PromptSession normally bounds completion floats to its input region.
+        # Give completion floats temporary room above the compact form. Leave
+        # the right prompt in the form and release menu space after stdout.
+        input_container = next(container for container in layout.walk()
+                               if isinstance(container, FloatContainer))
+        completion_floats = [floating for floating in input_container.floats if floating.ycursor]
+        input_container.floats = [floating for floating in input_container.floats if not floating.ycursor]
+        layout.container = FloatContainer(HSplit([
+            ConditionalContainer(
+                Window(height=self._completion_height),
+                filter=Condition(lambda: self._completion_height() > 0) & ~is_done,
+            ),
             ConditionalContainer(
                 Window(FormattedTextControl(self._swarm_toolbar), dont_extend_height=True,
                        wrap_lines=False),
-                filter=Condition(lambda: self.swarm.visible) & ~is_done,
+                filter=Condition(self._inspector_visible) & ~is_done,
             ),
-            layout.container,
-        ])
+            ConditionalContainer(
+                Window(FormattedTextControl(self._usage_toolbar), dont_extend_height=True,
+                       wrap_lines=True), filter=~is_done,
+            ),
+            self._form,
+        ], align=VerticalAlign.BOTTOM), completion_floats)
+        self._last_size = None
+        self._session.app.before_render += self._pin_on_resize
         self._history_enabled = history_enabled
         self.reading = False
 
+    def _inspector_visible(self) -> bool:
+        visible = self.swarm.visible and self._swarm_height() >= 3
+        if not visible:
+            self.swarm.focused = False
+        return visible
+
+    def _pin_on_resize(self, app) -> None:
+        size = app.output.get_size()
+        if size != self._last_size:
+            app.renderer.erase(leave_alternate_screen=False)
+            try:
+                # Native consoles move within a scrollback buffer, not just the
+                # viewport. Use their actual remaining visible rows.
+                down = max(0, app.output.get_rows_below_cursor_position() - 1)
+            except NotImplementedError:
+                # VT cursor-down clamps at the last physical row.
+                down = size.rows
+            app.output.cursor_down(down)
+            self._last_size = size
+        elif not app.is_done:
+            screen = app.renderer._last_screen
+            if screen is None:
+                return
+            height = app.layout.container.preferred_height(size.columns, size.rows).preferred
+            if screen.height > height:
+                # Release the old form's padding before stdout can erase/reset
+                # the renderer. Keep the new compact form at the same bottom.
+                down = screen.height - height
+                app.renderer.erase(leave_alternate_screen=False)
+                app.output.cursor_down(down)
+
+    def _completion_height(self) -> int:
+        state = self._session.default_buffer.complete_state
+        if state is None:
+            return 0
+        size = self._session.app.output.get_size()
+        return max(0, min(8, len(state.completions) + 1, size.rows - 4))
+
+    def _usage_toolbar(self) -> str:
+        return self.usage.render(self._session.app.output.get_size().columns)
+
+    def _swarm_height(self) -> int:
+        size = self._session.app.output.get_size()
+        form_height = self._form.preferred_height(
+            size.columns, size.rows
+        ).preferred
+        hud_height = len(self.usage.render(size.columns).splitlines())
+        return max(0, min(16, size.rows - form_height - hud_height - self._completion_height() - 1))
+
     def _swarm_toolbar(self):
         size = self._session.app.output.get_size()
-        return self.swarm.render(size.columns, max(1, min(16, size.rows - 10)))
+        return self.swarm.render(size.columns, self._swarm_height())
 
     def invalidate(self) -> None:
         self._session.app.invalidate()
@@ -251,11 +336,13 @@ class TerminalInput:
         """Read one line while preserving cursor and wrapped-line state."""
 
         self.reading = True
+        self._last_size = None
         try:
             try:
                 return await self._session.prompt_async(
                     ANSI(prompt.replace("\001", "").replace("\002", "")),
                     default=default,
+                    pre_run=lambda: self._pin_on_resize(self._session.app),
                 )
             except KeyboardInterrupt:
                 raise TerminalInputInterrupted from None

@@ -42,6 +42,9 @@ def capture_screen(terminal: TerminalInput, destination: Path) -> None:
     if screen is None:
         raise RuntimeError("Prompt-toolkit has not composed a screen")
     size = app.output.get_size()
+    # A normal-screen renderer owns only the compact bottom form. Export its
+    # cells at their physical bottom position; stdout needs emitted-ANSI capture.
+    origin = max(0, size.rows - screen.height)
     cells = []
     lines = []
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{size.columns * 9}" height="{size.rows * 19}" viewBox="0 0 {size.columns * 9} {size.rows * 19}">',
@@ -50,7 +53,7 @@ def capture_screen(terminal: TerminalInput, destination: Path) -> None:
     for y in range(size.rows):
         line = ""
         for x in range(size.columns):
-            char = screen.data_buffer[y][x]
+            char = screen.data_buffer[y - origin][x] if y >= origin else screen.data_buffer[-1][x]
             attrs = app._merged_style.get_attrs_for_style_str(char.style)
             foreground = attrs.color or "d8dee9"
             background = attrs.bgcolor or "181b21"
@@ -71,7 +74,7 @@ def capture_screen(terminal: TerminalInput, destination: Path) -> None:
         lines.append(line.rstrip())
     svg.append("</g></svg>")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.with_suffix(".cells.json").write_text(json.dumps({"columns": size.columns, "rows": size.rows, "cells": cells}, ensure_ascii=False, indent=2) + "\n")
+    destination.with_suffix(".cells.json").write_text(json.dumps({"columns": size.columns, "rows": size.rows, "origin": origin, "compositor_only": True, "cells": cells}, ensure_ascii=False, indent=2) + "\n")
     destination.with_suffix(".txt").write_text("\n".join(lines) + "\n")
     destination.with_suffix(".svg").write_text("\n".join(svg) + "\n")
 
