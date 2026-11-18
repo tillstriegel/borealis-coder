@@ -43,6 +43,7 @@ def main() -> int:
             "docs/INTERACTIVE_CLI.md",
             "docs/RESEARCH.md",
             "scripts/validate_release.py",
+            "skills/borealis/SKILL.md",
         ):
             if not any(name.endswith("/" + required) for name in names):
                 errors.append(f"sdist missing {required}")
