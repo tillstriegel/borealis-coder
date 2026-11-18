@@ -500,6 +500,29 @@ The server implements the ACP v2 baseline plus advertised session-delete, additi
 - additional workspace roots
 - per-session MCP server configuration
 
+## Use Borealis from another AI agent
+
+The portable [Borealis operator skill](skills/borealis/SKILL.md) teaches an
+external agent to delegate bounded tasks through `borealis run`, choose explicit
+permissions and budgets, parse results, resume sessions, and independently verify
+changes. It does not depend on a particular agent host.
+
+Install the CLI as above, then copy `skills/borealis/` from this repository or
+source distribution into your agent's supported skill directory. For example,
+to make it available in a project's `.agents/skills` directory, run from this
+checkout (replace the target with the actual project path):
+
+```bash
+mkdir -p /path/to/project/.agents/skills
+cp -R skills/borealis /path/to/project/.agents/skills/
+```
+
+Use your host's own skill location if different, and reload its skill catalog
+if needed. Inspect an existing `borealis` skill before replacing it. The skill
+ships in the repository and source distribution; installing the Python wheel
+installs the CLI, not a skill into your agent's configuration. The operator
+skill is distinct from project-local skills that Borealis itself consumes.
+
 ## Embed the runtime
 
 ```python

@@ -10,6 +10,7 @@ include pyproject.toml
 recursive-include docs *.md *.toml
 recursive-include scripts *.py
 recursive-include examples *
+recursive-include skills *.md
 recursive-include tests *.py
 recursive-include .github *.yml *.yaml
 prune .borealis
